@@ -1,0 +1,67 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "qapilot"
+version = "0.1.0"
+description = "AI 기반 테스트 시나리오/데이터 생성 및 통합 테스트 자동화 및 오류 분석 시스템"
+requires-python = ">=3.11"
+dependencies = [
+    # CLI
+    "typer>=0.12",
+    # AI 서버
+    "fastapi>=0.111",
+    "uvicorn>=0.30",
+    # Agent 프레임워크
+    "langgraph>=0.2",
+    "langchain-openai>=0.1",
+    # LLM
+    "openai>=1.30",
+    # 벡터 DB
+    "qdrant-client>=1.9",
+    # RDB
+    "asyncpg>=0.29",
+    "sqlalchemy>=2.0",
+    # 테스트 실행
+    "playwright>=1.44",
+    # AST 파싱
+    "tree-sitter>=0.22",
+    # 문서 파싱
+    "docling>=1.0",
+    "openpyxl>=3.1",
+    # 데이터 검증
+    "pydantic>=2.7",
+    # 로깅
+    "structlog>=24.1",
+    # 설정
+    "pyyaml>=6.0",
+    "python-dotenv>=1.0",
+    # 임베딩
+    "tiktoken>=0.7",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "black>=24.0",
+    "ruff>=0.4",
+    "isort>=5.13",
+]
+
+[project.scripts]
+qapilot = "qapilot.cli.main:app"
+
+[tool.black]
+line-length = 100
+
+[tool.ruff]
+line-length = 100
+
+[tool.isort]
+profile = "black"
+line_length = 100
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"

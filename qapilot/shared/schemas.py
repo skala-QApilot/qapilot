@@ -1,0 +1,386 @@
+"""공통 스키마 정의.
+
+PipelineState (LangGraph용 TypedDict) + Agent/Tool I/O (Pydantic 검증용)를 정의한다.
+
+Author: 공통
+Created: 2026-05-07
+"""
+
+from typing import Any, Literal, TypedDict
+
+from pydantic import BaseModel, Field
+
+
+# ═══════════════════════════════════════════════════
+# Pydantic 스키마 — Agent/Tool I/O 검증용
+# ═══════════════════════════════════════════════════
+
+
+class BaseMetadata(BaseModel):
+    """공통 메타데이터 (모든 Agent 필수)."""
+
+    model: str
+    tokens_used: int
+    duration_sec: float
+    retry_count: int = 0
+    cache_hit: bool = False
+
+
+class AgentInput(BaseModel):
+    """Agent 공통 입력."""
+
+    trace_id: str = Field(..., description="실행 추적 ID")
+    context: dict[str, Any] = Field(default_factory=dict)
+    params: dict[str, Any] = Field(default_factory=dict)
+
+
+class AgentOutput(BaseModel):
+    """Agent 공통 출력."""
+
+    trace_id: str = Field(..., description="실행 추적 ID")
+    result: dict[str, Any] = Field(..., description="실행 결과")
+    confidence: float = Field(..., ge=0.0, le=1.0)
+    metadata: BaseMetadata
+
+
+class ToolInput(BaseModel):
+    """Tool 공통 입력."""
+
+    trace_id: str = Field(..., description="실행 추적 ID")
+    params: dict[str, Any] = Field(default_factory=dict)
+
+
+class ToolOutput(BaseModel):
+    """Tool 공통 출력."""
+
+    trace_id: str = Field(..., description="실행 추적 ID")
+    result: dict[str, Any] = Field(..., description="실행 결과")
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+# ═══════════════════════════════════════════════════
+# TypedDict — 파이프라인 데이터 타입
+# ═══════════════════════════════════════════════════
+
+
+class RunOptions(TypedDict):
+    """실행 옵션."""
+
+    command: Literal["generate", "test"]
+    # generate 전용
+    trigger: Literal["init", "code_change", "doc_update", "natural_lang"] | None
+    user_input: str | None
+    # test 전용
+    scenario_ids: list[str] | None
+    filter: Literal["all", "failed", "affected"] | None
+    tags: list[str] | None
+
+
+# ── 코드베이스 스캔 ──
+
+
+class FileInfo(TypedDict):
+    """파일 분석 결과."""
+
+    path: str
+    language: str
+    endpoints: list[dict]
+    functions: list[dict]
+    dependencies: list[str]
+
+
+class GitDiff(TypedDict):
+    """Git 변경 정보."""
+
+    commit_hash: str
+    prev_hash: str
+    changed_files: list[str]
+    added_lines: int
+    deleted_lines: int
+    diff_detail: list[dict]
+
+
+class ScanResult(TypedDict):
+    """코드베이스 스캔 결과."""
+
+    files: list[FileInfo]
+    git_diff: GitDiff | None
+    framework: str
+    language: str
+    endpoint_count: int
+
+
+# ── 도메인 지식 ──
+
+
+class DomainRule(TypedDict):
+    """도메인 규칙."""
+
+    rule_id: str
+    source: str
+    category: str
+    content: str
+    similarity_score: float
+
+
+# ── 요구사항 ──
+
+
+class RequirementItem(TypedDict):
+    """추출된 요구사항 항목."""
+
+    req_id: str  # REQ-XXX
+    req_type: Literal["functional", "non_functional"]
+    content: str
+    priority: Literal["high", "medium", "low"]
+    domain_area: str
+
+
+# ── TS / TC / TV ──
+
+
+class TestValue(TypedDict):
+    """테스트 밸류."""
+
+    field: str
+    value: str
+    type: str
+    purpose: str
+
+
+class TestCase(TypedDict):
+    """테스트 케이스."""
+
+    tc_id: str
+    name: str
+    given: str
+    when: str
+    then: str
+    values: list[TestValue]
+    tags: list[str]
+    req_id: str | None
+
+
+class TestScenario(TypedDict):
+    """테스트 시나리오."""
+
+    ts_id: str
+    name: str
+    description: str
+    trigger: str
+    affected_files: list[str]
+    domain_rules_used: list[str]
+    test_cases: list[TestCase]
+
+
+# ── 액션 매핑 ──
+
+
+class ActionStep(TypedDict):
+    """UI 액션 스텝."""
+
+    step_no: int
+    action: str
+    selector: str
+    value: str | None
+    expected: str | None
+    api_endpoint: str | None
+    db_table: str | None
+
+
+class ActionMapping(TypedDict):
+    """시나리오-액션 매핑 결과."""
+
+    tc_id: str
+    steps: list[ActionStep]
+    selector_confidence: float
+
+
+# ── 코드 생성 ──
+
+
+class GeneratedCode(TypedDict):
+    """생성된 Playwright 코드."""
+
+    tc_id: str
+    code: str
+    self_fix_count: int
+    syntax_valid: bool
+
+
+# ── 테스트 실행 결과 ──
+
+
+class UIStepResult(TypedDict):
+    """UI 스텝 실행 결과."""
+
+    step_no: int
+    action: str
+    status: Literal["pass", "fail", "skip"]
+    screenshot_path: str | None
+    console_logs: list[str]
+    error: str | None
+    duration_ms: int
+
+
+class UITestResult(TypedDict):
+    """UI 테스트 결과."""
+
+    tc_id: str
+    status: Literal["pass", "fail"]
+    steps: list[UIStepResult]
+    total_duration_ms: int
+
+
+class APICall(TypedDict):
+    """API 호출 기록."""
+
+    timestamp: str
+    method: str
+    url: str
+    request_headers: dict
+    request_body: dict | None
+    status_code: int
+    response_body: dict | None
+    response_size: int
+    content_type: str
+    latency_ms: int
+    matched_step_no: int | None
+
+
+class APITraceResult(TypedDict):
+    """API 추적 결과."""
+
+    tc_id: str
+    calls: list[APICall]
+    total_calls: int
+    error_calls: int
+
+
+class DBSnapshot(TypedDict):
+    """DB 스냅샷."""
+
+    table: str
+    row_count_before: int
+    row_count_after: int
+    added: int
+    deleted: int
+    modified: int
+
+
+class DBTestResult(TypedDict):
+    """DB 테스트 결과."""
+
+    tc_id: str
+    snapshots: list[DBSnapshot]
+    summary: str
+
+
+# ── Cross-check ──
+
+
+class CrossCheckMismatch(TypedDict):
+    """불일치 항목."""
+
+    field: str
+    ui_value: str
+    api_value: str
+    db_value: str | None
+    severity: str
+
+
+class CrossCheckResult(TypedDict):
+    """Cross-check 결과."""
+
+    tc_id: str
+    match_score: float
+    matched_fields: int
+    mismatched_fields: int
+    mismatches: list[CrossCheckMismatch]
+    has_mismatch: bool
+
+
+# ── 장애 분석 ──
+
+
+class DefectClassification(TypedDict):
+    """결함 분류 결과."""
+
+    tc_id: str
+    defect_type: Literal["ui", "api", "data", "environment", "domain_rule"]
+    sub_type: str
+    description: str
+    rule_based: bool
+
+
+class Evidence(TypedDict):
+    """원인 근거."""
+
+    type: Literal["code_location", "domain_rule", "runtime_data"]
+    content: str
+
+
+class RootCauseCandidate(TypedDict):
+    """원인 후보."""
+
+    rank: int
+    cause: str
+    confidence: float
+    evidences: list[Evidence]
+    affected_file: str | None
+    affected_line: int | None
+
+
+class RootCauseResult(TypedDict):
+    """원인 추론 결과."""
+
+    tc_id: str
+    candidates: list[RootCauseCandidate]
+
+
+class FixSuggestion(TypedDict):
+    """수정 제안."""
+
+    file_path: str
+    line_number: int
+    blame_author: str | None
+    code_snippet: str
+    description: str
+    similar_issues: list[str]
+
+
+class FixResult(TypedDict):
+    """해결 방안 결과."""
+
+    tc_id: str
+    suggestions: list[FixSuggestion]
+
+
+# ── HITL ──
+
+
+class HITLRecord(TypedDict):
+    """HITL 검토 기록."""
+
+    target: Literal["scenario_gen", "natural_lang"]
+    target_id: str
+    requested_at: str
+    responded_at: str | None
+    decision: Literal["approved", "modified", "rejected"] | None
+    confidence_shown: float
+    modifications: dict | None
+    reviewer: str | None
+
+
+# ── 메타 ──
+
+
+class AgentMeta(TypedDict):
+    """Agent 실행 메타."""
+
+    agent_name: str
+    model: str
+    tokens_used: int
+    duration_sec: float
+    retry_count: int
+    cache_hit: bool

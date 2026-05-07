@@ -1,0 +1,22 @@
+# Environment
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+dist/
+build/
+
+# QApilot 로컬 데이터
+.qapilot/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+
+# Node (프론트엔드)
+node_modules/
