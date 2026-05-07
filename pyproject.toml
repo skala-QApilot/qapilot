@@ -13,11 +13,9 @@ dependencies = [
     # AI 서버
     "fastapi>=0.111",
     "uvicorn>=0.30",
-    # Agent 프레임워크
-    "langgraph>=0.2",
-    "langchain-openai>=0.1",
-    # LLM
-    "openai>=1.30",
+    # Agent 프레임워크 (langchain이 langgraph를 포함)
+    "langchain>=1.0",
+    "langchain-openai>=0.3",
     # 벡터 DB
     "qdrant-client>=1.9",
     # RDB
