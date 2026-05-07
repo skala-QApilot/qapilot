@@ -8,7 +8,6 @@ Created: 2026-05-07
 """
 
 from qapilot.agents.base_agent import BaseAgent
-from qapilot.shared.schemas import AgentInput, AgentOutput
 
 
 class CodeGeneratorAgent(BaseAgent):
@@ -21,5 +20,5 @@ class CodeGeneratorAgent(BaseAgent):
     HITL: X
     """
 
-    async def run(self, input: AgentInput) -> AgentOutput:
+    async def _execute(self, context: dict, params: dict) -> "ExecuteResult":
         raise NotImplementedError

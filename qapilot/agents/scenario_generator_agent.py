@@ -8,7 +8,6 @@ Created: 2026-05-07
 """
 
 from qapilot.agents.base_agent import BaseAgent
-from qapilot.shared.schemas import AgentInput, AgentOutput
 
 
 class ScenarioGeneratorAgent(BaseAgent):
@@ -21,5 +20,5 @@ class ScenarioGeneratorAgent(BaseAgent):
     HITL: O (항상, 승인 후 액션 매핑으로 진행)
     """
 
-    async def run(self, input: AgentInput) -> AgentOutput:
+    async def _execute(self, context: dict, params: dict) -> "ExecuteResult":
         raise NotImplementedError

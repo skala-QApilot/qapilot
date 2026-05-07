@@ -7,7 +7,6 @@
 Created: 2026-05-07
 """
 
-from qapilot.shared.schemas import ToolInput, ToolOutput
 from qapilot.tools.base_tool import BaseTool
 
 
@@ -20,5 +19,5 @@ class ReportTool(BaseTool):
     구성: 실행 요약 + 실패 케이스 + 원인 분석 + 해결 방안
     """
 
-    async def run(self, input: ToolInput) -> ToolOutput:
+    async def _execute(self, params: dict) -> dict:
         raise NotImplementedError

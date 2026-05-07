@@ -6,9 +6,23 @@ Author: 공통
 Created: 2026-05-07
 """
 
+from dataclasses import dataclass
 from typing import Any, Literal, TypedDict
 
 from pydantic import BaseModel, Field
+
+
+# ═══════════════════════════════════════════════════
+# _execute() 반환 타입
+# ═══════════════════════════════════════════════════
+
+
+@dataclass
+class ExecuteResult:
+    """BaseAgent._execute()의 반환 타입. 팀원은 이것만 반환하면 된다."""
+
+    result: dict[str, Any]
+    confidence: float  # 0.0~1.0
 
 
 # ═══════════════════════════════════════════════════

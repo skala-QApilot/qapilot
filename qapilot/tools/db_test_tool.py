@@ -7,7 +7,6 @@ trace_id 기준으로 SQL 호출을 추적한다.
 Created: 2026-05-07
 """
 
-from qapilot.shared.schemas import ToolInput, ToolOutput
 from qapilot.tools.base_tool import BaseTool
 
 
@@ -20,5 +19,5 @@ class DBTestTool(BaseTool):
     보안: DB 원본 데이터는 LLM에 전송하지 않음 (요약만)
     """
 
-    async def run(self, input: ToolInput) -> ToolOutput:
+    async def _execute(self, params: dict) -> dict:
         raise NotImplementedError
