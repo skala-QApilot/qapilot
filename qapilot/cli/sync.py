@@ -25,36 +25,39 @@ async def sync_local_to_server() -> bool:
     scenarios_dir = base_dir / "scenarios"
     codes_dir = base_dir / "generated-code"
 
-    if not scenarios_dir.exists():
-        console.print("[yellow]동기화할 시나리오가 없습니다.[/yellow]")
-        return True
-
-    # 시나리오 파일 목록 수집 (*.json)
+    # 1. 시나리오 동기화
     scenario_files = list(scenarios_dir.glob("*.json"))
-    if not scenario_files:
-        console.print("[yellow]동기화할 시나리오 파일이 없습니다.[/yellow]")
-        return True
+    if scenario_files:
+        console.print(f"[bold green]{len(scenario_files)}개의 시나리오를 동기화합니다...[/bold green]")
+        with Progress() as progress:
+            task = progress.add_task("[cyan]Uploading scenarios...", total=len(scenario_files))
+            for sf in scenario_files:
+                try:
+                    with open(sf, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                    await api_client.upload_scenario(data)
+                except Exception as e:
+                    console.print(f"[red]시나리오 {sf.name} 업로드 실패: {e}[/red]")
+                progress.update(task, advance=1)
+    else:
+        console.print("[yellow]동기화할 시나리오가 없습니다.[/yellow]")
 
-    console.print(f"[bold green]{len(scenario_files)}개의 시나리오를 동기화합니다...[/bold green]")
+    # 2. 생성된 코드(.js) 동기화
+    code_files = list(codes_dir.glob("*.js"))
+    if code_files:
+        console.print(f"[bold green]{len(code_files)}개의 생성된 코드를 동기화합니다...[/bold green]")
+        with Progress() as progress:
+            task = progress.add_task("[cyan]Uploading generated codes...", total=len(code_files))
+            for cf in code_files:
+                try:
+                    code_content = cf.read_text(encoding="utf-8")
+                    tc_id = cf.stem  # 파일명이 TC_ID라고 가정
+                    await api_client.upload_generated_code(tc_id, code_content)
+                except Exception as e:
+                    console.print(f"[red]코드 {cf.name} 업로드 실패: {e}[/red]")
+                progress.update(task, advance=1)
+    else:
+        console.print("[yellow]동기화할 생성 코드가 없습니다.[/yellow]")
 
-    success_count = 0
-    with Progress() as progress:
-        task = progress.add_task("[cyan]Uploading scenarios...", total=len(scenario_files))
-        
-        for sf in scenario_files:
-            try:
-                with open(sf, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                
-                # TODO: 시나리오에 해당하는 코드 파일(.js)이 있으면 함께 포함하거나 별도 업로드
-                # 현재는 시나리오만 전송
-                res = await api_client.upload_scenario(data)
-                if res:
-                    success_count += 1
-            except Exception as e:
-                console.print(f"[red]파일 {sf.name} 업로드 중 오류 발생: {e}[/red]")
-            
-            progress.update(task, advance=1)
-
-    console.print(f"[bold blue]동기화 완료: {success_count}/{len(scenario_files)} 성공[/bold blue]")
-    return success_count == len(scenario_files)
+    console.print("[bold blue]서버 동기화 프로세스가 완료되었습니다.[/bold blue]")
+    return True

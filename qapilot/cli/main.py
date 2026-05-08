@@ -25,8 +25,10 @@ api_client = ApiClient()
 
 @app.command()
 def init() -> None:
-    """프로젝트 초기화 + 코드 스캔."""
+    """프로젝트 초기화 + 코드 스캔 + 서버 설정."""
     console.print("[bold green]QApilot 초기화를 시작합니다...[/bold green]")
+    
+    # 1. 디렉토리 구조 생성
     base_dir = Path(".qapilot")
     dirs_to_create = [
         base_dir / "codebase-index",
@@ -42,11 +44,35 @@ def init() -> None:
     ]
     for d in dirs_to_create:
         d.mkdir(parents=True, exist_ok=True)
-
     console.print("디렉토리 구조 생성 완료.")
-    console.print("코드 스캔을 진행합니다...")
+
+    # 2. qapilot.config.yaml 생성 (인터랙티브)
+    config_file = Path("qapilot.config.yaml")
+    if not config_file.exists():
+        console.print("\n[bold cyan]중앙 서버 설정을 진행합니다 (나중에 수정 가능)[/bold cyan]")
+        server_url = typer.prompt("중앙 서버 URL (예: http://localhost:8000)", default="http://localhost:8000")
+        server_token = typer.prompt("서버 인증 토큰 (없으면 엔터)", default="", show_default=False)
+        
+        import yaml
+        config_data = {
+            "server": {
+                "url": server_url,
+                "token": server_token if server_token else None
+            },
+            "llm": {
+                "default_model": "gpt-4o-mini",
+                "deep_model": "gpt-4o"
+            }
+        }
+        with open(config_file, "w", encoding="utf-8") as f:
+            yaml.dump(config_data, f, default_flow_style=False, allow_unicode=True)
+        console.print(f"설정 파일 생성 완료: {config_file}")
+    else:
+        console.print(f"\n기존 설정 파일이 존재합니다: {config_file}")
+
+    console.print("\n코드 스캔을 진행합니다...")
     # TODO: codebase scanner 연동 (FR-000)
-    console.print("[bold blue]초기화 완료! 로컬 코드 인덱스가 생성되었습니다.[/bold blue]")
+    console.print("[bold blue]초기화 완료! 이제 qapilot generate를 통해 시나리오를 생성해 보세요.[/bold blue]")
 
 
 @app.command()
