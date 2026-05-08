@@ -32,20 +32,21 @@ MASCOT_BLUE = "#70c4c4"   # 캐릭터 안테나/귀마개
 MASCOT_FACE = "#bf9360"   # 캐릭터 얼굴(금색/갈색)
 
 def print_welcome_banner():
-    """웹 UI 테마 컬러와 픽셀 마스코트가 포함된 환영 배너 출력."""
+    """웹 UI 테마 컬러와 세련된 픽셀 마스코트가 포함된 환영 배너 출력."""
     
-    # 픽셀 마스코트 (qapilot-agent.png 모티브) - 정교화 및 오류 수정
+    # 픽셀 마스코트 (더 귀엽고 세련된 버전)
     mascot = (
-        f"         [{MASCOT_BLUE}]▄███▄[/]\n"
-        f"       [white]▄███████▄[/]\n"
-        f"      [white]███[/][{MASCOT_FACE}]▀▀▀▀▀[/][white]███[/]\n"
-        f"      [white]███[/][{MASCOT_FACE}] ◕ ◕ [/][white]███[/]\n"
-        f"      [white]▀██[/][{MASCOT_FACE}] ▄█▄ [/][white]██▀[/]\n"
-        f"        [white]▀█████▀[/]"
+        f"        [{MASCOT_BLUE}]◢██████◣[/]\n"
+        f"       [white]◢██████████◣[/]\n"
+        f"      [white]██[/][{MASCOT_FACE}]████████[/][white]██[/]\n"
+        f"      [white]██[/][{MASCOT_FACE}]█ ◕   ◕ █[/][white]██[/]\n"
+        f"      [white]██[/][{MASCOT_FACE}]████████[/][white]██[/]\n"
+        f"       [white]◥██████████◤[/]\n"
+        f"         [{BRAND_PURPLE}]◥██████◤[/]"
     )
 
     banner_content = Table.grid(expand=True)
-    banner_content.add_column(justify="center", width=22)
+    banner_content.add_column(justify="center", width=24)
     banner_content.add_column(justify="left")
     
     banner_content.add_row(
@@ -107,7 +108,8 @@ def init() -> None:
     project_table.add_row(f"[{BRAND_PURPLE}]4.[/{BRAND_PURPLE}]", "기타 / 직접 입력")
     console.print(project_table)
     
-    project_choice = IntPrompt.ask("유형을 선택하세요", choices=[1, 2, 3, 4], default=1)
+    # choices를 문자열로 전달해야 함 (Rich Prompt 사양)
+    project_choice = IntPrompt.ask("유형을 선택하세요", choices=["1", "2", "3", "4"], default=1)
     project_types = {1: "fastapi", 2: "springboot", 3: "nodejs", 4: "other"}
     framework = project_types[project_choice]
 
@@ -119,7 +121,7 @@ def init() -> None:
     model_table.add_row(f"[{BRAND_PURPLE}]3.[/{BRAND_PURPLE}]", "[bold]o3-mini[/bold] (최신 추론 특화 모델)")
     console.print(model_table)
     
-    model_choice = IntPrompt.ask("모델을 선택하세요", choices=[1, 2, 3], default=1)
+    model_choice = IntPrompt.ask("모델을 선택하세요", choices=["1", "2", "3"], default=1)
     models = {1: "gpt-4o-mini", 2: "gpt-4o", 3: "o3-mini"}
     selected_model = models[model_choice]
 
