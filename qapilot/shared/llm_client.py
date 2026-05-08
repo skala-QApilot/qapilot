@@ -15,7 +15,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
 
 from qapilot.shared.config import LLMConfig
-from qapilot.shared.errors import ErrorCode, LLMApiError
+from qapilot.shared.errors import ErrorCode, LLMApiError, QApilotError
 from qapilot.shared.logger import get_logger
 
 _MAX_LLM_RETRY = 3
@@ -63,6 +63,14 @@ class LLMClient:
         Raises:
             LLMApiError: 재시도 소진 시.
         """
+        # 토큰 예산 차단
+        if self.total_tokens >= self._config.max_tokens_per_task:
+            raise QApilotError(
+                ErrorCode.SYSTEM_002,
+                f"태스크 토큰 예산 초과: {self.total_tokens}/{self._config.max_tokens_per_task}",
+                {"used": self.total_tokens, "limit": self._config.max_tokens_per_task},
+            )
+
         model = model or self._config.default_model
         cache_key = self._cache_key(system_prompt, user_prompt, model)
 

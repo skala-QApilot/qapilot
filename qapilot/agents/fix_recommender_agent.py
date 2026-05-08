@@ -20,5 +20,7 @@ class FixRecommenderAgent(BaseAgent):
     HITL: X
     """
 
-    async def _execute(self, context: dict, params: dict) -> "ExecuteResult":
+    async def _execute(
+        self, context: dict, params: dict, last_error: str | None = None
+    ) -> "ExecuteResult":
         raise NotImplementedError

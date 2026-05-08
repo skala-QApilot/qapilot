@@ -20,5 +20,7 @@ class NaturalLanguageAgent(BaseAgent):
     HITL: O (항상, 승인 후 액션 매핑으로 진행)
     """
 
-    async def _execute(self, context: dict, params: dict) -> "ExecuteResult":
+    async def _execute(
+        self, context: dict, params: dict, last_error: str | None = None
+    ) -> "ExecuteResult":
         raise NotImplementedError

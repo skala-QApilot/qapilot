@@ -54,6 +54,7 @@ class BaseAgent(ABC):
         """Agent 실행 하네스. 팀원이 건드리지 않는 영역.
 
         흐름: 입력 가드레일 → 재시도 루프(타임아웃 포함) → 출력 가드레일 → 메타데이터 → 로깅
+        재시도 시 직전 에러 메시지를 last_error로 _execute()에 전달하여 자가 수정을 유도한다.
         """
         start = time.monotonic()
         self.logger.info("agent_start", params_keys=list(input.params.keys()))
@@ -62,14 +63,14 @@ class BaseAgent(ABC):
         Guardrails.check_input({**input.context, **input.params})
 
         # 재시도 루프
-        last_error: Exception | None = None
+        last_error: str | None = None
         retry_count = 0
 
         for attempt in range(self._resolved.max_retry + 1):
             retry_count = attempt
             try:
                 execute_result = await asyncio.wait_for(
-                    self._execute(input.context, input.params),
+                    self._execute(input.context, input.params, last_error=last_error),
                     timeout=self._resolved.timeout_sec,
                 )
 
@@ -107,18 +108,14 @@ class BaseAgent(ABC):
                 )
 
             except asyncio.TimeoutError:
-                last_error = AgentTimeoutError(
-                    ErrorCode.AGENT_003,
-                    f"타임아웃: {self._resolved.timeout_sec}초 초과",
-                    {"attempt": attempt},
-                )
+                last_error = f"타임아웃: {self._resolved.timeout_sec}초 초과"
                 self.logger.warning("agent_timeout", attempt=attempt)
 
             except AgentExecutionError:
                 raise  # 가드레일/검증 에러는 재시도하지 않음
 
             except Exception as e:
-                last_error = e
+                last_error = f"{type(e).__name__}: {e}"
                 self.logger.warning("agent_retry", attempt=attempt, error=str(e))
 
             # 다음 재시도 전 대기
@@ -128,12 +125,15 @@ class BaseAgent(ABC):
         raise AgentExecutionError(
             ErrorCode.AGENT_005,
             f"재시도 {self._resolved.max_retry + 1}회 모두 실패",
-            {"last_error": str(last_error)},
+            {"last_error": last_error},
         )
 
     @abstractmethod
     async def _execute(
-        self, context: dict[str, Any], params: dict[str, Any]
+        self,
+        context: dict[str, Any],
+        params: dict[str, Any],
+        last_error: str | None = None,
     ) -> ExecuteResult:
         """Agent 비즈니스 로직. 하위 클래스에서 구현한다.
 
@@ -142,10 +142,33 @@ class BaseAgent(ABC):
         Args:
             context: 컨텍스트 데이터 (코드베이스, 도메인 등).
             params: 입력 파라미터.
+            last_error: 이전 시도에서 발생한 에러 메시지. None이면 첫 시도.
+                self.with_correction_hint()으로 프롬프트에 첨부하면 LLM 자가 수정 유도 가능.
 
         Returns:
             ExecuteResult(result=dict, confidence=float).
         """
+
+    def with_correction_hint(self, prompt: str, last_error: str | None) -> str:
+        """프롬프트에 자가 수정 힌트를 추가한다.
+
+        팀원이 _execute() 내부에서 사용한다:
+            user_prompt = self.with_correction_hint(self.prompts.render(...), last_error)
+
+        Args:
+            prompt: 원본 프롬프트.
+            last_error: 이전 시도의 에러 메시지. None이면 원본 그대로 반환.
+
+        Returns:
+            last_error가 있으면 힌트가 추가된 프롬프트.
+        """
+        if not last_error:
+            return prompt
+        return (
+            f"{prompt}\n\n"
+            f"⚠️ 이전 시도에서 다음 오류가 발생했습니다:\n{last_error}\n\n"
+            f"출력 스키마와 형식을 정확히 준수하여 다시 작성하세요."
+        )
 
     async def use_tool(self, tool_name: str, params: dict[str, Any]) -> dict[str, Any]:
         """Tool을 호출한다. allowed_tools 화이트리스트를 검증한다.
