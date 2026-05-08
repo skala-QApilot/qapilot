@@ -36,6 +36,8 @@ dependencies = [
     # 설정
     "pyyaml>=6.0",
     "python-dotenv>=1.0",
+    # 통신
+    "httpx>=0.27",
     # 임베딩
     "tiktoken>=0.7",
 ]

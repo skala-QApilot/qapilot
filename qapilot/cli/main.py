@@ -13,11 +13,13 @@ from typing import Optional
 import typer
 from rich.console import Console
 
+from qapilot.cli.api_client import ApiClient
 from qapilot.orchestrator.runner import run_pipeline
 from qapilot.shared.schemas import RunOptions
 
 app = typer.Typer(help="QApilot — AI 기반 QA 자동화 시스템")
 console = Console()
+api_client = ApiClient()
 
 
 @app.command()
