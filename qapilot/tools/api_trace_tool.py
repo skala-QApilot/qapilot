@@ -7,7 +7,6 @@ trace_id 기준으로 UI 스텝과 API 호출을 매칭한다.
 Created: 2026-05-07
 """
 
-from qapilot.shared.schemas import ToolInput, ToolOutput
 from qapilot.tools.base_tool import BaseTool
 
 
@@ -20,5 +19,5 @@ class APITraceTool(BaseTool):
     제한: 10MB 초과 응답 body는 저장하지 않음
     """
 
-    async def run(self, input: ToolInput) -> ToolOutput:
+    async def _execute(self, params: dict) -> dict:
         raise NotImplementedError

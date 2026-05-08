@@ -7,7 +7,6 @@
 Created: 2026-05-07
 """
 
-from qapilot.shared.schemas import ToolInput, ToolOutput
 from qapilot.tools.base_tool import BaseTool
 
 
@@ -20,5 +19,5 @@ class CodebaseScannerTool(BaseTool):
     저장: .qapilot/codebase-index/
     """
 
-    async def run(self, input: ToolInput) -> ToolOutput:
+    async def _execute(self, params: dict) -> dict:
         raise NotImplementedError

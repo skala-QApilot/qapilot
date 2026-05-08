@@ -7,7 +7,6 @@ PRD, 약관, 정책서 등 도메인 산출물을 벡터 DB에 임베딩하고
 Created: 2026-05-07
 """
 
-from qapilot.shared.schemas import ToolInput, ToolOutput
 from qapilot.tools.base_tool import BaseTool
 
 
@@ -20,5 +19,5 @@ class DomainKnowledgeTool(BaseTool):
     저장: Qdrant + .qapilot/domain/
     """
 
-    async def run(self, input: ToolInput) -> ToolOutput:
+    async def _execute(self, params: dict) -> dict:
         raise NotImplementedError
