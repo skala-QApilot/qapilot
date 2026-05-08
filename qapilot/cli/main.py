@@ -14,6 +14,7 @@ import typer
 from rich.console import Console
 
 from qapilot.cli.api_client import ApiClient
+from qapilot.cli.sync import sync_local_to_server
 from qapilot.orchestrator.runner import run_pipeline
 from qapilot.shared.schemas import RunOptions
 
@@ -51,6 +52,7 @@ def init() -> None:
 @app.command()
 def generate(
     affected: bool = typer.Option(False, "--affected", help="Git 변경분만 생성"),
+    sync: bool = typer.Option(True, "--sync/--no-sync", help="완료 후 서버와 동기화"),
 ) -> None:
     """시나리오 자동 생성 (Layer 1)."""
     options: RunOptions = {
@@ -64,7 +66,11 @@ def generate(
     console.print("[bold green]시나리오 생성을 시작합니다 (Layer 1)...[/bold green]")
     result = asyncio.run(run_pipeline(options))
     console.print(f"[bold blue]시나리오 생성 완료! (상태: {result['status']})[/bold blue]")
-    console.print("생성된 시나리오와 테스트 코드가 서버로 동기화될 준비가 되었습니다.")
+    
+    if sync:
+        asyncio.run(sync_local_to_server())
+    else:
+        console.print("생성된 시나리오와 테스트 코드가 서버로 동기화될 준비가 되었습니다.")
 
 
 @app.command()
@@ -109,6 +115,13 @@ def rescan() -> None:
     console.print("[bold green]로컬 코드 인덱스 재생성을 시작합니다...[/bold green]")
     # TODO: codebase scanner 연동 (FR-000)
     console.print("[bold blue]재생성 완료![/bold blue]")
+
+
+@app.command()
+def sync() -> None:
+    """로컬 산출물을 서버와 동기화."""
+    console.print("[bold green]서버 동기화를 시작합니다...[/bold green]")
+    asyncio.run(sync_local_to_server())
 
 
 @app.command()
