@@ -32,17 +32,17 @@ MASCOT_BLUE = "#70c4c4"   # 캐릭터 안테나/귀마개
 MASCOT_FACE = "#bf9360"   # 캐릭터 얼굴(금색/갈색)
 
 def print_welcome_banner():
-    """웹 UI 테마 컬러와 세련된 픽셀 마스코트가 포함된 환영 배너 출력."""
+    """웹 UI 테마 컬러와 정교한 8비트 픽셀 마스코트가 포함된 환영 배너 출력."""
     
-    # 픽셀 마스코트 (더 귀엽고 세련된 버전)
+    # 레트로 픽셀 아트 버전 (더 '도트'스러운 느낌 강조)
     mascot = (
-        f"        [{MASCOT_BLUE}]◢██████◣[/]\n"
-        f"       [white]◢██████████◣[/]\n"
-        f"      [white]██[/][{MASCOT_FACE}]████████[/][white]██[/]\n"
-        f"      [white]██[/][{MASCOT_FACE}]█ ◕   ◕ █[/][white]██[/]\n"
-        f"      [white]██[/][{MASCOT_FACE}]████████[/][white]██[/]\n"
-        f"       [white]◥██████████◤[/]\n"
-        f"         [{BRAND_PURPLE}]◥██████◤[/]"
+        f"        [{MASCOT_BLUE}]  ▄▄████▄▄  [/[MASCOT_BLUE]]\n"
+        f"        [{MASCOT_BLUE}]▄█[white]██████[/]{MASCOT_BLUE}█▄[/[MASCOT_BLUE]]\n"
+        f"        [{MASCOT_BLUE}]█[white]█[/][{MASCOT_FACE}]  ▀▀▀▀  [/][white]█[/]{MASCOT_BLUE}█[/[MASCOT_BLUE]]\n"
+        f"        [{MASCOT_BLUE}]█[white]█[/][{MASCOT_FACE}]  ◕  ◕  [/][white]█[/]{MASCOT_BLUE}█[/[MASCOT_BLUE]]\n"
+        f"        [{MASCOT_BLUE}]█[white]█[/][{MASCOT_FACE}]   ▄█▄   [/][white]█[/]{MASCOT_BLUE}█[/[MASCOT_BLUE]]\n"
+        f"        [{MASCOT_BLUE}]◥█[white]██████[/]{MASCOT_BLUE}█◤[/[MASCOT_BLUE]]\n"
+        f"        [{MASCOT_BLUE}]  ▀▀████▀▀  [/[MASCOT_BLUE]]"
     )
 
     banner_content = Table.grid(expand=True)
@@ -108,7 +108,6 @@ def init() -> None:
     project_table.add_row(f"[{BRAND_PURPLE}]4.[/{BRAND_PURPLE}]", "기타 / 직접 입력")
     console.print(project_table)
     
-    # choices를 문자열로 전달해야 함 (Rich Prompt 사양)
     project_choice = IntPrompt.ask("유형을 선택하세요", choices=["1", "2", "3", "4"], default=1)
     project_types = {1: "fastapi", 2: "springboot", 3: "nodejs", 4: "other"}
     framework = project_types[project_choice]
