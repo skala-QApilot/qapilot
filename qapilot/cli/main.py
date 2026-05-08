@@ -29,24 +29,25 @@ console = Console()
 # 브랜드 컬러 정의 (QApilot-UI.png 참고)
 BRAND_COLOR = "#3617CE"  # Deep Indigo
 SUB_COLOR = "#EDE9FF"    # Light Purple
+MASCOT_BLUE = "#70c4c4"  # Suit Blue
+MASCOT_GOLD = "#bf9360"  # Face Gold
 
 def print_welcome_banner():
     """웹 UI 테마 컬러와 픽셀 마스코트가 포함된 환영 배너 출력."""
     
-    # 픽셀 마스코트 (qapilot-agent.png 모티브)
-    # Unicode 블록 문자를 사용하여 픽셀 느낌 구현
-    mascot = f"""
-        [#70c4c4]  ▄[/#70c4c4]
-        [white] ▄███▄ [/white]
-      [#70c4c4]▄[/#70c4c4][white]███████[/#70c4c4]▄[/#70c4c4]
-     [#70c4c4]█[/#70c4c4][white]█[/#70c4c4][#bf9360]▀▀▀▀▀[/#bf9360][white]█[/#70c4c4]█[/#70c4c4]
-     [#70c4c4]█[/#70c4c4][white]█[/#70c4c4][#bf9360] ◕ ◕ [/#bf9360][white]█[/#70c4c4]█[/#70c4c4]
-     [#70c4c4]▀[/#70c4c4][white]██[#bf9360] ▄█▄ [/#bf9360]██[/#70c4c4]▀[/#70c4c4]
-      [white] ▀█████▀ [/white]
-    """
+    # 픽셀 마스코트 (qapilot-agent.png 모티브) - 마크업 오류 수정 완료
+    mascot = (
+        f"        [{MASCOT_BLUE}]  ▄  [/[MASCOT_BLUE]]\n"
+        f"        [white] ▄███▄ [/white]\n"
+        f"      [{MASCOT_BLUE}]▄[/{MASCOT_BLUE}][white]███████[/white][{MASCOT_BLUE}]▄[/{MASCOT_BLUE}]\n"
+        f"     [{MASCOT_BLUE}]█[/{MASCOT_BLUE}][white]█[/white][{MASCOT_GOLD}]▀▀▀▀▀[/{MASCOT_GOLD}][white]█[/white][{MASCOT_BLUE}]█[/{MASCOT_BLUE}]\n"
+        f"     [{MASCOT_BLUE}]█[/{MASCOT_BLUE}][white]█[/white][{MASCOT_GOLD}] ◕ ◕ [/{MASCOT_GOLD}][white]█[/white][{MASCOT_BLUE}]█[/{MASCOT_BLUE}]\n"
+        f"     [{MASCOT_BLUE}]▀[/{MASCOT_BLUE}][white]██[/{white}][{MASCOT_GOLD}] ▄█▄ [/{MASCOT_GOLD}][white]██[/white][{MASCOT_BLUE}]▀[/{MASCOT_BLUE}]\n"
+        f"        [white] ▀███▀ [/white]"
+    )
 
     banner_content = Table.grid(expand=True)
-    banner_content.add_column(justify="center", width=20)
+    banner_content.add_column(justify="center", width=25)
     banner_content.add_column(justify="left")
     
     banner_content.add_row(
