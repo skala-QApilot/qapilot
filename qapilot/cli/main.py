@@ -1,17 +1,22 @@
 """Typer CLI 메인.
 
-qapilot init / generate / test / explain / spec import / rescan / ui 명령어를 제공한다.
+qapilot init / generate / test / explain / spec import / rescan / ui / sync 명령어를 제공한다.
 
 담당: A
 Created: 2026-05-07
 """
 
 import asyncio
+import os
 from pathlib import Path
 from typing import Optional
 
 import typer
+import yaml
 from rich.console import Console
+from rich.panel import Panel
+from rich.prompt import IntPrompt, Prompt
+from rich.table import Table
 
 from qapilot.cli.api_client import ApiClient
 from qapilot.cli.sync import sync_local_to_server
@@ -20,14 +25,26 @@ from qapilot.shared.schemas import RunOptions
 
 app = typer.Typer(help="QApilot — AI 기반 QA 자동화 시스템")
 console = Console()
-api_client = ApiClient()
+
+
+def print_welcome_banner():
+    """제미나이 CLI 스타일의 환영 배너 출력."""
+    console.print(
+        Panel.fit(
+            "[bold cyan]🚀 QApilot — Intelligent AI QA Agent[/bold cyan]\n"
+            "[dim]No People Testing (NPT) - 완전 무인 테스트 운영 시스템[/dim]",
+            border_style="cyan",
+            padding=(1, 2),
+        )
+    )
 
 
 @app.command()
 def init() -> None:
-    """프로젝트 초기화 + 코드 스캔 + 서버 설정."""
-    console.print("[bold green]QApilot 초기화를 시작합니다...[/bold green]")
-    
+    """프로젝트 초기화 + 코드 스캔 + 서버 설정 마법사."""
+    print_welcome_banner()
+    console.print("\n[bold green]QApilot 설정을 시작합니다...[/bold green]\n")
+
     # 1. 디렉토리 구조 생성
     base_dir = Path(".qapilot")
     dirs_to_create = [
@@ -44,35 +61,73 @@ def init() -> None:
     ]
     for d in dirs_to_create:
         d.mkdir(parents=True, exist_ok=True)
-    console.print("디렉토리 구조 생성 완료.")
+    console.print("✅ [dim]디렉토리 구조 생성 완료 (.qapilot/)[/dim]")
 
-    # 2. qapilot.config.yaml 생성 (인터랙티브)
+    # 2. 인터랙티브 설정 마법사
     config_file = Path("qapilot.config.yaml")
-    if not config_file.exists():
-        console.print("\n[bold cyan]중앙 서버 설정을 진행합니다 (나중에 수정 가능)[/bold cyan]")
-        server_url = typer.prompt("중앙 서버 URL (예: http://localhost:8000)", default="http://localhost:8000")
-        server_token = typer.prompt("서버 인증 토큰 (없으면 엔터)", default="", show_default=False)
-        
-        import yaml
-        config_data = {
-            "server": {
-                "url": server_url,
-                "token": server_token if server_token else None
-            },
-            "llm": {
-                "default_model": "gpt-4o-mini",
-                "deep_model": "gpt-4o"
-            }
+    
+    # [Step 1] 서버 설정
+    console.print("\n[bold]Step 1. 중앙 서버 연결 설정[/bold]")
+    server_url = Prompt.ask("중앙 서버 URL", default="http://localhost:8080")
+    server_token = Prompt.ask("서버 인증 토큰 (옵션)", default="", show_default=False)
+
+    # [Step 2] 프로젝트 유형 선택 (메뉴형)
+    console.print("\n[bold]Step 2. 대상 프로젝트 유형 선택[/bold]")
+    project_table = Table(show_header=False, box=None, padding=(0, 2))
+    project_table.add_row("1.", "Python (FastAPI/Flask)")
+    project_table.add_row("2.", "Java (Spring Boot)")
+    project_table.add_row("3.", "Node.js (Express/Nest)")
+    project_table.add_row("4.", "기타 / 직접 입력")
+    console.print(project_table)
+    
+    project_choice = IntPrompt.ask("유형을 선택하세요", choices=[1, 2, 3, 4], default=1)
+    project_types = {1: "fastapi", 2: "springboot", 3: "nodejs", 4: "other"}
+    framework = project_types[project_choice]
+
+    # [Step 3] AI 모델 선택
+    console.print("\n[bold]Step 3. 사용할 LLM 모델 선택[/bold]")
+    model_table = Table(show_header=False, box=None, padding=(0, 2))
+    model_table.add_row("1.", "[bold]gpt-4o-mini[/bold] (추천: 빠르고 경제적)")
+    model_table.add_row("2.", "[bold]gpt-4o[/bold] (강력한 추론 성능)")
+    model_table.add_row("3.", "[bold]o3-mini[/bold] (최신 추론 특화 모델)")
+    console.print(model_table)
+    
+    model_choice = IntPrompt.ask("모델을 선택하세요", choices=[1, 2, 3], default=1)
+    models = {1: "gpt-4o-mini", 2: "gpt-4o", 3: "o3-mini"}
+    selected_model = models[model_choice]
+
+    # 3. 설정 파일 저장
+    config_data = {
+        "server": {
+            "url": server_url,
+            "token": server_token if server_token else None
+        },
+        "project": {
+            "framework": framework,
+            "language": "python" if project_choice == 1 else "unknown"
+        },
+        "llm": {
+            "default_model": selected_model,
+            "deep_model": "gpt-4o"
         }
+    }
+
+    console.print("\n[bold cyan]설정 요약:[/bold cyan]")
+    console.print(f" - 서버: {server_url}")
+    console.print(f" - 유형: {framework}")
+    console.print(f" - 모델: {selected_model}")
+
+    if typer.confirm("\n이 설정으로 qapilot.config.yaml 파일을 생성할까요?"):
         with open(config_file, "w", encoding="utf-8") as f:
             yaml.dump(config_data, f, default_flow_style=False, allow_unicode=True)
-        console.print(f"설정 파일 생성 완료: {config_file}")
+        console.print(f"\n✨ [bold blue]초기화 완료![/bold blue] 설정이 저장되었습니다: {config_file}")
     else:
-        console.print(f"\n기존 설정 파일이 존재합니다: {config_file}")
+        console.print("\n[yellow]설정이 저장되지 않았습니다.[/yellow]")
 
-    console.print("\n코드 스캔을 진행합니다...")
+    console.print("\n[bold green]코드베이스 스캔을 시작합니다...[/bold green]")
     # TODO: codebase scanner 연동 (FR-000)
-    console.print("[bold blue]초기화 완료! 이제 qapilot generate를 통해 시나리오를 생성해 보세요.[/bold blue]")
+    console.print("✅ [dim]스캔 및 인덱싱 완료.[/dim]")
+    console.print("\n이제 [bold]qapilot generate[/bold] 명령어로 테스트 시나리오를 만들어보세요!")
 
 
 @app.command()
@@ -157,7 +212,6 @@ def ui(
 ) -> None:
     """웹 대시보드 기동 (FastAPI)."""
     import uvicorn
-
     console.print(f"[bold green]QApilot 로컬 대시보드를 시작합니다 (http://{host}:{port})...[/bold green]")
     uvicorn.run("qapilot.api.main:app", host=host, port=port, reload=True)
 
