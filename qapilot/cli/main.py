@@ -188,7 +188,7 @@ def generate_scenarios(
 def generate_code(
     sync: bool = typer.Option(True, "--sync/--no-sync", help="완료 후 서버와 동기화"),
 ) -> None:
-    """승인된 시나리오를 기반으로 테스트 코드 자동 생성."""
+    """저장된 시나리오를 기반으로 테스트 코드 자동 생성."""
     options: RunOptions = {
         "command": "generate_code",
         "trigger": None,
@@ -197,7 +197,7 @@ def generate_code(
         "filter": None,
         "tags": None,
     }
-    console.print(f"[bold {BRAND_PURPLE}]승인된 시나리오 기반 테스트 코드 생성을 시작합니다...[/bold {BRAND_PURPLE}]")
+    console.print(f"[bold {BRAND_PURPLE}]저장된 시나리오 기반 테스트 코드 생성을 시작합니다...[/bold {BRAND_PURPLE}]")
     result = asyncio.run(run_pipeline(options))
     console.print(f"[bold blue]테스트 코드 생성 완료! (상태: {result['status']})[/bold blue]")
     
