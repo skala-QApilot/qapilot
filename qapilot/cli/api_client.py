@@ -75,6 +75,29 @@ class ApiClient:
                 logger.error(f"테스트 결과 업로드 실패: {e}")
                 return False
 
+    async def upload_generated_code(self, tc_id: str, code: str) -> bool:
+        """생성된 Playwright 코드를 서버로 업로드한다."""
+        if not self.base_url:
+            return False
+
+        async with httpx.AsyncClient() as client:
+            try:
+                payload = {
+                    "tc_id": tc_id,
+                    "code": code
+                }
+                # 사양서 7.2절 기반 (코드 저장용 엔드포인트 제안)
+                response = await client.post(
+                    f"{self.base_url}/api/generated-code",
+                    json=payload,
+                    headers=self._get_headers()
+                )
+                response.raise_for_status()
+                return True
+            except Exception as e:
+                logger.error(f"생성 코드 업로드 실패({tc_id}): {e}")
+                return False
+
     async def check_health(self) -> bool:
         """서버 연결 상태를 확인한다."""
         if not self.base_url:

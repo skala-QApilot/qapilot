@@ -1,7 +1,8 @@
 """LangGraph StateGraph 정의.
 
 단일 그래프에서 command 값에 따라 진입점이 분기된다.
-- generate: Layer 1 (코드스캔 → 코드생성 → END)
+- generate_scenarios: 시나리오 생성 (코드스캔 → 도메인지식 → 요구사항추출 → 시나리오생성 → HITL 리뷰 큐 적재 → END)
+- generate_code: 코드 생성 (승인된 시나리오 로드 → 액션매핑 → 코드생성 → END)
 - test: Layer 2~3 (시나리오 로드 → 테스트 → 리포트 → END)
 
 담당: A
@@ -18,12 +19,15 @@ def build_pipeline() -> StateGraph:
     graph = StateGraph(PipelineState)
 
     # ── 노드 등록 ──
-    # Layer 1
+    # Layer 1 - Scenarios
     graph.add_node("codebase_scan", _codebase_scan)
     graph.add_node("domain_knowledge", _domain_knowledge)
     graph.add_node("requirement_extract", _requirement_extract)
     graph.add_node("scenario_generate", _scenario_generate)
     graph.add_node("hitl_review", _hitl_review)
+    
+    # Layer 1 - Code
+    graph.add_node("load_approved_scenarios", _load_approved_scenarios)
     graph.add_node("action_mapping", _action_mapping)
     graph.add_node("code_generate", _code_generate)
 
@@ -37,18 +41,26 @@ def build_pipeline() -> StateGraph:
     graph.add_node("report", _report)
 
     # ── 진입점 분기 ──
-    graph.add_conditional_edges(
-        START,
-        lambda state: "codebase_scan" if state["run_options"]["command"] == "generate"
-        else "load_scenarios",
-    )
+    def route_start(state: PipelineState):
+        cmd = state["run_options"]["command"]
+        if cmd == "generate_scenarios":
+            return "codebase_scan"
+        elif cmd == "generate_code":
+            return "load_approved_scenarios"
+        else:
+            return "load_scenarios"
 
-    # ── Layer 1 엣지 ──
+    graph.add_conditional_edges(START, route_start)
+
+    # ── Layer 1 - Scenarios 엣지 ──
     graph.add_edge("codebase_scan", "domain_knowledge")
     graph.add_edge("domain_knowledge", "requirement_extract")
     graph.add_edge("requirement_extract", "scenario_generate")
     graph.add_edge("scenario_generate", "hitl_review")
-    graph.add_edge("hitl_review", "action_mapping")
+    graph.add_edge("hitl_review", END)
+
+    # ── Layer 1 - Code 엣지 ──
+    graph.add_edge("load_approved_scenarios", "action_mapping")
     graph.add_edge("action_mapping", "code_generate")
     graph.add_edge("code_generate", END)
 
@@ -87,6 +99,10 @@ async def _scenario_generate(state: PipelineState) -> dict:
 
 
 async def _hitl_review(state: PipelineState) -> dict:
+    raise NotImplementedError
+
+
+async def _load_approved_scenarios(state: PipelineState) -> dict:
     raise NotImplementedError
 
 
