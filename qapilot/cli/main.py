@@ -13,56 +13,54 @@ from typing import Optional
 
 import typer
 import yaml
-from rich.console import Console
+from rich.align import Align
+from rich.console import Console, Group
 from rich.panel import Panel
 from rich.prompt import IntPrompt, Prompt
 from rich.table import Table
+from rich.text import Text
 
 from qapilot.cli.api_client import ApiClient
 from qapilot.cli.sync import sync_local_to_server
+from qapilot.cli.utils import render_image_to_text
 from qapilot.orchestrator.runner import run_pipeline
 from qapilot.shared.schemas import RunOptions
 
 app = typer.Typer(help="QApilot — AI 기반 QA 자동화 시스템")
 console = Console()
 
-# 브랜드 컬러 정의 (QApilot-UI.png 및 qapilot-agent.png 참고)
-BRAND_PURPLE = "#3617CE"  # 웹 UI 메인 인디고
-MASCOT_BLUE = "#70c4c4"   # 캐릭터 안테나/귀마개
-MASCOT_FACE = "#bf9360"   # 캐릭터 얼굴(금색/갈색)
+BRAND_PURPLE = "#3617CE"
 
-def print_welcome_banner():
-    """웹 UI 테마 컬러와 정교한 8비트 픽셀 마스코트가 포함된 환영 배너 출력."""
-    
-    # 레트로 픽셀 아트 버전 (더 '도트'스러운 느낌 강조)
-    mascot = (
-        f"        [{MASCOT_BLUE}]  ▄▄████▄▄  [/[MASCOT_BLUE]]\n"
-        f"        [{MASCOT_BLUE}]▄█[white]██████[/]{MASCOT_BLUE}█▄[/[MASCOT_BLUE]]\n"
-        f"        [{MASCOT_BLUE}]█[white]█[/][{MASCOT_FACE}]  ▀▀▀▀  [/][white]█[/]{MASCOT_BLUE}█[/[MASCOT_BLUE]]\n"
-        f"        [{MASCOT_BLUE}]█[white]█[/][{MASCOT_FACE}]  ◕  ◕  [/][white]█[/]{MASCOT_BLUE}█[/[MASCOT_BLUE]]\n"
-        f"        [{MASCOT_BLUE}]█[white]█[/][{MASCOT_FACE}]   ▄█▄   [/][white]█[/]{MASCOT_BLUE}█[/[MASCOT_BLUE]]\n"
-        f"        [{MASCOT_BLUE}]◥█[white]██████[/]{MASCOT_BLUE}█◤[/[MASCOT_BLUE]]\n"
-        f"        [{MASCOT_BLUE}]  ▀▀████▀▀  [/[MASCOT_BLUE]]"
-    )
 
-    banner_content = Table.grid(expand=True)
-    banner_content.add_column(justify="center", width=24)
-    banner_content.add_column(justify="left")
-    
-    banner_content.add_row(
-        mascot,
+def print_welcome_banner() -> None:
+    """곰돌이 우주비행사 마스코트 픽셀아트와 함께 환영 배너를 출력한다."""
+
+    mascot_path = Path(__file__).parent.parent / "assets" / "mascot2.png"
+
+    # 40 그리드 + cell_width=2 → 가로 80글자 × 세로 40줄.
+    mascot_text = render_image_to_text(mascot_path, grid_size=40, cell_width=2)
+    if mascot_text is None:
+        mascot_text = Text(
+            f"(mascot image missing: {mascot_path})", style="dim red"
+        )
+
+    info = (
         f"\n[bold {BRAND_PURPLE}]QApilot — Intelligent AI QA Agent[/bold {BRAND_PURPLE}]\n"
-        f"[dim]No People Testing (NPT) - 완전 무인 테스트 운영 시스템[/dim]\n\n"
-        f"[{BRAND_PURPLE}]v0.1.0[/{BRAND_PURPLE}] | [dim]Status:[/dim] [bold green]Ready[/bold green]"
+        f"[dim]No People Testing (NPT) — 완전 무인 테스트 운영 시스템[/dim]\n\n"
+        f"[{BRAND_PURPLE}]v0.1.0[/{BRAND_PURPLE}]  |  "
+        f"[dim]Status:[/dim] [bold green]Ready[/bold green]\n"
+        f"[dim]SK Telecom NOVA Project[/dim]"
     )
+
+    body = Group(Align.center(mascot_text), Align.center(info))
 
     console.print(
         Panel(
-            banner_content,
+            body,
             border_style=BRAND_PURPLE,
             padding=(1, 2),
-            subtitle=f"[bold {BRAND_PURPLE}]SK Telecom NOVA Project[/bold {BRAND_PURPLE}]",
-            subtitle_align="right"
+            subtitle=f"[bold {BRAND_PURPLE}]Welcome to QApilot[/bold {BRAND_PURPLE}]",
+            subtitle_align="right",
         )
     )
 

@@ -40,6 +40,8 @@ dependencies = [
     "httpx>=0.27",
     # 임베딩
     "tiktoken>=0.7",
+    # 이미지 처리 (CLI 픽셀 아트)
+    "Pillow>=10.0",
 ]
 
 [project.optional-dependencies]
@@ -56,6 +58,7 @@ qapilot = "qapilot.cli.main:app"
 
 [tool.setuptools]
 packages = ["qapilot"]
+package-data = {"qapilot" = ["assets/*.png"]}
 
 [tool.black]
 line-length = 100
