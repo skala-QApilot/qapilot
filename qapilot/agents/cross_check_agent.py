@@ -17,7 +17,6 @@ class CrossCheckAgent(BaseAgent):
     입력: UITestResult, APITraceResult, DBTestResult
     출력: List[CrossCheckResult], confidence
     호출 Tool: 없음
-    HITL: X
     """
 
     async def _execute(

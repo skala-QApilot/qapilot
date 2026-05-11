@@ -17,7 +17,6 @@ class RootCauseAgent(BaseAgent):
     입력: DefectClassification, CodebaseContext
     출력: List[RootCauseResult], confidence
     호출 Tool: 코드 인덱스 Tool, 도메인 지식 Tool
-    HITL: X
     """
 
     async def _execute(

@@ -41,12 +41,6 @@ class LLMApiError(QApilotError):
     pass
 
 
-class HITLRejectError(QApilotError):
-    """HITL 반려 에러."""
-
-    pass
-
-
 # 에러 코드 상수
 class ErrorCode:
     # Agent

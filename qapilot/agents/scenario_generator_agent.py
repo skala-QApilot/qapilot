@@ -17,7 +17,6 @@ class ScenarioGeneratorAgent(BaseAgent):
     입력: CodebaseContext, GitDiff, DomainRules, RequirementItems
     출력: List[TestScenario], confidence
     호출 Tool: 코드 인덱스 Tool, 도메인 지식 Tool
-    HITL: O (항상, 승인 후 액션 매핑으로 진행)
     """
 
     async def _execute(

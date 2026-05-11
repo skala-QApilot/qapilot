@@ -17,7 +17,6 @@ class DefectClassifierAgent(BaseAgent):
     입력: CrossCheckResult, 실패 로그
     출력: List[DefectClassification], confidence
     호출 Tool: 없음
-    HITL: X
     """
 
     async def _execute(

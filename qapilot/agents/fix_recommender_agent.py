@@ -17,7 +17,6 @@ class FixRecommenderAgent(BaseAgent):
     입력: RootCauseResult, CodebaseContext
     출력: List[FixResult], confidence
     호출 Tool: 코드 인덱스 Tool
-    HITL: X
     """
 
     async def _execute(
