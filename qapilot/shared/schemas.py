@@ -66,7 +66,7 @@ class ToolOutput(BaseModel):
 class RunOptions(TypedDict):
     """실행 옵션."""
 
-    command: Literal["generate", "test"]
+    command: Literal["generate_scenarios", "generate_code", "test"]
     # generate 전용
     trigger: Literal["init", "code_change", "doc_update", "natural_lang"] | None
     user_input: str | None

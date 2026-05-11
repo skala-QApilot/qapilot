@@ -153,17 +153,20 @@ def init() -> None:
     console.print(f"\n[bold green]코드베이스 스캔을 시작합니다...[/bold green]")
     # TODO: codebase scanner 연동 (FR-000)
     console.print("✅ [dim]스캔 및 인덱싱 완료.[/dim]")
-    console.print(f"\n이제 [bold {BRAND_PURPLE}]qapilot generate[/bold {BRAND_PURPLE}] 명령어로 테스트 시나리오를 만들어보세요!")
+    console.print(f"\n이제 [bold {BRAND_PURPLE}]qapilot generate scenarios[/bold {BRAND_PURPLE}] 명령어로 테스트 시나리오를 만들어보세요!")
 
 
-@app.command()
-def generate(
+generate_app = typer.Typer(help="시나리오 및 테스트 코드 자동 생성 (Layer 1)")
+app.add_typer(generate_app, name="generate")
+
+@generate_app.command("scenarios")
+def generate_scenarios(
     affected: bool = typer.Option(False, "--affected", help="Git 변경분만 생성"),
     sync: bool = typer.Option(True, "--sync/--no-sync", help="완료 후 서버와 동기화"),
 ) -> None:
-    """시나리오 자동 생성 (Layer 1)."""
+    """시나리오 자동 생성 및 HITL 리뷰 대기."""
     options: RunOptions = {
-        "command": "generate",
+        "command": "generate_scenarios",
         "trigger": "code_change" if affected else "init",
         "user_input": None,
         "scenario_ids": None,
@@ -172,12 +175,35 @@ def generate(
     }
     console.print(f"[bold {BRAND_PURPLE}]시나리오 생성을 시작합니다 (Layer 1)...[/bold {BRAND_PURPLE}]")
     result = asyncio.run(run_pipeline(options))
-    console.print(f"[bold blue]시나리오 생성 완료! (상태: {result['status']})[/bold blue]")
+    console.print(f"[bold blue]시나리오 생성 완료! HITL 리뷰 큐에 적재되었습니다. (상태: {result['status']})[/bold blue]")
     
     if sync:
         asyncio.run(sync_local_to_server())
     else:
-        console.print("생성된 시나리오와 테스트 코드가 서버로 동기화될 준비가 되었습니다.")
+        console.print("생성된 시나리오가 서버로 동기화될 준비가 되었습니다.")
+
+
+@generate_app.command("code")
+def generate_code(
+    sync: bool = typer.Option(True, "--sync/--no-sync", help="완료 후 서버와 동기화"),
+) -> None:
+    """승인된 시나리오를 기반으로 테스트 코드 자동 생성."""
+    options: RunOptions = {
+        "command": "generate_code",
+        "trigger": None,
+        "user_input": None,
+        "scenario_ids": None,
+        "filter": None,
+        "tags": None,
+    }
+    console.print(f"[bold {BRAND_PURPLE}]승인된 시나리오 기반 테스트 코드 생성을 시작합니다...[/bold {BRAND_PURPLE}]")
+    result = asyncio.run(run_pipeline(options))
+    console.print(f"[bold blue]테스트 코드 생성 완료! (상태: {result['status']})[/bold blue]")
+    
+    if sync:
+        asyncio.run(sync_local_to_server())
+    else:
+        console.print("생성된 코드가 서버로 동기화될 준비가 되었습니다.")
 
 
 @app.command()
