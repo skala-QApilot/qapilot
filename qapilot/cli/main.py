@@ -1,12 +1,13 @@
 """Typer CLI 메인.
 
-qapilot init / generate / test / explain / spec import / rescan / ui / sync 명령어를 제공한다.
+qapilot init / generate / test / explain / spec import / rescan / rule add / ui / sync 명령어를 제공한다.
 
 담당: A
 Created: 2026-05-07
 """
 
 import asyncio
+import uuid
 import os
 from pathlib import Path
 from typing import Optional
@@ -87,7 +88,7 @@ def init() -> None:
     ]
     for d in dirs_to_create:
         d.mkdir(parents=True, exist_ok=True)
-    console.print("✅ [dim]디렉토리 구조 생성 완료 (.qapilot/)[/dim]")
+    console.print("[dim]디렉토리 구조 생성 완료 (.qapilot/)[/dim]")
 
     # 2. 인터랙티브 설정 마법사
     config_file = Path("qapilot.config.yaml")
@@ -152,7 +153,7 @@ def init() -> None:
 
     console.print(f"\n[bold green]코드베이스 스캔을 시작합니다...[/bold green]")
     # TODO: codebase scanner 연동 (FR-000)
-    console.print("✅ [dim]스캔 및 인덱싱 완료.[/dim]")
+    console.print("[dim]스캔 및 인덱싱 완료.[/dim]")
     console.print(f"\n이제 [bold {BRAND_PURPLE}]qapilot generate scenarios[/bold {BRAND_PURPLE}] 명령어로 테스트 시나리오를 만들어보세요!")
 
 
@@ -279,6 +280,36 @@ def spec_import(file_path: str) -> None:
     console.print(f"[bold {BRAND_PURPLE}]도메인 문서({file_path}) 벡터 임베딩을 시작합니다...[/bold {BRAND_PURPLE}]")
     # TODO: DomainKnowledgeTool 연동 (FR-001)
     console.print("[bold blue]임베딩 완료![/bold blue]")
+
+
+# rule 서브커맨드
+rule_app = typer.Typer(help="도메인 규칙 관리")
+app.add_typer(rule_app, name="rule")
+
+
+@rule_app.command("add")
+def rule_add(
+    rule: str = typer.Argument(..., help="추가할 자연어 규칙 문장"),
+    category: str = typer.Option("custom_rule", "--category", "-c", help="규칙 카테고리"),
+) -> None:
+    """자연어 규칙을 도메인 지식 벡터 DB에 추가한다."""
+    from qapilot.shared.schemas import ToolInput
+    from qapilot.tools.domain_knowledge import DomainKnowledgeTool
+
+    tool = DomainKnowledgeTool()
+    result = asyncio.run(
+        tool.run(
+            ToolInput(
+                trace_id=str(uuid.uuid4()),
+                params={"action": "add_rule", "rule": rule, "category": category},
+            )
+        )
+    )
+    r = result.result
+    typer.echo(f"규칙 추가 완료")
+    typer.echo(f"  rule_id : {r['rule_id']}")
+    typer.echo(f"  category: {r['category']}")
+    typer.echo(f"  content : {r['content']}")
 
 
 if __name__ == "__main__":
