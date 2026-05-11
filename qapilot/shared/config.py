@@ -55,11 +55,17 @@ class DashboardConfig(BaseModel):
     port: int = 7860
 
 
+class ServerConfig(BaseModel):
+    url: str | None = None
+    token: str | None = None
+
+
 class QApilotConfig(BaseModel):
     llm: LLMConfig = LLMConfig()
     agent: AgentConfig = AgentConfig()
     test: TestConfig = TestConfig()
     dashboard: DashboardConfig = DashboardConfig()
+    server: ServerConfig = ServerConfig()
 
 
 def load_config(config_path: Path | None = None) -> QApilotConfig:
