@@ -51,7 +51,10 @@ class DocumentParser:
             if file_path.suffix.lower() in (".xlsx", ".xls"):
                 blocks = self._parse_excel(file_path)
             else:
-                blocks = self._parse_with_docling(file_path)
+                try:
+                    blocks = self._parse_with_docling(file_path)
+                except Exception:
+                    blocks = self._parse_pdf_fallback(file_path)
         except ToolExecutionError:
             raise
         except Exception as e:
@@ -88,6 +91,29 @@ class DocumentParser:
         result = DocumentConverter().convert(str(file_path))
         markdown = result.document.export_to_markdown()
         return self._split_markdown_sections(markdown, file_path.stem)
+
+    def _parse_pdf_fallback(self, file_path: Path) -> list[dict]:
+        """pypdfium2로 PDF를 페이지 단위 블록으로 파싱하는 폴백 메서드.
+
+        docling 파싱이 실패한 경우(인코딩 오류 등) 호출된다.
+
+        Args:
+            file_path: 파싱할 PDF 파일 경로.
+
+        Returns:
+            list[dict]: text, section(page_N) 키를 가진 페이지 블록 목록.
+        """
+        import pypdfium2 as pdfium
+
+        pdf = pdfium.PdfDocument(str(file_path))
+        blocks = []
+        for i in range(len(pdf)):
+            page = pdf[i]
+            textpage = page.get_textpage()
+            text = textpage.get_text_range()
+            if text.strip():
+                blocks.append({"text": text, "section": f"page_{i + 1}"})
+        return blocks
 
     def _parse_excel(self, file_path: Path) -> list[dict]:
         """openpyxl로 XLSX 파일을 파싱하여 시트별 블록 목록을 반환한다.
