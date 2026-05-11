@@ -78,13 +78,19 @@ class ToolOutput(BaseModel):
 
 
 class RunOptions(TypedDict):
-    """실행 옵션."""
+    """실행 옵션.
+
+    파이프라인은 3단계로 분리되어 있다:
+    - generate_scenarios: Layer 1A — 시나리오 + 테스트 데이터 생성
+    - generate_code: Layer 1B — 액션 매핑 + Playwright 코드 생성
+    - test: Layer 2~3 — 테스트 실행 + (필요 시) 장애 분석
+    """
 
     command: Literal["generate_scenarios", "generate_code", "test"]
-    # generate 전용
+    # generate_scenarios 전용
     trigger: Literal["init", "code_change", "doc_update", "natural_lang"] | None
     user_input: str | None
-    # test 전용
+    # generate_code / test 공통 — 대상 시나리오 필터
     scenario_ids: list[str] | None
     filter: Literal["all", "failed", "affected"] | None
     tags: list[str] | None
@@ -368,22 +374,6 @@ class FixResult(TypedDict):
 
     tc_id: str
     suggestions: list[FixSuggestion]
-
-
-# ── HITL ──
-
-
-class HITLRecord(TypedDict):
-    """HITL 검토 기록."""
-
-    target: Literal["scenario_gen", "natural_lang"]
-    target_id: str
-    requested_at: str
-    responded_at: str | None
-    decision: Literal["approved", "modified", "rejected"] | None
-    confidence_shown: float
-    modifications: dict | None
-    reviewer: str | None
 
 
 # ── 메타 ──
