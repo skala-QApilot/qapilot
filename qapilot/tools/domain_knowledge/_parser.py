@@ -1,8 +1,7 @@
-"""도메인 지식 Tool — 문서 파싱·청킹·민감정보 마스킹.
+"""도메인 지식 Tool — 문서 파싱.
 
 PDF·DOCX 등은 docling, XLSX는 openpyxl로 파싱한다.
-파싱 결과를 슬라이딩 윈도우 방식으로 청크로 분할하고
-민감정보를 마스킹한다.
+파싱 결과를 _chunker 모듈에 위임하여 청크로 분할하고 민감정보를 마스킹한다.
 
 Author: 전아린
 Created: 2026-05-07
@@ -10,27 +9,17 @@ Created: 2026-05-07
 
 from __future__ import annotations
 
-import re
 import uuid
 from pathlib import Path
 
 from qapilot.shared.errors import ErrorCode, ToolExecutionError
-
-_CHUNK_SIZE = 300     # 청크당 단어 수
-_CHUNK_OVERLAP = 50   # 인접 청크 간 겹치는 단어 수
-
-_SENSITIVE_PATTERNS = [
-    r"\d{6}-\d{7}",                                        # 주민등록번호
-    r"\d{3}-\d{3,4}-\d{4}",                                # 전화번호
-    r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}", # 이메일
-    r"\b(?:\d[ \-]?){13,16}\b",                            # 카드번호
-]
+from qapilot.tools.domain_knowledge._chunker import mask_sensitive, split_markdown_sections, split_text
 
 
 class DocumentParser:
     """문서 파일을 파싱하여 청크 목록으로 변환한다.
 
-    역할: PDF·DOCX·XLSX 파싱, 섹션 분할, 슬라이딩 윈도우 청킹, 민감정보 마스킹
+    역할: PDF·DOCX·XLSX 파싱, _chunker에 청킹·마스킹 위임
     입력: 파일 경로
     출력: list[dict] — chunk_id, source, section, text
     """
@@ -65,8 +54,8 @@ class DocumentParser:
 
         chunks = []
         for block in blocks:
-            masked = self._mask_sensitive(block["text"])
-            for chunk_text in self._split_text(masked):
+            masked = mask_sensitive(block["text"])
+            for chunk_text in split_text(masked):
                 chunks.append(
                     {
                         "chunk_id": str(uuid.uuid4()),
@@ -90,7 +79,7 @@ class DocumentParser:
 
         result = DocumentConverter().convert(str(file_path))
         markdown = result.document.export_to_markdown()
-        return self._split_markdown_sections(markdown, file_path.stem)
+        return split_markdown_sections(markdown, file_path.stem)
 
     def _parse_pdf_fallback(self, file_path: Path) -> list[dict]:
         """pypdfium2로 PDF를 페이지 단위 블록으로 파싱하는 폴백 메서드.
@@ -138,67 +127,3 @@ class DocumentParser:
                 blocks.append({"text": text, "section": sheet_name})
         wb.close()
         return blocks
-
-    def _split_markdown_sections(self, markdown: str, default_name: str) -> list[dict]:
-        """마크다운을 헤더(#) 기준으로 섹션 블록 목록으로 분할한다.
-
-        Args:
-            markdown: 분할할 마크다운 문자열.
-            default_name: 헤더가 없는 경우 사용할 기본 섹션명.
-
-        Returns:
-            list[dict]: text, section 키를 가진 섹션 블록 목록.
-        """
-        blocks: list[dict] = []
-        current_section = default_name
-        current_lines: list[str] = []
-
-        for line in markdown.splitlines():
-            if line.startswith("#"):
-                if current_lines:
-                    text = "\n".join(current_lines).strip()
-                    if text:
-                        blocks.append({"text": text, "section": current_section})
-                    current_lines = []
-                current_section = line.lstrip("#").strip() or default_name
-            else:
-                current_lines.append(line)
-
-        if current_lines:
-            text = "\n".join(current_lines).strip()
-            if text:
-                blocks.append({"text": text, "section": current_section})
-
-        return blocks
-
-    def _split_text(self, text: str) -> list[str]:
-        """텍스트를 슬라이딩 윈도우 방식으로 단어 단위 청크로 분할한다.
-
-        Args:
-            text: 분할할 텍스트.
-
-        Returns:
-            list[str]: 분할된 청크 목록. 빈 텍스트이면 빈 리스트를 반환한다.
-        """
-        words = text.split()
-        if not words:
-            return []
-        chunks = []
-        i = 0
-        while i < len(words):
-            chunks.append(" ".join(words[i : i + _CHUNK_SIZE]))
-            i += _CHUNK_SIZE - _CHUNK_OVERLAP
-        return chunks
-
-    def _mask_sensitive(self, text: str) -> str:
-        """주민번호·전화번호·이메일·카드번호 패턴을 '***'으로 마스킹한다.
-
-        Args:
-            text: 마스킹을 적용할 원본 텍스트.
-
-        Returns:
-            str: 민감정보가 마스킹된 텍스트.
-        """
-        for pattern in _SENSITIVE_PATTERNS:
-            text = re.sub(pattern, "***", text)
-        return text
