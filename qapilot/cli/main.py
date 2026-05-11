@@ -35,7 +35,7 @@ BRAND_PURPLE = "#3617CE"
 def print_welcome_banner() -> None:
     """곰돌이 우주비행사 마스코트 픽셀아트와 함께 환영 배너를 출력한다."""
 
-    mascot_path = Path(__file__).parent.parent / "assets" / "mascot2.png"
+    mascot_path = Path(__file__).parent.parent / "assets" / "mascot.png"
 
     # 40 그리드 + cell_width=2 → 가로 80글자 × 세로 40줄.
     mascot_text = render_image_to_text(mascot_path, grid_size=40, cell_width=2)
