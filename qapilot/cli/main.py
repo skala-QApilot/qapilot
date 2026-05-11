@@ -165,7 +165,7 @@ def generate_scenarios(
     affected: bool = typer.Option(False, "--affected", help="Git 변경분만 생성"),
     sync: bool = typer.Option(True, "--sync/--no-sync", help="완료 후 서버와 동기화"),
 ) -> None:
-    """시나리오 자동 생성 및 HITL 리뷰 대기."""
+    """시나리오 자동 생성. 생성 후 사용자가 대시보드에서 검토·수정한다."""
     options: RunOptions = {
         "command": "generate_scenarios",
         "trigger": "code_change" if affected else "init",
@@ -176,7 +176,7 @@ def generate_scenarios(
     }
     console.print(f"[bold {BRAND_PURPLE}]시나리오 생성을 시작합니다 (Layer 1)...[/bold {BRAND_PURPLE}]")
     result = asyncio.run(run_pipeline(options))
-    console.print(f"[bold blue]시나리오 생성 완료! HITL 리뷰 큐에 적재되었습니다. (상태: {result['status']})[/bold blue]")
+    console.print(f"[bold blue]시나리오 생성 완료! 대시보드(qapilot ui)에서 검토 후 'qapilot generate code'를 실행하세요. (상태: {result['status']})[/bold blue]")
     
     if sync:
         asyncio.run(sync_local_to_server())

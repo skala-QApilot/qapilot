@@ -27,7 +27,6 @@ class RequirementExtractorAgent(BaseAgent):
     입력: 도메인 문서 텍스트
     출력: List[RequirementItem], confidence
     호출 Tool: 도메인 지식 Tool
-    HITL: X (파이프라인 hitl_review 노드에서 처리)
     """
 
     allowed_tools = ["domain_knowledge"]

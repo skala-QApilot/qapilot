@@ -17,7 +17,6 @@ class CodeGeneratorAgent(BaseAgent):
     입력: List[ActionMapping]
     출력: List[GeneratedCode], confidence
     호출 Tool: 없음
-    HITL: X
     """
 
     async def _execute(

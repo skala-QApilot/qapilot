@@ -37,9 +37,7 @@ from qapilot.shared.schemas import ExecuteResult
 
 
 class MyAgent(BaseAgent):
-    """역할: ...
-    HITL: X
-    """
+    """역할: ..."""
 
     # 사용 가능 Tool 화이트리스트 (없으면 빈 리스트)
     allowed_tools = ["codebase_scanner", "domain_knowledge"]
@@ -301,7 +299,7 @@ ExecuteResult(
 
 - `result`는 다음 Agent의 입력으로 그대로 전달되므로, 후속 Agent가 기대하는 형식을 따라야 한다 (`shared/schemas.py`의 TypedDict 참조).
 - `confidence`는 LLM 자가 평가 + 매칭 기반 + 근거 기반을 조합하여 산출한다.
-  - HITL 대상 Agent (시나리오 생성, 자연어 해석): 사용자에게 함께 표시됨
+  - 시나리오 생성·자연어 해석 Agent: 대시보드에서 사용자에게 함께 표시됨 (검토 참고용)
   - 그 외 Agent: 로그/리포트에만 기록됨
 
 ---

@@ -22,23 +22,29 @@ async def run_pipeline(options: RunOptions) -> PipelineState:
         "status": "running",
         "current_layer": "",
         "error": None,
+        # Layer 1A
         "scan_result": None,
         "domain_rules": [],
         "requirements": [],
         "scenarios": [],
-        "hitl_records": [],
-        "hitl_approved": False,
+        "saved_scenario_paths": [],
+        # Layer 1B
         "action_mappings": [],
         "generated_codes": [],
+        "saved_code_paths": [],
+        # Layer 2
         "ui_results": [],
         "api_results": [],
         "db_results": [],
         "cross_check_results": [],
         "has_mismatch": False,
+        # Layer 3
         "defect_results": [],
         "root_cause_results": [],
         "fix_results": [],
+        # 리포트
         "report_path": None,
+        # 메타
         "agent_logs": [],
         "total_cost": 0.0,
     }
