@@ -2,6 +2,9 @@
 requires = ["setuptools>=68.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
+[tool.setuptools.packages.find]
+include = ["qapilot*"]
+
 [project]
 name = "qapilot"
 version = "0.1.0"
@@ -28,6 +31,8 @@ dependencies = [
     # 문서 파싱
     "docling>=1.0",
     "openpyxl>=3.1",
+    # 임베딩 (로컬 오픈소스 모델)
+    "sentence-transformers>=3.0",
     # 데이터 검증
     "pydantic>=2.7",
     # 로깅
