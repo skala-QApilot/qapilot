@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any
 
 from qapilot.shared.errors import ErrorCode, ToolExecutionError
+from qapilot.shared.schemas import DomainRule
 from qapilot.tools.base_tool import BaseTool
 from qapilot.tools.domain_knowledge._glossary import GlossaryManager
 from qapilot.tools.domain_knowledge._parser import DocumentParser
@@ -185,3 +186,29 @@ class DomainKnowledgeTool(BaseTool):
 
         self.logger.info("glossary_updated", code=code_name, business=business_name)
         return {"code_name": code_name, "business_name": business_name, "total_entries": len(glossary)}
+
+    @staticmethod
+    def format_rules_for_prompt(rules: list[DomainRule]) -> str:
+        """DomainRule 목록을 LLM 프롬프트에 주입할 수 있는 문자열로 변환한다.
+
+        시나리오 생성 Agent가 RAG 검색 결과를 프롬프트에 포함할 때 사용한다.
+
+        Args:
+            rules: search action이 반환한 DomainRule 목록.
+
+        Returns:
+            str: 번호 목록 형식의 도메인 규칙 문자열.
+                 rules가 비어 있으면 빈 문자열을 반환한다.
+        """
+        if not rules:
+            return ""
+
+        lines = ["[도메인 규칙 — 시나리오 생성 시 반드시 준수하세요]"]
+        for i, rule in enumerate(rules, start=1):
+            lines.append(
+                f"{i}. {rule['content']}"
+                f"\n   (출처: {rule['source'] or '직접 입력'}"
+                f" | 분류: {rule['category']}"
+                f" | 유사도: {rule['similarity_score']})"
+            )
+        return "\n".join(lines)
