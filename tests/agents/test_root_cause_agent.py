@@ -1,15 +1,11 @@
 """RootCauseAgent 단위 테스트.
 
-테스트 케이스:
-- 정상 케이스: RootCauseResult 구조(tc_id + candidates) 반환
-- confidence 보정: code_location +0.2, runtime_data +0.2, 둘 다 +0.4 (최대 1.0)
-- summary 빈값 시 mismatches fallback
-- LLM 응답 파싱 실패 시 fallback candidate 반환 (예외 없음)
-- candidate 3개 초과 시 3개까지 trim
-- 잘못된 evidence type 제거
-- Judge 실패 시 max candidate confidence fallback
-- tc_id 있는데 context 없으면 warnings 포함
-- _select_relevant_code_context 키워드 필터링
+cause별 confidence (RootCauseCandidate.confidence):
+- LLM 기본값 + 관련성 페널티(-0.4) + evidence 보정(code_location +0.3, runtime_data +0.3)
+
+응답 전체 confidence (ExecuteResult.confidence):
+- LLM-as-Judge: relevance / diversity / ranking_validity / evidence_quality 4개 지표 평균
+  → (avg - 1) / 4 로 0.0~1.0 정규화
 """
 
 from __future__ import annotations
@@ -27,10 +23,14 @@ from qapilot.shared.schemas import ExecuteResult
 
 FIXTURES_DIR = Path(__file__).parent.parent / "fixtures" / "root_cause"
 
-# Judge 정상 응답 (relevance=4, evidence_quality=4, diversity=3)
-_JUDGE_OK = json.dumps(
-    {"relevance": 4, "evidence_quality": 4, "diversity": 3, "reason": "분석 적절"}
-)
+# Judge 정상 응답 — 4개 지표 포함
+_JUDGE_OK = json.dumps({
+    "relevance": 4,
+    "diversity": 3,
+    "ranking_validity": 4,
+    "evidence_quality": 4,
+    "reason": "분석 적절",
+})
 
 
 # ─── 헬퍼 ──────────────────────────────────────────────────────────────────────
@@ -142,18 +142,20 @@ async def test_result_has_no_warning_field_when_contexts_provided(
     assert "warnings" not in result.result
 
 
-# ─── agent-level confidence ────────────────────────────────────────────────────
+# ─── 응답 전체 confidence (Judge 기반) ────────────────────────────────────────
 
 
 async def test_agent_confidence_from_judge(llm_response_content):
-    """Judge 점수로 agent-level confidence를 계산한다.
+    """Judge 4개 지표 평균으로 agent-level confidence를 계산한다.
 
-    relevance=4, evidence_quality=4, diversity=4 → avg=4 → (4-1)/4 = 0.75
+    relevance=4, diversity=4, ranking_validity=4, evidence_quality=4
+    → avg=4 → (4-1)/4 = 0.75
     """
     agent = _make_agent()
-    judge_resp = json.dumps(
-        {"relevance": 4, "evidence_quality": 4, "diversity": 4, "reason": "ok"}
-    )
+    judge_resp = json.dumps({
+        "relevance": 4, "diversity": 4, "ranking_validity": 4,
+        "evidence_quality": 4, "reason": "ok",
+    })
     agent.llm.chat = _mock_chat(llm_response_content, judge_resp)
 
     result = await agent._execute(context={}, params={"tc_id": "TC-001"})
@@ -161,11 +163,54 @@ async def test_agent_confidence_from_judge(llm_response_content):
     assert result.confidence == pytest.approx(0.75)
 
 
-# ─── confidence 보정 케이스 ────────────────────────────────────────────────────
+async def test_judge_four_criteria_max_score():
+    """Judge 4개 지표 모두 5점이면 agent confidence = 1.0."""
+    agent = _make_agent()
+    judge_resp = json.dumps({
+        "relevance": 5, "diversity": 5, "ranking_validity": 5,
+        "evidence_quality": 5, "reason": "perfect",
+    })
+    agent.llm.chat = _mock_chat(_single_candidate_llm(), judge_resp)
+
+    result = await agent._execute(context={}, params={})
+
+    assert result.confidence == pytest.approx(1.0)
+
+
+async def test_judge_failure_fallback_to_max_candidate_confidence():
+    """Judge 호출 실패 시 rule-base로 계산된 candidate 최고 confidence를 사용한다."""
+    agent = _make_agent()
+    root_causes = json.dumps({"root_causes": [
+        {"rank": 1, "cause": "원인 1", "confidence": 0.7, "evidences": []},
+        {"rank": 2, "cause": "원인 2", "confidence": 0.4, "evidences": []},
+    ]})
+    agent.llm.chat = _mock_chat(root_causes, "judge 응답 파싱 불가 텍스트")
+
+    result = await agent._execute(context={}, params={"tc_id": "TC-001"})
+
+    # LLM confidence 무시 → rule-base 고정 base 0.5, evidence/penalty 없음 → 0.5
+    assert result.confidence == pytest.approx(0.5)
+
+
+async def test_judge_failure_missing_fields_fallback():
+    """Judge 응답에 필드가 누락되면 fallback을 사용한다."""
+    agent = _make_agent()
+    root_causes = json.dumps({"root_causes": [
+        {"rank": 1, "cause": "원인", "confidence": 0.6, "evidences": []},
+    ]})
+    agent.llm.chat = _mock_chat(root_causes, json.dumps({"relevance": 3}))
+
+    result = await agent._execute(context={}, params={"tc_id": "TC-001"})
+
+    # LLM confidence 무시 → rule-base 0.5
+    assert result.confidence == pytest.approx(0.5)
+
+
+# ─── cause별 confidence — evidence 보정 ────────────────────────────────────────
 
 
 async def test_confidence_boost_code_location():
-    """code_location evidence 1개 이상이면 +0.2."""
+    """code_location evidence 1개 이상이면 +0.3."""
     agent = _make_agent()
     agent.llm.chat = _mock_chat(
         _single_candidate_llm(0.5, [{"type": "code_location", "content": "app/service.py:84"}]),
@@ -174,11 +219,11 @@ async def test_confidence_boost_code_location():
 
     result = await agent._execute(context={}, params={"tc_id": "TC-001"})
 
-    assert result.result["root_causes"][0]["candidates"][0]["confidence"] == pytest.approx(0.7)
+    assert result.result["root_causes"][0]["candidates"][0]["confidence"] == pytest.approx(0.8)
 
 
 async def test_confidence_boost_runtime_data():
-    """runtime_data evidence 1개 이상이면 +0.2."""
+    """runtime_data evidence 1개 이상이면 +0.3."""
     agent = _make_agent()
     agent.llm.chat = _mock_chat(
         _single_candidate_llm(0.5, [{"type": "runtime_data", "content": "HTTP 500"}]),
@@ -187,11 +232,11 @@ async def test_confidence_boost_runtime_data():
 
     result = await agent._execute(context={}, params={"tc_id": "TC-001"})
 
-    assert result.result["root_causes"][0]["candidates"][0]["confidence"] == pytest.approx(0.7)
+    assert result.result["root_causes"][0]["candidates"][0]["confidence"] == pytest.approx(0.8)
 
 
 async def test_confidence_boost_both_types_capped_at_one():
-    """code_location + runtime_data 둘 다 있으면 +0.4, 1.0 초과 금지."""
+    """code_location + runtime_data 둘 다 있으면 base 0.5 + 0.6 = 1.1 → clamp 1.0."""
     agent = _make_agent()
     agent.llm.chat = _mock_chat(
         _single_candidate_llm(0.9, [
@@ -206,14 +251,111 @@ async def test_confidence_boost_both_types_capped_at_one():
     assert result.result["root_causes"][0]["candidates"][0]["confidence"] == pytest.approx(1.0)
 
 
-async def test_confidence_without_evidence_stays_low():
-    """evidence가 없으면 LLM confidence 그대로 유지된다."""
+async def test_confidence_without_evidence_uses_rule_base():
+    """evidence가 없으면 rule-base 고정값 0.5가 그대로 사용된다. LLM confidence는 무시."""
     agent = _make_agent()
     agent.llm.chat = _mock_chat(_single_candidate_llm(0.3, []), _JUDGE_OK)
 
     result = await agent._execute(context={}, params={"tc_id": "TC-001"})
 
-    assert result.result["root_causes"][0]["candidates"][0]["confidence"] == pytest.approx(0.3)
+    assert result.result["root_causes"][0]["candidates"][0]["confidence"] == pytest.approx(0.5)
+
+
+# ─── cause별 confidence — 관련성 페널티 ───────────────────────────────────────
+
+
+async def test_relevance_penalty_when_cause_unrelated():
+    """cause에 입력 키워드가 전혀 없으면 -0.4 페널티를 적용한다."""
+    agent = _make_agent()
+    agent.llm.chat = _mock_chat(
+        json.dumps({"root_causes": [
+            {"rank": 1, "cause": "완전히 무관한 원인 설명", "confidence": 0.8, "evidences": []}
+        ]}),
+        _JUDGE_OK,
+    )
+
+    result = await agent._execute(
+        context={},
+        params={"tc_id": "TC-001", "error_code": "HTTP_500", "summary": "결제 실패"},
+    )
+
+    # base 0.5 (LLM confidence 무시), 입력 토큰이 cause에 없음 → -0.4
+    # 0.5 - 0.4 = 0.1
+    assert result.result["root_causes"][0]["candidates"][0]["confidence"] == pytest.approx(0.1)
+
+
+async def test_no_relevance_penalty_when_cause_matches():
+    """cause에 입력 키워드가 포함되면 페널티를 적용하지 않는다."""
+    agent = _make_agent()
+    agent.llm.chat = _mock_chat(
+        json.dumps({"root_causes": [
+            {"rank": 1, "cause": "결제 처리 중 HTTP_500 오류 발생", "confidence": 0.5, "evidences": []}
+        ]}),
+        _JUDGE_OK,
+    )
+
+    result = await agent._execute(
+        context={},
+        params={"tc_id": "TC-001", "error_code": "HTTP_500", "summary": "결제 실패"},
+    )
+
+    # base 0.5 (LLM confidence 무시), 입력 토큰이 cause에 포함됨 → 페널티 없음 → 0.5
+    assert result.result["root_causes"][0]["candidates"][0]["confidence"] == pytest.approx(0.5)
+
+
+async def test_no_relevance_penalty_when_no_input_tokens():
+    """error_code, summary, mismatches가 없으면 관련성 페널티를 적용하지 않는다."""
+    agent = _make_agent()
+    agent.llm.chat = _mock_chat(_single_candidate_llm(0.8), _JUDGE_OK)
+
+    # error_code, summary, mismatches 모두 없음
+    result = await agent._execute(context={}, params={"tc_id": "TC-001"})
+
+    # base 0.5 (LLM confidence 무시), 입력 토큰 없음 → 페널티 없음 → 0.5
+    assert result.result["root_causes"][0]["candidates"][0]["confidence"] == pytest.approx(0.5)
+
+
+async def test_relevance_penalty_combined_with_evidence_boost():
+    """관련성 페널티와 evidence 보정이 함께 적용된다."""
+    agent = _make_agent()
+    agent.llm.chat = _mock_chat(
+        json.dumps({"root_causes": [
+            {"rank": 1, "cause": "무관한 원인 설명", "confidence": 0.8,
+             "evidences": [{"type": "code_location", "content": "app/x.py:1"}]}
+        ]}),
+        _JUDGE_OK,
+    )
+
+    result = await agent._execute(
+        context={},
+        params={"tc_id": "TC-001", "error_code": "HTTP_500", "summary": "결제 실패"},
+    )
+
+    # base 0.5 - 0.4 (관련성 페널티) + 0.3 (code_location) = 0.4
+    assert result.result["root_causes"][0]["candidates"][0]["confidence"] == pytest.approx(0.4)
+
+
+async def test_relevance_check_uses_mismatch_fields():
+    """mismatches의 field 이름도 관련성 키워드로 활용된다."""
+    agent = _make_agent()
+    agent.llm.chat = _mock_chat(
+        json.dumps({"root_causes": [
+            {"rank": 1, "cause": "order_status 불일치 발생", "confidence": 0.6, "evidences": []}
+        ]}),
+        _JUDGE_OK,
+    )
+
+    result = await agent._execute(
+        context={},
+        params={
+            "tc_id": "TC-001",
+            "mismatches": [{"field": "order_status", "ui_value": "ok",
+                            "api_value": "fail", "db_value": None, "severity": "high"}],
+        },
+    )
+
+    # base 0.5, "order" 또는 "status"가 cause에 포함됨 → 페널티 없음 → 0.5
+    assert result.result["root_causes"][0]["candidates"][0]["confidence"] == pytest.approx(0.5)
 
 
 # ─── summary fallback ──────────────────────────────────────────────────────────
@@ -271,8 +413,8 @@ async def test_parse_failure_returns_fallback_result():
 
     candidates = result.result["root_causes"][0]["candidates"]
     assert len(candidates) >= 1
-    assert candidates[0]["confidence"] < 0.4  # fallback은 0.1 기반 (evidence boost 포함해도 낮음)
-    assert "warnings" not in result.result  # warnings 필드 없음, cause에 상황 표현
+    assert candidates[0]["confidence"] < 0.5  # fallback은 낮은 confidence
+    assert "warnings" not in result.result
 
 
 async def test_missing_root_causes_key_returns_fallback_result():
@@ -287,7 +429,7 @@ async def test_missing_root_causes_key_returns_fallback_result():
 
     candidates = result.result["root_causes"][0]["candidates"]
     assert len(candidates) >= 1
-    assert candidates[0]["confidence"] < 0.4  # fallback은 0.1 기반 (evidence boost 포함해도 낮음)
+    assert candidates[0]["confidence"] < 0.5
 
 
 async def test_parse_response_raises_on_invalid_json():
@@ -360,36 +502,6 @@ async def test_all_invalid_evidences_result_in_empty_list():
     assert result.result["root_causes"][0]["candidates"][0]["evidences"] == []
 
 
-# ─── Judge 실패 fallback ───────────────────────────────────────────────────────
-
-
-async def test_judge_failure_fallback_to_max_candidate_confidence():
-    """Judge 호출 실패(파싱 불가) 시 candidate 최고 confidence를 agent confidence로 사용한다."""
-    agent = _make_agent()
-    root_causes = json.dumps({"root_causes": [
-        {"rank": 1, "cause": "원인 1", "confidence": 0.7, "evidences": []},
-        {"rank": 2, "cause": "원인 2", "confidence": 0.4, "evidences": []},
-    ]})
-    agent.llm.chat = _mock_chat(root_causes, "judge 응답 파싱 불가 텍스트")
-
-    result = await agent._execute(context={}, params={"tc_id": "TC-001"})
-
-    assert result.confidence == pytest.approx(0.7)
-
-
-async def test_judge_failure_missing_fields_fallback():
-    """Judge 응답에 필드가 누락되면 fallback을 사용한다."""
-    agent = _make_agent()
-    root_causes = json.dumps({"root_causes": [
-        {"rank": 1, "cause": "원인", "confidence": 0.6, "evidences": []},
-    ]})
-    agent.llm.chat = _mock_chat(root_causes, json.dumps({"relevance": 3}))
-
-    result = await agent._execute(context={}, params={"tc_id": "TC-001"})
-
-    assert result.confidence == pytest.approx(0.6)
-
-
 # ─── tc_id context 없을 때 candidate 처리 ─────────────────────────────────────
 
 
@@ -446,7 +558,7 @@ async def test_no_confidence_override_when_tc_id_empty():
     result = await agent._execute(context={}, params={})
 
     candidates = result.result["root_causes"][0]["candidates"]
-    assert candidates[0]["confidence"] > 0.0  # 0.0으로 강제되지 않음
+    assert candidates[0]["confidence"] > 0.0
 
 
 # ─── 관련 코드 컨텍스트 필터링 ────────────────────────────────────────────────
