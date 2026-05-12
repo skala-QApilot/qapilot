@@ -84,6 +84,11 @@ class LLMClient:
         """
         # 토큰 예산 차단
         if self.total_tokens >= self._config.max_tokens_per_task:
+            self._logger.error(
+                "llm_budget_exceeded",
+                used=self.total_tokens,
+                limit=self._config.max_tokens_per_task,
+            )
             raise QApilotError(
                 ErrorCode.SYSTEM_002,
                 f"태스크 토큰 예산 초과: {self.total_tokens}/{self._config.max_tokens_per_task}",

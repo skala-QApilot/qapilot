@@ -60,7 +60,11 @@ class BaseAgent(ABC):
         self.logger.info("agent_start", params_keys=list(input.params.keys()))
 
         # 입력 가드레일
-        Guardrails.check_input({**input.context, **input.params})
+        try:
+            Guardrails.check_input({**input.context, **input.params})
+        except AgentExecutionError as e:
+            self.logger.error("input_guardrail_blocked", code=e.code, detail=e.context)
+            raise
 
         # 재시도 루프
         last_error: str | None = None
@@ -80,7 +84,11 @@ class BaseAgent(ABC):
                     )
 
                 # 출력 가드레일
-                Guardrails.check_output(execute_result.result)
+                try:
+                    Guardrails.check_output(execute_result.result)
+                except AgentExecutionError as e:
+                    self.logger.error("output_guardrail_blocked", code=e.code, detail=e.context)
+                    raise
 
                 # 메타데이터 수집
                 duration = round(time.monotonic() - start, 2)
@@ -124,6 +132,11 @@ class BaseAgent(ABC):
             if attempt < self._resolved.max_retry:
                 await asyncio.sleep(2 ** (attempt + 1))
 
+        self.logger.error(
+            "agent_failed",
+            retries=self._resolved.max_retry + 1,
+            last_error=last_error,
+        )
         raise AgentExecutionError(
             ErrorCode.AGENT_005,
             f"재시도 {self._resolved.max_retry + 1}회 모두 실패",
@@ -186,6 +199,7 @@ class BaseAgent(ABC):
             AgentExecutionError: 화이트리스트에 없는 Tool 호출 시.
         """
         if tool_name not in self.allowed_tools:
+            self.logger.error("tool_denied", tool=tool_name, allowed=self.allowed_tools)
             raise AgentExecutionError(
                 ErrorCode.AGENT_001,
                 f"Tool '{tool_name}'은 허용 목록에 없습니다: {self.allowed_tools}",

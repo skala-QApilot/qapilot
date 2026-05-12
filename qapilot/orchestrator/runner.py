@@ -8,11 +8,20 @@ Created: 2026-05-07
 
 from qapilot.orchestrator.pipeline import build_pipeline
 from qapilot.orchestrator.state import PipelineState
+from qapilot.shared.logger import get_logger
 from qapilot.shared.schemas import RunOptions
 
 
 async def run_pipeline(options: RunOptions) -> PipelineState:
     """파이프라인을 실행하고 최종 상태를 반환한다."""
+    logger = get_logger(source="orchestrator")
+    logger.info(
+        "pipeline_start",
+        command=options["command"],
+        trigger=options.get("trigger"),
+        filter=options.get("filter"),
+    )
+
     graph = build_pipeline()
     app = graph.compile()
 
@@ -49,10 +58,20 @@ async def run_pipeline(options: RunOptions) -> PipelineState:
         "total_cost": 0.0,
     }
 
-    result = await app.ainvoke(initial_state)
+    try:
+        result = await app.ainvoke(initial_state)
+    except Exception as e:
+        logger.error("pipeline_failed", error=f"{type(e).__name__}: {e}")
+        raise
 
     # Agent 실행 로그의 비용을 합산해 파이프라인 총 비용으로 집계한다.
     result["total_cost"] = round(
         sum(log.get("cost_usd", 0.0) for log in result.get("agent_logs", [])), 6
+    )
+    logger.info(
+        "pipeline_complete",
+        status=result.get("status"),
+        total_cost_usd=result["total_cost"],
+        trace_id=result.get("trace_id"),
     )
     return result
