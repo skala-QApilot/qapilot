@@ -41,7 +41,6 @@ class BaseTool(ABC):
             ToolOutput (trace_id, result, metadata).
         """
         start = time.monotonic()
-        self.logger.info("tool_start", params_keys=list(input.params.keys()))
 
         try:
             result = await asyncio.wait_for(

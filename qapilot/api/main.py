@@ -11,10 +11,12 @@ from qapilot.api.agent_router import router as agent_router
 from qapilot.api.defect_router import router as defect_router
 from qapilot.api.report_router import router as report_router
 from qapilot.api.scenario_router import router as scenario_router
+from qapilot.shared.logger import setup_logger
 
 
 def create_app() -> FastAPI:
     """FastAPI 앱을 생성한다."""
+    setup_logger()
     app = FastAPI(title="QApilot", version="0.1.0")
 
     # 라우터 등록

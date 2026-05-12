@@ -25,12 +25,19 @@ from qapilot.cli.api_client import ApiClient
 from qapilot.cli.sync import sync_local_to_server
 from qapilot.cli.utils import render_image_to_text
 from qapilot.orchestrator.runner import run_pipeline
+from qapilot.shared.logger import setup_logger
 from qapilot.shared.schemas import RunOptions
 
 app = typer.Typer(help="QApilot — AI 기반 QA 자동화 시스템")
 console = Console()
 
 BRAND_PURPLE = "#3617CE"
+
+
+@app.callback()
+def _init_cli() -> None:
+    """모든 CLI 명령 실행 전에 로깅을 초기화한다."""
+    setup_logger()
 
 
 def print_welcome_banner() -> None:

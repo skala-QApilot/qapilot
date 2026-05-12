@@ -35,6 +35,7 @@ class BaseMetadata(BaseModel):
 
     model: str
     tokens_used: int
+    cost_usd: float = 0.0
     duration_sec: float
     retry_count: int = 0
     cache_hit: bool = False
@@ -385,6 +386,7 @@ class AgentMeta(TypedDict):
     agent_name: str
     model: str
     tokens_used: int
+    cost_usd: float
     duration_sec: float
     retry_count: int
     cache_hit: bool
