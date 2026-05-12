@@ -1,25 +1,375 @@
 """원인 추론 Agent.
 
-로그, 코드베이스, Git 이력을 종합 분석하여
-결함 원인 후보 Top-N을 신뢰도 및 근거와 함께 도출한다.
+CrossCheckResult 기반으로 테스트 실패의 근본 원인 후보 Top-N을
+신뢰도와 근거와 함께 도출한다.
 
 담당: F
 Created: 2026-05-07
 """
 
+from __future__ import annotations
+
+import json
+import re
+from pathlib import Path
+from typing import Any
+
 from qapilot.agents.base_agent import BaseAgent
+from qapilot.shared.errors import AgentExecutionError, ErrorCode
+from qapilot.shared.schemas import Evidence, ExecuteResult, RootCauseCandidate, RootCauseResult
+
+# tc_id 기준 더미 컨텍스트 파일 위치 (실제 DB 조회 전까지 사용)
+_DUMMY_CONTEXT_DIR = Path(__file__).parent.parent.parent / "tests" / "fixtures" / "contexts"
+
+_VALID_EVIDENCE_TYPES = frozenset({"code_location", "runtime_data"})
+
+# LLM-as-Judge: 추론 결과 품질 평가 (1~5점 3개 지표 → 0.0~1.0 confidence)
+_JUDGE_PROMPT = """너는 원인 추론 결과를 평가하는 Judge야.
+아래 입력과 추론 결과를 보고 각 항목을 1~5점으로 평가해라.
+점수 외 다른 텍스트 없이 JSON만 반환해라.
+
+## 입력
+- error_code: {error_code}
+- situation_summary: {situation_summary}
+
+## 추론 결과
+{root_cause_result}
+
+## 평가 항목
+1. relevance: 입력과 원인 후보들이 얼마나 관련되어 있는가
+   1 = 전혀 무관 / 5 = 완전히 일치
+
+2. evidence_quality: 각 원인에 대한 evidence가 원인을 실제로 뒷받침하는가
+   1 = 근거 없는 추측 / 5 = 명확한 근거로 원인 설명
+
+3. diversity: Top-N 후보들이 서로 다른 원인을 가리키는가
+   1 = 모두 동일한 원인 / 5 = 완전히 독립적인 원인
+
+## 응답 형식
+{{
+  "relevance": 점수,
+  "evidence_quality": 점수,
+  "diversity": 점수,
+  "reason": "한 줄 평가 요약"
+}}"""
 
 
 class RootCauseAgent(BaseAgent):
     """원인 추론 Agent.
 
-    역할: 로그+코드+Git → Top-N 원인 후보 + 근거 3종
-    입력: DefectClassification, CodebaseContext
-    출력: List[RootCauseResult], confidence
-    호출 Tool: 코드 인덱스 Tool, 도메인 지식 Tool
+    역할: CrossCheckResult + 컨텍스트 → Top-N 원인 후보 + 근거
+    입력: CrossCheckResult 필드, code_context, runtime_context
+    출력: {"root_causes": [RootCauseResult], "warnings": [...]}
+    호출 Tool: 없음
+
+    tc_id:    테스트 케이스 식별자. 코드베이스·로그 조회 키로 사용.
+    trace_id: 오케스트레이터가 주입하는 실행 추적 ID (self.trace_id). 컨텍스트 조회에는 사용하지 않음.
     """
 
+    allowed_tools: list[str] = []
+
     async def _execute(
-        self, context: dict, params: dict, last_error: str | None = None
-    ) -> "ExecuteResult":
-        raise NotImplementedError
+        self,
+        context: dict[str, Any],
+        params: dict[str, Any],
+        last_error: str | None = None,
+    ) -> ExecuteResult:
+        """CrossCheckResult 기반으로 원인 후보 Top-N을 추론한다.
+
+        Args:
+            context: 파이프라인 컨텍스트. code_context, runtime_context를 읽는다.
+            params: 실행 파라미터.
+                tc_id, error_code, summary, mismatches, has_mismatch,
+                code_context, runtime_context
+                (trace_id는 self.trace_id로 오케스트레이터가 주입 — params로 받지 않음)
+            last_error: 이전 시도 에러. 자가 수정 힌트에 사용.
+
+        Returns:
+            ExecuteResult: root_causes(list[RootCauseResult])와 warnings, confidence 포함.
+        """
+        tc_id = params.get("tc_id") or context.get("tc_id", "")
+        error_code = params.get("error_code") or context.get("error_code", "")
+        summary: str = params.get("summary") or context.get("summary") or ""
+        mismatches: list = params.get("mismatches") or context.get("mismatches") or []
+        has_mismatch: bool = params.get("has_mismatch", context.get("has_mismatch", False))
+
+        code_context_raw = params.get("code_context") or context.get("code_context", "")
+        runtime_context_raw = params.get("runtime_context") or context.get("runtime_context", "")
+
+        # params/context에 없으면 tc_id 기준 더미 파일에서 로드
+        if not code_context_raw and tc_id:
+            code_context_raw = self._load_dummy_context(tc_id, "code_context")
+        if not runtime_context_raw and tc_id:
+            runtime_context_raw = self._load_dummy_context(tc_id, "runtime_context")
+
+        # 컨텍스트 가용성 확인 및 경고 로그
+        code_missing = tc_id and not code_context_raw
+        runtime_missing = tc_id and not runtime_context_raw
+        if code_missing:
+            self.logger.warning("context_not_found", tc_id=tc_id, trace_id=self.trace_id, missing="code_context")
+        if runtime_missing:
+            self.logger.warning("context_not_found", tc_id=tc_id, trace_id=self.trace_id, missing="runtime_context")
+
+        # summary가 없으면 mismatches에서 fallback 생성
+        if not summary and mismatches:
+            summary = "; ".join(
+                f"{m.get('field', '')}: ui={m.get('ui_value', '')}, api={m.get('api_value', '')}"
+                for m in mismatches
+            )
+
+        # 관련 코드 컨텍스트만 추려서 프롬프트 크기 최적화
+        code_context_filtered = self._select_relevant_code_context(
+            self._stringify(code_context_raw),
+            error_code,
+            summary,
+            mismatches,
+        )
+
+        context_text = self._format_context(
+            code_context_filtered,
+            self._stringify(runtime_context_raw),
+        )
+        input_data = {
+            "tc_id": tc_id,
+            "error_code": error_code,
+            "summary": summary,
+            "mismatches": mismatches,
+            "has_mismatch": has_mismatch,
+        }
+
+        user_prompt = self.with_correction_hint(
+            self.prompts.render(
+                context=context_text,
+                input_data=json.dumps(input_data, ensure_ascii=False, indent=2),
+            ),
+            last_error,
+        )
+
+        response = await self.llm.chat(
+            system_prompt=self.prompts.system(),
+            user_prompt=user_prompt,
+        )
+
+        # 파싱 실패 시 fallback candidate 생성 (재시도 유도 대신 안전한 최소 결과 반환)
+        try:
+            candidates = self._parse_response(response.content)
+        except AgentExecutionError as e:
+            self.logger.warning("parse_failed_using_fallback", tc_id=tc_id, error=str(e))
+            candidates = self._build_fallback_candidates(error_code, summary, mismatches)
+
+        candidates = candidates[:3]
+        for candidate in candidates:
+            candidate["confidence"] = self._apply_confidence(candidate)
+
+        # 양쪽 context 모두 없을 때: confidence 0.0 강제 + note evidence 추가
+        if code_missing and runtime_missing:
+            note: Evidence = {"type": "runtime_data", "content": "error_code와 summary만으로 추론"}
+            for candidate in candidates:
+                candidate["confidence"] = 0.0
+                candidate["evidences"] = candidate.get("evidences", []) + [note]
+
+        agent_confidence = await self._run_judge(error_code, summary, candidates)
+
+        self.logger.info("root_cause_analyzed", tc_id=tc_id, candidate_count=len(candidates))
+
+        root_cause_result: RootCauseResult = {"tc_id": tc_id, "candidates": candidates}
+        return ExecuteResult(
+            result={"root_causes": [root_cause_result]},
+            confidence=agent_confidence,
+        )
+
+    def _parse_response(self, content: str) -> list[RootCauseCandidate]:
+        """LLM 응답 JSON을 파싱하고 RootCauseCandidate 목록을 반환한다.
+
+        Raises:
+            AgentExecutionError: JSON 파싱 실패 또는 root_causes 키 누락 시.
+        """
+        try:
+            cleaned = re.sub(r"```(?:json)?\s*|\s*```", "", content).strip()
+            data = json.loads(cleaned)
+        except json.JSONDecodeError as e:
+            raise AgentExecutionError(
+                ErrorCode.AGENT_004,
+                f"LLM 출력 JSON 파싱 실패: {e}\n출력 앞부분: {content[:300]}",
+            ) from e
+
+        if "root_causes" not in data:
+            raise AgentExecutionError(
+                ErrorCode.AGENT_004,
+                f"'root_causes' 필드가 없습니다. 출력: {content[:300]}",
+            )
+
+        candidates: list[RootCauseCandidate] = []
+        for i, raw in enumerate(data["root_causes"], start=1):
+            valid_evidences: list[Evidence] = [
+                {"type": e["type"], "content": e.get("content", "")}
+                for e in raw.get("evidences", [])
+                if e.get("type") in _VALID_EVIDENCE_TYPES
+            ]
+            candidates.append({
+                "rank": raw.get("rank", i),
+                "cause": raw.get("cause", ""),
+                "confidence": float(raw.get("confidence", 0.5)),
+                "evidences": valid_evidences,
+            })
+
+        return candidates
+
+    def _build_fallback_candidates(
+        self,
+        error_code: str,
+        summary: str,
+        mismatches: list[dict],
+    ) -> list[RootCauseCandidate]:
+        """LLM 응답 파싱 실패 시 입력 데이터 기반으로 최소 fallback candidate를 생성한다."""
+        cause_parts = [p for p in [error_code, summary[:100] if summary else ""] if p]
+        cause = (
+            f"파싱 실패 - 입력 기반 최소 분석: {', '.join(cause_parts)}"
+            if cause_parts
+            else "원인 분석 실패 (LLM 응답 파싱 불가)"
+        )
+
+        evidences: list[Evidence] = []
+        runtime_parts = [p for p in [
+            f"error_code={error_code}" if error_code else "",
+            summary[:200] if summary else "",
+            f"mismatch fields: {[m.get('field', '') for m in mismatches]}" if mismatches else "",
+        ] if p]
+        if runtime_parts:
+            evidences.append({"type": "runtime_data", "content": "; ".join(runtime_parts)})
+
+        return [{"rank": 1, "cause": cause, "confidence": 0.1, "evidences": evidences}]
+
+    def _apply_confidence(self, candidate: dict[str, Any]) -> float:
+        """evidence 유형에 따라 confidence를 보정하고 0.0~1.0으로 clamp한다.
+
+        code_location 1개 이상: +0.2
+        runtime_data 1개 이상: +0.2
+        """
+        base = float(candidate.get("confidence", 0.5))
+        evidences = candidate.get("evidences", [])
+        boost = 0.0
+        if any(e.get("type") == "code_location" for e in evidences):
+            boost += 0.2
+        if any(e.get("type") == "runtime_data" for e in evidences):
+            boost += 0.2
+        return min(1.0, max(0.0, base + boost))
+
+    async def _run_judge(
+        self,
+        error_code: str,
+        summary: str,
+        candidates: list[dict[str, Any]],
+    ) -> float:
+        """Judge LLM으로 추론 결과를 평가하고 0.0~1.0 confidence를 반환한다.
+
+        평가 지표(relevance, evidence_quality, diversity)의 평균을
+        1~5 → 0.0~1.0 구간으로 정규화: (avg - 1) / 4
+
+        실패 시 candidate 최고 confidence로 fallback.
+        """
+        fallback = max((c["confidence"] for c in candidates), default=0.5)
+        if not candidates:
+            return fallback
+
+        judge_prompt = _JUDGE_PROMPT.format(
+            error_code=error_code or "(없음)",
+            situation_summary=summary or "(없음)",
+            root_cause_result=json.dumps(candidates, ensure_ascii=False, indent=2),
+        )
+
+        try:
+            response = await self.llm.chat(
+                system_prompt="JSON만 반환하라.",
+                user_prompt=judge_prompt,
+            )
+            cleaned = re.sub(r"```(?:json)?\s*|\s*```", "", response.content).strip()
+            scores = json.loads(cleaned)
+            relevance = float(scores["relevance"])
+            evidence_quality = float(scores["evidence_quality"])
+            diversity = float(scores["diversity"])
+        except Exception:
+            return fallback
+
+        avg = (relevance + evidence_quality + diversity) / 3
+        return min(1.0, max(0.0, (avg - 1) / 4))
+
+    @staticmethod
+    def _select_relevant_code_context(
+        code_context_str: str,
+        error_code: str,
+        summary: str,
+        mismatches: list[dict],
+    ) -> str:
+        """error_code, summary, mismatches 키워드 기준으로 관련 코드 컨텍스트를 추린다.
+
+        JSON 구조(files 배열)이면 파일별 스코어링 후 관련 파일만 반환.
+        평문이면 줄 단위 필터링.
+        키워드가 없거나 매칭 결과가 없으면 전체를 그대로 반환한다(안전 fallback).
+        """
+        if not code_context_str:
+            return code_context_str
+
+        # 키워드 수집 및 토큰화
+        tokens: set[str] = set()
+        for text in [error_code, summary]:
+            if text:
+                tokens.update(t for t in re.split(r"[\s_/.:,\-]+", text.lower()) if t)
+        for m in mismatches:
+            field = m.get("field", "")
+            if field:
+                tokens.update(t for t in re.split(r"[\s_/.:,\-]+", field.lower()) if t)
+
+        if not tokens:
+            return code_context_str
+
+        # JSON 구조 시도
+        try:
+            data = json.loads(code_context_str)
+        except (json.JSONDecodeError, TypeError):
+            # 평문: 줄 단위 필터링
+            lines = code_context_str.splitlines()
+            relevant = [ln for ln in lines if any(t in ln.lower() for t in tokens)]
+            return "\n".join(relevant) if relevant else code_context_str
+
+        # JSON에 files 배열이 있으면 파일별 스코어링
+        if isinstance(data, dict) and "files" in data:
+            relevant = [
+                f for f in data["files"]
+                if any(t in json.dumps(f, ensure_ascii=False).lower() for t in tokens)
+            ]
+            if relevant:
+                return json.dumps({**data, "files": relevant}, ensure_ascii=False, indent=2)
+
+        return code_context_str
+
+    @staticmethod
+    def _load_dummy_context(trace_id: str, key: str) -> str:
+        """trace_id 기준으로 tests/fixtures/contexts/ 아래 더미 컨텍스트를 로드한다.
+
+        실제 DB/스토리지 조회가 구현되기 전까지 사용하는 임시 로더.
+        파일이 없으면 빈 문자열을 반환한다.
+        """
+        path = _DUMMY_CONTEXT_DIR / trace_id / f"{key}.json"
+        if path.exists():
+            return path.read_text(encoding="utf-8")
+        return ""
+
+    @staticmethod
+    def _stringify(val: Any) -> str:
+        """값을 문자열로 변환한다. dict/list는 JSON으로 직렬화."""
+        if isinstance(val, str):
+            return val
+        if val:
+            return json.dumps(val, ensure_ascii=False, indent=2)
+        return ""
+
+    @staticmethod
+    def _format_context(code_context: str, runtime_context: str) -> str:
+        """코드/런타임 컨텍스트를 프롬프트용 문자열로 조합한다."""
+        parts = []
+        if code_context:
+            parts.append(f"## 코드 컨텍스트\n{code_context}")
+        if runtime_context:
+            parts.append(f"## 런타임 컨텍스트\n{runtime_context}")
+        return "\n\n".join(parts) if parts else "(컨텍스트 없음)"

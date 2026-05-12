@@ -336,7 +336,7 @@ class DefectClassification(TypedDict):
 class Evidence(TypedDict):
     """원인 근거."""
 
-    type: Literal["code_location", "domain_rule", "runtime_data"]
+    type: Literal["code_location", "runtime_data"]
     content: str
 
 
@@ -347,8 +347,7 @@ class RootCauseCandidate(TypedDict):
     cause: str
     confidence: float
     evidences: list[Evidence]
-    affected_file: str | None
-    affected_line: int | None
+
 
 
 class RootCauseResult(TypedDict):
