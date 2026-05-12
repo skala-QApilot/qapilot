@@ -17,6 +17,7 @@ from langchain_openai import ChatOpenAI
 from qapilot.shared.config import LLMConfig
 from qapilot.shared.errors import ErrorCode, LLMApiError, QApilotError
 from qapilot.shared.logger import get_logger
+from qapilot.shared.pricing import calc_cost
 
 _MAX_LLM_RETRY = 3
 _BACKOFF_BASE_SEC = 1
@@ -28,19 +29,37 @@ class LLMResponse:
 
     content: str
     model: str
-    tokens_used: int
+    input_tokens: int
+    output_tokens: int
+    cost_usd: float
     cached: bool
+
+    @property
+    def tokens_used(self) -> int:
+        """입력+출력 합계 토큰."""
+        return self.input_tokens + self.output_tokens
 
 
 class LLMClient:
-    """LLM 호출 클라이언트. BaseAgent에서 self.llm으로 사용된다."""
+    """LLM 호출 클라이언트. BaseAgent에서 self.llm으로 사용된다.
+
+    누적 사용량을 인스턴스 단위로 추적한다 (Agent 1회 실행 = LLMClient 1개):
+    total_input_tokens / total_output_tokens / total_cost_usd.
+    """
 
     def __init__(self, config: LLMConfig, trace_id: str | None = None):
         self._config = config
         self._logger = get_logger(source="llm_client", trace_id=trace_id)
         self._cache: dict[str, LLMResponse] = {}
-        self.total_tokens: int = 0
+        self.total_input_tokens: int = 0
+        self.total_output_tokens: int = 0
+        self.total_cost_usd: float = 0.0
         self.cache_hit: bool = False
+
+    @property
+    def total_tokens(self) -> int:
+        """입력+출력 누적 합계 토큰."""
+        return self.total_input_tokens + self.total_output_tokens
 
     async def chat(
         self,
@@ -80,7 +99,9 @@ class LLMClient:
             return self._cache[cache_key]
 
         response = await self._call_with_retry(system_prompt, user_prompt, model, temperature)
-        self.total_tokens += response.tokens_used
+        self.total_input_tokens += response.input_tokens
+        self.total_output_tokens += response.output_tokens
+        self.total_cost_usd = round(self.total_cost_usd + response.cost_usd, 6)
         self._cache[cache_key] = response
         return response
 
@@ -99,11 +120,15 @@ class LLMClient:
         for attempt in range(_MAX_LLM_RETRY):
             try:
                 result = await llm.ainvoke(messages)
-                tokens = result.usage_metadata.get("total_tokens", 0) if result.usage_metadata else 0
+                usage = result.usage_metadata or {}
+                input_tokens = usage.get("input_tokens", 0)
+                output_tokens = usage.get("output_tokens", 0)
                 return LLMResponse(
                     content=result.content,
                     model=model,
-                    tokens_used=tokens,
+                    input_tokens=input_tokens,
+                    output_tokens=output_tokens,
+                    cost_usd=calc_cost(model, input_tokens, output_tokens),
                     cached=False,
                 )
             except Exception as e:
