@@ -62,7 +62,6 @@ dev = [
 qapilot = "qapilot.cli.main:app"
 
 [tool.setuptools]
-packages = ["qapilot"]
 package-data = {"qapilot" = ["assets/*.png"]}
 
 [tool.black]
