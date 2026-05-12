@@ -50,4 +50,9 @@ async def run_pipeline(options: RunOptions) -> PipelineState:
     }
 
     result = await app.ainvoke(initial_state)
+
+    # Agent 실행 로그의 비용을 합산해 파이프라인 총 비용으로 집계한다.
+    result["total_cost"] = round(
+        sum(log.get("cost_usd", 0.0) for log in result.get("agent_logs", [])), 6
+    )
     return result

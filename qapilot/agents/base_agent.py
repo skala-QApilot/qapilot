@@ -87,6 +87,7 @@ class BaseAgent(ABC):
                 metadata = BaseMetadata(
                     model=self._resolved.model,
                     tokens_used=self.llm.total_tokens,
+                    cost_usd=self.llm.total_cost_usd,
                     duration_sec=duration,
                     retry_count=retry_count,
                     cache_hit=self.llm.cache_hit,
@@ -97,6 +98,7 @@ class BaseAgent(ABC):
                     confidence=execute_result.confidence,
                     duration_sec=duration,
                     tokens=metadata.tokens_used,
+                    cost_usd=metadata.cost_usd,
                     retries=retry_count,
                 )
 
