@@ -1,12 +1,13 @@
 # QApilot 구현 플랜
 
-> **Version**: 1.2  
-> **최종 수정일**: 2026-05-11  
+> **Version**: 1.3  
+> **최종 수정일**: 2026-05-13  
 > **기반 문서**: 요구사항정의서 v0.4 / 개발표준정의서 v0.4  
 > **변경 이력**:  
 > - v1.0 (2026-05-07): 최초 작성. Orchestrator 고정 DAG 전환, HITL 범위 축소, 리포트 단일 형식 반영
 > - v1.1 (2026-05-07): generate/test 파이프라인 분리 확정. generate=Layer1만, test=Layer2~3만
 > - v1.2 (2026-05-11): HITL 모듈 제거. generate를 generate_scenarios/generate_code 2단계로 추가 분리. 사용자는 두 명령 사이에서 시나리오를 자유롭게 수정·삭제 가능
+> - v1.3 (2026-05-13): §8.4 Interactive Shell Mode (REPL) 추가. `qapilot` 단독 실행 시 인터랙티브 셸 진입 (Claude Code 패턴 차용). 명령 히스토리는 휘발성 (Phase 2 에서 opt-in 영속화 검토).
 
 ---
 
@@ -507,6 +508,46 @@ class ToolOutput(BaseModel):
 | `qapilot test --failed` | 이전 실패 건만 재실행 |
 | `qapilot test --affected` | Git 변경분 영향 시나리오만 실행 |
 | `qapilot test --tag {태그}` | 태그 기반 필터 실행 |
+
+### 8.4 Interactive Shell Mode (REPL)
+
+| 명령어 | 동작 |
+|---|---|
+| `qapilot` | 인자 없이 실행 시 인터랙티브 셸 (REPL) 진입. 모든 CLI 명령을 연속 입력 가능 |
+
+#### 셸 안 사용법
+- 모든 일회성 명령 그대로 사용 가능 (`init`, `generate scenarios`, `generate code`, `test`, ...)
+- 슬래시 명령 (Phase 1): `/help`, `/exit`, `/clear`
+- `exit`, `quit`, Ctrl-D 로도 종료. Ctrl-C 를 1.5초 안에 두 번 누르면 종료, 한 번만 누르면 현재 명령만 중단
+- 명령 히스토리는 **현재 세션 안에서만 휘발** (↑/↓ 으로 동일 세션 내 이전 명령 호출). 사내 도메인·정책·DSN 등 민감 입력의 디스크 평문 저장 위험 회피. Phase 2 에서 `qapilot.config.yaml` 의 `repl.history_persistent: true` opt-in 토글 도입 고려 (마스킹·권한 0600·크기 cap 동반)
+- Tab 자동완성 지원
+
+#### 동작 시나리오 예시
+```text
+$ qapilot
+[쿼카 우주비행사 마스코트 배너]
+Interactive Shell (REPL) 모드
+명령을 연속 입력하세요. /help 로 도움말, /exit (또는 Ctrl-D) 로 종료.
+
+qapilot> spec import docs/policy_v3.md
+임베딩 완료
+  file          : docs/policy_v3.md
+  chunks_total  : 24
+  chunks_stored : 24
+  chunks_failed : 0
+qapilot> generate scenarios
+시나리오 생성을 시작합니다 (Layer 1)...
+...
+qapilot> /exit
+bye.
+```
+
+#### Phase 2/3 확장 후보 (별도 이슈)
+- 슬래시 명령 추가: `/cost`, `/model`, `/memory`, `/sessions`, `/compact`, `/resume`
+- 입력 큐 — 작업 실행 중 다음 명령 미리 입력 가능 (FIFO 자동 실행)
+- Bracketed paste / heredoc / 백슬래시 라인 연결 — 멀티라인 입력
+- 모드별 prompt 변경 (예: `qapilot[generate]>`)
+- 자연어 입력 → FR-003 NaturalLanguageAgent 해석 (가장 Claude Code 다움)
 
 ---
 
