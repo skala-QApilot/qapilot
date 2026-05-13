@@ -1,0 +1,25 @@
+{
+  "files": [
+    {
+      "path": "app/services/payment_service.py",
+      "relevant_lines": [
+        {"line": 84, "content": "    db.execute(insert_stmt)"},
+        {"line": 85, "content": "    # TODO: db.commit() 누락"},
+        {"line": 86, "content": "    return {'status': 'completed'}"}
+      ],
+      "note": "트랜잭션 커밋 없이 응답 반환"
+    },
+    {
+      "path": "app/core/database.py",
+      "relevant_lines": [
+        {"line": 31, "content": "engine = create_engine(DATABASE_URL, pool_size=5, max_overflow=0)"}
+      ],
+      "note": "pool_size=5 고정, max_overflow=0으로 연결 고갈 위험"
+    }
+  ],
+  "git_diff": {
+    "commit_hash": "a1b2c3d",
+    "changed_files": ["app/services/payment_service.py"],
+    "summary": "결제 처리 흐름 리팩토링 - commit 호출 제거됨"
+  }
+}

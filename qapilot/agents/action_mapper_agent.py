@@ -8,7 +8,6 @@ Created: 2026-05-07
 """
 
 from qapilot.agents.base_agent import BaseAgent
-from qapilot.shared.schemas import AgentInput, AgentOutput
 
 
 class ActionMapperAgent(BaseAgent):
@@ -18,8 +17,9 @@ class ActionMapperAgent(BaseAgent):
     입력: TestScenario, CodebaseContext (endpoints.json)
     출력: List[ActionMapping], confidence
     호출 Tool: 코드 인덱스 Tool
-    HITL: X
     """
 
-    async def run(self, input: AgentInput) -> AgentOutput:
+    async def _execute(
+        self, context: dict, params: dict, last_error: str | None = None
+    ) -> "ExecuteResult":
         raise NotImplementedError

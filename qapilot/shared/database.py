@@ -1,19 +1,43 @@
-"""DB 연결 모듈."""
+"""QApilot 내부 PostgreSQL — 비동기 엔진·세션 팩토리.
+
+요구사항·시나리오 등 QApilot 자체 데이터를 저장한다.
+system-under-test DB와 별개의 연결이다.
+
+Author: 전아린
+Created: 2026-05-11
+"""
+
+from __future__ import annotations
 
 import os
-from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
-from sqlalchemy.orm import sessionmaker
+import re
 
-DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://qapilot:qapilot@localhost:5432/qapilot")
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.orm import DeclarativeBase
 
-# asyncpg 드라이버 사용하도록 URL 변환
-# postgresql:// → postgresql+asyncpg://
-ASYNC_DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+asyncpg://")
 
-engine = create_async_engine(ASYNC_DATABASE_URL, echo=False)
+def _async_url() -> str:
+    """DATABASE_URL의 드라이버를 asyncpg로 변환한다."""
+    url = os.getenv("DATABASE_URL", "postgresql://qapilot:qapilot@localhost:5432/qapilot")
+    return re.sub(r"^postgresql(\+\w+)?://", "postgresql+asyncpg://", url)
 
-AsyncSessionLocal = sessionmaker(
+
+engine = create_async_engine(_async_url(), pool_pre_ping=True, echo=False)
+
+AsyncSessionLocal = async_sessionmaker(
     bind=engine,
     class_=AsyncSession,
     expire_on_commit=False,
+    autoflush=False,
 )
+
+
+class Base(DeclarativeBase):
+    pass
+
+
+async def create_tables() -> None:
+    """애플리케이션 기동 시 테이블을 생성한다 (없는 경우에만)."""
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
