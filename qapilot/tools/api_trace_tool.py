@@ -13,7 +13,9 @@ from datetime import datetime, timezone
 from playwright.async_api import Page, Request, Response
 
 from qapilot.shared.schemas import APICall, APITraceResult, ToolInput, ToolOutput
+from qapilot.tools.base_tool import BaseTool
 
+MAX_BODY_SIZE = 10 * 1024 * 1024  # 10MB
 
 
 class APITraceTool(BaseTool):
@@ -24,7 +26,6 @@ class APITraceTool(BaseTool):
     출력: List[APITraceResult]
     제한: 10MB 초과 응답 body는 저장하지 않음
     """
-
 
     def __init__(self, trace_id: str | None = None):
         super().__init__(trace_id=trace_id)
