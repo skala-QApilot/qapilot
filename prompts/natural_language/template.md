@@ -1,11 +1,17 @@
-# 컨텍스트
+# 코드베이스 컨텍스트
 
-{{context}}
+{{scan_result_summary}}
 
-# 입력 데이터
+# 도메인 규칙
 
-{{input_data}}
+{{domain_rules}}
+
+# 사용자 입력
+
+{{user_input}}
 
 # 지시사항
 
-위 컨텍스트와 입력 데이터를 기반으로 분석을 수행하라.
+위 코드베이스 컨텍스트와 도메인 규칙을 참조하여
+사용자 입력을 RequirementItem JSON 배열로 변환하라.
+JSON 배열 외에 아무것도 출력하지 않는다.
