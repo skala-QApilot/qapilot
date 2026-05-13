@@ -5,6 +5,9 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools.packages.find]
 include = ["qapilot*"]
 
+[tool.setuptools.package-data]
+qapilot = ["assets/*.png"]
+
 [project]
 name = "qapilot"
 version = "0.1.0"
@@ -14,6 +17,7 @@ dependencies = [
     # CLI
     "typer>=0.12",
     "rich>=13.0",
+    "prompt_toolkit>=3.0",
     # AI 서버
     "fastapi>=0.111",
     "uvicorn>=0.30",
@@ -29,6 +33,13 @@ dependencies = [
     "playwright>=1.44",
     # AST 파싱
     "tree-sitter>=0.22",
+    "tree-sitter-python>=0.23",
+    "tree-sitter-javascript>=0.23",
+    "tree-sitter-typescript>=0.23",
+    "tree-sitter-java>=0.23",
+    "tree-sitter-yaml>=0.6",
+    # Git
+    "gitpython>=3.1",
     # 문서 파싱
     "docling>=1.0",
     "openpyxl>=3.1",
@@ -60,9 +71,6 @@ dev = [
 
 [project.scripts]
 qapilot = "qapilot.cli.main:app"
-
-[tool.setuptools]
-package-data = {"qapilot" = ["assets/*.png"]}
 
 [tool.black]
 line-length = 100

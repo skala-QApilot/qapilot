@@ -1,0 +1,234 @@
+{
+  "scenarios": [
+    {
+      "ts_id": "TS-001",
+      "name": "회원가입 시나리오",
+      "description": "이메일과 비밀번호로 회원가입 정상/예외 흐름 검증",
+      "trigger": "init",
+      "affected_files": [
+        "src/auth.py"
+      ],
+      "domain_rules_used": [
+        "f3dec18f",
+        "035867f5",
+        "f3809c18",
+        "350a84db",
+        "76f1d18d"
+      ],
+      "test_cases": [
+        {
+          "tc_id": "TS-001-TC-01",
+          "name": "정상 회원가입",
+          "given": "유효한 이메일과 8자 이상의 비밀번호를 입력한 상태에서",
+          "when": "회원가입 요청을 전송 시",
+          "then": "회원가입이 성공하고 201 상태 코드가 반환된다",
+          "values": [
+            {
+              "field": "email",
+              "value": "test@example.com",
+              "type": "string",
+              "purpose": "유효한 이메일"
+            },
+            {
+              "field": "password",
+              "value": "securePassword123",
+              "type": "string",
+              "purpose": "유효한 비밀번호"
+            }
+          ],
+          "tags": [
+            "normal"
+          ],
+          "req_id": "REQ-001"
+        },
+        {
+          "tc_id": "TS-001-TC-02",
+          "name": "이메일 중복으로 회원가입 실패",
+          "given": "이미 가입된 이메일을 입력한 상태에서",
+          "when": "회원가입 요청을 전송 시",
+          "then": "회원가입이 실패하고 '이메일이 이미 사용 중입니다' 에러 메시지가 반환된다",
+          "values": [
+            {
+              "field": "email",
+              "value": "existing@example.com",
+              "type": "string",
+              "purpose": "중복된 이메일"
+            },
+            {
+              "field": "password",
+              "value": "securePassword123",
+              "type": "string",
+              "purpose": "유효한 비밀번호"
+            }
+          ],
+          "tags": [
+            "edge_case"
+          ],
+          "req_id": "REQ-001"
+        },
+        {
+          "tc_id": "TS-001-TC-03",
+          "name": "비밀번호 최소 길이 경계값 테스트",
+          "given": "유효한 이메일을 입력한 상태에서",
+          "when": "비밀번호를 7자로 설정하고 회원가입 요청을 전송 시",
+          "then": "회원가입이 실패하고 '비밀번호는 최소 8자 이상이어야 합니다' 에러 메시지가 반환된다",
+          "values": [
+            {
+              "field": "email",
+              "value": "test@example.com",
+              "type": "string",
+              "purpose": "유효한 이메일"
+            },
+            {
+              "field": "password",
+              "value": "short",
+              "type": "string",
+              "purpose": "짧은 비밀번호"
+            }
+          ],
+          "tags": [
+            "boundary"
+          ],
+          "req_id": "REQ-001"
+        },
+        {
+          "tc_id": "TS-001-TC-04",
+          "name": "미성년자 가입 시 법정대리인 동의 필요",
+          "given": "만 19세 미만의 사용자 정보를 입력한 상태에서",
+          "when": "회원가입 요청을 전송 시",
+          "then": "회원가입이 실패하고 '법정대리인 동의가 필요합니다' 에러 메시지가 반환된다",
+          "values": [
+            {
+              "field": "email",
+              "value": "minor@example.com",
+              "type": "string",
+              "purpose": "미성년자 이메일"
+            },
+            {
+              "field": "password",
+              "value": "securePassword123",
+              "type": "string",
+              "purpose": "유효한 비밀번호"
+            },
+            {
+              "field": "guardian_consent",
+              "value": "false",
+              "type": "boolean",
+              "purpose": "법정대리인 동의 없음"
+            }
+          ],
+          "tags": [
+            "edge_case"
+          ],
+          "req_id": "REQ-002"
+        }
+      ]
+    },
+    {
+      "ts_id": "TS-002",
+      "name": "로그인 시나리오",
+      "description": "이메일과 비밀번호로 로그인 정상/예외 흐름 검증",
+      "trigger": "init",
+      "affected_files": [
+        "src/auth.py"
+      ],
+      "domain_rules_used": [
+        "f3dec18f",
+        "035867f5",
+        "f3809c18",
+        "350a84db",
+        "76f1d18d"
+      ],
+      "test_cases": [
+        {
+          "tc_id": "TS-002-TC-01",
+          "name": "정상 로그인",
+          "given": "유효한 이메일과 비밀번호를 입력한 상태에서",
+          "when": "로그인 요청을 전송 시",
+          "then": "로그인이 성공하고 JWT 토큰이 반환된다",
+          "values": [
+            {
+              "field": "email",
+              "value": "test@example.com",
+              "type": "string",
+              "purpose": "유효한 이메일"
+            },
+            {
+              "field": "password",
+              "value": "securePassword123",
+              "type": "string",
+              "purpose": "유효한 비밀번호"
+            }
+          ],
+          "tags": [
+            "normal"
+          ],
+          "req_id": "REQ-003"
+        },
+        {
+          "tc_id": "TS-002-TC-02",
+          "name": "잘못된 비밀번호로 로그인 실패",
+          "given": "유효한 이메일과 잘못된 비밀번호를 입력한 상태에서",
+          "when": "로그인 요청을 전송 시",
+          "then": "로그인이 실패하고 '이메일 또는 비밀번호가 올바르지 않습니다' 에러 메시지가 반환된다",
+          "values": [
+            {
+              "field": "email",
+              "value": "test@example.com",
+              "type": "string",
+              "purpose": "유효한 이메일"
+            },
+            {
+              "field": "password",
+              "value": "wrongPassword",
+              "type": "string",
+              "purpose": "잘못된 비밀번호"
+            }
+          ],
+          "tags": [
+            "edge_case"
+          ],
+          "req_id": "REQ-003"
+        },
+        {
+          "tc_id": "TS-002-TC-03",
+          "name": "비로그인 상태에서 대시보드 접근 시도",
+          "given": "로그인하지 않은 상태에서",
+          "when": "대시보드 접근 요청을 전송 시",
+          "then": "접근이 거부되고 401 상태 코드가 반환된다",
+          "values": [],
+          "tags": [
+            "auth"
+          ],
+          "req_id": "REQ-003"
+        },
+        {
+          "tc_id": "TS-002-TC-04",
+          "name": "동시 로그인 요청",
+          "given": "유효한 이메일과 비밀번호를 입력한 상태에서",
+          "when": "동시에 로그인 요청을 두 번 전송 시",
+          "then": "두 요청 모두 성공하고 JWT 토큰이 반환된다",
+          "values": [
+            {
+              "field": "email",
+              "value": "test@example.com",
+              "type": "string",
+              "purpose": "유효한 이메일"
+            },
+            {
+              "field": "password",
+              "value": "securePassword123",
+              "type": "string",
+              "purpose": "유효한 비밀번호"
+            }
+          ],
+          "tags": [
+            "concurrency"
+          ],
+          "req_id": "REQ-003"
+        }
+      ]
+    }
+  ],
+  "prd_code_mismatches": []
+}

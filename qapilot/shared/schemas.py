@@ -108,6 +108,7 @@ class FileInfo(TypedDict):
     endpoints: list[dict]
     functions: list[dict]
     dependencies: list[str]
+    models: list[dict]
 
 
 class GitDiff(TypedDict):
@@ -119,6 +120,10 @@ class GitDiff(TypedDict):
     added_lines: int
     deleted_lines: int
     diff_detail: list[dict]
+    author: str            # HEAD commit 작성자 이름
+    author_email: str      # HEAD commit 작성자 이메일
+    commit_timestamp: str  # HEAD commit 시점 (ISO 8601 UTC)
+    blame: list[dict]      # 변경 파일별 blame 요약
 
 
 class ScanResult(TypedDict):

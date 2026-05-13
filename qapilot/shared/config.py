@@ -60,7 +60,15 @@ class ServerConfig(BaseModel):
     token: str | None = None
 
 
+class ProjectConfig(BaseModel):
+    name: str | None = None
+    target_url: str | None = None
+    root: str | None = None
+    repo_path: str | None = None
+
+
 class QApilotConfig(BaseModel):
+    project: ProjectConfig = ProjectConfig()
     llm: LLMConfig = LLMConfig()
     agent: AgentConfig = AgentConfig()
     test: TestConfig = TestConfig()

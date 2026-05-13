@@ -16,11 +16,12 @@ from rich.progress import Progress
 from qapilot.cli.api_client import ApiClient
 
 console = Console()
-api_client = ApiClient()
 
 
 async def sync_local_to_server() -> bool:
     """로컬의 모든 시나리오와 생성된 코드를 서버로 동기화한다."""
+    # SERVER_URL 미설정 시 경고는 import 시점이 아닌 실제 sync 시점에 한 번만 노출
+    api_client = ApiClient()
     base_dir = Path(".qapilot")
     scenarios_dir = base_dir / "scenarios"
     codes_dir = base_dir / "generated-code"
