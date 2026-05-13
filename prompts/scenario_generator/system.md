@@ -19,7 +19,6 @@
 - 동일한 Given-When-Then 조합의 중복 TC를 생성하지 않는다.
 - tags는 normal / edge_case / boundary / auth / concurrency 중에서 선택한다.
 - req_id는 요구사항 목록의 REQ-XXX 중 가장 관련 있는 것을 명시하고, 없으면 null로 설정한다.
-- PRD-코드 불일치 항목이 있으면 해당 TS의 description에 "⚠️ 미구현 의심" 메모를 포함한다.
 
 ## 출력 형식
 ```json
