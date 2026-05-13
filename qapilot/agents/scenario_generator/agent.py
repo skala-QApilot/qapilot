@@ -11,12 +11,12 @@ from __future__ import annotations
 
 from typing import Any
 
-from qapilot.agents._scenario_generator.parser import (
+from qapilot.agents.scenario_generator.parser import (
     detect_prd_code_mismatch,
     format_mismatches,
     parse_response,
 )
-from qapilot.agents._scenario_generator.repository import save_scenarios
+from qapilot.agents.scenario_generator.repository import save_scenarios
 from qapilot.agents.base_agent import BaseAgent
 from qapilot.shared.schemas import ExecuteResult
 
