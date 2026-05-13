@@ -283,10 +283,29 @@ app.add_typer(spec_app, name="spec")
 
 @spec_app.command("import")
 def spec_import(file_path: str) -> None:
-    """도메인 문서를 임베딩한다."""
-    console.print(f"[bold {BRAND_PURPLE}]도메인 문서({file_path}) 벡터 임베딩을 시작합니다...[/bold {BRAND_PURPLE}]")
-    # TODO: DomainKnowledgeTool 연동 (FR-001)
-    console.print("[bold blue]임베딩 완료![/bold blue]")
+    """도메인 문서를 파싱·청킹·임베딩하여 Qdrant 에 적재한다."""
+    from qapilot.shared.schemas import ToolInput
+    from qapilot.tools.domain_knowledge import DomainKnowledgeTool
+
+    console.print(
+        f"[bold {BRAND_PURPLE}]도메인 문서({file_path}) 벡터 임베딩을 시작합니다...[/bold {BRAND_PURPLE}]"
+    )
+
+    tool = DomainKnowledgeTool()
+    result = asyncio.run(
+        tool.run(
+            ToolInput(
+                trace_id=str(uuid.uuid4()),
+                params={"action": "import", "file_path": file_path},
+            )
+        )
+    )
+    r = result.result
+    typer.echo("임베딩 완료")
+    typer.echo(f"  file          : {r['file']}")
+    typer.echo(f"  chunks_total  : {r['chunks_total']}")
+    typer.echo(f"  chunks_stored : {r['chunks_stored']}")
+    typer.echo(f"  chunks_failed : {r['chunks_failed']}")
 
 
 # rule 서브커맨드
