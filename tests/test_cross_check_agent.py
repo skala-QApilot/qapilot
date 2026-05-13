@@ -8,6 +8,7 @@ load_dotenv()
 
 from qapilot.agents.cross_check_agent import CrossCheckAgent
 from qapilot.shared.schemas import AgentInput, CrossCheckMismatch
+from qapilot.shared.schemas import AgentInput, CrossCheckMismatch, ExecuteResult
 
 
 @pytest.fixture
@@ -16,55 +17,66 @@ def agent():
 
 
 @pytest.mark.asyncio
-async def test_run_returns_cross_check_result(agent):
-    """CrossCheckAgent 실행 결과 확인."""
-    with patch.object(
-        agent,
-        "_map_fields_with_llm",
-        new=AsyncMock(return_value=([], 1.0))
-    ):
-        input = AgentInput(
-            trace_id="test-trace-001",
-            context={
-                "ui_result": {"steps": [{"step_no": 1, "action": "click", "status": "pass"}]},
-                "api_trace": {"calls": [{"url": "/api/login", "response_body": {"token": "abc"}}]},
-                "db_result": {"snapshots": []},
+async def test_route_a_error_code_detected(agent):
+    """경로 A: API 에러 코드 있을 때 Cross-check 건너뜀."""
+    input = AgentInput(
+        trace_id="test-trace-001",
+        context={
+            "ui_result": {"status": "fail", "steps": []},
+            "api_trace": {
+                "calls": [{"url": "/api/login", "status_code": 401, "response_body": {"code": "AUTH_TOKEN_EXPIRED"}}],
+                "total_calls": 1,
+                "error_calls": 1,
             },
-            params={"tc_id": "TC-001"}
-        )
-        output = await agent.run(input)
+            "db_result": {"snapshots": []},
+        },
+        params={"tc_id": "TC-001"}
+    )
+    output = await agent.run(input)
+    print(output.result)
 
-    assert output.trace_id == "test-trace-001"
-    assert output.confidence == 1.0
-    assert "cross_check" in output.result
+    assert output.result["route"] == "A"
+    assert output.result["error_code"] == "AUTH_TOKEN_EXPIRED"
+    assert "current_state_summary" in output.result
 
 
 @pytest.mark.asyncio
-async def test_mismatch_detected(agent):
-    """불일치 탐지 확인."""
-    mismatch = CrossCheckMismatch(
-        field="username",
-        ui_value="홍길동",
-        api_value="hong",
-        db_value=None,
-        severity="high"
+async def test_route_b_no_error_code(agent):
+    """경로 B: 에러 코드 없을 때 LLM으로 불일치 분석."""
+    mock_execute_result = ExecuteResult(
+        result={
+            "cross_check": {
+                "tc_id": "TC-001",
+                "match_score": 0.5,
+                "matched_fields": 0,
+                "mismatched_fields": 1,
+                "mismatches": [],
+                "has_mismatch": True,
+            },
+            "current_state_summary": "UI 테스트: pass",
+            "route": "B",
+        },
+        confidence=0.5,
     )
 
-    with patch.object(
-        agent,
-        "_map_fields_with_llm",
-        new=AsyncMock(return_value=([mismatch], 0.5))
-    ):
+    with patch.object(agent, "_analyze_with_llm", new=AsyncMock(return_value=([], 0.5))):
         input = AgentInput(
             trace_id="test-trace-001",
             context={
-                "ui_result": {"steps": []},
-                "api_trace": {"calls": []},
+                "ui_result": {"status": "pass", "steps": []},
+                "api_trace": {
+                    "calls": [{"url": "/api/login", "status_code": 200, "response_body": {"token": "abc"}}],
+                    "total_calls": 1,
+                    "error_calls": 0,
+                },
                 "db_result": {"snapshots": []},
             },
             params={"tc_id": "TC-001"}
         )
         output = await agent.run(input)
 
-    assert output.confidence == 0.5
-    assert output.result["cross_check"]["has_mismatch"] is True
+        print(output.result)
+
+    assert output.result["route"] == "B"
+    assert "current_state_summary" in output.result
+

@@ -8,17 +8,13 @@ Created: 2026-05-07
 """
 
 import json
-import os
-
-from langchain_openai import ChatOpenAI
+from typing import Any
 
 from qapilot.agents.base_agent import BaseAgent
 from qapilot.shared.schemas import (
-    AgentInput,
-    AgentOutput,
-    BaseMetadata,
     CrossCheckMismatch,
     CrossCheckResult,
+    ExecuteResult,
 )
 
 
@@ -27,72 +23,85 @@ class CrossCheckAgent(BaseAgent):
 
     역할: UI↔API↔DB 데이터 정합성 검증, 정합성 점수 산출
     입력: UITestResult, APITraceResult, DBTestResult
-    출력: List[CrossCheckResult], confidence
+    출력: CrossCheckResult, confidence
     호출 Tool: 없음
     HITL: X
     """
 
-    def __init__(self, trace_id: str | None = None):
-        super().__init__(trace_id=trace_id)
-        self.llm = ChatOpenAI(
-            model="gpt-4o-mini",
-            api_key=os.getenv("OPENAI_API_KEY"),
-            temperature=0,
-        )
+    agent_name = "cross_check"
 
-    async def _extract_ui_data(self, ui_result: dict) -> dict:
-        """UI 테스트 결과에서 주요 데이터 추출."""
-        extracted = {}
-        steps = ui_result.get("steps", [])
-        for step in steps:
-            if step.get("status") == "pass":
-                extracted[f"step_{step.get('step_no')}"] = step.get("action")
-        return extracted
-
-    async def _extract_api_data(self, api_trace: dict) -> dict:
-        """API 응답 body에서 주요 데이터 추출."""
-        extracted = {}
+    def _extract_error_code(self, api_trace: dict) -> str | None:
+        """API 응답에서 에러 코드 추출."""
         calls = api_trace.get("calls", [])
         for call in calls:
-            if call.get("response_body"):
-                extracted[call.get("url", "")] = call.get("response_body")
-        return extracted
+            status_code = call.get("status_code", 200)
+            if status_code >= 400:
+                response_body = call.get("response_body", {}) or {}
+                if isinstance(response_body, dict) and "code" in response_body:
+                    return response_body["code"]
+                return str(status_code)
+        return None
 
-    async def _map_fields_with_llm(
-        self, ui_data: dict, api_data: dict, db_data: dict
+    def _summarize_current_state(
+        self, ui_result: dict, api_trace: dict, db_result: dict
+    ) -> str:
+        """현재 상태 요약 생성."""
+        ui_status = ui_result.get("status", "unknown")
+        total_calls = api_trace.get("total_calls", 0)
+        error_calls = api_trace.get("error_calls", 0)
+        db_tables = len(db_result.get("snapshots", []))
+
+        return (
+            f"UI 테스트: {ui_status}, "
+            f"API 호출: 총 {total_calls}건 (에러 {error_calls}건), "
+            f"DB 테이블: {db_tables}개 스냅샷"
+        )
+
+    async def _analyze_with_llm(
+        self,
+        ui_result: dict,
+        api_trace: dict,
+        db_result: dict,
+        last_error: str | None,
     ) -> tuple[list[CrossCheckMismatch], float]:
-        """LLM으로 UI/API/DB 필드 매핑 및 불일치 탐지."""
-        prompt = f"""
-다음 UI, API, DB 데이터를 비교하여 불일치를 탐지해주세요.
+        """LLM으로 UI/API/DB 불일치 분석."""
+        system_prompt = self.prompts.system()
+        user_prompt = self.prompts.render(
+            context=json.dumps(
+                {
+                    "ui_result": ui_result,
+                    "api_trace": api_trace,
+                    "db_result": db_result,
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            input_data=json.dumps(
+                {
+                    "task": "UI, API, DB 데이터를 비교하여 불일치를 탐지하고 JSON으로 반환하세요.",
+                    "output_schema": {
+                        "mismatches": [
+                            {
+                                "field": "필드명",
+                                "ui_value": "UI 값",
+                                "api_value": "API 값",
+                                "db_value": "DB 값 또는 null",
+                                "severity": "high/medium/low",
+                            }
+                        ],
+                        "match_score": "0.0~1.0",
+                    },
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+        )
 
-UI 데이터:
-{json.dumps(ui_data, ensure_ascii=False, indent=2)}
-
-API 데이터:
-{json.dumps(api_data, ensure_ascii=False, indent=2)}
-
-DB 데이터:
-{json.dumps(db_data, ensure_ascii=False, indent=2)}
-
-응답은 반드시 아래 JSON 형식으로만 답해주세요:
-{{
-  "mismatches": [
-    {{
-      "field": "필드명",
-      "ui_value": "UI 값",
-      "api_value": "API 값",
-      "db_value": "DB 값 또는 null",
-      "severity": "high/medium/low"
-    }}
-  ],
-  "match_score": 0.0~1.0
-}}
-"""
-        response = await self.llm.ainvoke(prompt)
-        content = response.content
+        user_prompt = self.with_correction_hint(user_prompt, last_error)
+        response = await self.llm.chat(system_prompt, user_prompt)
 
         try:
-            parsed = json.loads(content)
+            parsed = json.loads(response.content)
             mismatches = [CrossCheckMismatch(**m) for m in parsed.get("mismatches", [])]
             match_score = float(parsed.get("match_score", 1.0))
         except Exception:
@@ -101,45 +110,60 @@ DB 데이터:
 
         return mismatches, match_score
 
-    async def run(self, input: AgentInput) -> AgentOutput:
-        """UI↔API↔DB 정합성 검증."""
-        import time
-        start = time.time()
+    async def _execute(
+        self,
+        context: dict[str, Any],
+        params: dict[str, Any],
+        last_error: str | None = None,
+    ) -> ExecuteResult:
+        """경로 A/B 분기 후 Cross-check 수행."""
+        tc_id = params.get("tc_id", "unknown")
+        ui_result = context.get("ui_result", {})
+        api_trace = context.get("api_trace", {})
+        db_result = context.get("db_result", {})
 
-        tc_id = input.params.get("tc_id", "unknown")
-        ui_result = input.context.get("ui_result", {})
-        api_trace = input.context.get("api_trace", {})
-        db_result = input.context.get("db_result", {})
-
-        # 1. 각 계층 데이터 추출
-        ui_data = await self._extract_ui_data(ui_result)
-        api_data = await self._extract_api_data(api_trace)
-        db_data = db_result.get("snapshots", [])
-
-        # 2. LLM으로 필드 매핑 및 불일치 탐지
-        mismatches, match_score = await self._map_fields_with_llm(
-            ui_data, api_data, db_data
+        current_state_summary = self._summarize_current_state(
+            ui_result, api_trace, db_result
         )
 
-        # 3. CrossCheckResult 생성
+        error_code = self._extract_error_code(api_trace)
+        if error_code:
+            result = CrossCheckResult(
+                tc_id=tc_id,
+                match_score=0.0,
+                matched_fields=0,
+                mismatched_fields=0,
+                mismatches=[],
+                has_mismatch=True,
+            )
+            return ExecuteResult(
+                result={
+                    "cross_check": result,
+                    "error_code": error_code,
+                    "current_state_summary": current_state_summary,
+                    "route": "A",
+                },
+                confidence=1.0,
+            )
+
+        mismatches, match_score = await self._analyze_with_llm(
+            ui_result, api_trace, db_result, last_error
+        )
+
         result = CrossCheckResult(
             tc_id=tc_id,
             match_score=match_score,
-            matched_fields=len(ui_data) - len(mismatches),
+            matched_fields=0,
             mismatched_fields=len(mismatches),
             mismatches=mismatches,
             has_mismatch=len(mismatches) > 0,
         )
 
-        duration = time.time() - start
-
-        return AgentOutput(
-            trace_id=input.trace_id,
-            result={"cross_check": result},
+        return ExecuteResult(
+            result={
+                "cross_check": result,
+                "current_state_summary": current_state_summary,
+                "route": "B",
+            },
             confidence=match_score,
-            metadata=BaseMetadata(
-                model="gpt-4o-mini",
-                tokens_used=0,
-                duration_sec=round(duration, 2),
-            ),
         )
