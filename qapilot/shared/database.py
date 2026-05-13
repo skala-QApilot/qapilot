@@ -40,3 +40,4 @@ async def create_tables() -> None:
     """애플리케이션 기동 시 테이블을 생성한다 (없는 경우에만)."""
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+
