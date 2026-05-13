@@ -1,0 +1,91 @@
+{
+  "scan_result": {
+    "files": [
+      {
+        "path": "app/api/users.py",
+        "language": "python",
+        "endpoints": [
+          {
+            "method": "POST",
+            "path": "/users",
+            "handler": "create_user"
+          }
+        ],
+        "functions": [
+          {
+            "name": "create_user",
+            "line_start": 18,
+            "line_end": 34,
+            "params": "(request: UserCreate, db: Session)",
+            "return_type": "UserResponse",
+            "calls": ["db.query", "User", "db.add", "db.commit", "db.refresh"]
+          }
+        ],
+        "dependencies": [
+          "from fastapi import APIRouter, HTTPException",
+          "from sqlalchemy.orm import Session",
+          "from app.models.user import User",
+          "from app.schemas.user import UserCreate, UserResponse"
+        ],
+        "models": [
+          {
+            "name": "UserCreate",
+            "fields": ["email", "password", "name"],
+            "source": "python"
+          }
+        ]
+      },
+      {
+        "path": "app/models/user.py",
+        "language": "python",
+        "endpoints": [],
+        "functions": [],
+        "dependencies": [
+          "from sqlalchemy import Column, String, UniqueConstraint",
+          "from app.core.database import Base"
+        ],
+        "models": [
+          {
+            "name": "User",
+            "fields": ["id", "email", "password_hash", "name"],
+            "source": "python"
+          }
+        ]
+      }
+    ],
+    "git_diff": {
+      "commit_hash": "b2c3d4e5f6a1",
+      "prev_hash": "a1b2c3d4e5f6",
+      "changed_files": [
+        "app/api/users.py"
+      ],
+      "added_lines": 8,
+      "deleted_lines": 2,
+      "diff_detail": [
+        {
+          "file": "app/api/users.py",
+          "added": 8,
+          "deleted": 2
+        }
+      ],
+      "author": "yubin",
+      "author_email": "yubin@example.com",
+      "commit_timestamp": "2026-05-13T02:30:00Z",
+      "blame": [
+        {
+          "file": "app/api/users.py",
+          "author": "yubin",
+          "author_email": "yubin@example.com",
+          "timestamp": "2026-05-13T02:30:00Z"
+        }
+      ]
+    },
+    "framework": "fastapi",
+    "language": "python",
+    "endpoint_count": 1
+  },
+  "_metadata": {
+    "trigger": "code_change",
+    "files_scanned": 2
+  }
+}

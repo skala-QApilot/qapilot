@@ -1,0 +1,22 @@
+{
+  "tc_id": "TC-001",
+  "candidates": [
+    {
+      "rank": 1,
+      "cause": "결제 서비스에서 DB 트랜잭션 커밋 누락",
+      "confidence": 0.8,
+      "evidences": [
+        {"type": "code_location", "content": "app/services/payment_service.py:84 - commit 누락"},
+        {"type": "runtime_data", "content": "HTTP 500, IntegrityError: transaction not committed"}
+      ]
+    },
+    {
+      "rank": 2,
+      "cause": "DB 연결 풀 크기 설정 미흡으로 인한 연결 고갈",
+      "confidence": 0.4,
+      "evidences": [
+        {"type": "code_location", "content": "app/core/database.py:31 - pool_size=5 설정"}
+      ]
+    }
+  ]
+}
