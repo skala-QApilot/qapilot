@@ -1,8 +1,9 @@
 """APITraceTool 단위 테스트."""
 
 import pytest
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock
 
+from qapilot.shared.errors import ToolExecutionError
 from qapilot.shared.schemas import ToolInput
 from qapilot.tools.api_trace_tool import APITraceTool
 
@@ -14,12 +15,12 @@ def tool():
 
 @pytest.mark.asyncio
 async def test_run_without_page_raises_error(tool):
-    """page 없으면 ValueError 발생 확인."""
+    """page 없으면 ToolExecutionError 발생 확인."""
     input = ToolInput(
         trace_id="test-trace-001",
         params={"tc_id": "TC-001"}
     )
-    with pytest.raises(ValueError):
+    with pytest.raises(ToolExecutionError):
         await tool.run(input)
 
 
@@ -35,7 +36,6 @@ async def test_listener_registered(tool):
     )
     output = await tool.run(input)
 
-    # request, response 리스너 2개 등록됐는지 확인
     assert mock_page.on.call_count == 2
     assert output.trace_id == "test-trace-001"
     assert "api_trace" in output.result

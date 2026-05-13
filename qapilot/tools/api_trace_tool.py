@@ -9,10 +9,11 @@ Created: 2026-05-07
 
 import json
 from datetime import datetime, timezone
+from typing import Any
 
 from playwright.async_api import Page, Request, Response
+from qapilot.shared.schemas import APICall, APITraceResult
 
-from qapilot.shared.schemas import APICall, APITraceResult, ToolInput, ToolOutput
 from qapilot.tools.base_tool import BaseTool
 
 MAX_BODY_SIZE = 10 * 1024 * 1024  # 10MB
@@ -27,8 +28,8 @@ class APITraceTool(BaseTool):
     제한: 10MB 초과 응답 body는 저장하지 않음
     """
 
-    def __init__(self, trace_id: str | None = None):
-        super().__init__(trace_id=trace_id)
+    def __init__(self, trace_id: str | None = None, **kwargs):
+        super().__init__(trace_id=trace_id, **kwargs)
         self._calls: list[APICall] = []
         self._request_times: dict[str, datetime] = {}
 
@@ -40,11 +41,9 @@ class APITraceTool(BaseTool):
         """응답 캡처."""
         url = response.url
 
-        # 시작 시간으로 latency 계산
         start = self._request_times.pop(url, datetime.now(timezone.utc))
         latency_ms = int((datetime.now(timezone.utc) - start).total_seconds() * 1000)
 
-        # response body (10MB 초과 시 저장 안 함)
         response_body = None
         try:
             body_bytes = await response.body()
@@ -53,7 +52,6 @@ class APITraceTool(BaseTool):
         except Exception:
             pass
 
-        # request body
         request_body = None
         try:
             post_data = response.request.post_data
@@ -77,24 +75,20 @@ class APITraceTool(BaseTool):
         )
         self._calls.append(call)
 
-    async def run(self, input: ToolInput) -> ToolOutput:
+    async def _execute(self, params: dict[str, Any]) -> dict[str, Any]:
         """Playwright page에 네트워크 리스너 등록하고 API 호출 캡처."""
-        page: Page = input.params.get("page")
-        tc_id: str = input.params.get("tc_id", "unknown")
+        page: Page = params.get("page")
+        tc_id: str = params.get("tc_id", "unknown")
 
         if page is None:
             raise ValueError("params에 'page' (Playwright Page 인스턴스) 필요")
 
-        # 리스너 초기화
         self._calls = []
         self._request_times = {}
 
-        # 네트워크 리스너 등록
         page.on("request", self._on_request)
         page.on("response", self._on_response)
 
-        # 테스트 실행은 외부(UI Test Tool)에서 함
-        # 여기선 리스너만 등록하고 결과 반환
         error_calls = sum(1 for c in self._calls if c["status_code"] >= 400)
 
         result = APITraceResult(
@@ -104,8 +98,4 @@ class APITraceTool(BaseTool):
             error_calls=error_calls,
         )
 
-        return ToolOutput(
-            trace_id=input.trace_id,
-            result={"api_trace": result},
-            metadata={"total_calls": len(self._calls)},
-        )
+        return {"api_trace": result}
