@@ -1,20 +1,35 @@
 """파이프라인 실행 엔트리포인트.
 
-CLI와 API에서 호출하는 진입점.
+CLI와 API에서 호출하는 진입점. trace_id 는 호출부에서 주입할 수 있고,
+주지 않으면 여기서 발급한다 (API 미들웨어 등이 발급한 값을 전달하는 경로 대비).
 
 담당: A
 Created: 2026-05-07
 """
 
+import structlog
+
+from qapilot.modules.trace_module import TraceModule
 from qapilot.orchestrator.pipeline import build_pipeline
 from qapilot.orchestrator.state import PipelineState
 from qapilot.shared.logger import get_logger
 from qapilot.shared.schemas import RunOptions
 
 
-async def run_pipeline(options: RunOptions) -> PipelineState:
-    """파이프라인을 실행하고 최종 상태를 반환한다."""
-    logger = get_logger(source="orchestrator")
+async def run_pipeline(options: RunOptions, trace_id: str | None = None) -> PipelineState:
+    """파이프라인을 실행하고 최종 상태를 반환한다.
+
+    Args:
+        options: 실행 옵션.
+        trace_id: 외부에서 발급된 trace_id. None 이면 새로 발급한다.
+
+    Returns:
+        파이프라인 최종 상태.
+    """
+    trace_id = trace_id or TraceModule.generate_trace_id()
+    # 실행 스코프 전체에 trace_id 를 노출한다 (이후 호출되는 모든 로그에 자동 포함).
+    structlog.contextvars.bind_contextvars(trace_id=trace_id)
+    logger = get_logger(source="orchestrator", trace_id=trace_id)
     logger.info(
         "pipeline_start",
         command=options["command"],
@@ -27,7 +42,7 @@ async def run_pipeline(options: RunOptions) -> PipelineState:
 
     initial_state: PipelineState = {
         "run_options": options,
-        "trace_id": "",  # trace_module에서 발급
+        "trace_id": trace_id,
         "status": "running",
         "current_layer": "",
         "error": None,
@@ -72,6 +87,5 @@ async def run_pipeline(options: RunOptions) -> PipelineState:
         "pipeline_complete",
         status=result.get("status"),
         total_cost_usd=result["total_cost"],
-        trace_id=result.get("trace_id"),
     )
     return result
