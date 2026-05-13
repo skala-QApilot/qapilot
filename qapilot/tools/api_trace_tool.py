@@ -28,7 +28,6 @@ class APITraceTool(BaseTool):
     제한: 10MB 초과 응답 body는 저장하지 않음
     """
 
-
     def __init__(self, trace_id: str | None = None, **kwargs):
         super().__init__(trace_id=trace_id, **kwargs)
         self._calls: list[APICall] = []
@@ -100,4 +99,3 @@ class APITraceTool(BaseTool):
         )
 
         return {"api_trace": result}
-
