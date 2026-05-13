@@ -1,0 +1,26 @@
+{
+  "confidence": 0.75,
+  "fix_results": [
+    {
+      "tc_id": "TC-001",
+      "suggestions": [
+        {
+          "file_path": "app/services/payment_service.py",
+          "line_number": 84,
+          "blame_author": null,
+          "code_snippet": "",
+          "description": "결제 처리 로직에서 db.commit()을 명시적으로 호출하여 트랜잭션을 커밋하세요. try-except 블록 내 finally에서 rollback 처리도 함께 추가하세요.",
+          "similar_issues": []
+        },
+        {
+          "file_path": "app/core/database.py",
+          "line_number": 31,
+          "blame_author": null,
+          "code_snippet": "",
+          "description": "pool_size와 max_overflow 값을 서버 부하에 맞게 조정하세요. 현재 pool_size=5, max_overflow=0 설정은 동시 요청이 많을 때 연결 고갈을 유발할 수 있습니다.",
+          "similar_issues": []
+        }
+      ]
+    }
+  ]
+}

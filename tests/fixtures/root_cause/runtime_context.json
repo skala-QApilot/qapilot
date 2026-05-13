@@ -1,0 +1,5 @@
+{
+  "error_log": "HTTP 500, IntegrityError: transaction not committed",
+  "api_response": {"status": 500, "error": "Internal Server Error"},
+  "stack_trace": "File app/services/payment_service.py line 84 in process_payment"
+}

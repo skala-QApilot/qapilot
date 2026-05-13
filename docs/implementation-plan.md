@@ -1,11 +1,13 @@
 # QApilot 구현 플랜
 
-> **Version**: 1.0  
-> **최종 수정일**: 2026-05-07  
+> **Version**: 1.3  
+> **최종 수정일**: 2026-05-13  
 > **기반 문서**: 요구사항정의서 v0.4 / 개발표준정의서 v0.4  
 > **변경 이력**:  
 > - v1.0 (2026-05-07): 최초 작성. Orchestrator 고정 DAG 전환, HITL 범위 축소, 리포트 단일 형식 반영
 > - v1.1 (2026-05-07): generate/test 파이프라인 분리 확정. generate=Layer1만, test=Layer2~3만
+> - v1.2 (2026-05-11): HITL 모듈 제거. generate를 generate_scenarios/generate_code 2단계로 추가 분리. 사용자는 두 명령 사이에서 시나리오를 자유롭게 수정·삭제 가능
+> - v1.3 (2026-05-13): §8.4 Interactive Shell Mode (REPL) 추가. `qapilot` 단독 실행 시 인터랙티브 셸 진입 (Claude Code 패턴 차용). 명령 히스토리는 휘발성 (Phase 2 에서 opt-in 영속화 검토).
 
 ---
 
@@ -16,7 +18,7 @@
 | 프로젝트명 | QApilot — AI 기반 테스트 시나리오/데이터 생성 및 통합 테스트 자동화 및 오류 분석 시스템 |
 | 유형 | Agentic AI (신규 개발) |
 | 기간 | 2026-04-17 ~ 2026-06-23 |
-| 비전 | NPT(No People Testing) — 완전 무인 테스트 운영. 사람 개입은 시나리오 승인(HITL)으로만 제한 |
+| 비전 | NPT(No People Testing) — 완전 무인 테스트 운영. 사람 개입은 시나리오 검토 단계(generate_scenarios ↔ generate_code 사이)로만 제한 |
 | 적용 대상 | 웹 애플리케이션 + REST API + RDB 기반 서비스 |
 | 사용자 그룹 | QA 담당자, 개발자, 개발 리더, PM |
 
@@ -32,22 +34,32 @@
 
 ## 2. 시스템 아키텍처
 
-### 2.1 전체 구조 (2개 독립 파이프라인 + 고정 DAG)
+### 2.1 전체 구조 (3개 독립 파이프라인 + 고정 DAG)
 
-generate와 test는 **독립된 파이프라인**으로 분리된다.
-generate의 산출물(.qapilot/scenarios/, .qapilot/generated-code/)을 test가 로드하여 실행한다.
+generate_scenarios, generate_code, test는 **독립된 파이프라인**으로 분리된다.
+사용자는 generate_scenarios와 generate_code 사이에서 대시보드를 통해
+시나리오를 자유롭게 수정·삭제할 수 있다 (HITL 모듈 불필요).
 
-```
+```text
 ═══════════════════════════════════════════════════════════════════════
-  [qapilot generate] — Layer 1 파이프라인
+  [qapilot generate scenarios] — Layer 1A 파이프라인
 ═══════════════════════════════════════════════════════════════════════
 
   코드스캔Tool → 도메인지식Tool → 요구사항추출Agent
-  → 시나리오생성Agent → [HITL 승인] → 액션매핑Agent → 코드생성Agent
-  → .qapilot/scenarios/ + .qapilot/generated-code/ 에 저장
+  → 시나리오생성Agent → .qapilot/scenarios/ 에 저장
 
   * 자연어 입력 시 별도 진입점:
-    자연어해석Agent → [HITL 승인] → 액션매핑Agent → 코드생성Agent
+    자연어해석Agent → .qapilot/scenarios/ 에 저장
+
+═══════════════════════════════════════════════════════════════════════
+  [사용자가 대시보드에서 시나리오 검토/수정/삭제]
+       └ GET / PUT / DELETE /api/scenarios/{id}
+═══════════════════════════════════════════════════════════════════════
+  [qapilot generate code] — Layer 1B 파이프라인
+═══════════════════════════════════════════════════════════════════════
+
+  저장된 시나리오 로드 → 액션매핑Agent → 코드생성Agent
+  → .qapilot/generated-code/ 에 저장
 
 ═══════════════════════════════════════════════════════════════════════
   [qapilot test] — Layer 2~3 파이프라인
@@ -63,8 +75,10 @@ generate의 산출물(.qapilot/scenarios/, .qapilot/generated-code/)을 test가 
 ═══════════════════════════════════════════════════════════════════════
 ```
 
-- **generate**: 시나리오와 테스트 코드를 생성하고 HITL 승인까지 완료. 산출물을 로컬에 저장
-- **test**: 이미 승인된 시나리오/코드를 로드하여 실행. HITL 미발생. 야간 무인 실행 가능
+- **generate_scenarios**: 시나리오 + 테스트 데이터만 생성하여 저장. 코드 생성 안 함
+- **(사이 시점)**: 사용자가 대시보드에서 시나리오 자유 수정/삭제. 명령 실행 없음
+- **generate_code**: 저장된 시나리오를 기반으로 액션 매핑 + Playwright 코드 생성/저장
+- **test**: 저장된 시나리오/코드를 로드하여 실행. 야간 무인 실행 가능
 
 ### 2.2 Orchestrator 설계 결정
 
@@ -72,25 +86,29 @@ generate의 산출물(.qapilot/scenarios/, .qapilot/generated-code/)을 test가 
 |---|---|
 | 방식 | **사전 정의된 고정 DAG** (LLM 미사용) |
 | 구현체 | LangGraph StateGraph **1개** |
-| 분기 | `command`로 진입점 분기 (generate→Layer1, test→Layer2~3) + `has_mismatch`로 Layer 3 실행 여부 |
+| 분기 | `command`로 3개 진입점 분기 (generate_scenarios / generate_code / test) + `has_mismatch`로 Layer 3 실행 여부 |
 | 근거 | 파이프라인 흐름이 완전 확정적. LLM 판단이 필요한 지점 없음. 안정성·속도·비용 모두 우위 |
 
 ```python
 graph = StateGraph(PipelineState)
 
-# ── Layer 1 노드 (generate) ──
+# ── Layer 1A 노드 (generate_scenarios) ──
 graph.add_edge("codebase_scan", "domain_knowledge")
 graph.add_edge("domain_knowledge", "requirement_extract")
 graph.add_edge("requirement_extract", "scenario_generate")
-graph.add_edge("scenario_generate", "hitl_review")        # HITL 필수
-graph.add_edge("hitl_review", "action_mapping")
+graph.add_edge("scenario_generate", "save_scenarios")
+graph.add_edge("save_scenarios", END)
+
+# ── Layer 1B 노드 (generate_code) ──
+graph.add_edge("load_scenarios_for_codegen", "action_mapping")
 graph.add_edge("action_mapping", "code_generate")
-graph.add_edge("code_generate", END)                      # generate 종료
+graph.add_edge("code_generate", "save_codes")
+graph.add_edge("save_codes", END)
 
 # ── Layer 2~3 노드 (test) ──
-graph.add_edge("load_scenarios", "test_execution")        # UI/API/DB 병렬
+graph.add_edge("load_scenarios_for_test", "test_execution")
 graph.add_edge("test_execution", "cross_check")
-graph.add_conditional_edges(                               # Layer 3 조건부
+graph.add_conditional_edges(
     "cross_check",
     lambda state: "defect_classify" if state["has_mismatch"] else "report",
 )
@@ -99,11 +117,14 @@ graph.add_edge("root_cause", "fix_recommend")
 graph.add_edge("fix_recommend", "report")
 graph.add_edge("report", END)
 
-# ── 진입점 분기 ──
+# ── 진입점 분기 (3개 명령) ──
 graph.add_conditional_edges(
     START,
-    lambda state: "codebase_scan" if state["command"] == "generate"
-                  else "load_scenarios",
+    lambda state: {
+        "generate_scenarios": "codebase_scan",
+        "generate_code": "load_scenarios_for_codegen",
+        "test": "load_scenarios_for_test",
+    }[state["run_options"]["command"]],
 )
 ```
 
@@ -132,17 +153,17 @@ Orchestrator     │ 실행  │ 실행  │ —
 
 ### 3.2 Agent (LLM 사용) — 9개
 
-| FR | 이름 | Layer | 핵심 역할 | HITL |
-|---|---|---|---|---|
-| FR-024 | 요구사항 추출 Agent | L1 | PRD에서 REQ-XXX 구조화 추출, RTM 행 생성 | X |
-| FR-002 | 시나리오 생성 Agent | L1 | 코드+도메인+Git diff 기반 정상/엣지 시나리오+테스트데이터 생성 | **O** |
-| FR-003 | 자연어 요구사항 해석 Agent | L1 | 자연어 → Given/When/Then 구조화 | **O** |
-| FR-004 | 시나리오-액션 매핑 Agent | L1 | 시나리오 → UI액션+API매핑+검증포인트 분해 | X |
-| FR-005 | Playwright 코드 생성 Agent | L1 | 액션 시퀀스 → Playwright JS 코드 | X |
-| FR-008 | Cross-check Agent | L2 | UI↔API↔DB 데이터 정합성 검증, 정합성 점수 산출 | X |
-| FR-009 | 장애 분류 Agent | L3 | 규칙 1차 + LLM 보조 → 5개 카테고리 분류 | X |
-| FR-010 | 원인 추론 Agent | L3 | 로그+코드+Git → Top-N 원인 후보 + 근거 3종 | X |
-| FR-011 | 해결 방안 추천 Agent | L3 | 파일경로+담당자+수정 snippet 제시 | X |
+| FR | 이름 | Layer | 핵심 역할 |
+|---|---|---|---|
+| FR-024 | 요구사항 추출 Agent | L1A | PRD에서 REQ-XXX 구조화 추출, RTM 행 생성 |
+| FR-002 | 시나리오 생성 Agent | L1A | 코드+도메인+Git diff 기반 정상/엣지 시나리오+테스트데이터 생성 |
+| FR-003 | 자연어 요구사항 해석 Agent | L1A | 자연어 → Given/When/Then 구조화 |
+| FR-004 | 시나리오-액션 매핑 Agent | L1B | 시나리오 → UI액션+API매핑+검증포인트 분해 |
+| FR-005 | Playwright 코드 생성 Agent | L1B | 액션 시퀀스 → Playwright JS 코드 |
+| FR-008 | Cross-check Agent | L2 | UI↔API↔DB 데이터 정합성 검증, 정합성 점수 산출 |
+| FR-009 | 장애 분류 Agent | L3 | 규칙 1차 + LLM 보조 → 5개 카테고리 분류 |
+| FR-010 | 원인 추론 Agent | L3 | 로그+코드+Git → Top-N 원인 후보 + 근거 3종 |
+| FR-011 | 해결 방안 추천 Agent | L3 | 파일경로+담당자+수정 snippet 제시 |
 
 ### 3.3 Tool (결정적, LLM 미사용) — 6개
 
@@ -155,11 +176,10 @@ Orchestrator     │ 실행  │ 실행  │ —
 | FR-020 | DB 테스트 Tool | 전후 스냅샷, SQL 추적, 시드 주입/자동 롤백 |
 | FR-012 | 리포트 Tool | 테스트 결과 리포트 생성 (단일 형식) |
 
-### 3.4 Module (인프라/UI/설정) — 9개
+### 3.4 Module (인프라/UI/설정) — 8개
 
 | FR | 이름 | 역할 |
 |---|---|---|
-| FR-014 | HITL 모듈 | 시나리오 생성/자연어 해석 결과의 승인/수정/반려 |
 | FR-015 | Trace ID 모듈 | UUID v4 발급, UI→API→DB 전 계층 전파 |
 | FR-016 | CLI + 웹 대시보드 | Typer CLI + React 대시보드 (포트 7860) |
 | FR-017 | 캐시 모듈 | .qapilot/ 디렉토리, LLM 캐시, Git hash 기반 증분 |
@@ -169,29 +189,40 @@ Orchestrator     │ 실행  │ 실행  │ —
 | FR-022 | 요구사항 변경 히스토리 | 버전별 diff, 영향 시나리오 자동 식별 |
 | FR-023 | 시나리오 의존성 그래프 | D3.js/Cytoscape.js DAG 시각화 |
 
+> **FR-014 HITL 모듈은 구현하지 않는다.** generate_scenarios / generate_code 명령 분리로
+> 사용자가 그 사이에서 시나리오를 자유롭게 검토/수정/삭제할 수 있어 별도 모듈이 불필요하다.
+> 시나리오 CRUD는 `api/scenario_router.py`(GET/POST/PUT/DELETE)에서 제공한다.
+
 ---
 
 ## 4. 핵심 정책 (요구사항 문서 대비 변경 사항)
 
 ### 4.1 HITL 정책
 
-> **요구사항 문서와 달리, 아래 정책으로 확정합니다.**
+> **요구사항 문서의 FR-014 HITL 모듈은 별도 모듈로 구현하지 않습니다.**
+> 파이프라인을 generate_scenarios / generate_code / test 3단계로 분리하여
+> 사용자 검토 시점이 자연스럽게 보장됩니다.
 
 | 항목 | 정책 |
 |---|---|
-| 적용 지점 | **시나리오 생성(FR-002)** + **자연어 해석(FR-003)** 이 2곳만 |
-| 적용 방식 | confidence 무관하게 **항상** HITL 큐 적재 → 승인 후에만 후속 진행 |
+| HITL 모듈 | **구현하지 않음** (FR-014 미적용) |
+| 사용자 검토 시점 | `generate_scenarios` 완료 후 → 사용자가 대시보드에서 시나리오 자유 수정/삭제 → `generate_code` 실행 |
+| 검토 방식 | 시나리오 CRUD API (`GET/POST/PUT/DELETE /api/scenarios/{id}`) |
 | 나머지 Agent | confidence는 로그/리포트 참조용으로만 기록. 자체 Fallback 처리 |
-| 야간 실행(FR-018) | 이미 승인된 시나리오만 실행 → **HITL 미발생, 완전 무인** |
+| 야간 실행(FR-018) | `test` 명령만 스케줄링. 시나리오/코드는 이미 저장되어 있음 → **완전 무인** |
 
-```
-[시나리오 생성 / 자연어 해석]
-  → 항상 HITL 큐 적재
-  → 사용자 승인/수정/반려
-  → 승인 후에만 액션 매핑으로 진행
+```text
+[qapilot generate scenarios]
+  → 시나리오 + 테스트 데이터 생성 → .qapilot/scenarios/ 저장 → 끝
+
+[사용자가 대시보드에서 시나리오 검토/수정/삭제]
+  → GET/PUT/DELETE /api/scenarios/{id}
+  → 명령 실행 없음. 자유 시점
+
+[qapilot generate code]
+  → 저장된 시나리오 로드 → 액션 매핑 → 코드 생성 → 저장 → 끝
 
 [그 외 Agent: Cross-check, 장애분류, 원인추론, 해결추천 등]
-  → HITL 큐에 적재하지 않음
   → confidence < 임계값 → 자체 Fallback (재시도, 규칙 기반 등)
   → confidence는 리포트/로그에 기록
 ```
@@ -214,32 +245,35 @@ Orchestrator     │ 실행  │ 실행  │ —
 |---|---|
 | 방식 | LangGraph StateGraph 기반 사전 정의 DAG |
 | LLM 사용 | 없음 |
-| 분기 | `has_mismatch` boolean 조건만 (Layer 3 실행 여부) |
+| 분기 | `command` 3개 진입점 분기 + `has_mismatch` boolean 조건 (Layer 3 실행 여부) |
 | 선택적 실행 | CLI 옵션 파싱 기반 (`--case / --failed / --affected / --tag`) |
 | 재시도 | 규칙 기반 (최대 3회, exponential backoff) |
 
 ### 4.4 파이프라인 분리 정책
 
-> **generate와 test는 독립된 파이프라인으로 실행합니다. 1→2→3 한 번에 실행하는 경로는 없습니다.**
+> **generate_scenarios / generate_code / test 3개 독립 파이프라인.**
+> Layer 1→2→3을 한 번에 실행하는 경로는 없습니다.
 
-| 항목 | generate | test |
-|---|---|---|
-| 실행 명령 | `qapilot generate` | `qapilot test [옵션]` |
-| 실행 범위 | Layer 1만 | Layer 2~3만 |
-| 입력 | 코드베이스 + 도메인 문서 (+ 자연어 입력) | .qapilot/에 저장된 시나리오/코드 |
-| 산출물 | .qapilot/scenarios/ + .qapilot/generated-code/ | .qapilot/results/ + 리포트 |
-| HITL | 발생 (시나리오 승인) | 미발생 (승인 완료된 시나리오만 실행) |
-| 야간 무인 | 불가 (HITL 대기) | **가능** |
+| 항목 | generate_scenarios | generate_code | test |
+|---|---|---|---|
+| 실행 명령 | `qapilot generate scenarios` | `qapilot generate code` | `qapilot test [옵션]` |
+| 실행 범위 | Layer 1A | Layer 1B | Layer 2~3 |
+| 입력 | 코드베이스 + 도메인 문서 (+ 자연어) | .qapilot/scenarios/ | .qapilot/scenarios/ + generated-code/ |
+| 산출물 | .qapilot/scenarios/ | .qapilot/generated-code/ | .qapilot/results/ + 리포트 |
+| 사용자 검토 | 후속 검토 가능 (대시보드) | 후속 검토 가능 (대시보드) | - |
+| 야간 무인 | 불가 (코드 미생성 상태) | 불가 | **가능** |
 
-```
+```text
 사용자 워크플로우:
 
-1) qapilot generate              → 시나리오 생성 + HITL 승인
-2) qapilot test                  → 승인된 전체 시나리오 테스트
-3) qapilot test --failed         → 이전 실패 건만 재실행
-4) qapilot test --case TS-001    → 특정 시나리오만 실행
-5) qapilot test --affected       → Git 변경분 영향 시나리오만 실행
-6) qapilot test --tag payment    → 태그 기반 필터 실행
+1) qapilot generate scenarios          → 시나리오만 생성
+2) [대시보드에서 시나리오 자유 수정/삭제]
+3) qapilot generate code               → 액션 매핑 + Playwright 코드 생성
+4) qapilot test                        → 전체 시나리오 테스트
+5) qapilot test --failed               → 이전 실패 건만 재실행
+6) qapilot test --case TS-001          → 특정 시나리오만 실행
+7) qapilot test --affected             → Git 변경분 영향 시나리오만 실행
+8) qapilot test --tag payment          → 태그 기반 필터 실행
 ```
 
 ---
@@ -299,7 +333,6 @@ qapilot/
 │   ├── state.py                     # PipelineState 정의
 │   └── runner.py                    # CLI에서 호출하는 실행 엔트리포인트
 ├── modules/                         # 인프라 모듈
-│   ├── hitl_module.py
 │   ├── trace_module.py
 │   ├── cache_module.py
 │   ├── schedule_module.py
@@ -308,9 +341,8 @@ qapilot/
 │   └── main.py
 ├── api/                             # FastAPI 라우터
 │   ├── agent_router.py
-│   ├── scenario_router.py
+│   ├── scenario_router.py           # GET/POST/PUT/DELETE (사용자 시나리오 검토)
 │   ├── defect_router.py
-│   ├── hitl_router.py
 │   └── report_router.py
 ├── web/dist/                        # React 빌드 결과물 (QApilot-UI)
 ├── shared/                          # 공통 유틸/타입/인터페이스
@@ -398,14 +430,11 @@ class ToolOutput(BaseModel):
 
 | URI | Method | 설명 |
 |---|---|---|
-| /api/agent/run | POST | 테스트 실행 요청 |
+| /api/agent/run | POST | 파이프라인 실행 요청 (generate_scenarios / generate_code / test) |
 | /api/scenarios | GET / POST | 시나리오 목록 / 생성 |
-| /api/scenarios/{id} | GET / PUT | 시나리오 상세 / 수정 |
+| /api/scenarios/{id} | GET / PUT / DELETE | 시나리오 상세 / 수정 / 삭제 (사용자 검토 시 사용) |
 | /api/defects | GET | 결함 목록 |
 | /api/defects/{id} | GET | 결함 상세 |
-| /api/hitl/pending | GET | HITL 대기 목록 |
-| /api/hitl/{id}/approve | POST | HITL 승인 |
-| /api/hitl/{id}/reject | POST | HITL 반려 |
 | /api/reports | GET | 리포트 목록 |
 | /api/reports/{trace_id} | GET | 실행별 리포트 |
 
@@ -459,22 +488,66 @@ class ToolOutput(BaseModel):
 | `qapilot rescan` | 코드 인덱스 재생성 | - |
 | `qapilot explain <id>` | 결함 원인 분석 (단건 조회) | - |
 
-### 8.2 generate 명령어 (Layer 1)
+### 8.2 generate 명령어 (Layer 1A / 1B 분리)
 
 | 명령어 | 동작 |
 |---|---|
-| `qapilot generate` | 시나리오 자동 생성 → HITL 승인 → 코드 생성 → 저장 |
-| `qapilot generate --affected` | Git 변경분 영향 범위만 시나리오 생성 |
+| `qapilot generate scenarios` | 시나리오 + 테스트 데이터 생성 → .qapilot/scenarios/ 저장 |
+| `qapilot generate scenarios --affected` | Git 변경분 영향 범위만 시나리오 생성 |
+| `qapilot generate code` | 저장된 시나리오 → 액션 매핑 + Playwright 코드 생성 → .qapilot/generated-code/ 저장 |
+| `qapilot generate code --case {id}` | 특정 시나리오의 코드만 생성 |
+
+두 명령 사이에서 사용자는 대시보드(`GET/PUT/DELETE /api/scenarios/{id}`)를 통해 시나리오를 자유롭게 검토·수정·삭제할 수 있다.
 
 ### 8.3 test 명령어 (Layer 2~3)
 
 | 명령어 | 동작 |
 |---|---|
-| `qapilot test` | 승인된 전체 시나리오 테스트 실행 |
+| `qapilot test` | 저장된 전체 시나리오 테스트 실행 |
 | `qapilot test --case {id}` | 특정 시나리오만 실행 |
 | `qapilot test --failed` | 이전 실패 건만 재실행 |
 | `qapilot test --affected` | Git 변경분 영향 시나리오만 실행 |
 | `qapilot test --tag {태그}` | 태그 기반 필터 실행 |
+
+### 8.4 Interactive Shell Mode (REPL)
+
+| 명령어 | 동작 |
+|---|---|
+| `qapilot` | 인자 없이 실행 시 인터랙티브 셸 (REPL) 진입. 모든 CLI 명령을 연속 입력 가능 |
+
+#### 셸 안 사용법
+- 모든 일회성 명령 그대로 사용 가능 (`init`, `generate scenarios`, `generate code`, `test`, ...)
+- 슬래시 명령 (Phase 1): `/help`, `/exit`, `/clear`
+- `exit`, `quit`, Ctrl-D 로도 종료. Ctrl-C 를 1.5초 안에 두 번 누르면 종료, 한 번만 누르면 현재 명령만 중단
+- 명령 히스토리는 **현재 세션 안에서만 휘발** (↑/↓ 으로 동일 세션 내 이전 명령 호출). 사내 도메인·정책·DSN 등 민감 입력의 디스크 평문 저장 위험 회피. Phase 2 에서 `qapilot.config.yaml` 의 `repl.history_persistent: true` opt-in 토글 도입 고려 (마스킹·권한 0600·크기 cap 동반)
+- Tab 자동완성 지원
+
+#### 동작 시나리오 예시
+```text
+$ qapilot
+[쿼카 우주비행사 마스코트 배너]
+Interactive Shell (REPL) 모드
+명령을 연속 입력하세요. /help 로 도움말, /exit (또는 Ctrl-D) 로 종료.
+
+qapilot> spec import docs/policy_v3.md
+임베딩 완료
+  file          : docs/policy_v3.md
+  chunks_total  : 24
+  chunks_stored : 24
+  chunks_failed : 0
+qapilot> generate scenarios
+시나리오 생성을 시작합니다 (Layer 1)...
+...
+qapilot> /exit
+bye.
+```
+
+#### Phase 2/3 확장 후보 (별도 이슈)
+- 슬래시 명령 추가: `/cost`, `/model`, `/memory`, `/sessions`, `/compact`, `/resume`
+- 입력 큐 — 작업 실행 중 다음 명령 미리 입력 가능 (FIFO 자동 실행)
+- Bracketed paste / heredoc / 백슬래시 라인 연결 — 멀티라인 입력
+- 모드별 prompt 변경 (예: `qapilot[generate]>`)
+- 자연어 입력 → FR-003 NaturalLanguageAgent 해석 (가장 Claude Code 다움)
 
 ---
 
@@ -488,9 +561,9 @@ class ToolOutput(BaseModel):
 | 2 | Docker Compose (PostgreSQL + Qdrant) | docker compose up 기동 확인 |
 | 3 | shared/ 공통 모듈: 스키마(AgentInput/Output, ToolInput/Output), BaseAgent/BaseTool ABC, trace_id 유틸, 에러 코드, 구조화 로깅, config 로드 | Pydantic 스키마 단위 테스트 통과 |
 | 4 | FastAPI 서버 기본 셋업 + API 라우터 골격 | /api/agent/run 엔드포인트 응답 |
-| 5 | Orchestrator 고정 DAG 골격 (단일 StateGraph, command 분기) | 빈 노드로 generate/test 양쪽 경로 실행 성공 |
+| 5 | Orchestrator 고정 DAG 골격 (단일 StateGraph, 3개 진입점 분기) | 빈 노드로 generate_scenarios/generate_code/test 3개 경로 실행 성공 |
 
-### Phase 1: Layer 1 — 컨텍스트 + 시나리오 (Week 2~3)
+### Phase 1A: Layer 1A — 시나리오 생성 파이프라인 (Week 2)
 
 | # | FR | 작업 | 검증 |
 |---|---|---|---|
@@ -499,9 +572,17 @@ class ToolOutput(BaseModel):
 | 3 | FR-024 | 요구사항 추출 Agent: PRD에서 REQ-XXX 추출, RTM 행 생성 | 샘플 PRD → REQ-XXX 목록 |
 | 4 | FR-002 | 시나리오 생성 Agent: 코드컨텍스트+도메인+Git diff → 시나리오+테스트데이터, TS/TC/TV 구조 | 골든셋 대비 Pass@1 60%+ |
 | 5 | FR-003 | 자연어 요구사항 해석 Agent: 자연어 → Given/When/Then | 샘플 입력 → 구조화 출력 |
-| 6 | FR-014 | HITL 모듈: 승인/수정/반려 큐 (시나리오 생성 + 자연어 해석 전용) | HITL 큐 적재 → 승인 플로우 |
-| 7 | FR-004 | 시나리오-액션 매핑 Agent: 시나리오 → UI액션+API매핑+검증포인트, DOM 셀렉터 매칭 | 구조화 시나리오 → Step 시퀀스 출력 |
-| 8 | FR-005 | Playwright 코드 생성 Agent: Step 시퀀스 → Playwright JS 코드, trace_id 주입 | 생성 코드 컴파일 성공 |
+| 6 | - | save_scenarios 노드: .qapilot/scenarios/{ts_id}.json 저장 | 파일 저장 확인 |
+| 7 | - | 시나리오 CRUD API: GET/POST/PUT/DELETE /api/scenarios | 사용자 수정/삭제 플로우 확인 |
+
+### Phase 1B: Layer 1B — 코드 생성 파이프라인 (Week 3)
+
+| # | FR | 작업 | 검증 |
+|---|---|---|---|
+| 1 | - | load_scenarios_for_codegen 노드: .qapilot/scenarios/ 로드 | 저장된 시나리오 로드 확인 |
+| 2 | FR-004 | 시나리오-액션 매핑 Agent: 시나리오 → UI액션+API매핑+검증포인트, DOM 셀렉터 매칭 | 구조화 시나리오 → Step 시퀀스 출력 |
+| 3 | FR-005 | Playwright 코드 생성 Agent: Step 시퀀스 → Playwright JS 코드, trace_id 주입 | 생성 코드 컴파일 성공 |
+| 4 | - | save_codes 노드: .qapilot/generated-code/ 저장 | 파일 저장 확인 |
 
 ### Phase 2: Layer 2 — 테스트 실행 + 교차 검증 (Week 3~4)
 
@@ -525,18 +606,18 @@ class ToolOutput(BaseModel):
 
 | # | FR | 작업 | 검증 |
 |---|---|---|---|
-| 1 | FR-013 | Orchestrator 통합: 단일 StateGraph에 전체 노드 연결, command 분기 + 선택적 실행 옵션 | generate/test 양쪽 경로 실행 성공 |
-| 3 | FR-012 | 리포트 Tool: 단일 형식 템플릿, 실행요약+실패케이스+원인분석+해결방안 | 리포트 생성 확인 |
-| 4 | FR-021 | 증적 캡처-보관: .qapilot/evidence/{trace_id}/ 저장, 대시보드 연동 | TC별 증적 묶음 확인 |
+| 1 | FR-013 | Orchestrator 통합: 단일 StateGraph에 전체 노드 연결, 3개 진입점 분기 + 선택적 실행 옵션 | generate_scenarios / generate_code / test 3개 경로 실행 성공 |
+| 2 | FR-012 | 리포트 Tool: 단일 형식 템플릿, 실행요약+실패케이스+원인분석+해결방안 | 리포트 생성 확인 |
+| 3 | FR-021 | 증적 캡처-보관: .qapilot/evidence/{trace_id}/ 저장, 대시보드 연동 | TC별 증적 묶음 확인 |
 
 ### Phase 5: CLI + 대시보드 + 부가 모듈 (Week 5~6)
 
 | # | FR | 작업 | 검증 |
 |---|---|---|---|
-| 1 | FR-016 | CLI (Typer): init/generate/test/explain/spec import/rescan | 각 명령어 정상 동작 |
+| 1 | FR-016 | CLI (Typer): init / generate scenarios / generate code / test / explain / spec import / rescan | 각 명령어 정상 동작 |
 | 2 | FR-019 | 진척률 대시보드 (React): 6탭, RTM, 메트릭, CSV export | 대시보드 로딩 3초 이내 |
 | 3 | FR-017 | 캐시 모듈: .qapilot/ 관리, LLM 캐시, TTL, 증분 | 동일 입력 캐시 히트 |
-| 4 | FR-018 | 스케줄링 모듈: 자동 배치 실행 (완전 무인, HITL 미발생) | 스케줄 실행 → 리포트 자동 생성 |
+| 4 | FR-018 | 스케줄링 모듈: 자동 배치 실행 (test 명령만 스케줄링) | 스케줄 실행 → 리포트 자동 생성 |
 | 5 | FR-022 | 요구사항 변경 히스토리: 버전 diff, 영향 시나리오 식별 | v2 업로드 → 영향 식별 |
 | 6 | FR-023 | 시나리오 의존성 그래프: D3.js/Cytoscape.js DAG | 그래프 렌더링 + 인터랙션 |
 
@@ -544,7 +625,7 @@ class ToolOutput(BaseModel):
 
 | # | 작업 | 검증 |
 |---|---|---|
-| 1 | E2E 통합 테스트 (generate → test 양쪽 파이프라인) | 시나리오 1개 실행 2분 이내 |
+| 1 | E2E 통합 테스트 (generate scenarios → generate code → test 3단계 파이프라인) | 시나리오 1개 실행 2분 이내 |
 | 2 | 성능 튜닝 | 코드 스캔 diff 10초 이내, 대시보드 로딩 3초 이내 |
 | 3 | 보안 점검 | OWASP Top 10, 프롬프트 인젝션 방지, 민감정보 마스킹 |
 | 4 | 골든셋 인수 테스트 | 시나리오 정확도 75%+, 장애 분류 85%+, 원인 추론 Top-3 75%+ |

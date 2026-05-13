@@ -9,7 +9,6 @@ Created: 2026-05-07
 
 import os
 from typing import Any
-
 from qapilot.tools.base_tool import BaseTool
 
 MODULE_URL = os.getenv("QAPILOT_MODULE_URL", "")
@@ -30,3 +29,6 @@ class DBTestTool(BaseTool):
     async def _execute(self, params: dict[str, Any]) -> dict[str, Any]:
         # TODO: DB 스캔 모듈 스펙 확정 후 구현 예정
         raise NotImplementedError("DB 스캔 모듈 스펙 확정 후 구현 예정")
+
+
+

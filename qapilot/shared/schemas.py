@@ -6,9 +6,23 @@ Author: 공통
 Created: 2026-05-07
 """
 
+from dataclasses import dataclass
 from typing import Any, Literal, TypedDict
 
 from pydantic import BaseModel, Field
+
+
+# ═══════════════════════════════════════════════════
+# _execute() 반환 타입
+# ═══════════════════════════════════════════════════
+
+
+@dataclass
+class ExecuteResult:
+    """BaseAgent._execute()의 반환 타입. 팀원은 이것만 반환하면 된다."""
+
+    result: dict[str, Any]
+    confidence: float  # 0.0~1.0
 
 
 # ═══════════════════════════════════════════════════
@@ -21,6 +35,7 @@ class BaseMetadata(BaseModel):
 
     model: str
     tokens_used: int
+    cost_usd: float = 0.0
     duration_sec: float
     retry_count: int = 0
     cache_hit: bool = False
@@ -64,13 +79,19 @@ class ToolOutput(BaseModel):
 
 
 class RunOptions(TypedDict):
-    """실행 옵션."""
+    """실행 옵션.
 
-    command: Literal["generate", "test"]
-    # generate 전용
+    파이프라인은 3단계로 분리되어 있다:
+    - generate_scenarios: Layer 1A — 시나리오 + 테스트 데이터 생성
+    - generate_code: Layer 1B — 액션 매핑 + Playwright 코드 생성
+    - test: Layer 2~3 — 테스트 실행 + (필요 시) 장애 분석
+    """
+
+    command: Literal["generate_scenarios", "generate_code", "test"]
+    # generate_scenarios 전용
     trigger: Literal["init", "code_change", "doc_update", "natural_lang"] | None
     user_input: str | None
-    # test 전용
+    # generate_code / test 공통 — 대상 시나리오 필터
     scenario_ids: list[str] | None
     filter: Literal["all", "failed", "affected"] | None
     tags: list[str] | None
@@ -87,6 +108,7 @@ class FileInfo(TypedDict):
     endpoints: list[dict]
     functions: list[dict]
     dependencies: list[str]
+    models: list[dict]
 
 
 class GitDiff(TypedDict):
@@ -98,6 +120,10 @@ class GitDiff(TypedDict):
     added_lines: int
     deleted_lines: int
     diff_detail: list[dict]
+    author: str            # HEAD commit 작성자 이름
+    author_email: str      # HEAD commit 작성자 이메일
+    commit_timestamp: str  # HEAD commit 시점 (ISO 8601 UTC)
+    blame: list[dict]      # 변경 파일별 blame 요약
 
 
 class ScanResult(TypedDict):
@@ -182,10 +208,10 @@ class ActionStep(TypedDict):
     step_no: int
     action: str
     selector: str
+    selector_type: str
     value: str | None
     expected: str | None
     api_endpoint: str | None
-    db_table: str | None
 
 
 class ActionMapping(TypedDict):
@@ -316,7 +342,7 @@ class DefectClassification(TypedDict):
 class Evidence(TypedDict):
     """원인 근거."""
 
-    type: Literal["code_location", "domain_rule", "runtime_data"]
+    type: Literal["code_location", "runtime_data"]
     content: str
 
 
@@ -327,8 +353,7 @@ class RootCauseCandidate(TypedDict):
     cause: str
     confidence: float
     evidences: list[Evidence]
-    affected_file: str | None
-    affected_line: int | None
+
 
 
 class RootCauseResult(TypedDict):
@@ -356,22 +381,6 @@ class FixResult(TypedDict):
     suggestions: list[FixSuggestion]
 
 
-# ── HITL ──
-
-
-class HITLRecord(TypedDict):
-    """HITL 검토 기록."""
-
-    target: Literal["scenario_gen", "natural_lang"]
-    target_id: str
-    requested_at: str
-    responded_at: str | None
-    decision: Literal["approved", "modified", "rejected"] | None
-    confidence_shown: float
-    modifications: dict | None
-    reviewer: str | None
-
-
 # ── 메타 ──
 
 
@@ -381,6 +390,7 @@ class AgentMeta(TypedDict):
     agent_name: str
     model: str
     tokens_used: int
+    cost_usd: float
     duration_sec: float
     retry_count: int
     cache_hit: bool

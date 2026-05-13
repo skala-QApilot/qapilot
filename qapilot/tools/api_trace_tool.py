@@ -13,6 +13,7 @@ from typing import Any
 
 from playwright.async_api import Page, Request, Response
 from qapilot.shared.schemas import APICall, APITraceResult
+
 from qapilot.tools.base_tool import BaseTool
 
 MAX_BODY_SIZE = 10 * 1024 * 1024  # 10MB
@@ -99,3 +100,4 @@ class APITraceTool(BaseTool):
         )
 
         return {"api_trace": result}
+

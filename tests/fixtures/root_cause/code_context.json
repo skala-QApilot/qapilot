@@ -1,0 +1,7 @@
+{
+  "files": [
+    "app/services/payment_service.py:84 - commit 누락",
+    "app/core/database.py:31 - pool_size=5 설정"
+  ],
+  "summary": "결제 서비스 코드에서 트랜잭션 커밋 누락 발견"
+}

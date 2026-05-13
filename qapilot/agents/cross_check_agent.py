@@ -25,7 +25,6 @@ class CrossCheckAgent(BaseAgent):
     입력: UITestResult, APITraceResult, DBTestResult
     출력: CrossCheckResult, confidence
     호출 Tool: 없음
-    HITL: X
     """
 
     agent_name = "cross_check"

@@ -1,0 +1,33 @@
+{
+  "ui_result": {
+    "tc_id": "TC-001",
+    "status": "fail",
+    "failed_step": {
+      "step_no": 4,
+      "action": "assert_text",
+      "expected": "주문 완료",
+      "actual": "처리 중",
+      "error": "AssertionError: 텍스트 불일치"
+    }
+  },
+  "api_trace": {
+    "calls": [
+      {
+        "method": "POST",
+        "url": "/api/orders",
+        "status_code": 500,
+        "response_body": {"error": "IntegrityError: transaction not committed"},
+        "latency_ms": 312
+      }
+    ],
+    "error_calls": 1
+  },
+  "db_snapshot": {
+    "table": "orders",
+    "row_count_before": 42,
+    "row_count_after": 42,
+    "added": 0,
+    "note": "INSERT 실행됐으나 커밋 없어 롤백됨"
+  },
+  "stack_trace": "Traceback (most recent call last):\n  File \"app/services/payment_service.py\", line 84, in process_payment\n    db.execute(insert_stmt)\nsqlalchemy.exc.IntegrityError: (psycopg2.errors.InFailedSqlTransaction) transaction not committed"
+}

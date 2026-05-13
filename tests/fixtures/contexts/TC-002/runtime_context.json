@@ -1,0 +1,35 @@
+{
+  "ui_result": {
+    "tc_id": "TC-002",
+    "status": "fail",
+    "failed_step": {
+      "step_no": 3,
+      "action": "submit_form",
+      "expected": "회원가입 성공 메시지",
+      "actual": "서버 오류 발생",
+      "error": "AssertionError: 예상 메시지 없음"
+    }
+  },
+  "api_trace": {
+    "calls": [
+      {
+        "method": "POST",
+        "url": "/api/users",
+        "status_code": 500,
+        "response_body": {
+          "detail": "IntegrityError: (psycopg2.errors.UniqueViolation) duplicate key value violates unique constraint \"users_email_key\""
+        },
+        "latency_ms": 87
+      }
+    ],
+    "error_calls": 1
+  },
+  "db_snapshot": {
+    "table": "users",
+    "row_count_before": 15,
+    "row_count_after": 15,
+    "added": 0,
+    "note": "INSERT 실패로 신규 사용자 미등록"
+  },
+  "stack_trace": "Traceback (most recent call last):\n  File \"app/api/users.py\", line 28, in create_user\n    db.commit()\nsqlalchemy.exc.IntegrityError: (psycopg2.errors.UniqueViolation) duplicate key value violates unique constraint \"users_email_key\"\nDETAIL: Key (email)=(test@example.com) already exists."
+}
