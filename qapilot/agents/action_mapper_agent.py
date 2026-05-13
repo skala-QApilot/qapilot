@@ -15,7 +15,7 @@ from typing import Any
 
 from qapilot.agents.base_agent import BaseAgent
 from qapilot.shared.errors import AgentExecutionError, ErrorCode
-from qapilot.shared.schemas import ActionMapping, ExecuteResult
+from qapilot.shared.schemas import ActionMapping, ActionStep, ExecuteResult
 
 
 MAX_TC_PER_BATCH = 50
@@ -188,7 +188,7 @@ class ActionMapperAgent(BaseAgent):
             "selector_confidence": float(item["selector_confidence"]),
         }
 
-    def _validate_step(self, item: Any) -> dict:
+    def _validate_step(self, item: Any) -> ActionStep:
         """단일 ActionStep 구조와 enum 값을 검증한다."""
         required = ("step_no", "action", "selector", "selector_type")
         if not isinstance(item, dict):
