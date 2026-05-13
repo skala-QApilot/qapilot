@@ -105,8 +105,25 @@ def init() -> None:
         console.print("\n[yellow]설정이 저장되지 않았습니다.[/yellow]")
 
     console.print(f"\n[bold green]코드베이스 스캔을 시작합니다...[/bold green]")
-    # TODO: codebase scanner 연동 (FR-000)
-    console.print("[dim]스캔 및 인덱싱 완료.[/dim]")
+    import asyncio
+    import uuid
+    from qapilot.shared.schemas import ToolInput
+    from qapilot.tools.codebase_scanner_tool import CodebaseScannerTool
+
+    tool = CodebaseScannerTool()
+    try:
+        result = asyncio.run(
+            tool.run(
+                ToolInput(
+                    trace_id=str(uuid.uuid4()),
+                    params={"trigger": "init"},
+                )
+            )
+        )
+        r = result.result["scan_result"]
+        console.print(f"[dim]스캔 및 인덱싱 완료 (파일: {len(r['files'])}개, 엔드포인트: {r['endpoint_count']}개, 프레임워크: {r['framework']})[/dim]")
+    except Exception as e:
+        console.print(f"[red]스캔 중 오류 발생: {e}[/red]")
     console.print(
         f"\n이제 [bold {BRAND_PURPLE}]qapilot generate scenarios[/bold {BRAND_PURPLE}] "
         f"명령어로 테스트 시나리오를 만들어보세요!"
