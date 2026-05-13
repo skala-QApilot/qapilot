@@ -128,17 +128,59 @@ def test(
 @app.command()
 def explain(defect_id: str) -> None:
     """결함 원인 분석."""
+    from qapilot.shared.schemas import AgentInput
+    from qapilot.agents.root_cause_agent import RootCauseAgent
+
     console.print(f"[bold {BRAND_PURPLE}]결함({defect_id}) 원인 분석을 시작합니다...[/bold {BRAND_PURPLE}]")
-    # TODO: 단건 분석 로직 연동 (FR-010)
-    console.print("[bold blue]분석 완료![/bold blue]")
+    
+    agent = RootCauseAgent()
+    try:
+        result = asyncio.run(
+            agent.run(
+                AgentInput(
+                    trace_id=str(uuid.uuid4()),
+                    context={},
+                    params={"tc_id": defect_id},
+                )
+            )
+        )
+        candidates = result.result.get("root_causes", [])
+        if candidates:
+            for c in candidates:
+                console.print(f"- [bold yellow]{c.get('cause', '알 수 없음')}[/bold yellow] (신뢰도: {c.get('confidence', 0)})")
+        else:
+            console.print("[yellow]원인 후보를 찾지 못했습니다.[/yellow]")
+            
+        console.print("[bold blue]분석 완료![/bold blue]")
+    except Exception as e:
+        console.print(f"[red]분석 중 오류 발생: {e}[/red]")
 
 
 @app.command()
 def rescan() -> None:
     """코드 인덱스 재생성."""
+    from qapilot.shared.schemas import ToolInput
+    from qapilot.tools.codebase_scanner_tool import CodebaseScannerTool
+
     console.print(f"[bold {BRAND_PURPLE}]로컬 코드 인덱스 재생성을 시작합니다...[/bold {BRAND_PURPLE}]")
-    # TODO: codebase scanner 연동 (FR-000)
-    console.print("[bold blue]재생성 완료![/bold blue]")
+    
+    tool = CodebaseScannerTool()
+    try:
+        result = asyncio.run(
+            tool.run(
+                ToolInput(
+                    trace_id=str(uuid.uuid4()),
+                    params={"trigger": "code_change"},
+                )
+            )
+        )
+        r = result.result.get("scan_result", {})
+        files_cnt = len(r.get('files', []))
+        endpoint_cnt = r.get('endpoint_count', 0)
+        framework = r.get('framework', 'unknown')
+        console.print(f"[bold blue]재생성 완료! (파일: {files_cnt}개, 엔드포인트: {endpoint_cnt}개, 프레임워크: {framework})[/bold blue]")
+    except Exception as e:
+        console.print(f"[red]재생성 중 오류 발생: {e}[/red]")
 
 
 @app.command()
