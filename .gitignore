@@ -1,5 +1,7 @@
 # Environment
 .env
+.venv/
+venv/
 
 # Python
 __pycache__/
@@ -14,6 +16,7 @@ build/
 # IDE
 .vscode/
 .idea/
+.claude
 
 # OS
 .DS_Store

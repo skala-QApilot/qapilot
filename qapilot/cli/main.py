@@ -25,12 +25,19 @@ from qapilot.cli.api_client import ApiClient
 from qapilot.cli.sync import sync_local_to_server
 from qapilot.cli.utils import render_image_to_text
 from qapilot.orchestrator.runner import run_pipeline
+from qapilot.shared.logger import setup_logger
 from qapilot.shared.schemas import RunOptions
 
 app = typer.Typer(help="QApilot — AI 기반 QA 자동화 시스템")
 console = Console()
 
 BRAND_PURPLE = "#3617CE"
+
+
+@app.callback()
+def _init_cli() -> None:
+    """모든 CLI 명령 실행 전에 로깅을 초기화한다."""
+    setup_logger()
 
 
 def print_welcome_banner() -> None:
@@ -165,7 +172,7 @@ def generate_scenarios(
     affected: bool = typer.Option(False, "--affected", help="Git 변경분만 생성"),
     sync: bool = typer.Option(True, "--sync/--no-sync", help="완료 후 서버와 동기화"),
 ) -> None:
-    """시나리오 자동 생성 및 HITL 리뷰 대기."""
+    """시나리오 자동 생성. 생성 후 사용자가 대시보드에서 검토·수정한다."""
     options: RunOptions = {
         "command": "generate_scenarios",
         "trigger": "code_change" if affected else "init",
@@ -176,7 +183,7 @@ def generate_scenarios(
     }
     console.print(f"[bold {BRAND_PURPLE}]시나리오 생성을 시작합니다 (Layer 1)...[/bold {BRAND_PURPLE}]")
     result = asyncio.run(run_pipeline(options))
-    console.print(f"[bold blue]시나리오 생성 완료! HITL 리뷰 큐에 적재되었습니다. (상태: {result['status']})[/bold blue]")
+    console.print(f"[bold blue]시나리오 생성 완료! 대시보드(qapilot ui)에서 검토 후 'qapilot generate code'를 실행하세요. (상태: {result['status']})[/bold blue]")
     
     if sync:
         asyncio.run(sync_local_to_server())
@@ -188,7 +195,7 @@ def generate_scenarios(
 def generate_code(
     sync: bool = typer.Option(True, "--sync/--no-sync", help="완료 후 서버와 동기화"),
 ) -> None:
-    """승인된 시나리오를 기반으로 테스트 코드 자동 생성."""
+    """저장된 시나리오를 기반으로 테스트 코드 자동 생성."""
     options: RunOptions = {
         "command": "generate_code",
         "trigger": None,
@@ -197,7 +204,7 @@ def generate_code(
         "filter": None,
         "tags": None,
     }
-    console.print(f"[bold {BRAND_PURPLE}]승인된 시나리오 기반 테스트 코드 생성을 시작합니다...[/bold {BRAND_PURPLE}]")
+    console.print(f"[bold {BRAND_PURPLE}]저장된 시나리오 기반 테스트 코드 생성을 시작합니다...[/bold {BRAND_PURPLE}]")
     result = asyncio.run(run_pipeline(options))
     console.print(f"[bold blue]테스트 코드 생성 완료! (상태: {result['status']})[/bold blue]")
     

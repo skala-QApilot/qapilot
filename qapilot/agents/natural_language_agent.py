@@ -17,7 +17,6 @@ class NaturalLanguageAgent(BaseAgent):
     입력: 사용자 자연어 텍스트
     출력: List[TestScenario], confidence
     호출 Tool: 도메인 지식 Tool
-    HITL: O (항상, 승인 후 액션 매핑으로 진행)
     """
 
     async def _execute(

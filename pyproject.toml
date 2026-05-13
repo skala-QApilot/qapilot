@@ -64,7 +64,6 @@ dev = [
 [project.scripts]
 qapilot = "qapilot.cli.main:app"
 
-
 [tool.black]
 line-length = 100
 

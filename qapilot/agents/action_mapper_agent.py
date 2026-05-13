@@ -17,7 +17,6 @@ class ActionMapperAgent(BaseAgent):
     입력: TestScenario, CodebaseContext (endpoints.json)
     출력: List[ActionMapping], confidence
     호출 Tool: 코드 인덱스 Tool
-    HITL: X
     """
 
     async def _execute(
