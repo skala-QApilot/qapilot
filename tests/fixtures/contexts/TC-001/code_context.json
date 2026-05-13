@@ -1,25 +1,93 @@
 {
-  "files": [
-    {
-      "path": "app/services/payment_service.py",
-      "relevant_lines": [
-        {"line": 84, "content": "    db.execute(insert_stmt)"},
-        {"line": 85, "content": "    # TODO: db.commit() 누락"},
-        {"line": 86, "content": "    return {'status': 'completed'}"}
+  "scan_result": {
+    "files": [
+      {
+        "path": "app/services/payment_service.py",
+        "language": "python",
+        "endpoints": [
+          {
+            "method": "POST",
+            "path": "/payments",
+            "handler": "process_payment"
+          }
+        ],
+        "functions": [
+          {
+            "name": "process_payment",
+            "line_start": 78,
+            "line_end": 92,
+            "params": "(request: PaymentRequest, db: Session)",
+            "return_type": "dict",
+            "calls": ["validate_payment", "db.execute", "db.commit"]
+          }
+        ],
+        "dependencies": [
+          "from sqlalchemy.orm import Session",
+          "from app.core.database import get_db",
+          "from app.models.order import Order"
+        ],
+        "models": [
+          {
+            "name": "PaymentRequest",
+            "fields": ["order_id", "amount", "method"],
+            "source": "python"
+          }
+        ]
+      },
+      {
+        "path": "app/core/database.py",
+        "language": "python",
+        "endpoints": [],
+        "functions": [
+          {
+            "name": "get_db",
+            "line_start": 28,
+            "line_end": 35,
+            "params": "()",
+            "return_type": "Generator",
+            "calls": ["SessionLocal"]
+          }
+        ],
+        "dependencies": [
+          "from sqlalchemy import create_engine",
+          "from sqlalchemy.orm import sessionmaker"
+        ],
+        "models": []
+      }
+    ],
+    "git_diff": {
+      "commit_hash": "a1b2c3d4e5f6",
+      "prev_hash": "f9e8d7c6b5a4",
+      "changed_files": [
+        "app/services/payment_service.py"
       ],
-      "note": "트랜잭션 커밋 없이 응답 반환"
+      "added_lines": 12,
+      "deleted_lines": 3,
+      "diff_detail": [
+        {
+          "file": "app/services/payment_service.py",
+          "added": 12,
+          "deleted": 3
+        }
+      ],
+      "author": "yubin",
+      "author_email": "yubin@example.com",
+      "commit_timestamp": "2026-05-13T01:00:00Z",
+      "blame": [
+        {
+          "file": "app/services/payment_service.py",
+          "author": "yubin",
+          "author_email": "yubin@example.com",
+          "timestamp": "2026-05-13T01:00:00Z"
+        }
+      ]
     },
-    {
-      "path": "app/core/database.py",
-      "relevant_lines": [
-        {"line": 31, "content": "engine = create_engine(DATABASE_URL, pool_size=5, max_overflow=0)"}
-      ],
-      "note": "pool_size=5 고정, max_overflow=0으로 연결 고갈 위험"
-    }
-  ],
-  "git_diff": {
-    "commit_hash": "a1b2c3d",
-    "changed_files": ["app/services/payment_service.py"],
-    "summary": "결제 처리 흐름 리팩토링 - commit 호출 제거됨"
+    "framework": "fastapi",
+    "language": "python",
+    "endpoint_count": 1
+  },
+  "_metadata": {
+    "trigger": "init",
+    "files_scanned": 2
   }
 }

@@ -37,7 +37,7 @@ _JUDGE_OK = json.dumps({
 
 
 def _llm_resp(content: str) -> LLMResponse:
-    return LLMResponse(content=content, model="gpt-4o-mini", tokens_used=10, cached=False)
+    return LLMResponse(content=content, model="gpt-4o-mini", input_tokens=5, output_tokens=5, cost_usd=0.0, cached=False)
 
 
 def _make_agent() -> RootCauseAgent:
@@ -210,7 +210,7 @@ async def test_judge_failure_missing_fields_fallback():
 
 
 async def test_confidence_boost_code_location():
-    """code_location evidence 1개 이상이면 +0.3."""
+    """code_location evidence 1개 이상이면 +0.2."""
     agent = _make_agent()
     agent.llm.chat = _mock_chat(
         _single_candidate_llm(0.5, [{"type": "code_location", "content": "app/service.py:84"}]),
@@ -219,11 +219,11 @@ async def test_confidence_boost_code_location():
 
     result = await agent._execute(context={}, params={"tc_id": "TC-001"})
 
-    assert result.result["root_causes"][0]["candidates"][0]["confidence"] == pytest.approx(0.8)
+    assert result.result["root_causes"][0]["candidates"][0]["confidence"] == pytest.approx(0.7)
 
 
 async def test_confidence_boost_runtime_data():
-    """runtime_data evidence 1개 이상이면 +0.3."""
+    """runtime_data evidence 1개 이상이면 +0.2."""
     agent = _make_agent()
     agent.llm.chat = _mock_chat(
         _single_candidate_llm(0.5, [{"type": "runtime_data", "content": "HTTP 500"}]),
@@ -232,11 +232,11 @@ async def test_confidence_boost_runtime_data():
 
     result = await agent._execute(context={}, params={"tc_id": "TC-001"})
 
-    assert result.result["root_causes"][0]["candidates"][0]["confidence"] == pytest.approx(0.8)
+    assert result.result["root_causes"][0]["candidates"][0]["confidence"] == pytest.approx(0.7)
 
 
-async def test_confidence_boost_both_types_capped_at_one():
-    """code_location + runtime_data 둘 다 있으면 base 0.5 + 0.6 = 1.1 → clamp 1.0."""
+async def test_confidence_boost_both_types():
+    """code_location + runtime_data 둘 다 있으면 base 0.5 + 0.4 = 0.9."""
     agent = _make_agent()
     agent.llm.chat = _mock_chat(
         _single_candidate_llm(0.9, [
@@ -248,7 +248,7 @@ async def test_confidence_boost_both_types_capped_at_one():
 
     result = await agent._execute(context={}, params={"tc_id": "TC-001"})
 
-    assert result.result["root_causes"][0]["candidates"][0]["confidence"] == pytest.approx(1.0)
+    assert result.result["root_causes"][0]["candidates"][0]["confidence"] == pytest.approx(0.9)
 
 
 async def test_confidence_without_evidence_uses_rule_base():
@@ -331,8 +331,8 @@ async def test_relevance_penalty_combined_with_evidence_boost():
         params={"tc_id": "TC-001", "error_code": "HTTP_500", "summary": "결제 실패"},
     )
 
-    # base 0.5 - 0.4 (관련성 페널티) + 0.3 (code_location) = 0.4
-    assert result.result["root_causes"][0]["candidates"][0]["confidence"] == pytest.approx(0.4)
+    # base 0.5 - 0.4 (관련성 페널티) + 0.2 (code_location) = 0.3
+    assert result.result["root_causes"][0]["candidates"][0]["confidence"] == pytest.approx(0.3)
 
 
 async def test_relevance_check_uses_mismatch_fields():
