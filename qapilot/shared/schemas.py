@@ -208,10 +208,10 @@ class ActionStep(TypedDict):
     step_no: int
     action: str
     selector: str
+    selector_type: str
     value: str | None
     expected: str | None
     api_endpoint: str | None
-    db_table: str | None
 
 
 class ActionMapping(TypedDict):
