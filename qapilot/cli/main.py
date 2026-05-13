@@ -27,10 +27,18 @@ from qapilot.shared.schemas import RunOptions
 
 app = typer.Typer(help="QApilot — AI 기반 QA 자동화 시스템")
 
-@app.callback()
-def _init_cli() -> None:
-    """모든 CLI 명령 실행 전에 로깅을 초기화한다."""
+@app.callback(invoke_without_command=True)
+def _init_cli(ctx: typer.Context) -> None:
+    """모든 CLI 명령 실행 전에 로깅을 초기화한다.
+
+    인자 없이 실행 시 인터랙티브 셸 (REPL) 진입.
+    """
     setup_logger()
+    if ctx.invoked_subcommand is None:
+        from qapilot.cli.repl import run_repl
+
+        run_repl(app)
+        raise typer.Exit()
 
 
 # `qapilot init` — 핸들러는 cli/commands/init.py 에 정의됨.
