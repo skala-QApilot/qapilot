@@ -13,8 +13,8 @@ import json
 import re
 from typing import Any
 
-from qapilot.agents._requirement_repository import save_requirements
 from qapilot.agents.base_agent import BaseAgent
+from qapilot.agents.requirement_extractor.repository import save_requirements
 from qapilot.shared.database import create_tables
 from qapilot.shared.errors import AgentExecutionError, ErrorCode
 from qapilot.shared.schemas import ExecuteResult, RequirementItem
