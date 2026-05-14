@@ -286,24 +286,118 @@ async def _save_scenarios(state: PipelineState) -> dict:
 
 async def _load_scenarios_for_codegen(state: PipelineState) -> dict:
     """.qapilot/scenarios/ 에서 시나리오를 로드한다 (코드 생성용)."""
-    raise NotImplementedError
+    import json
+    from pathlib import Path
+    
+    scenarios_dir = Path(".qapilot") / "scenarios"
+    if not scenarios_dir.exists():
+        return {"scenarios": [], "error": "시나리오 디렉토리가 없습니다."}
 
+    scenario_ids = state["run_options"].get("scenario_ids") or []
+    scenarios = []
 
-async def _load_approved_scenarios(state: PipelineState) -> dict:
-    raise NotImplementedError
+    for path in scenarios_dir.glob("*.json"):
+        if path.name == "raw": continue
+        if path.name == "regression": continue
+        
+        ts_id = path.stem
+        if scenario_ids and ts_id not in scenario_ids:
+            continue
+        try:
+            ts = json.loads(path.read_text(encoding="utf-8"))
+            scenarios.append(ts)
+        except Exception:
+            pass
+
+    scenarios.sort(key=lambda x: x.get("ts_id", ""))
+    
+    # scan_result 를 디스크 캐시에서 복원 (ActionMapperAgent 가 사용)
+    scan_result = None
+    try:
+        endpoints_path = Path(".qapilot") / "codebase-index" / "endpoints.json"
+        if endpoints_path.exists():
+            endpoints = json.loads(endpoints_path.read_text(encoding="utf-8"))
+            scan_result = {"files": [{"path": "mock", "endpoints": endpoints}]}
+    except Exception:
+        pass
+
+    return {
+        "scenarios": scenarios,
+        "scan_result": scan_result,
+        "current_layer": "L1B",
+    }
 
 
 async def _action_mapping(state: PipelineState) -> dict:
-    raise NotImplementedError
+    from qapilot.agents.action_mapper_agent import ActionMapperAgent
+    from qapilot.shared.schemas import AgentInput
+
+    agent = ActionMapperAgent(trace_id=state.get("trace_id"))
+    result = await agent.run(
+        AgentInput(
+            trace_id=state.get("trace_id") or "",
+            context={
+                "scenarios": state.get("scenarios") or [],
+                "scan_result": state.get("scan_result")
+            },
+            params={},
+        )
+    )
+
+    agent_logs = state.get("agent_logs", []) + [result.metadata.model_dump()]
+
+    return {
+        "action_mappings": result.result.get("action_mappings", []),
+        "agent_logs": agent_logs,
+    }
 
 
 async def _code_generate(state: PipelineState) -> dict:
-    raise NotImplementedError
+    from qapilot.agents.code_generator_agent import CodeGeneratorAgent
+    from qapilot.shared.schemas import AgentInput
+
+    agent = CodeGeneratorAgent(trace_id=state.get("trace_id"))
+    result = await agent.run(
+        AgentInput(
+            trace_id=state.get("trace_id") or "",
+            context={
+                "action_mappings": state.get("action_mappings", []),
+                "scenarios": state.get("scenarios", [])
+            },
+            params={},
+        )
+    )
+
+    agent_logs = state.get("agent_logs", []) + [result.metadata.model_dump()]
+
+    return {
+        "generated_codes": result.result.get("generated_codes", []),
+        "agent_logs": agent_logs,
+    }
 
 
 async def _save_codes(state: PipelineState) -> dict:
     """생성된 Playwright 코드를 .qapilot/generated-code/ 에 저장한다."""
-    raise NotImplementedError
+    import json
+    from pathlib import Path
+
+    generated_codes = state.get("generated_codes") or []
+    out_dir = Path(".qapilot") / "generated-code"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    saved_paths = []
+    for code_obj in generated_codes:
+        tc_id = code_obj.get("tc_id")
+        if not tc_id:
+            continue
+        path = out_dir / f"{tc_id}.js"
+        path.write_text(code_obj.get("code", ""), encoding="utf-8")
+        saved_paths.append(str(path))
+
+    return {
+        "saved_code_paths": saved_paths,
+        "status": "completed",
+    }
 
 
 async def _load_scenarios_for_test(state: PipelineState) -> dict:
