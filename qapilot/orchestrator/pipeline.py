@@ -8,9 +8,20 @@
 HITL은 별도 모듈로 두지 않고, generate_scenarios 와 generate_code 명령 사이에서
 사용자가 대시보드를 통해 자유롭게 시나리오를 수정·삭제할 수 있도록 한다.
 
+3-Layer 영속화 정책 (Phase 1, project_qapilot_pipeline_persistence_layers.md):
+- L1 메모리 PipelineState: 모든 노드 결과 (단일 실행 흐름)
+- L2 디스크 캐시 (.qapilot/): codebase-index, scenarios, generated-code, results, reports
+- L3 서버 DB: Phase 2 별도 PR
+
 담당: A
 Created: 2026-05-07
 """
+
+import json
+import uuid as _uuid
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
 
 from langgraph.graph import END, START, StateGraph
 
@@ -99,25 +110,178 @@ def _entry_point(command: str) -> str:
 # ═══════════════════════════════════════════════════
 
 
+# ── Layer 1A 헬퍼: spec §6.1 디스크 캐시 ──────────────────────────────────────
+def _save_codebase_index_to_disk(scan: dict) -> None:
+    """spec §6.1 의 .qapilot/codebase-index/ 4파일 저장 (L2 디스크 캐시).
+
+    Tool 본체의 `.qapilot/manifest.json` (증분 분석 추적용) 과 독립.
+    본 manifest 는 spec §6.1 정합용으로 codebase-index/ 안에 둔다.
+    """
+    cache_dir = Path(".qapilot") / "codebase-index"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    endpoints: list[dict] = []
+    models: list[dict] = []
+    callgraph: dict[str, list[str]] = {}
+    for fi in scan.get("files", []) or []:
+        file_path = fi.get("path", "")
+        for ep in fi.get("endpoints", []) or []:
+            endpoints.append({"file": file_path, **ep})
+        for md in fi.get("models", []) or []:
+            models.append({"file": file_path, **md})
+        callgraph[file_path] = list(fi.get("dependencies", []) or [])
+
+    manifest = {
+        "scan_timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "commit_hash": (scan.get("git_diff") or {}).get("commit_hash", ""),
+        "framework": scan.get("framework"),
+        "language": scan.get("language"),
+        "file_count": len(scan.get("files", []) or []),
+        "endpoint_count": int(scan.get("endpoint_count", 0) or 0),
+    }
+
+    for filename, payload in (
+        ("endpoints.json", endpoints),
+        ("models.json", models),
+        ("callgraph.json", callgraph),
+        ("manifest.json", manifest),
+    ):
+        (cache_dir / filename).write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+
+
+# ── Layer 1A 노드 (generate_scenarios) ────────────────────────────────────────
+
+
 async def _codebase_scan(state: PipelineState) -> dict:
-    raise NotImplementedError
+    """FR-000 CodebaseScannerTool 호출 + spec §6.1 디스크 캐시."""
+    from qapilot.shared.schemas import ToolInput
+    from qapilot.tools.codebase_scanner_tool import CodebaseScannerTool
+
+    trace_id = state.get("trace_id") or str(_uuid.uuid4())
+    trigger = state["run_options"].get("trigger") or "init"
+
+    tool = CodebaseScannerTool(trace_id=trace_id)
+    result = await tool.run(
+        ToolInput(trace_id=trace_id, params={"trigger": trigger})
+    )
+    scan: dict[str, Any] = result.result["scan_result"]
+
+    # L2: spec §6.1 정합 디스크 캐시 (Tool 본체 무수정)
+    _save_codebase_index_to_disk(scan)
+
+    return {
+        "trace_id": trace_id,
+        "scan_result": scan,
+        "current_layer": "L1A",
+    }
 
 
 async def _domain_knowledge(state: PipelineState) -> dict:
-    raise NotImplementedError
+    """FR-001 DomainKnowledgeTool search 호출 → domain_rules.
+
+    scan_result 의 framework + 첫 endpoint 경로들을 합쳐 query 생성.
+    Qdrant 가 L2 역할 수행(별도 디스크 저장 X).
+    """
+    from qapilot.shared.schemas import ToolInput
+    from qapilot.tools.domain_knowledge import DomainKnowledgeTool
+
+    scan = state.get("scan_result") or {}
+    framework = scan.get("framework") or ""
+    paths: list[str] = []
+    for fi in (scan.get("files") or [])[:5]:
+        for ep in (fi.get("endpoints") or [])[:2]:
+            path = ep.get("path") or ep.get("name") or ""
+            if path:
+                paths.append(path)
+    query = " ".join(filter(None, [framework] + paths[:5])) or "테스트 시나리오"
+
+    tool = DomainKnowledgeTool(trace_id=state["trace_id"])
+    try:
+        result = await tool.run(
+            ToolInput(
+                trace_id=state["trace_id"],
+                params={"action": "search", "query": query, "top_k": 10},
+            )
+        )
+        rules = result.result.get("rules", []) or []
+    except Exception:
+        # 도메인 인덱스 미준비 시 rules 빈 채로 진행 (시나리오 품질 ↓ 가능)
+        rules = []
+
+    return {"domain_rules": rules}
 
 
 async def _requirement_extract(state: PipelineState) -> dict:
-    raise NotImplementedError
+    """FR-024 RequirementExtractorAgent 호출.
+
+    run_options.user_input 이 있으면 PRD 텍스트로 사용. 없으면 skip (빈 requirements).
+    RequirementExtractorAgent 는 document_text 누락 시 AgentExecutionError 발생하므로
+    노드 측에서 미리 분기.
+    """
+    user_input = (state["run_options"].get("user_input") or "").strip()
+    if not user_input:
+        return {"requirements": []}
+
+    from qapilot.agents.requirement_extractor_agent import RequirementExtractorAgent
+    from qapilot.shared.schemas import AgentInput
+
+    agent = RequirementExtractorAgent(trace_id=state["trace_id"])
+    output = await agent.run(
+        AgentInput(
+            trace_id=state["trace_id"],
+            context={"domain_rules": state.get("domain_rules") or []},
+            params={"document_text": user_input, "existing_count": 0},
+        )
+    )
+    requirements = output.result.get("requirements", []) or []
+    return {"requirements": requirements}
 
 
 async def _scenario_generate(state: PipelineState) -> dict:
-    raise NotImplementedError
+    """FR-002 ScenarioGeneratorAgent 호출 → TS/TC/TV 시나리오 목록."""
+    from qapilot.agents.scenario_generator.agent import ScenarioGeneratorAgent
+    from qapilot.shared.schemas import AgentInput
+
+    trigger = state["run_options"].get("trigger") or "code_change"
+    affected_only = trigger == "code_change"
+
+    agent = ScenarioGeneratorAgent(trace_id=state["trace_id"])
+    output = await agent.run(
+        AgentInput(
+            trace_id=state["trace_id"],
+            context={
+                "scan_result": state.get("scan_result"),
+                "domain_rules": state.get("domain_rules") or [],
+                "requirements": state.get("requirements") or [],
+            },
+            params={"trigger": trigger, "affected_only": affected_only},
+        )
+    )
+    scenarios = output.result.get("scenarios", []) or []
+    return {"scenarios": scenarios}
 
 
 async def _save_scenarios(state: PipelineState) -> dict:
-    """생성된 시나리오를 .qapilot/scenarios/ 에 저장한다."""
-    raise NotImplementedError
+    """생성된 시나리오를 .qapilot/scenarios/{ts_id}.json 에 저장 (spec §6.1, L2)."""
+    scenarios = state.get("scenarios") or []
+    scenarios_dir = Path(".qapilot") / "scenarios"
+    scenarios_dir.mkdir(parents=True, exist_ok=True)
+
+    saved_paths: list[str] = []
+    for idx, ts in enumerate(scenarios, start=1):
+        ts_id = ts.get("ts_id") or f"TS-{idx:03d}"
+        path = scenarios_dir / f"{ts_id}.json"
+        path.write_text(
+            json.dumps(ts, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        saved_paths.append(str(path))
+
+    return {
+        "saved_scenario_paths": saved_paths,
+        "status": "completed",
+    }
 
 
 async def _load_scenarios_for_codegen(state: PipelineState) -> dict:
