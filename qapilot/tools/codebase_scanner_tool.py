@@ -920,6 +920,9 @@ class CodebaseScannerTool(BaseTool):
         """
         try:
             repo = git.Repo(repo_path)
+            # Ensure git paths are unquoted for Python to read them correctly, bypassing core.quotePath
+            repo.git.config("core.quotePath", "false", local=True)
+            
             commit = repo.head.commit
             current = commit.hexsha
             parents = commit.parents
@@ -933,7 +936,9 @@ class CodebaseScannerTool(BaseTool):
 
             if prev:
                 changed = repo.git.diff(f"{prev}..{current}", "--name-only")
-                changed_files = changed.splitlines()
+                changed_files = [
+                    f.strip('"') for f in changed.splitlines() if f.strip()
+                ]
                 stat = repo.git.diff(f"{prev}..{current}", "--stat")
                 added, deleted = self._parse_stat(stat)
                 diff_detail = self._parse_diff_detail(repo, prev, current)
