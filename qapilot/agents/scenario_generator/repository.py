@@ -17,10 +17,15 @@ def save_scenarios(scenarios: list[TestScenario]) -> None:
     """각 시나리오를 .qapilot/scenarios/{ts_id}.json에 저장한다."""
     _SCENARIOS_DIR.mkdir(parents=True, exist_ok=True)
     for scenario in scenarios:
-        path = _SCENARIOS_DIR / f"{scenario['ts_id']}.json"
-        path.write_text(
-            json.dumps(scenario, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
+        save_scenario(scenario)
+
+
+def save_scenario(scenario: TestScenario) -> Path:
+    """단일 시나리오를 .qapilot/scenarios/{ts_id}.json에 저장한다."""
+    _SCENARIOS_DIR.mkdir(parents=True, exist_ok=True)
+    path = _SCENARIOS_DIR / f"{scenario['ts_id']}.json"
+    path.write_text(json.dumps(scenario, ensure_ascii=False, indent=2), encoding="utf-8")
+    return path
 
 
 def load_scenario(ts_id: str) -> TestScenario | None:
@@ -39,3 +44,12 @@ def load_all_scenarios() -> list[TestScenario]:
         json.loads(p.read_text(encoding="utf-8"))
         for p in sorted(_SCENARIOS_DIR.glob("TS-*.json"))
     ]
+
+
+def delete_scenario(ts_id: str) -> bool:
+    """ts_id에 해당하는 시나리오 파일을 삭제한다. 삭제 여부를 반환한다."""
+    path = _SCENARIOS_DIR / f"{ts_id}.json"
+    if not path.exists():
+        return False
+    path.unlink()
+    return True
