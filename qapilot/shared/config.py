@@ -31,7 +31,7 @@ class AgentOverride(BaseModel):
 
 
 class AgentConfig(BaseModel):
-    timeout_sec: int = 60
+    timeout_sec: int = 120
     max_retry: int = 3
     overrides: dict[str, AgentOverride] = Field(default_factory=dict)
 

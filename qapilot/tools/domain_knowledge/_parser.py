@@ -39,6 +39,8 @@ class DocumentParser:
         try:
             if file_path.suffix.lower() in (".xlsx", ".xls"):
                 blocks = self._parse_excel(file_path)
+            elif file_path.suffix.lower() == ".md":
+                blocks = self._parse_markdown(file_path)
             else:
                 try:
                     blocks = self._parse_with_docling(file_path)
@@ -103,6 +105,12 @@ class DocumentParser:
             if text.strip():
                 blocks.append({"text": text, "section": f"page_{i + 1}"})
         return blocks
+
+    @staticmethod
+    def _parse_markdown(file_path: Path) -> list[dict]:
+        """마크다운 파일을 헤더 기준으로 섹션 블록 목록으로 파싱한다."""
+        text = file_path.read_text(encoding="utf-8", errors="replace")
+        return split_markdown_sections(text, file_path.stem)
 
     def _parse_excel(self, file_path: Path) -> list[dict]:
         """openpyxl로 XLSX 파일을 파싱하여 시트별 블록 목록을 반환한다.
