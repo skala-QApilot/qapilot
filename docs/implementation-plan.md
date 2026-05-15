@@ -1,13 +1,14 @@
 # QApilot 구현 플랜
 
-> **Version**: 1.3  
-> **최종 수정일**: 2026-05-13  
+> **Version**: 1.4  
+> **최종 수정일**: 2026-05-15  
 > **기반 문서**: 요구사항정의서 v0.4 / 개발표준정의서 v0.4  
 > **변경 이력**:  
 > - v1.0 (2026-05-07): 최초 작성. Orchestrator 고정 DAG 전환, HITL 범위 축소, 리포트 단일 형식 반영
 > - v1.1 (2026-05-07): generate/test 파이프라인 분리 확정. generate=Layer1만, test=Layer2~3만
 > - v1.2 (2026-05-11): HITL 모듈 제거. generate를 generate_scenarios/generate_code 2단계로 추가 분리. 사용자는 두 명령 사이에서 시나리오를 자유롭게 수정·삭제 가능
 > - v1.3 (2026-05-13): §8.4 Interactive Shell Mode (REPL) 추가. `qapilot` 단독 실행 시 인터랙티브 셸 진입 (Claude Code 패턴 차용). 명령 히스토리는 휘발성 (Phase 2 에서 opt-in 영속화 검토).
+> - v1.4 (2026-05-15): §4.5 ActionMapper ↔ CodeGenerator ↔ UITestTool 공통 정책 명문화. §7.5 ErrorCode 체계에 UI Test 전용 7종 (`TOOL_UI_*`) 부록. 27종 action vocabulary 매핑 표 추가.
 
 ---
 
@@ -276,6 +277,90 @@ Orchestrator     │ 실행  │ 실행  │ —
 8) qapilot test --tag payment          → 태그 기반 필터 실행
 ```
 
+### 4.5 ActionMapper ↔ CodeGenerator ↔ UITestTool 정책 (v1.4 신규)
+
+> 본 정책은 PR #73 (ActionMapper 정규화) + PR #79 (CodeGenerator 프롬프트 + UITestTool vocabulary 확장) 으로 정착되었다. **세 컴포넌트의 책임을 계층화** 하여 fail 을 ActionMapping 생성 시점 → 코드 생성 시점 → 실행 시점 으로 점진 분산.
+
+#### 4.5.1 공통 원칙
+
+| 컴포넌트 | 책임 |
+|---|---|
+| **ActionMapper** | 가능한 한 실패하지 않고 표준화 (정규화 계층). LLM이 비표준 action을 내도 alias dict로 표준 action 변환 |
+| **CodeGenerator** | 가능한 한 코드 생성을 멈추지 않음 (관대한 코드 생성 계층). unsupported action은 `test.skip` 또는 주석으로 폴백 |
+| **UITestTool** | 실제 유효성 판정자. action 27종 모두 실행 시도 + 1-step fallback + 카테고리화된 에러 기록 |
+| **QA 사용자** | selector/action 을 직접 수정하지 않음. 시나리오 검토 (대시보드)와 결과 분석만 |
+
+#### 4.5.2 표준 action vocabulary (27종)
+
+ActionMapper / CodeGenerator / UITestTool 모두 동일 vocabulary 공유.
+
+| 그룹 | action | selector 필요? | value 의미 | expected 의미 |
+|---|---|---|---|---|
+| **page-level (9)** | `navigate` | X | URL (relative/absolute) | - |
+| | `reload` | X | - | - |
+| | `go_back` | X | - | - |
+| | `go_forward` | X | - | - |
+| | `wait` | X | timeout(ms) 숫자 또는 미지정 → networkidle | - |
+| | `wait_for_url` | X | URL pattern | - |
+| | `wait_for_load_state` | X | "load" \| "domcontentloaded" \| "networkidle" | - |
+| | `wait_for_response` | X | URL pattern | - |
+| | `assert_url` | X | - | URL pattern |
+| **DOM (10)** | `fill` | O | 입력값 | - |
+| | `clear` | O | - | - |
+| | `click` | O | - | - |
+| | `dblclick` | O | - | - |
+| | `hover` | O | - | - |
+| | `select` | O | option 값 | - |
+| | `check` | O | - | - |
+| | `uncheck` | O | - | - |
+| | `press` | O | 키 이름 (e.g. "Enter") | - |
+| | `upload` | O | 파일 경로 | - |
+| **assert (8)** | `assert` (=assert_visible 별칭) | O | - | - |
+| | `assert_visible` / `assert_hidden` | O | - | - |
+| | `assert_enabled` / `assert_disabled` | O | - | - |
+| | `assert_text` | O | - | 기대 텍스트 |
+| | `assert_value` | O | - | 기대 값 |
+| | `assert_count` | O | - | 기대 개수 (숫자, fallback=0) |
+
+#### 4.5.3 selector_type 9종 매핑
+
+| selector_type | Python Playwright (UITestTool) | JS Playwright (CodeGenerator 출력) |
+|---|---|---|
+| `role` | `page.get_by_role(s)` | `page.getByRole(s)` |
+| `label` | `page.get_by_label(s)` | `page.getByLabel(s)` |
+| `placeholder` | `page.get_by_placeholder(s)` | `page.getByPlaceholder(s)` |
+| `text` | `page.get_by_text(s)` | `page.getByText(s)` |
+| `testid` | `page.get_by_test_id(s)` | `page.getByTestId(s)` |
+| `alttext` | `page.get_by_alt_text(s)` | `page.getByAltText(s)` |
+| `title` | `page.get_by_title(s)` | `page.getByTitle(s)` |
+| `css` | `page.locator(s)` | `page.locator(s)` |
+| `xpath` | `page.locator(f"xpath={s}")` | `page.locator(s)` |
+
+#### 4.5.4 Fallback 정책 (1-step 한정)
+
+**ActionMapper 측**:
+- 비표준 action → alias dict 로 표준 변환 (예: `input` → `fill`, `verify` → `assert`)
+- selector 없는데 DOM action → `selector = expected or value or action`, `selector_type = text`, confidence 감점
+- 검증 실패는 JSON 구조 위반·필수 필드 누락만
+
+**CodeGenerator 측** (`prompts/code_generator/system.md` §일반 4):
+- unsupported action 도착 → `test.skip(true, 'unsupported action: <action>')` 또는 주석 처리
+- selector null + DOM action → `page.getByText(expected || value || action)`
+
+**UITestTool 측** (`qapilot/tools/ui_test_tool.py`):
+- `press` value 누락 → "Enter"
+- `wait_for_load_state` value 모호 → "networkidle"
+- `assert_count` expected 비숫자/None → 0
+- selector None + DOM action → `get_by_text(expected||value||action)` + `TOOL_UI_FALLBACK_USED` 경고
+
+#### 4.5.5 confidence 감점 요인 (ActionMapper)
+
+- 비표준 action 정규화 발생
+- 비표준 selector_type 정규화 발생
+- fallback selector 사용
+- css/xpath 사용 비율 높음
+- api_endpoint 매핑률 낮음
+
 ---
 
 ## 5. 기술 스택
@@ -467,6 +552,22 @@ class ToolOutput(BaseModel):
 - 모든 에러 로그에 trace_id 필수 포함
 - LLM API 실패: 최대 3회 재시도 (exponential backoff)
 - Agent 타임아웃: 기본 60초 (config 변경 가능)
+
+#### 7.5.1 UI Test Tool 전용 에러 코드 (v1.4 신규)
+
+`UIStepResult.error` 필드는 raw string 이 아닌 카테고리 prefix 를 포함한다 (`"<CODE>: <detail>"` 형식). CrossCheckAgent (PR #62) 의 UI 에러 추출 기능과 통합되어 결함 분류 시 활용.
+
+| 코드 | 발생 조건 | 예시 메시지 | 활용 (Cross-check) |
+|---|---|---|---|
+| `TOOL_UI_LOCATOR_NOT_FOUND` | DOM action 의 selector 가 화면에 없음 (Locator 30s 타임아웃) | `TOOL_UI_LOCATOR_NOT_FOUND: locator("#submit") - 30000ms timeout` | UI 요소 누락 → UI 카테고리 결함 |
+| `TOOL_UI_TIMEOUT` | 페이지 로드 / wait 타임아웃 | `TOOL_UI_TIMEOUT: page.goto exceeded 30s` | 네트워크/성능 → INFRA 카테고리 |
+| `TOOL_UI_ASSERTION_FAIL` | `expect(...)` 단언 실패 | `TOOL_UI_ASSERTION_FAIL: expected "가입 완료" got "오류 발생"` | 기대 ≠ 실제 → RULE/UI 카테고리 |
+| `TOOL_UI_NAVIGATION_FAIL` | navigate URL 접속 실패 (ECONNREFUSED 등) | `TOOL_UI_NAVIGATION_FAIL: net::ERR_CONNECTION_REFUSED` | SUT 미기동 → INFRA |
+| `TOOL_UI_UNSUPPORTED_ACTION` | (방어) ActionMapper 정규화 후에도 미지원 action | `TOOL_UI_UNSUPPORTED_ACTION: 지원하지 않는 action: 'drag'` | ActionMapper 정규화 누락 — 본 카테고리 발생 시 ActionMapper alias dict 갱신 신호 |
+| `TOOL_UI_FALLBACK_USED` | 1-step fallback 적용 (selector None + DOM action 등) | `TOOL_UI_FALLBACK_USED: get_by_text('가입 완료')` | 로그용 — fail 분류 아님 |
+| `TOOL_UI_UNKNOWN` | 분류 외 일반 예외 | `TOOL_UI_UNKNOWN: KeyError: 'foo'` | 추적 후 새 카테고리 도입 검토 |
+
+본 코드들은 `qapilot/shared/errors.py` 의 `ErrorCode` 클래스에 상수로 정의되며, `qapilot/tools/ui_test_tool.py` 가 `_run_steps` 의 except 분기에서 자동 prefix 한다.
 
 ### 7.6 가드레일
 
