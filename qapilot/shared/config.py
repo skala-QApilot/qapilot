@@ -60,6 +60,13 @@ class ServerConfig(BaseModel):
     token: str | None = None
 
 
+class AuthConfig(BaseModel):
+    jwt_secret: str | None = None
+    jwt_algorithm: str = "HS256"
+    access_token_expire_minutes: int = 60
+    refresh_token_expire_days: int = 7
+
+
 class ProjectConfig(BaseModel):
     name: str | None = None
     target_url: str | None = None
@@ -74,6 +81,7 @@ class QApilotConfig(BaseModel):
     test: TestConfig = TestConfig()
     dashboard: DashboardConfig = DashboardConfig()
     server: ServerConfig = ServerConfig()
+    auth: AuthConfig = AuthConfig()
 
 
 def load_config(config_path: Path | None = None) -> QApilotConfig:

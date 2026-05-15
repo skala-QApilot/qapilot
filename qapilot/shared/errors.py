@@ -41,6 +41,12 @@ class LLMApiError(QApilotError):
     pass
 
 
+class AuthError(QApilotError):
+    """인증/인가 에러."""
+
+    pass
+
+
 # 에러 코드 상수
 class ErrorCode:
     # Agent
@@ -49,6 +55,11 @@ class ErrorCode:
     AGENT_003 = "AGENT_003"  # 타임아웃
     AGENT_004 = "AGENT_004"  # 출력 스키마 검증 실패
     AGENT_005 = "AGENT_005"  # 재시도 소진
+
+    # Agent API
+    AGENT_API_001 = "AGENT_API_001"  # 파이프라인 실행 실패
+    AGENT_API_002 = "AGENT_API_002"  # trace 없음
+    AGENT_API_003 = "AGENT_API_003"  # 잘못된 요청
 
     # Tool
     TOOL_001 = "TOOL_001"  # Tool 일반 실행 실패
@@ -61,3 +72,53 @@ class ErrorCode:
     SYSTEM_001 = "SYSTEM_001"  # 설정 오류
     SYSTEM_002 = "SYSTEM_002"  # 예산 초과
     SYSTEM_003 = "SYSTEM_003"  # 파이프라인 중단
+
+    # Auth
+    AUTH_001 = "AUTH_001"  # 이메일/비밀번호 불일치
+    AUTH_002 = "AUTH_002"  # 액세스 토큰 만료
+    AUTH_003 = "AUTH_003"  # 토큰 무효/서명 불일치
+    AUTH_004 = "AUTH_004"  # 권한 부족
+    AUTH_005 = "AUTH_005"  # 사용자 없음
+
+    # Service
+    SERVICE_001 = "SERVICE_001"  # 서비스 없음
+    SERVICE_002 = "SERVICE_002"  # 대상 경로 없음
+    SERVICE_003 = "SERVICE_003"  # 서비스 생성 실패
+
+    # Sync
+    SYNC_001 = "SYNC_001"  # items 없음
+    SYNC_002 = "SYNC_002"  # 저장 실패
+
+    # Service scope scenarios / runs / dashboard
+    SCENARIO_001 = "SCENARIO_001"  # 시나리오 없음
+    SCENARIO_002 = "SCENARIO_002"  # 시나리오 저장 실패
+    TC_001 = "TC_001"  # TC 없음
+    RUN_001 = "RUN_001"  # 실행 없음
+    DASHBOARD_001 = "DASHBOARD_001"  # 대시보드 집계 실패
+
+    # Round 1 service APIs
+    RESULT_001 = "RESULT_001"  # 결과 없음
+    FILE_001 = "FILE_001"  # 파일 없음
+    FILE_002 = "FILE_002"  # 파일 저장 실패
+    VERSION_001 = "VERSION_001"  # 버전 없음
+    CHANGE_REQUEST_001 = "CHANGE_REQUEST_001"  # 변경 요청 없음
+    CHANGE_REQUEST_002 = "CHANGE_REQUEST_002"  # 잘못된 status 값
+    GROUP_001 = "GROUP_001"  # 그룹 없음
+    GROUP_002 = "GROUP_002"  # 스케줄 생성 실패
+
+    # Round 2 service APIs
+    RTM_001 = "RTM_001"  # RTM 버전 없음
+    RTM_002 = "RTM_002"  # 요구사항 없음
+    EVIDENCE_001 = "EVIDENCE_001"  # 증적 없음
+    REPORT_001 = "REPORT_001"  # 리포트 없음
+
+    # Round 3 service APIs
+    NOTIFICATION_001 = "NOTIFICATION_001"  # 알림 없음
+    MEMBER_001 = "MEMBER_001"  # 멤버 없음
+    MEMBER_002 = "MEMBER_002"  # 멤버 초대 실패
+    RETEST_001 = "RETEST_001"  # 재테스트 그룹 없음
+    RETEST_002 = "RETEST_002"  # failed_tc_ids 없음
+
+    # Test Variables
+    TV_001 = "TV_001"  # TV 없음
+    TV_002 = "TV_002"  # TV 저장 실패
