@@ -18,6 +18,7 @@ Created: 2026-05-07
 """
 
 import json
+import re
 import uuid as _uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -35,12 +36,14 @@ def build_pipeline() -> StateGraph:
     # ═══════════════════════════════════════════════════
     # Layer 1A — generate_scenarios
     # ═══════════════════════════════════════════════════
+    graph.add_node("doc_import", _doc_import)
     graph.add_node("codebase_scan", _codebase_scan)
     graph.add_node("domain_knowledge", _domain_knowledge)
     graph.add_node("requirement_extract", _requirement_extract)
     graph.add_node("scenario_generate", _scenario_generate)
     graph.add_node("save_scenarios", _save_scenarios)
 
+    graph.add_edge("doc_import", "codebase_scan")
     graph.add_edge("codebase_scan", "domain_knowledge")
     graph.add_edge("domain_knowledge", "requirement_extract")
     graph.add_edge("requirement_extract", "scenario_generate")
@@ -96,7 +99,7 @@ def build_pipeline() -> StateGraph:
 def _entry_point(command: str) -> str:
     """command 값에 따른 진입 노드를 반환한다."""
     entry_map = {
-        "generate_scenarios": "codebase_scan",
+        "generate_scenarios": "doc_import",
         "generate_code": "load_scenarios_for_codegen",
         "test": "load_scenarios_for_test",
     }
@@ -122,6 +125,7 @@ def _save_codebase_index_to_disk(scan: dict) -> None:
 
     endpoints: list[dict] = []
     models: list[dict] = []
+    functions: list[dict] = []
     callgraph: dict[str, list[str]] = {}
     for fi in scan.get("files", []) or []:
         file_path = fi.get("path", "")
@@ -129,6 +133,18 @@ def _save_codebase_index_to_disk(scan: dict) -> None:
             endpoints.append({"file": file_path, **ep})
         for md in fi.get("models", []) or []:
             models.append({"file": file_path, **md})
+        for fn in fi.get("functions", []) or []:
+            fn_dict = {"file": file_path, **fn}
+            line_start = fn.get("line_start", 0)
+            line_end = fn.get("line_end", line_start)
+            if file_path and line_start:
+                try:
+                    src_lines = Path(file_path).read_text(encoding="utf-8", errors="replace").splitlines()
+                    excerpt = src_lines[line_start - 1 : min(line_end, line_start + 40) - 1]
+                    fn_dict["body_excerpt"] = "\n".join(excerpt)
+                except Exception:
+                    pass
+            functions.append(fn_dict)
         callgraph[file_path] = list(fi.get("dependencies", []) or [])
 
     manifest = {
@@ -143,6 +159,7 @@ def _save_codebase_index_to_disk(scan: dict) -> None:
     for filename, payload in (
         ("endpoints.json", endpoints),
         ("models.json", models),
+        ("functions.json", functions),
         ("callgraph.json", callgraph),
         ("manifest.json", manifest),
     ):
@@ -152,6 +169,78 @@ def _save_codebase_index_to_disk(scan: dict) -> None:
 
 
 # ── Layer 1A 노드 (generate_scenarios) ────────────────────────────────────────
+
+_SUPPORTED_DOC_SUFFIXES = frozenset({".md", ".pdf", ".docx", ".xlsx", ".xls"})
+_DOMAIN_INDEX_DIR = Path(".qapilot") / "domain"
+_VERSION_RE = re.compile(r'^(.+?)_v(\d+(?:\.\d+)*)$', re.IGNORECASE)
+
+
+def _filter_latest_doc_versions(paths: list[Path]) -> list[Path]:
+    """버전 접미사(_vN 또는 _vN.M)가 있는 파일은 각 그룹에서 최신 버전만 남긴다."""
+    versioned: dict[str, list[tuple[tuple[int, ...], Path]]] = {}
+    unversioned: list[Path] = []
+    for path in paths:
+        m = _VERSION_RE.match(path.stem)
+        if m:
+            version = tuple(int(x) for x in m.group(2).split("."))
+            versioned.setdefault(m.group(1), []).append((version, path))
+        else:
+            unversioned.append(path)
+    result = list(unversioned)
+    for _, versions in versioned.items():
+        result.append(max(versions, key=lambda x: x[0])[1])
+    return result
+
+
+async def _doc_import(state: PipelineState) -> dict:
+    """docs/ 디렉토리의 문서를 Qdrant에 임포트한다.
+
+    이미 임포트된 파일(index.json 존재 + 경로 일치)은 건너뛴다.
+    Qdrant 미가동 시 예외를 삼키고 진행한다.
+    """
+    from qapilot.shared.config import load_config
+    from qapilot.shared.schemas import ToolInput
+    from qapilot.tools.domain_knowledge import DomainKnowledgeTool
+
+    trace_id = state.get("trace_id") or str(_uuid.uuid4())
+    config = load_config()
+    proj = config.project
+    repo_root = Path(proj.root or proj.repo_path or ".")
+    docs_dir = repo_root / "docs"
+
+    if not docs_dir.exists():
+        return {}
+
+    doc_files = _filter_latest_doc_versions([
+        p for p in docs_dir.rglob("*")
+        if p.is_file() and p.suffix.lower() in _SUPPORTED_DOC_SUFFIXES
+    ])
+
+    tool = DomainKnowledgeTool(trace_id=trace_id)
+    logger = tool.logger
+
+    for doc_path in sorted(doc_files):
+        index_path = _DOMAIN_INDEX_DIR / f"{doc_path.stem}.index.json"
+        if index_path.exists():
+            try:
+                saved = json.loads(index_path.read_text(encoding="utf-8"))
+                if saved.get("file") == str(doc_path):
+                    logger.info("doc_import_skip", file=str(doc_path))
+                    continue
+            except Exception:
+                pass
+
+        try:
+            await tool.run(
+                ToolInput(
+                    trace_id=trace_id,
+                    params={"action": "import", "file_path": str(doc_path)},
+                )
+            )
+        except Exception as e:
+            logger.warning("doc_import_failed", file=str(doc_path), error=str(e))
+
+    return {}
 
 
 async def _codebase_scan(state: PipelineState) -> dict:
