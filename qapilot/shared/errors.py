@@ -57,6 +57,16 @@ class ErrorCode:
     TOOL_004 = "TOOL_004"  # 네트워크 실패
     TOOL_005 = "TOOL_005"  # 파싱 실패
 
+    # UI Test Tool 전용 (FR-006) — UIStepResult.error 카테고리 prefix.
+    # CrossCheckAgent (PR #62 의 UI 에러 코드 추출) 가 step 에러를 분류할 때 사용한다.
+    TOOL_UI_LOCATOR_NOT_FOUND = "TOOL_UI_LOCATOR_NOT_FOUND"  # selector 가 화면에 없음 (locator 타임아웃)
+    TOOL_UI_TIMEOUT = "TOOL_UI_TIMEOUT"  # 페이지 로드 / wait 타임아웃
+    TOOL_UI_ASSERTION_FAIL = "TOOL_UI_ASSERTION_FAIL"  # expect(...) 실패
+    TOOL_UI_NAVIGATION_FAIL = "TOOL_UI_NAVIGATION_FAIL"  # navigate URL 접속 실패
+    TOOL_UI_UNSUPPORTED_ACTION = "TOOL_UI_UNSUPPORTED_ACTION"  # 정규화 통과 후 미지원
+    TOOL_UI_FALLBACK_USED = "TOOL_UI_FALLBACK_USED"  # 1-step fallback 적용 (모호 케이스)
+    TOOL_UI_UNKNOWN = "TOOL_UI_UNKNOWN"  # 분류 외 일반 예외
+
     # System
     SYSTEM_001 = "SYSTEM_001"  # 설정 오류
     SYSTEM_002 = "SYSTEM_002"  # 예산 초과

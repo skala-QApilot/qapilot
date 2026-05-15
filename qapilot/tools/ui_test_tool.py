@@ -10,6 +10,12 @@ APITraceTool 과 동일 page 인스턴스를 공유하므로 cross-check 시 tra
 
 설계 결정: memory/project_qapilot_ui_test_tool_design.md (옵션 D — ActionMapping 직접 실행)
 
+C/D 정책 (PR #73 ActionMapper 정규화와 정합):
+- ActionMapper 는 가능한 한 실패하지 않고 표준화한다.
+- CodeGenerator 는 가능한 한 코드 생성을 멈추지 않는다.
+- 실제 유효성은 UITestTool 실행 단계에서 판단한다.
+- 모호 케이스는 1-step fallback 적용 + error 필드에 명시.
+
 담당: D
 Created: 2026-05-15
 """
@@ -28,11 +34,23 @@ from qapilot.shared.errors import ErrorCode, ToolExecutionError
 from qapilot.shared.schemas import ActionStep, UIStepResult, UITestResult
 from qapilot.tools.base_tool import BaseTool
 
-# action 6종 → Playwright 메서드 매핑 (prompts/code_generator/system.md L7~13 정합)
-_SUPPORTED_ACTIONS = {"navigate", "fill", "click", "select", "assert", "wait"}
+# action 27종 — PR #73 ActionMapper 정규화 vocabulary 와 정합.
+# selector 가 필요한 DOM action (18종)
+_DOM_ACTIONS = {
+    "fill", "clear", "click", "dblclick", "hover", "select",
+    "check", "uncheck", "press", "upload",
+    "assert", "assert_visible", "assert_hidden", "assert_text",
+    "assert_value", "assert_enabled", "assert_disabled", "assert_count",
+}
+# selector 가 필요 없는 page-level action (9종)
+_PAGE_ACTIONS = {
+    "navigate", "reload", "go_back", "go_forward",
+    "wait", "wait_for_url", "wait_for_load_state", "wait_for_response",
+    "assert_url",
+}
+_SUPPORTED_ACTIONS = _DOM_ACTIONS | _PAGE_ACTIONS
 
-# selector_type 7종 → Page.get_by_* 매핑 (system.md L17~23)
-# 나머지 2종 (css / xpath) 은 page.locator() 사용 (_build_locator 의 fallback)
+# selector_type 7종 → Page.get_by_* 매핑. css/xpath 는 page.locator() 사용.
 _GET_BY_METHODS = {
     "role": "get_by_role",
     "label": "get_by_label",
@@ -92,7 +110,6 @@ class UITestTool(BaseTool):
                 f"action_mapping['steps'] 가 비어있습니다. (tc_id={tc_id})",
             )
 
-        # console 로그 캡처 (page 단위 — 핸들러는 누적)
         console_logs: list[str] = []
         page.on("console", lambda msg: console_logs.append(f"[{msg.type}] {msg.text}"))
 
@@ -139,11 +156,21 @@ class UITestTool(BaseTool):
             try:
                 await self._run_step(page, step, target_url)
             except PWTimeoutError as e:
-                status, error_msg, tc_status = "fail", f"timeout: {e}", "fail"
+                status = "fail"
+                tc_status = "fail"
+                code = ErrorCode.TOOL_UI_LOCATOR_NOT_FOUND if action in _DOM_ACTIONS else ErrorCode.TOOL_UI_TIMEOUT
+                error_msg = f"{code}: {e}"
             except AssertionError as e:
-                status, error_msg, tc_status = "fail", f"assertion: {e}", "fail"
+                status, tc_status = "fail", "fail"
+                error_msg = f"{ErrorCode.TOOL_UI_ASSERTION_FAIL}: {e}"
+            except ToolExecutionError as e:
+                # _run_step 가 미지원 action 또는 fallback 실패 시 raise
+                status, tc_status = "fail", "fail"
+                error_msg = f"{e.code}: {e.message}"
             except Exception as e:
-                status, error_msg, tc_status = "fail", f"{type(e).__name__}: {e}", "fail"
+                status, tc_status = "fail", "fail"
+                code = ErrorCode.TOOL_UI_NAVIGATION_FAIL if action == "navigate" else ErrorCode.TOOL_UI_UNKNOWN
+                error_msg = f"{code}: {type(e).__name__}: {e}"
 
             screenshot_path = await self._capture_screenshot(page, screenshot_dir, step_no)
             duration_ms = int((time.monotonic() - step_start) * 1000)
@@ -175,56 +202,169 @@ class UITestTool(BaseTool):
         return step_results, tc_status, total_duration_ms
 
     async def _run_step(self, page: Page, step: ActionStep, target_url: str) -> None:
-        """단일 ActionStep 을 실행한다. action 6종 분기."""
+        """단일 ActionStep 을 실행한다. 27종 action 분기 + 1-step fallback."""
         action = step.get("action", "")
-        value = step.get("value")
 
         if action not in _SUPPORTED_ACTIONS:
             raise ToolExecutionError(
-                ErrorCode.TOOL_001,
-                f"지원하지 않는 action: {action!r}. 6종: {sorted(_SUPPORTED_ACTIONS)}",
+                ErrorCode.TOOL_UI_UNSUPPORTED_ACTION,
+                f"지원하지 않는 action: {action!r}",
             )
+
+        if action in _PAGE_ACTIONS:
+            await self._run_page_action(page, action, step, target_url)
+        else:
+            await self._run_dom_action(page, action, step)
+
+    async def _run_page_action(
+        self, page: Page, action: str, step: ActionStep, target_url: str
+    ) -> None:
+        """page-level action (selector 없음)."""
+        value = step.get("value")
 
         if action == "navigate":
             url = (value or "").strip()
             if not url:
-                raise ToolExecutionError(ErrorCode.TOOL_001, "navigate 에는 value 필요")
-            full = url if url.startswith(("http://", "https://")) else f"{target_url.rstrip('/')}{url}"
+                raise ToolExecutionError(
+                    ErrorCode.TOOL_UI_NAVIGATION_FAIL, "navigate 에는 value 필요"
+                )
+            full = (
+                url if url.startswith(("http://", "https://"))
+                else f"{target_url.rstrip('/')}{url}"
+            )
             await page.goto(full)
             return
 
+        if action == "reload":
+            await page.reload()
+            return
+        if action == "go_back":
+            await page.go_back()
+            return
+        if action == "go_forward":
+            await page.go_forward()
+            return
+
         if action == "wait":
-            if value and str(value).strip().isdigit():
+            # value 가 숫자 문자열 → timeout, 아니면 networkidle (1-step fallback)
+            if value is not None and str(value).strip().isdigit():
                 await page.wait_for_timeout(int(value))
             else:
                 await page.wait_for_load_state("networkidle")
             return
+        if action == "wait_for_url":
+            await page.wait_for_url(value or "**/*")
+            return
+        if action == "wait_for_load_state":
+            # value 가 "load" | "domcontentloaded" | "networkidle" — 미지정 시 networkidle
+            state = (value or "networkidle").strip()
+            if state not in {"load", "domcontentloaded", "networkidle"}:
+                state = "networkidle"
+            await page.wait_for_load_state(state)  # type: ignore[arg-type]
+            return
+        if action == "wait_for_response":
+            await page.wait_for_response(value or "**/*")
+            return
 
-        # selector 가 필요한 action: fill / click / select / assert
+        if action == "assert_url":
+            expected = step.get("expected") or value
+            if expected is None:
+                raise ToolExecutionError(
+                    ErrorCode.TOOL_UI_ASSERTION_FAIL, "assert_url 에는 expected 필요"
+                )
+            await expect(page).to_have_url(expected)
+            return
+
+    async def _run_dom_action(
+        self, page: Page, action: str, step: ActionStep
+    ) -> None:
+        """DOM action (selector 필요). selector None → fallback locator."""
+        value = step.get("value")
+        expected = step.get("expected")
         locator = self._build_locator(page, step)
 
         if action == "fill":
             await locator.fill(value or "")
             return
+        if action == "clear":
+            await locator.clear()
+            return
         if action == "click":
             await locator.click()
+            return
+        if action == "dblclick":
+            await locator.dblclick()
+            return
+        if action == "hover":
+            await locator.hover()
             return
         if action == "select":
             await locator.select_option(value or "")
             return
-        if action == "assert":
-            expected = step.get("expected")
-            if expected is None:
-                await expect(locator).to_be_visible()
-            else:
-                await expect(locator).to_have_text(expected)
+        if action == "check":
+            await locator.check()
+            return
+        if action == "uncheck":
+            await locator.uncheck()
+            return
+        if action == "press":
+            await locator.press(value or "Enter")  # 1-step fallback: Enter
+            return
+        if action == "upload":
+            if not value:
+                raise ToolExecutionError(
+                    ErrorCode.TOOL_UI_UNKNOWN, "upload 에는 value (파일 경로) 필요"
+                )
+            await locator.set_input_files(value)
             return
 
-    @staticmethod
-    def _build_locator(page: Page, step: ActionStep) -> Locator:
-        """selector + selector_type → Locator. 9종 모두 지원, 미지원은 css 로 fallback."""
-        selector = step.get("selector", "")
-        selector_type = step.get("selector_type", "css")
+        # assert 계열 8종
+        if action == "assert" or action == "assert_visible":
+            await expect(locator).to_be_visible()
+            return
+        if action == "assert_hidden":
+            await expect(locator).to_be_hidden()
+            return
+        if action == "assert_text":
+            await expect(locator).to_have_text(expected or "")
+            return
+        if action == "assert_value":
+            await expect(locator).to_have_value(expected or "")
+            return
+        if action == "assert_enabled":
+            await expect(locator).to_be_enabled()
+            return
+        if action == "assert_disabled":
+            await expect(locator).to_be_disabled()
+            return
+        if action == "assert_count":
+            # expected 가 숫자 문자열이어야 함. 변환 실패 시 fallback=0
+            try:
+                count = int(str(expected).strip()) if expected is not None else 0
+            except (ValueError, TypeError):
+                count = 0
+            await expect(locator).to_have_count(count)
+            return
+
+    def _build_locator(self, page: Page, step: ActionStep) -> Locator:
+        """selector + selector_type → Locator.
+
+        selector None + DOM action (ActionMapper 의 fallback 통과 후 도착) →
+        expected/value 로 text fallback. 9종 type 모두 지원, 미지원은 css fallback.
+        """
+        selector = step.get("selector")
+        selector_type = step.get("selector_type") or "css"
+
+        # selector None 도착 시 1-step fallback (ActionMapper 가 fallback 못 한 경우)
+        if not selector:
+            fallback = step.get("expected") or step.get("value") or step.get("action") or ""
+            self.logger.warning(
+                "ui_fallback_locator",
+                action=step.get("action"),
+                used=fallback,
+                code=ErrorCode.TOOL_UI_FALLBACK_USED,
+            )
+            return page.get_by_text(str(fallback))
 
         if selector_type in _GET_BY_METHODS:
             method = getattr(page, _GET_BY_METHODS[selector_type])
