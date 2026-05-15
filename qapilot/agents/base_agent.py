@@ -19,7 +19,7 @@ from qapilot.shared.config import (
     load_config,
     resolve_agent_config,
 )
-from qapilot.shared.errors import AgentExecutionError, AgentTimeoutError, ErrorCode
+from qapilot.shared.errors import AgentExecutionError, ErrorCode
 from qapilot.shared.guardrails import Guardrails
 from qapilot.shared.llm_client import LLMClient
 from qapilot.shared.logger import get_logger
@@ -73,10 +73,7 @@ class BaseAgent(ABC):
         for attempt in range(self._resolved.max_retry + 1):
             retry_count = attempt
             try:
-                execute_result = await asyncio.wait_for(
-                    self._execute(input.context, input.params, last_error=last_error),
-                    timeout=self._resolved.timeout_sec,
-                )
+                execute_result = await self._execute(input.context, input.params, last_error=last_error)
 
                 if not isinstance(execute_result, ExecuteResult):
                     raise AgentExecutionError(
@@ -116,10 +113,6 @@ class BaseAgent(ABC):
                     confidence=execute_result.confidence,
                     metadata=metadata,
                 )
-
-            except asyncio.TimeoutError:
-                last_error = f"타임아웃: {self._resolved.timeout_sec}초 초과"
-                self.logger.warning("agent_timeout", attempt=attempt)
 
             except AgentExecutionError:
                 raise  # 가드레일/검증 에러는 재시도하지 않음
