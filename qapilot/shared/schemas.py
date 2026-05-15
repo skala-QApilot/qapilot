@@ -196,6 +196,7 @@ class TestScenario(TypedDict):
     trigger: str
     affected_files: list[str]
     domain_rules_used: list[str]
+    depends_on: list[str]  # 선행 실행이 필요한 TS ID 목록 (예: ["TS-001"])
     test_cases: list[TestCase]
 
 
