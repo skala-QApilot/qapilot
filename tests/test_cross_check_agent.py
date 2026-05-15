@@ -7,7 +7,6 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from qapilot.agents.cross_check_agent import CrossCheckAgent
-from qapilot.shared.schemas import AgentInput, CrossCheckMismatch
 from qapilot.shared.schemas import AgentInput, CrossCheckMismatch, ExecuteResult
 
 
@@ -17,7 +16,7 @@ def agent():
 
 
 @pytest.mark.asyncio
-async def test_route_a_error_code_detected(agent):
+async def test_route_a_api_error_code_detected(agent):
     """경로 A: API 에러 코드 있을 때 Cross-check 건너뜀."""
     input = AgentInput(
         trace_id="test-trace-001",
@@ -32,34 +31,48 @@ async def test_route_a_error_code_detected(agent):
         },
         params={"tc_id": "TC-001"}
     )
-    output = await agent.run(input)
-    print(output.result)
+
+    with patch.object(agent, "_analyze_with_llm", new=AsyncMock(return_value=([], 1.0, "none", "모든 계층 데이터가 일치함."))):
+        output = await agent.run(input)
+        print(output.result)
 
     assert output.result["route"] == "A"
     assert output.result["error_code"] == "AUTH_TOKEN_EXPIRED"
-    assert "current_state_summary" in output.result
+    assert "summary" in output.result
+
+
+@pytest.mark.asyncio
+async def test_route_a_ui_error_code_detected(agent):
+    """경로 A: UI 에러 코드 있을 때 Cross-check 건너뜀."""
+    input = AgentInput(
+        trace_id="test-trace-001",
+        context={
+            "ui_result": {
+                "status": "fail",
+                "steps": [{"step_no": 1, "action": "click", "status": "fail", "error": "UI_REQUIRED_FIELD", "screenshot_path": None, "console_logs": [], "duration_ms": 100}]
+            },
+            "api_trace": {
+                "calls": [],
+                "total_calls": 0,
+                "error_calls": 0,
+            },
+            "db_result": {"snapshots": []},
+        },
+        params={"tc_id": "TC-001"}
+    )
+
+    with patch.object(agent, "_analyze_with_llm", new=AsyncMock(return_value=([], 1.0, "none", "모든 계층 데이터가 일치함."))):
+        output = await agent.run(input)
+        print(output.result)
+    assert output.result["route"] == "A"
+    assert output.result["error_code"] == "UI_REQUIRED_FIELD"
+    assert "summary" in output.result
 
 
 @pytest.mark.asyncio
 async def test_route_b_no_error_code(agent):
     """경로 B: 에러 코드 없을 때 LLM으로 불일치 분석."""
-    mock_execute_result = ExecuteResult(
-        result={
-            "cross_check": {
-                "tc_id": "TC-001",
-                "match_score": 0.5,
-                "matched_fields": 0,
-                "mismatched_fields": 1,
-                "mismatches": [],
-                "has_mismatch": True,
-            },
-            "current_state_summary": "UI 테스트: pass",
-            "route": "B",
-        },
-        confidence=0.5,
-    )
-
-    with patch.object(agent, "_analyze_with_llm", new=AsyncMock(return_value=([], 0.5))):
+    with patch.object(agent, "_analyze_with_llm", new=AsyncMock(return_value=([], 0.5, "ui-api-mismatch", "api /api/login의 응답은 hong이(가) 왔기 때문에, 로그인 화면의 username 부분에서 홍길동이 떠야 하는데 hong이 떴음."))):
         input = AgentInput(
             trace_id="test-trace-001",
             context={
@@ -74,9 +87,8 @@ async def test_route_b_no_error_code(agent):
             params={"tc_id": "TC-001"}
         )
         output = await agent.run(input)
-
         print(output.result)
 
     assert output.result["route"] == "B"
-    assert "current_state_summary" in output.result
-
+    assert output.result["error_code"] == "ui-api-mismatch"
+    assert "summary" in output.result

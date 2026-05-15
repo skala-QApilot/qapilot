@@ -312,7 +312,6 @@ class CrossCheckMismatch(TypedDict):
     ui_value: str
     api_value: str
     db_value: str | None
-    severity: str
 
 
 class CrossCheckResult(TypedDict):
