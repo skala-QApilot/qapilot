@@ -241,12 +241,12 @@ async def test_no_screenshot_when_dir_omitted(tool):
     page.screenshot.assert_not_awaited()
 
 
-# ── assert (expect 모듈 사용) ────────────────────────────────────────────────
+# ── assert 8종 (expect 모듈 사용) ────────────────────────────────────────────
 
 
 @pytest.mark.asyncio
-async def test_assert_with_expected_calls_to_have_text(tool):
-    """assert + expected → expect(locator).to_have_text(expected)."""
+async def test_assert_text_calls_to_have_text(tool):
+    """assert_text + expected → expect(locator).to_have_text(expected)."""
     page = _mock_page()
     locator = page.locator.return_value
 
@@ -257,9 +257,289 @@ async def test_assert_with_expected_calls_to_have_text(tool):
         await tool.run(_input({
             "page": page, "tc_id": "TC-1",
             "action_mapping": {"steps": [
-                {"step_no": 1, "action": "assert", "selector": "#msg",
+                {"step_no": 1, "action": "assert_text", "selector": "#msg",
                  "selector_type": "css", "expected": "OK"},
             ]},
         }))
     exp.assert_called_once_with(locator)
     fake_assertion.to_have_text.assert_awaited_once_with("OK")
+
+
+@pytest.mark.asyncio
+async def test_assert_alias_uses_to_be_visible(tool):
+    """assert (별칭) → expect(locator).to_be_visible() — selector 단순 존재 검증."""
+    page = _mock_page()
+    locator = page.locator.return_value
+
+    fake_assertion = MagicMock()
+    fake_assertion.to_be_visible = AsyncMock()
+
+    with patch("qapilot.tools.ui_test_tool.expect", return_value=fake_assertion):
+        await tool.run(_input({
+            "page": page, "tc_id": "TC-1",
+            "action_mapping": {"steps": [
+                {"step_no": 1, "action": "assert", "selector": "#msg",
+                 "selector_type": "css", "expected": "OK"},
+            ]},
+        }))
+    fake_assertion.to_be_visible.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("action,expect_method,arg", [
+    ("assert_visible", "to_be_visible", None),
+    ("assert_hidden", "to_be_hidden", None),
+    ("assert_enabled", "to_be_enabled", None),
+    ("assert_disabled", "to_be_disabled", None),
+    ("assert_value", "to_have_value", "abc"),
+])
+async def test_assert_simple_variants(tool, action, expect_method, arg):
+    """assert_visible/hidden/enabled/disabled/value 5종."""
+    page = _mock_page()
+    fake_assertion = MagicMock()
+    setattr(fake_assertion, expect_method, AsyncMock())
+
+    step = {"step_no": 1, "action": action, "selector": "#x", "selector_type": "css"}
+    if arg is not None:
+        step["expected"] = arg
+
+    with patch("qapilot.tools.ui_test_tool.expect", return_value=fake_assertion):
+        await tool.run(_input({
+            "page": page, "tc_id": "TC-1",
+            "action_mapping": {"steps": [step]},
+        }))
+    method = getattr(fake_assertion, expect_method)
+    if arg is None:
+        method.assert_awaited_once()
+    else:
+        method.assert_awaited_once_with(arg)
+
+
+@pytest.mark.asyncio
+async def test_assert_count_converts_to_int(tool):
+    """assert_count expected 문자열 '3' → to_have_count(3)."""
+    page = _mock_page()
+    fake_assertion = MagicMock()
+    fake_assertion.to_have_count = AsyncMock()
+
+    with patch("qapilot.tools.ui_test_tool.expect", return_value=fake_assertion):
+        await tool.run(_input({
+            "page": page, "tc_id": "TC-1",
+            "action_mapping": {"steps": [
+                {"step_no": 1, "action": "assert_count", "selector": ".item",
+                 "selector_type": "css", "expected": "3"},
+            ]},
+        }))
+    fake_assertion.to_have_count.assert_awaited_once_with(3)
+
+
+@pytest.mark.asyncio
+async def test_assert_count_fallback_to_zero_on_bad_value(tool):
+    """assert_count expected 가 비숫자/None → fallback 0."""
+    page = _mock_page()
+    fake_assertion = MagicMock()
+    fake_assertion.to_have_count = AsyncMock()
+
+    with patch("qapilot.tools.ui_test_tool.expect", return_value=fake_assertion):
+        await tool.run(_input({
+            "page": page, "tc_id": "TC-1",
+            "action_mapping": {"steps": [
+                {"step_no": 1, "action": "assert_count", "selector": ".item",
+                 "selector_type": "css", "expected": "abc"},
+            ]},
+        }))
+    fake_assertion.to_have_count.assert_awaited_once_with(0)
+
+
+@pytest.mark.asyncio
+async def test_assert_url_uses_page(tool):
+    """assert_url → expect(page).to_have_url(expected) — selector 불필요."""
+    page = _mock_page()
+    fake_assertion = MagicMock()
+    fake_assertion.to_have_url = AsyncMock()
+
+    with patch("qapilot.tools.ui_test_tool.expect", return_value=fake_assertion) as exp:
+        await tool.run(_input({
+            "page": page, "tc_id": "TC-1",
+            "action_mapping": {"steps": [
+                {"step_no": 1, "action": "assert_url",
+                 "selector": None, "selector_type": None,
+                 "expected": "/dashboard"},
+            ]},
+        }))
+    exp.assert_called_once_with(page)
+    fake_assertion.to_have_url.assert_awaited_once_with("/dashboard")
+
+
+# ── 신규 page-level action ───────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_reload_go_back_forward(tool):
+    """reload / go_back / go_forward — selector null OK."""
+    page = _mock_page()
+    page.reload = AsyncMock()
+    page.go_back = AsyncMock()
+    page.go_forward = AsyncMock()
+    await tool.run(_input({
+        "page": page, "tc_id": "TC-1",
+        "action_mapping": {"steps": [
+            {"step_no": 1, "action": "reload"},
+            {"step_no": 2, "action": "go_back"},
+            {"step_no": 3, "action": "go_forward"},
+        ]},
+    }))
+    page.reload.assert_awaited_once()
+    page.go_back.assert_awaited_once()
+    page.go_forward.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_wait_for_url(tool):
+    page = _mock_page()
+    page.wait_for_url = AsyncMock()
+    await tool.run(_input({
+        "page": page, "tc_id": "TC-1",
+        "action_mapping": {"steps": [
+            {"step_no": 1, "action": "wait_for_url", "value": "**/dashboard"},
+        ]},
+    }))
+    page.wait_for_url.assert_awaited_once_with("**/dashboard")
+
+
+@pytest.mark.asyncio
+async def test_wait_for_load_state_default_networkidle(tool):
+    """value 미지정 / 잘못된 값 → fallback 'networkidle'."""
+    page = _mock_page()
+    await tool.run(_input({
+        "page": page, "tc_id": "TC-1",
+        "action_mapping": {"steps": [
+            {"step_no": 1, "action": "wait_for_load_state"},
+            {"step_no": 2, "action": "wait_for_load_state", "value": "load"},
+            {"step_no": 3, "action": "wait_for_load_state", "value": "bogus"},
+        ]},
+    }))
+    calls = [c.args[0] for c in page.wait_for_load_state.await_args_list]
+    assert calls == ["networkidle", "load", "networkidle"]
+
+
+@pytest.mark.asyncio
+async def test_wait_for_response(tool):
+    page = _mock_page()
+    page.wait_for_response = AsyncMock()
+    await tool.run(_input({
+        "page": page, "tc_id": "TC-1",
+        "action_mapping": {"steps": [
+            {"step_no": 1, "action": "wait_for_response", "value": "**/api/login"},
+        ]},
+    }))
+    page.wait_for_response.assert_awaited_once_with("**/api/login")
+
+
+# ── 신규 DOM action ─────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_dom_extended_actions(tool):
+    """clear/dblclick/hover/check/uncheck/press/upload — locator 메서드 호출 검증."""
+    page = _mock_page()
+    locator = page.locator.return_value
+    locator.clear = AsyncMock()
+    locator.dblclick = AsyncMock()
+    locator.hover = AsyncMock()
+    locator.check = AsyncMock()
+    locator.uncheck = AsyncMock()
+    locator.press = AsyncMock()
+    locator.set_input_files = AsyncMock()
+
+    await tool.run(_input({
+        "page": page, "tc_id": "TC-1",
+        "action_mapping": {"steps": [
+            {"step_no": 1, "action": "clear", "selector": "#x", "selector_type": "css"},
+            {"step_no": 2, "action": "dblclick", "selector": "#x", "selector_type": "css"},
+            {"step_no": 3, "action": "hover", "selector": "#x", "selector_type": "css"},
+            {"step_no": 4, "action": "check", "selector": "#x", "selector_type": "css"},
+            {"step_no": 5, "action": "uncheck", "selector": "#x", "selector_type": "css"},
+            {"step_no": 6, "action": "press", "selector": "#x",
+             "selector_type": "css", "value": "Enter"},
+            {"step_no": 7, "action": "upload", "selector": "#x",
+             "selector_type": "css", "value": "/tmp/a.png"},
+        ]},
+    }))
+    locator.clear.assert_awaited_once()
+    locator.dblclick.assert_awaited_once()
+    locator.hover.assert_awaited_once()
+    locator.check.assert_awaited_once()
+    locator.uncheck.assert_awaited_once()
+    locator.press.assert_awaited_once_with("Enter")
+    locator.set_input_files.assert_awaited_once_with("/tmp/a.png")
+
+
+@pytest.mark.asyncio
+async def test_press_fallback_to_enter(tool):
+    """press value 누락 → 1-step fallback 'Enter'."""
+    page = _mock_page()
+    locator = page.locator.return_value
+    locator.press = AsyncMock()
+    await tool.run(_input({
+        "page": page, "tc_id": "TC-1",
+        "action_mapping": {"steps": [
+            {"step_no": 1, "action": "press", "selector": "#x", "selector_type": "css"},
+        ]},
+    }))
+    locator.press.assert_awaited_once_with("Enter")
+
+
+# ── selector None fallback (DOM action) ─────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_selector_none_dom_action_falls_back_to_text(tool):
+    """selector None + DOM action → expected/value/action 으로 text fallback."""
+    page = _mock_page()
+    await tool.run(_input({
+        "page": page, "tc_id": "TC-1",
+        "action_mapping": {"steps": [
+            {"step_no": 1, "action": "click",
+             "selector": None, "selector_type": None,
+             "expected": "가입 완료"},
+        ]},
+    }))
+    # _build_locator 가 page.get_by_text("가입 완료") 호출했어야
+    page.get_by_text.assert_called_once_with("가입 완료")
+
+
+# ── 에러 카테고리 prefix ─────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_error_code_prefix_for_unsupported(tool):
+    """unsupported action → error 가 TOOL_UI_UNSUPPORTED_ACTION prefix."""
+    page = _mock_page()
+    out = await tool.run(_input({
+        "page": page, "tc_id": "TC-1",
+        "action_mapping": {"steps": [
+            {"step_no": 1, "action": "teleport"},
+        ]},
+    }))
+    err = out.result["ui_result"]["steps"][0]["error"]
+    assert err is not None and err.startswith("TOOL_UI_UNSUPPORTED_ACTION")
+
+
+@pytest.mark.asyncio
+async def test_error_code_prefix_for_assertion_fail(tool):
+    """AssertionError → error 가 TOOL_UI_ASSERTION_FAIL prefix."""
+    page = _mock_page()
+    fake_assertion = MagicMock()
+    fake_assertion.to_be_visible = AsyncMock(side_effect=AssertionError("not visible"))
+
+    with patch("qapilot.tools.ui_test_tool.expect", return_value=fake_assertion):
+        out = await tool.run(_input({
+            "page": page, "tc_id": "TC-1",
+            "action_mapping": {"steps": [
+                {"step_no": 1, "action": "assert_visible",
+                 "selector": "#x", "selector_type": "css"},
+            ]},
+        }))
+    err = out.result["ui_result"]["steps"][0]["error"]
+    assert err is not None and err.startswith("TOOL_UI_ASSERTION_FAIL")
