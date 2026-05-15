@@ -60,9 +60,6 @@ dependencies = [
     "Pillow>=10.0",
 ]
 
-[tool.setuptools.packages.find]
-include = ["qapilot*"]
-
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0",
