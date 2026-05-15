@@ -19,12 +19,12 @@ logger = get_logger(__name__)
 class ApiClient:
     """중앙 서버와 통신하는 클라이언트."""
 
-    def __init__(self):
+    def __init__(self, base_url: str | None = None, token: str | None = None):
         config = load_config()
-        # 환경변수 우선, 없으면 config.yaml 참조
-        self.base_url = os.getenv("SERVER_URL") or config.server.url
-        self.token = os.getenv("SERVER_TOKEN") or config.server.token
-        
+        # 환경변수 우선, 그다음 명시적 인자, 마지막으로 config.yaml 참조
+        self.base_url = os.getenv("SERVER_URL") or base_url or config.server.url
+        self.token = os.getenv("SERVER_TOKEN") or token or config.server.token
+
         if not self.base_url:
             logger.warning("SERVER_URL이 설정되지 않았습니다. 서버 동기화가 불가능합니다.")
 
@@ -97,6 +97,24 @@ class ApiClient:
             except Exception as e:
                 logger.error(f"생성 코드 업로드 실패({tc_id}): {e}")
                 return False
+
+    async def register_project(self, payload: Dict[str, Any]) -> Dict[str, Any] | None:
+        """프로젝트 메타데이터를 서버에 등록한다."""
+        if not self.base_url:
+            return None
+
+        async with httpx.AsyncClient() as client:
+            try:
+                response = await client.post(
+                    f"{self.base_url}/api/projects/register",
+                    json=payload,
+                    headers=self._get_headers(),
+                )
+                response.raise_for_status()
+                return response.json()
+            except Exception as e:
+                logger.error(f"프로젝트 등록 실패: {e}")
+                return None
 
     async def check_health(self) -> bool:
         """서버 연결 상태를 확인한다."""
