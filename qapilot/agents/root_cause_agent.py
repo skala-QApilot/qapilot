@@ -19,11 +19,12 @@ from pathlib import Path
 from typing import Any
 
 from qapilot.agents.base_agent import BaseAgent
+from qapilot.shared.codebase_context_loader import CodebaseContextLoader
 from qapilot.shared.errors import AgentExecutionError, ErrorCode
 from qapilot.shared.prompt_loader import PromptLoader
 from qapilot.shared.schemas import Evidence, ExecuteResult, RootCauseCandidate, RootCauseResult
 
-# tc_id 기준 더미 컨텍스트 파일 위치 (실제 DB 조회 전까지 사용)
+# runtime_context 더미 파일 위치 (tc_id 기반, 테스트/개발용)
 _DUMMY_CONTEXT_DIR = Path(__file__).parent.parent.parent / "tests" / "fixtures" / "contexts"
 
 # Judge 프롬프트 파일 경로 (없으면 인라인 상수로 fallback)
@@ -90,10 +91,9 @@ class RootCauseAgent(BaseAgent):
         """CrossCheckResult 기반으로 원인 후보 Top-N을 추론한다.
 
         Args:
-            context: 파이프라인 컨텍스트. code_context, runtime_context를 읽는다.
+            context: 파이프라인 컨텍스트.
             params: 실행 파라미터.
-                tc_id, error_code, summary, mismatches, has_mismatch,
-                code_context, runtime_context
+                tc_id, error_code, summary, mismatches, has_mismatch, runtime_context
             last_error: 이전 시도 에러. 자가 수정 힌트에 사용.
 
         Returns:
@@ -107,22 +107,21 @@ class RootCauseAgent(BaseAgent):
         mismatches: list = params.get("mismatches") or context.get("mismatches") or []
         has_mismatch: bool = params.get("has_mismatch", context.get("has_mismatch", False))
 
-        code_context_raw = params.get("code_context") or context.get("code_context", "")
-        runtime_context_raw = params.get("runtime_context") or context.get("runtime_context", "")
+        # runtime_context: tc_id 기반 더미 파일 (파이프라인 완성 전까지)
+        runtime_context_raw = self._load_dummy_context(tc_id, "runtime_context") if tc_id else ""
 
-        # params/context에 없으면 tc_id 기준 더미 파일에서 로드
-        if not code_context_raw and tc_id:
-            code_context_raw = self._load_dummy_context(tc_id, "code_context")
-        if not runtime_context_raw and tc_id:
-            runtime_context_raw = self._load_dummy_context(tc_id, "runtime_context")
+        runtime_str = self._stringify(runtime_context_raw)
 
-        # 컨텍스트 가용성 확인 및 경고 로그
-        code_missing = tc_id and not code_context_raw
+        # LLM으로 단서 추출 (실패 시 정규식 fallback)
+        clues = await self._extract_clues_with_llm(
+            error_code, summary, mismatches, runtime_str,
+        )
+
+        # codebase-index에서 항상 관련 항목 선별 (코드 컨텍스트의 유일한 소스)
+        code_context_raw = self._load_from_codebase_index(clues, error_code)
+
+        # runtime_context 가용성 경고 (tc_id가 지정됐는데 없을 때)
         runtime_missing = tc_id and not runtime_context_raw
-        if code_missing:
-            self.logger.warning(
-                "context_not_found", tc_id=tc_id, trace_id=self.trace_id, missing="code_context"
-            )
         if runtime_missing:
             self.logger.warning(
                 "context_not_found", tc_id=tc_id, trace_id=self.trace_id, missing="runtime_context"
@@ -135,14 +134,7 @@ class RootCauseAgent(BaseAgent):
                 for m in mismatches
             )
 
-        # 관련 코드 컨텍스트만 추려서 프롬프트 크기 최적화
-        code_context_filtered = self._select_relevant_code_context(
-            self._stringify(code_context_raw), error_code, summary, mismatches,
-        )
-
-        context_text = self._format_context(
-            code_context_filtered, self._stringify(runtime_context_raw),
-        )
+        context_text = self._format_context(code_context_raw, runtime_str)
         input_data = {
             "tc_id": tc_id,
             "error_code": error_code,
@@ -179,8 +171,8 @@ class RootCauseAgent(BaseAgent):
                 candidate, error_code, summary, mismatches
             )
 
-        # 양쪽 context 모두 없을 때: confidence 0.0 강제 + note evidence 추가
-        if code_missing and runtime_missing:
+        # 코드 컨텍스트(index)도 없고 runtime도 없을 때: confidence 0.0 강제
+        if not code_context_raw and runtime_missing:
             note: Evidence = {"type": "runtime_data", "content": "error_code와 summary만으로 추론"}
             for candidate in candidates:
                 candidate["confidence"] = 0.0
@@ -370,52 +362,394 @@ class RootCauseAgent(BaseAgent):
 
         return [{"rank": 1, "cause": cause, "confidence": 0.1, "evidences": evidences}]
 
-    # ── 컨텍스트 처리 유틸 ─────────────────────────────────────────────────────
+    # ── codebase-index 연동 ────────────────────────────────────────────────────
+
+    def _load_from_codebase_index(self, clues: dict[str, Any], error_code: str = "") -> str:
+        """codebase-index 메타데이터를 로드하고 관련 항목을 선별하여 반환한다.
+
+        인덱스가 없거나 모든 파일이 비어 있으면 warning을 남기고 빈 문자열을 반환한다.
+        """
+        repo_path = self._config.project.repo_path
+        base_dir = Path(repo_path) if repo_path else Path(".")
+
+        index = CodebaseContextLoader.load(base_dir=base_dir)
+
+        if not index["_dir_found"]:
+            self.logger.warning("codebase_index_not_found", base_dir=str(base_dir))
+            return ""
+
+        all_empty = (
+            not index["endpoints"]
+            and not index["models"]
+            and not index["callgraph"]
+            and not index["manifest"]
+        )
+        if all_empty:
+            self.logger.warning("codebase_index_empty", base_dir=str(base_dir))
+            return ""
+
+        ctx = self._select_from_index(index, clues)
+
+        parsed = json.loads(ctx)
+        has_specific = parsed.get("endpoints") or parsed.get("models") or parsed.get("callgraph")
+        if not has_specific:
+            self.logger.warning("codebase_index_no_relevant_match", error_code=error_code)
+
+        return ctx
+
+    def _select_from_index(self, index: dict[str, Any], clues: dict[str, Any]) -> str:
+        """codebase-index에서 에러와 관련된 항목만 선별하여 JSON 문자열로 반환한다.
+
+        선별 흐름:
+          Phase 1 — 단서(clues) 수신 : LLM 또는 정규식으로 이미 추출된 단서
+          Phase 2 — 점수화 선택      : endpoint·model별 점수화 후 Top-N
+          Phase 3 — 칼그래프 확장    : 선별 파일 기반 1-hop 의존 관계 포함
+          Phase 4 — 컨텍스트 구성
+        """
+        self.logger.info(
+            "codebase_index_selection_start",
+            from_llm=clues.get("from_llm", False),
+            mismatch_fields=sorted(clues["mismatch_fields"]),
+            tokens=sorted(clues["tokens"]),
+            url_segments=sorted(clues["url_segments"]),
+            file_stems=sorted(clues["file_stems"]),
+            llm_endpoints=sorted(clues.get("endpoints", set())),
+            llm_functions=sorted(clues.get("functions", set())),
+            llm_files=sorted(clues.get("files", set())),
+            llm_models=sorted(clues.get("models", set())),
+        )
+
+        # ── Phase 2·3: endpoint 점수화 ────────────────────────────────────────
+        scored_eps: list[tuple[int, dict]] = []
+        for ep in index.get("endpoints", []):
+            score = self._score_endpoint(ep, clues)
+            if score > 0:
+                scored_eps.append((score, ep))
+        scored_eps.sort(key=lambda x: -x[0])
+        selected_endpoints = [ep for _, ep in scored_eps[:10]]
+
+        selected_files: set[str] = {ep["file"] for ep in selected_endpoints if ep.get("file")}
+
+        for score, ep in scored_eps[:10]:
+            self.logger.debug(
+                "codebase_index_selection_detail",
+                source="endpoints.json",
+                item=f"{ep.get('method','')} {ep.get('path','')} ({ep.get('handler','')})".strip(),
+                score=score,
+            )
+
+        # ── Phase 2·3: model 점수화 ───────────────────────────────────────────
+        scored_models: list[tuple[int, dict]] = []
+        for model in index.get("models", []):
+            score = self._score_model(model, clues)
+            if score > 0:
+                scored_models.append((score, model))
+        scored_models.sort(key=lambda x: -x[0])
+        selected_models = [m for _, m in scored_models[:10]]
+
+        selected_files.update(m["file"] for m in selected_models if m.get("file"))
+
+        for score, model in scored_models[:10]:
+            self.logger.debug(
+                "codebase_index_selection_detail",
+                source="models.json",
+                item=model.get("name", ""),
+                score=score,
+            )
+
+        # ── Phase 4: callgraph 1-hop 확장 ─────────────────────────────────────
+        # 선별된 파일의 callgraph 항목 포함 → 의존 모듈 이름을 추가 후보 파일로 확장
+        callgraph = index.get("callgraph", {})
+        selected_callgraph: dict[str, Any] = {}
+        expanded_stems: set[str] = set()
+
+        for fp, deps in callgraph.items():
+            if any(sf in fp or fp in sf for sf in selected_files):
+                selected_callgraph[fp] = deps
+                # import 구문에서 모듈명 추출 → 1-hop 확장 후보
+                for dep in deps:
+                    for mod in re.findall(r"[\w]+", dep.split("import")[-1]):
+                        if len(mod) >= 3 and mod.islower():
+                            expanded_stems.add(mod)
+
+        # 1-hop: 아직 포함되지 않은 파일 중 확장 후보와 이름이 겹치는 항목 추가
+        if expanded_stems:
+            for fp, deps in callgraph.items():
+                if fp in selected_callgraph:
+                    continue
+                stem = Path(fp).stem.lower()
+                if any(s in stem or stem in s for s in expanded_stems):
+                    selected_callgraph[fp] = deps
+
+        # ── Phase 5: manifest 요약 필드만 포함 ───────────────────────────────
+        manifest = index.get("manifest", {})
+        manifest_summary = {
+            k: manifest[k]
+            for k in ("framework", "language", "file_count", "endpoint_count")
+            if k in manifest
+        }
+
+        self.logger.info(
+            "codebase_index_selection_result",
+            endpoints_selected=len(selected_endpoints),
+            models_selected=len(selected_models),
+            callgraph_files_selected=len(selected_callgraph),
+            manifest_fields=list(manifest_summary.keys()),
+        )
+
+        selected: dict[str, Any] = {
+            "source": "codebase-index",
+            "manifest": manifest_summary,
+            "endpoints": selected_endpoints,
+            "models": selected_models,
+            "callgraph": selected_callgraph,
+        }
+        total_items = len(selected_endpoints) + len(selected_models) + len(selected_callgraph)
+        self.logger.info(
+            "codebase_index_context_built",
+            total_items=total_items,
+            context_bytes=len(json.dumps(selected, ensure_ascii=False)),
+        )
+        return json.dumps(selected, ensure_ascii=False, indent=2)
+
+    # ── 단서 추출 / 점수화 헬퍼 ────────────────────────────────────────────────
 
     @staticmethod
-    def _select_relevant_code_context(
-        code_context_str: str,
+    def _extract_clues(
         error_code: str,
         summary: str,
-        mismatches: list[dict],
-    ) -> str:
-        """error_code, summary, mismatches 키워드 기준으로 관련 코드 컨텍스트를 추린다.
+        mismatches: list,
+        runtime_context: str,
+    ) -> dict[str, Any]:
+        """에러 관련 단서를 다각도로 추출한다.
 
-        JSON 구조(files 배열)이면 파일별 스코어링 후 관련 파일만 반환.
-        평문이면 줄 단위 필터링.
-        키워드가 없거나 매칭 결과가 없으면 전체를 그대로 반환한다(안전 fallback).
+        Returns:
+            tokens         — 기본 토큰 (2자 이상 단어)
+            url_segments   — request.path에서 추출한 경로 세그먼트
+            file_stems     — stack trace 등에서 추출한 파일 줄기 이름
+            mismatch_fields — mismatches[].field 값 (정확 매칭용)
         """
-        if not code_context_str:
-            return code_context_str
-
         tokens: set[str] = set()
-        for text in [error_code, summary]:
-            if text:
-                tokens.update(t for t in re.split(r"[\s_/.:,\-]+", text.lower()) if t)
-        for m in mismatches:
-            field = m.get("field", "")
-            if field:
-                tokens.update(t for t in re.split(r"[\s_/.:,\-]+", field.lower()) if t)
+        url_segments: set[str] = set()
+        file_stems: set[str] = set()
+        mismatch_fields: set[str] = set()
 
-        if not tokens:
-            return code_context_str
+        # error_code + summary + mismatch 값에서 기본 토큰 추출
+        all_text = " ".join(filter(None, [error_code, summary]))
+        for m in mismatches:
+            for k in ("field", "ui_value", "api_value", "db_value"):
+                val = m.get(k) or ""
+                if val:
+                    all_text += " " + str(val)
+            if m.get("field"):
+                mismatch_fields.add(m["field"].lower())
+
+        for t in re.split(r"[^a-zA-Z0-9가-힣]+", all_text.lower()):
+            if len(t) >= 2:
+                tokens.add(t)
+
+        # runtime_context에서 추가 단서 추출
+        if runtime_context:
+            try:
+                rt = json.loads(runtime_context)
+
+                # 1) request.path → URL 세그먼트 ("api", "v1" 등 일반 접두사 제외)
+                req_path = (rt.get("request") or {}).get("path", "") or \
+                           (rt.get("request") or {}).get("url", "")
+                if req_path:
+                    for seg in req_path.split("/"):
+                        seg = re.sub(r"\{.*?\}", "", seg).strip()  # {param} 제거
+                        if seg and seg not in ("api", "v1", "v2", "v3"):
+                            url_segments.add(seg.lower())
+                            for t in re.split(r"[^a-zA-Z0-9]+", seg.lower()):
+                                if len(t) >= 2:
+                                    tokens.add(t)
+
+                # 2) error.type / error.message → 추가 토큰
+                err = rt.get("error") or rt.get("exception") or {}
+                if isinstance(err, dict):
+                    for v in (err.get("type", ""), err.get("message", ""), err.get("detail", "")):
+                        for t in re.split(r"[^a-zA-Z0-9가-힣]+", str(v).lower()):
+                            if len(t) >= 2:
+                                tokens.add(t)
+
+                # 3) 전체 JSON 텍스트에서 .py 파일 참조 추출 (stack trace 등)
+                rt_text = json.dumps(rt, ensure_ascii=False)
+                for ref in re.findall(r"[\w/\\]+\.py", rt_text):
+                    stem = Path(ref).stem.lower()
+                    if len(stem) >= 3:
+                        file_stems.add(stem)
+
+            except (json.JSONDecodeError, AttributeError, TypeError):
+                # plain text runtime_context — .py 참조만 추출
+                for ref in re.findall(r"[\w/\\]+\.py", runtime_context):
+                    stem = Path(ref).stem.lower()
+                    if len(stem) >= 3:
+                        file_stems.add(stem)
+
+        return {
+            "tokens": tokens,
+            "url_segments": url_segments,
+            "file_stems": file_stems,
+            "mismatch_fields": mismatch_fields,
+            # LLM 추출 필드 — 기본값 빈 set (LLM 성공 시 채워짐)
+            "endpoints": set(),
+            "functions": set(),
+            "files": set(),
+            "models": set(),
+            "keywords": set(),
+            "from_llm": False,
+        }
+
+    async def _extract_clues_with_llm(
+        self,
+        error_code: str,
+        summary: str,
+        mismatches: list,
+        runtime_context: str,
+    ) -> dict[str, Any]:
+        """LLM으로 에러 관련 코드 단서를 추출한다. 실패 시 정규식 fallback.
+
+        LLM 추출 결과(endpoints, files, functions, models, keywords)를
+        정규식 결과와 병합해 반환한다.
+        """
+        regex_clues = self._extract_clues(error_code, summary, mismatches, runtime_context)
+
+        mismatch_text = (
+            ", ".join(f"{m.get('field')}({m.get('ui_value')}→{m.get('api_value')})"
+                      for m in mismatches)
+            if mismatches else "없음"
+        )
+        runtime_snippet = runtime_context[:600] if runtime_context else "없음"
+
+        prompt = (
+            "에러 정보를 분석해 관련 코드 요소를 추출해라.\n\n"
+            f"error_code: {error_code or '없음'}\n"
+            f"summary: {summary or '없음'}\n"
+            f"mismatches: {mismatch_text}\n"
+            f"runtime: {runtime_snippet}\n\n"
+            "아래 JSON 형식으로만 반환해라:\n"
+            '{\n'
+            '  "endpoints": ["관련 API 경로 세그먼트. 예: orders, payment"],\n'
+            '  "files": ["관련 파일명(확장자 제외). 예: orders, payment_service"],\n'
+            '  "functions": ["관련 함수/핸들러명. 예: create_order"],\n'
+            '  "models": ["관련 모델/클래스명. 예: OrderOut"],\n'
+            '  "keywords": ["기타 검색 키워드"]\n'
+            '}'
+        )
 
         try:
-            data = json.loads(code_context_str)
-        except (json.JSONDecodeError, TypeError):
-            lines = code_context_str.splitlines()
-            relevant = [ln for ln in lines if any(t in ln.lower() for t in tokens)]
-            return "\n".join(relevant) if relevant else code_context_str
+            response = await self.llm.chat(
+                system_prompt="코드 단서 추출 전문가야. JSON만 반환해라.",
+                user_prompt=prompt,
+            )
+            cleaned = re.sub(r"```(?:json)?\s*|\s*```", "", response.content).strip()
+            data = json.loads(cleaned)
 
-        if isinstance(data, dict) and "files" in data:
-            relevant = [
-                f for f in data["files"]
-                if any(t in json.dumps(f, ensure_ascii=False).lower() for t in tokens)
-            ]
-            if relevant:
-                return json.dumps({**data, "files": relevant}, ensure_ascii=False, indent=2)
+            llm_clues = {
+                "endpoints": set(str(e).lower().strip("/") for e in data.get("endpoints", [])),
+                "functions": set(str(f).lower() for f in data.get("functions", [])),
+                "files":     set(str(f).lower() for f in data.get("files", [])),
+                "models":    set(str(m) for m in data.get("models", [])),
+                "keywords":  set(str(k).lower() for k in data.get("keywords", [])),
+                "from_llm":  True,
+            }
+            # url_segments, file_stems, tokens에 LLM 결과도 병합
+            regex_clues["url_segments"] |= llm_clues["endpoints"]
+            regex_clues["file_stems"]   |= llm_clues["files"]
+            regex_clues["tokens"]       |= llm_clues["keywords"]
 
-        return code_context_str
+            self.logger.info(
+                "codebase_index_llm_clues_extracted",
+                endpoints=sorted(llm_clues["endpoints"]),
+                files=sorted(llm_clues["files"]),
+                functions=sorted(llm_clues["functions"]),
+                models=sorted(llm_clues["models"]),
+            )
+            return {**regex_clues, **llm_clues}
+
+        except Exception as e:
+            self.logger.warning(
+                "codebase_index_llm_clues_failed",
+                error=str(e),
+                fallback="regex",
+            )
+            return regex_clues
+
+    @staticmethod
+    def _score_endpoint(ep: dict, clues: dict[str, Any]) -> int:
+        """endpoint 하나의 관련성 점수를 계산한다.
+
+        LLM 추출 단서 (높은 신뢰도):
+          +8  LLM이 추출한 endpoint 세그먼트가 path에 포함
+          +6  LLM이 추출한 함수명이 handler에 포함
+          +4  LLM이 추출한 파일명이 file_stem에 포함
+
+        정규식 단서 (fallback):
+          +5  URL 세그먼트가 path에 포함
+          +4  stack trace 파일명이 file_stem과 일치
+          +3  토큰이 path에 포함
+          +2  토큰이 handler에 포함
+          +1  토큰이 파일명에 포함
+        """
+        path      = ep.get("path", "").lower()
+        handler   = ep.get("handler", "").lower()
+        file_stem = Path(ep.get("file") or "x.py").stem.lower()
+
+        score = 0
+        for ep_seg in clues.get("endpoints", set()):
+            if ep_seg in path:  score += 8
+        for fn in clues.get("functions", set()):
+            if fn in handler:   score += 6
+        for f in clues.get("files", set()):
+            if f in file_stem or file_stem in f: score += 4
+
+        for t in clues["tokens"]:
+            if t in path:      score += 3
+            if t in handler:   score += 2
+            if t in file_stem: score += 1
+        for seg in clues["url_segments"]:
+            if seg in path:    score += 5
+        for fs in clues["file_stems"]:
+            if fs in file_stem or file_stem in fs: score += 4
+        return score
+
+    @staticmethod
+    def _score_model(model: dict, clues: dict[str, Any]) -> int:
+        """model 하나의 관련성 점수를 계산한다.
+
+        LLM 추출 단서 (높은 신뢰도):
+          +8  LLM이 추출한 모델명이 name에 포함
+          +4  LLM이 추출한 파일명이 file_stem에 포함
+
+        정규식 단서 (fallback):
+          +5  mismatch field명이 fields에 포함
+          +4  stack trace 파일명이 file_stem과 일치
+          +3  토큰이 model name에 포함
+          +2  토큰이 field명에 포함
+          +1  토큰이 파일명에 포함
+        """
+        name       = model.get("name", "").lower()
+        fields_str = " ".join(model.get("fields") or []).lower()
+        file_stem  = Path(model.get("file") or "x.py").stem.lower()
+
+        score = 0
+        for m in clues.get("models", set()):
+            if m.lower() in name or name in m.lower(): score += 8
+        for f in clues.get("files", set()):
+            if f in file_stem or file_stem in f:       score += 4
+
+        for t in clues["tokens"]:
+            if t in name:        score += 3
+            if t in fields_str:  score += 2
+            if t in file_stem:   score += 1
+        for mf in clues["mismatch_fields"]:
+            if mf in fields_str: score += 5
+        for fs in clues["file_stems"]:
+            if fs in file_stem or file_stem in fs:     score += 4
+        return score
+
+    # ── 컨텍스트 처리 유틸 ─────────────────────────────────────────────────────
 
     @staticmethod
     def _load_dummy_context(tc_id: str, key: str) -> str:
