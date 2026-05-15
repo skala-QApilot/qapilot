@@ -12,11 +12,13 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 
 from qapilot.agents.root_cause_agent import RootCauseAgent
-from qapilot.shared.config import QApilotConfig
+from qapilot.shared.codebase_context_loader import CodebaseContextLoader
+from qapilot.shared.config import ProjectConfig, QApilotConfig
 from qapilot.shared.errors import AgentExecutionError
 from qapilot.shared.llm_client import LLMResponse
 from qapilot.shared.schemas import ExecuteResult
@@ -44,13 +46,23 @@ def _make_agent() -> RootCauseAgent:
     return RootCauseAgent(config=QApilotConfig())
 
 
+_CLUE_EMPTY = json.dumps(
+    {"endpoints": [], "files": [], "functions": [], "models": [], "keywords": []}
+)
+
 def _mock_chat(*responses: str):
-    """호출 순서대로 다른 LLMResponse를 반환하는 async callable."""
+    """호출 순서대로 다른 LLMResponse를 반환하는 async callable.
+
+    단서 추출 호출(system_prompt에 '단서 추출' 포함)은 큐를 소비하지 않고
+    빈 단서 JSON을 반환해 기존 테스트 순서를 유지한다.
+    """
     queue = [_llm_resp(r) for r in responses]
     call_count = 0
 
     async def _chat(system_prompt: str, user_prompt: str, **kwargs) -> LLMResponse:
         nonlocal call_count
+        if "단서 추출" in system_prompt:          # _extract_clues_with_llm 호출
+            return _llm_resp(_CLUE_EMPTY)
         resp = queue[call_count] if call_count < len(queue) else queue[-1]
         call_count += 1
         return resp
@@ -78,21 +90,12 @@ def llm_response_content() -> str:
     return (FIXTURES_DIR / "llm_response.json").read_text(encoding="utf-8")
 
 
-@pytest.fixture
-def code_context() -> dict:
-    return json.loads((FIXTURES_DIR / "code_context.json").read_text(encoding="utf-8"))
-
-
-@pytest.fixture
-def runtime_context() -> dict:
-    return json.loads((FIXTURES_DIR / "runtime_context.json").read_text(encoding="utf-8"))
-
 
 # ─── 반환 구조 검증 ────────────────────────────────────────────────────────────
 
 
 async def test_result_has_root_cause_result_structure(
-    cross_check_input, llm_response_content, code_context, runtime_context
+    cross_check_input, llm_response_content
 ):
     """결과는 RootCauseResult 구조(tc_id + candidates)를 가져야 한다."""
     agent = _make_agent()
@@ -100,11 +103,7 @@ async def test_result_has_root_cause_result_structure(
 
     result = await agent._execute(
         context={},
-        params={
-            **cross_check_input,
-            "code_context": json.dumps(code_context, ensure_ascii=False),
-            "runtime_context": json.dumps(runtime_context, ensure_ascii=False),
-        },
+        params={**cross_check_input},
     )
 
     assert isinstance(result, ExecuteResult)
@@ -124,19 +123,15 @@ async def test_result_has_root_cause_result_structure(
 
 
 async def test_result_has_no_warning_field_when_contexts_provided(
-    cross_check_input, llm_response_content, code_context, runtime_context
+    cross_check_input, llm_response_content
 ):
-    """컨텍스트가 모두 주어지면 result에 warnings 필드가 없다."""
+    """결과에 warnings 필드가 없다."""
     agent = _make_agent()
     agent.llm.chat = _mock_chat(llm_response_content, _JUDGE_OK)
 
     result = await agent._execute(
         context={},
-        params={
-            **cross_check_input,
-            "code_context": json.dumps(code_context, ensure_ascii=False),
-            "runtime_context": json.dumps(runtime_context, ensure_ascii=False),
-        },
+        params={**cross_check_input},
     )
 
     assert "warnings" not in result.result
@@ -561,92 +556,549 @@ async def test_no_confidence_override_when_tc_id_empty():
     assert candidates[0]["confidence"] > 0.0
 
 
-# ─── 관련 코드 컨텍스트 필터링 ────────────────────────────────────────────────
+
+# ─── CodebaseContextLoader 테스트 ──────────────────────────────────────────────
 
 
-def test_select_relevant_code_context_filters_by_keyword():
-    """error_code 키워드와 일치하는 파일만 반환한다."""
-    code_ctx = json.dumps({
-        "files": [
-            {"path": "app/payment_service.py", "note": "payment processing"},
-            {"path": "app/user_service.py", "note": "user management"},
-        ]
+def _make_index_dir(tmp_path: Path) -> Path:
+    """tmp_path 아래 .qapilot/codebase-index/ 를 생성하고 반환한다."""
+    d = tmp_path / ".qapilot" / "codebase-index"
+    d.mkdir(parents=True)
+    return d
+
+
+def test_loader_loads_all_four_files(tmp_path):
+    """모든 4개 JSON 파일을 올바르게 로드한다."""
+    d = _make_index_dir(tmp_path)
+    (d / "endpoints.json").write_text('[{"path": "/test", "method": "GET"}]')
+    (d / "models.json").write_text('[{"name": "TestModel", "fields": ["id"]}]')
+    (d / "callgraph.json").write_text('{"file.py": ["dep.py"]}')
+    (d / "manifest.json").write_text('{"language": "python", "framework": "fastapi"}')
+
+    result = CodebaseContextLoader.load(base_dir=tmp_path)
+
+    assert result["_dir_found"] is True
+    assert result["endpoints"] == [{"path": "/test", "method": "GET"}]
+    assert result["models"] == [{"name": "TestModel", "fields": ["id"]}]
+    assert result["callgraph"] == {"file.py": ["dep.py"]}
+    assert result["manifest"] == {"language": "python", "framework": "fastapi"}
+
+
+def test_loader_missing_files_return_empty_defaults(tmp_path):
+    """일부 파일이 없어도 빈 기본값으로 안전하게 처리한다."""
+    d = _make_index_dir(tmp_path)
+    (d / "endpoints.json").write_text('[{"path": "/only"}]')
+    # models, callgraph, manifest 없음
+
+    result = CodebaseContextLoader.load(base_dir=tmp_path)
+
+    assert result["_dir_found"] is True
+    assert result["endpoints"] == [{"path": "/only"}]
+    assert result["models"] == []
+    assert result["callgraph"] == {}
+    assert result["manifest"] == {}
+
+
+def test_loader_missing_directory_returns_dir_not_found(tmp_path):
+    """인덱스 디렉토리 자체가 없으면 _dir_found=False와 빈 구조를 반환한다."""
+    result = CodebaseContextLoader.load(base_dir=tmp_path)
+
+    assert result["_dir_found"] is False
+    assert result["endpoints"] == []
+    assert result["models"] == []
+    assert result["callgraph"] == {}
+    assert result["manifest"] == {}
+
+
+def test_loader_default_base_dir_does_not_crash():
+    """base_dir 미지정 시 현재 디렉토리 기준으로 동작하며 예외가 없다."""
+    result = CodebaseContextLoader.load()  # base_dir=None → Path(".")
+    assert isinstance(result, dict)
+    assert "_dir_found" in result
+
+
+# ─── RootCauseAgent + codebase-index 연동 테스트 ─────────────────────────────
+
+
+def _agent_with_index(tmp_path: Path) -> RootCauseAgent:
+    """repo_path가 tmp_path로 설정된 에이전트를 반환한다."""
+    return RootCauseAgent(
+        config=QApilotConfig(project=ProjectConfig(repo_path=str(tmp_path)))
+    )
+
+
+def _write_full_index(index_dir: Path) -> None:
+    """테스트용 기본 인덱스 파일 세트를 생성한다."""
+    (index_dir / "endpoints.json").write_text(json.dumps([
+        {"file": "app/routers/orders.py", "method": "POST", "path": "/orders", "handler": "create_order"},
+        {"file": "app/routers/auth.py", "method": "POST", "path": "/login", "handler": "login"},
+    ]))
+    (index_dir / "models.json").write_text(json.dumps([
+        {"file": "app/schemas.py", "name": "OrderOut", "fields": ["id", "status", "total_amount"]},
+        {"file": "app/schemas.py", "name": "LoginRequest", "fields": ["email", "password"]},
+    ]))
+    (index_dir / "callgraph.json").write_text(json.dumps({
+        "app/routers/orders.py": ["app/schemas.py", "app/models.py"],
+        "app/routers/auth.py": ["app/schemas.py"],
+    }))
+    (index_dir / "manifest.json").write_text(json.dumps({
+        "language": "python",
+        "framework": "fastapi",
+        "file_count": 10,
+        "endpoint_count": 5,
+        "scan_timestamp": "2026-05-15T00:00:00Z",
+        "commit_hash": "abc123",
+    }))
+
+
+async def test_codebase_index_injected_into_prompt_when_no_code_context(tmp_path):
+    """code_context가 없으면 codebase-index 내용이 LLM 프롬프트에 포함된다."""
+    d = _make_index_dir(tmp_path)
+    _write_full_index(d)
+
+    agent = _agent_with_index(tmp_path)
+    captured: list[str] = []
+
+    async def capture_chat(system_prompt: str, user_prompt: str, **kwargs) -> LLMResponse:
+        if not captured and "단서 추출" not in system_prompt:
+            captured.append(user_prompt)
+        return _llm_resp(_single_candidate_llm())
+
+    agent.llm.chat = capture_chat
+
+    await agent._execute(
+        context={},
+        params={"error_code": "ORDER_ERROR", "summary": "주문 처리 실패"},
+    )
+
+    assert captured, "LLM이 호출되지 않았습니다"
+    prompt = captured[0]
+    assert "codebase-index" in prompt
+    assert "create_order" in prompt  # order 토큰으로 orders 엔드포인트 선택됨
+    assert "OrderOut" in prompt       # order 토큰으로 OrderOut 모델 선택됨
+
+
+async def test_error_code_summary_based_filtering(tmp_path):
+    """error_code/summary 토큰과 매칭되는 항목만 선별된다."""
+    d = _make_index_dir(tmp_path)
+    (d / "endpoints.json").write_text(json.dumps([
+        {"file": "payment.py", "method": "POST", "path": "/pay", "handler": "process_payment"},
+        {"file": "auth.py", "method": "GET", "path": "/profile", "handler": "get_profile"},
+    ]))
+    (d / "models.json").write_text("[]")
+    (d / "callgraph.json").write_text("{}")
+    (d / "manifest.json").write_text('{"language": "python"}')
+
+    agent = _agent_with_index(tmp_path)
+    captured: list[str] = []
+
+    async def capture_chat(system_prompt: str, user_prompt: str, **kwargs) -> LLMResponse:
+        if not captured and "단서 추출" not in system_prompt:
+            captured.append(user_prompt)
+        return _llm_resp(_single_candidate_llm())
+
+    agent.llm.chat = capture_chat
+    await agent._execute(
+        context={},
+        params={"error_code": "PAYMENT_FAILED", "summary": "결제 실패"},
+    )
+
+    prompt = captured[0]
+    assert "process_payment" in prompt   # payment 토큰 매칭
+    assert "get_profile" not in prompt   # 무관 항목 제외됨
+
+
+async def test_manifest_includes_only_summary_fields(tmp_path):
+    """manifest는 framework/language/file_count/endpoint_count 필드만 포함한다."""
+    d = _make_index_dir(tmp_path)
+    (d / "endpoints.json").write_text("[]")
+    (d / "models.json").write_text("[]")
+    (d / "callgraph.json").write_text("{}")
+    (d / "manifest.json").write_text(json.dumps({
+        "framework": "fastapi",
+        "language": "python",
+        "file_count": 62,
+        "endpoint_count": 33,
+        "scan_timestamp": "2026-05-15T00:00:00Z",  # 제외 대상
+        "commit_hash": "abc123deadbeef",             # 제외 대상
+    }))
+
+    agent = _agent_with_index(tmp_path)
+    captured: list[str] = []
+
+    async def capture_chat(system_prompt: str, user_prompt: str, **kwargs) -> LLMResponse:
+        if not captured and "단서 추출" not in system_prompt:
+            captured.append(user_prompt)
+        return _llm_resp(_single_candidate_llm())
+
+    agent.llm.chat = capture_chat
+    await agent._execute(context={}, params={"error_code": "ANY_ERROR"})
+
+    prompt = captured[0]
+    assert "fastapi" in prompt
+    assert "python" in prompt
+    assert "scan_timestamp" not in prompt
+    assert "abc123deadbeef" not in prompt
+
+
+async def test_no_match_fallback_to_manifest_only(tmp_path):
+    """관련 항목이 없으면 manifest만 포함한 컨텍스트로 LLM을 호출한다."""
+    d = _make_index_dir(tmp_path)
+    (d / "endpoints.json").write_text(json.dumps([
+        {"file": "x.py", "method": "GET", "path": "/xyz", "handler": "xyz_handler"},
+    ]))
+    (d / "models.json").write_text("[]")
+    (d / "callgraph.json").write_text("{}")
+    (d / "manifest.json").write_text('{"language": "python", "framework": "fastapi"}')
+
+    agent = _agent_with_index(tmp_path)
+    captured: list[str] = []
+
+    async def capture_chat(system_prompt: str, user_prompt: str, **kwargs) -> LLMResponse:
+        if not captured and "단서 추출" not in system_prompt:
+            captured.append(user_prompt)
+        return _llm_resp(_single_candidate_llm())
+
+    agent.llm.chat = capture_chat
+    await agent._execute(
+        context={},
+        params={"error_code": "TOTALLY_UNRELATED_CODE_ZZZ"},
+    )
+
+    prompt = captured[0]
+    assert "fastapi" in prompt    # manifest는 포함됨
+    assert "xyz_handler" not in prompt  # 매칭 안 된 항목은 제외됨
+
+
+async def test_missing_index_logs_warning(tmp_path):
+    """codebase-index 디렉토리가 없으면 codebase_index_not_found warning을 남긴다."""
+    # tmp_path에 .qapilot/codebase-index/ 없음
+    agent = _agent_with_index(tmp_path)
+    agent.llm.chat = _mock_chat(_single_candidate_llm(), _JUDGE_OK)
+    mock_logger = MagicMock()
+    agent.logger = mock_logger
+
+    await agent._execute(context={}, params={})
+
+    warning_events = [call.args[0] for call in mock_logger.warning.call_args_list]
+    assert "codebase_index_not_found" in warning_events
+
+
+async def test_selection_start_and_result_logged(tmp_path):
+    """codebase-index 선별 시 selection_start / selection_result 로그가 남는다."""
+    d = _make_index_dir(tmp_path)
+    _write_full_index(d)
+
+    agent = _agent_with_index(tmp_path)
+    agent.llm.chat = _mock_chat(_single_candidate_llm(), _JUDGE_OK)
+    mock_logger = MagicMock()
+    agent.logger = mock_logger
+
+    await agent._execute(
+        context={},
+        params={"error_code": "ORDER_ERROR", "summary": "주문 실패"},
+    )
+
+    info_events = [call.args[0] for call in mock_logger.info.call_args_list]
+    assert "codebase_index_selection_start" in info_events
+    assert "codebase_index_selection_result" in info_events
+
+
+async def test_no_relevant_match_logs_warning(tmp_path):
+    """토큰 매칭 항목이 없으면 codebase_index_no_relevant_match warning을 남긴다."""
+    d = _make_index_dir(tmp_path)
+    (d / "endpoints.json").write_text(json.dumps([
+        {"file": "x.py", "method": "GET", "path": "/xyz", "handler": "xyz_handler"},
+    ]))
+    (d / "models.json").write_text("[]")
+    (d / "callgraph.json").write_text("{}")
+    (d / "manifest.json").write_text('{"language": "python"}')
+
+    agent = _agent_with_index(tmp_path)
+    agent.llm.chat = _mock_chat(_single_candidate_llm(), _JUDGE_OK)
+    mock_logger = MagicMock()
+    agent.logger = mock_logger
+
+    await agent._execute(
+        context={},
+        params={"error_code": "TOTALLY_UNRELATED_ZZZ_999"},
+    )
+
+    warning_events = [call.args[0] for call in mock_logger.warning.call_args_list]
+    assert "codebase_index_no_relevant_match" in warning_events
+
+
+async def test_index_always_runs_regardless_of_direct_code_context(tmp_path):
+    """codebase-index 탐색은 code_context 제공 여부와 무관하게 항상 실행된다."""
+    d = _make_index_dir(tmp_path)
+    (d / "endpoints.json").write_text(json.dumps([
+        {"file": "routers/orders.py", "method": "POST", "path": "/orders", "handler": "create_order"},
+    ]))
+    (d / "models.json").write_text("[]")
+    (d / "callgraph.json").write_text("{}")
+    (d / "manifest.json").write_text('{"language": "python"}')
+
+    agent = _agent_with_index(tmp_path)
+    captured: list[str] = []
+
+    async def capture_chat(system_prompt: str, user_prompt: str, **kwargs) -> LLMResponse:
+        if not captured and "단서 추출" not in system_prompt:
+            captured.append(user_prompt)
+        return _llm_resp(_single_candidate_llm())
+
+    agent.llm.chat = capture_chat
+
+    # code_context를 직접 줘도 index 탐색이 실행돼 index 결과가 프롬프트에 포함된다
+    await agent._execute(
+        context={},
+        params={
+            "code_context": json.dumps({"files": [{"path": "/direct"}]}),
+            "error_code": "ORDER_ERROR",
+        },
+    )
+
+    prompt = captured[0]
+    assert "create_order" in prompt  # index 결과가 항상 포함됨
+
+
+async def test_callgraph_entries_for_matched_files_included(tmp_path):
+    """선별된 endpoint/model의 파일에 대응하는 callgraph 항목만 포함된다."""
+    d = _make_index_dir(tmp_path)
+    (d / "endpoints.json").write_text(json.dumps([
+        {"file": "routers/orders.py", "method": "POST", "path": "/orders", "handler": "create_order"},
+    ]))
+    (d / "models.json").write_text("[]")
+    (d / "callgraph.json").write_text(json.dumps({
+        "routers/orders.py": ["schemas.py", "models.py"],
+        "routers/auth.py": ["schemas.py"],  # 관련 없는 파일
+    }))
+    (d / "manifest.json").write_text("{}")
+
+    agent = _agent_with_index(tmp_path)
+    captured: list[str] = []
+
+    async def capture_chat(system_prompt: str, user_prompt: str, **kwargs) -> LLMResponse:
+        if not captured and "단서 추출" not in system_prompt:
+            captured.append(user_prompt)
+        return _llm_resp(_single_candidate_llm())
+
+    agent.llm.chat = capture_chat
+    await agent._execute(
+        context={},
+        params={"error_code": "ORDER_FAIL", "summary": "order 처리 오류"},
+    )
+
+    prompt = captured[0]
+    assert "routers/orders.py" in prompt   # 매칭된 파일의 callgraph
+    assert "routers/auth.py" not in prompt  # 무관 파일의 callgraph는 제외
+
+
+def test_runtime_context_request_path_extracted_as_url_segment():
+    """runtime_context의 request.path에서 URL 세그먼트가 추출된다."""
+    import json as _json
+    runtime_ctx = _json.dumps({
+        "request": {"method": "POST", "path": "/api/payment"},
+        "error": {"type": "ValueError"},
     })
-
-    filtered = RootCauseAgent._select_relevant_code_context(
-        code_ctx, error_code="PAYMENT_FAILED", summary="", mismatches=[]
-    )
-
-    data = json.loads(filtered)
-    assert len(data["files"]) == 1
-    assert "payment" in data["files"][0]["path"]
+    clues = RootCauseAgent._extract_clues("UNKNOWN", "", [], runtime_ctx)
+    assert "payment" in clues["url_segments"]
 
 
-def test_select_relevant_code_context_no_keywords_returns_full():
-    """키워드가 전혀 없으면 전체 컨텍스트를 그대로 반환한다."""
-    code_ctx = json.dumps({
-        "files": [
-            {"path": "app/service.py", "note": "some service"},
-            {"path": "app/other.py", "note": "other stuff"},
-        ]
+def test_runtime_context_stack_trace_extracted_as_file_stem():
+    """runtime_context의 stack trace .py 참조에서 파일명이 추출된다."""
+    import json as _json
+    runtime_ctx = _json.dumps({
+        "traceback": "File routers/orders.py line 42 in create_order",
     })
+    clues = RootCauseAgent._extract_clues("XYZ", "", [], runtime_ctx)
+    assert "orders" in clues["file_stems"]
 
-    filtered = RootCauseAgent._select_relevant_code_context(
-        code_ctx, error_code="", summary="", mismatches=[]
+
+async def test_mismatch_field_exact_match_scores_high(tmp_path):
+    """mismatch field명이 model fields에 있으면 높은 점수로 선별된다."""
+    d = _make_index_dir(tmp_path)
+    (d / "endpoints.json").write_text("[]")
+    (d / "models.json").write_text(json.dumps([
+        {"file": "schemas.py", "name": "OrderOut", "fields": ["id", "penalty_amount", "status"]},
+        {"file": "schemas.py", "name": "LoginRequest", "fields": ["email", "password"]},
+    ]))
+    (d / "callgraph.json").write_text("{}")
+    (d / "manifest.json").write_text("{}")
+
+    agent = _agent_with_index(tmp_path)
+    captured: list[str] = []
+
+    async def capture_chat(system_prompt: str, user_prompt: str, **kwargs) -> LLMResponse:
+        if not captured and "단서 추출" not in system_prompt:
+            captured.append(user_prompt)
+        return _llm_resp(_single_candidate_llm())
+
+    agent.llm.chat = capture_chat
+
+    await agent._execute(
+        context={},
+        params={
+            "error_code": "MISMATCH",
+            "mismatches": [{"field": "penalty_amount", "ui_value": "0", "api_value": "5000"}],
+        },
     )
 
-    assert json.loads(filtered) == json.loads(code_ctx)
+    prompt = captured[0]
+    assert "OrderOut" in prompt       # penalty_amount field 정확 매칭 → 고점수
+    assert "LoginRequest" not in prompt  # 무관 model 제외
 
 
-def test_select_relevant_code_context_no_match_returns_full():
-    """키워드가 있지만 일치하는 파일이 없으면 전체를 반환한다 (안전 fallback)."""
-    code_ctx = json.dumps({
-        "files": [
-            {"path": "app/service.py", "note": "generic service"},
-        ]
-    })
+async def test_regression_cross_check_input_flow_unchanged(
+    cross_check_input, llm_response_content
+):
+    """cross_check_input 흐름이 변경 없이 동작한다. runtime_context는 tc_id 기반 더미에서 로드."""
+    agent = _make_agent()
+    agent.llm.chat = _mock_chat(llm_response_content, _JUDGE_OK)
 
-    filtered = RootCauseAgent._select_relevant_code_context(
-        code_ctx, error_code="UNKNOWN_XYZ", summary="", mismatches=[]
+    result = await agent._execute(
+        context={},
+        params={**cross_check_input},
     )
 
-    assert json.loads(filtered) == json.loads(code_ctx)
+    rc = result.result["root_causes"][0]
+    assert rc["tc_id"] == cross_check_input["tc_id"]
+    assert len(rc["candidates"]) >= 1
 
 
-def test_select_relevant_code_context_mismatch_field_keyword():
-    """mismatches field 이름도 키워드로 사용된다."""
-    code_ctx = json.dumps({
-        "files": [
-            {"path": "app/order_service.py", "note": "order processing"},
-            {"path": "app/auth_service.py", "note": "authentication"},
-        ]
-    })
+# ─── code_context_raw 내용 확인 (디버그용) ────────────────────────────────────
 
-    filtered = RootCauseAgent._select_relevant_code_context(
-        code_ctx,
-        error_code="",
-        summary="",
-        mismatches=[{"field": "order_status", "ui_value": "x", "api_value": "y",
-                     "db_value": None, "severity": "high"}],
+
+async def test_code_context_raw():
+    """ code_context_raw 내용 확인
+
+    흐름:
+      CrossCheck 입력 → tc_id 기반 runtime 로드 → LLM 단서 추출
+      → 인덱스 검색 → 원인 추론 LLM 호출 → 결과 출력
+    """
+    SYSTEM_UNDER_TEST = Path(__file__).parent.parent.parent.parent / "system-under-test"
+    if not SYSTEM_UNDER_TEST.exists():
+        pytest.skip("system-under-test 경로 없음")
+
+    # ── 1. CrossCheck 입력 (TC-001 fixture)
+    cross_check = json.loads((FIXTURES_DIR / "cross_check_input.json").read_text())
+    print("\n" + "=" * 60)
+    print("① CrossCheck 입력")
+    print(f"   tc_id      : {cross_check['tc_id']}")
+    print(f"   error_code : {cross_check['error_code']}")
+    print(f"   summary    : {cross_check['summary']}")
+    print(f"   mismatches : {[m['field'] for m in cross_check.get('mismatches', [])]}")
+
+    # ── 2. Agent 구성 (실제 인덱스 사용)
+    agent = RootCauseAgent(config=QApilotConfig(
+        project=ProjectConfig(repo_path=str(SYSTEM_UNDER_TEST))
+    ))
+
+    # LLM mock — 단서 추출·원인 분석·Judge 각 응답 캡처
+    llm_calls: list[dict] = []
+    analysis_resp = _single_candidate_llm()
+
+    async def capturing_llm(system_prompt: str, user_prompt: str, **_) -> LLMResponse:
+        if "단서 추출" in system_prompt:
+            # 실제 단서 추출은 mock 반환 (LLM 비용 없이 테스트)
+            content = json.dumps({
+                "endpoints": ["orders"],
+                "files": ["orders"],
+                "functions": ["create_order"],
+                "models": ["OrderOut", "ContractOut"],
+                "keywords": ["integrity", "order"],
+            })
+            llm_calls.append({"role": "clue_extraction", "response": content})
+            return _llm_resp(content)
+        if "root_causes" not in "".join(llm_calls[c]["role"] for c in range(len(llm_calls)) if "analysis" in llm_calls[c]["role"] if False) and len([c for c in llm_calls if c["role"] == "analysis"]) == 0:
+            llm_calls.append({"role": "analysis", "prompt_snippet": user_prompt[:300]})
+            return _llm_resp(analysis_resp)
+        llm_calls.append({"role": "judge"})
+        return _llm_resp(_JUDGE_OK)
+
+    agent.llm.chat = capturing_llm
+
+    # ── 3. 단서 추출 미리 보기
+    runtime_raw = agent._load_dummy_context(cross_check["tc_id"], "runtime_context")
+    clues = await agent._extract_clues_with_llm(
+        error_code=cross_check["error_code"],
+        summary=cross_check["summary"],
+        mismatches=cross_check.get("mismatches", []),
+        runtime_context=runtime_raw,
     )
 
-    data = json.loads(filtered)
-    assert len(data["files"]) == 1
-    assert "order" in data["files"][0]["path"]
+    print("\n② Runtime Context (tc_id 기반 더미)")
+    if runtime_raw:
+        rt = json.loads(runtime_raw)
+        print(f"   api_calls  : {len((rt.get('api_trace') or {}).get('calls', []))}건")
+        print(f"   stack_trace: {rt.get('stack_trace', '')[:80]}...")
+    else:
+        print("   (없음)")
 
+    print("\n③ LLM 단서 추출 결과")
+    print(f"   from_llm  : {clues['from_llm']}")
+    print(f"   tokens    : {sorted(clues['tokens'])[:8]} ...")
+    print(f"   endpoints : {sorted(clues['endpoints'])}")
+    print(f"   functions : {sorted(clues['functions'])}")
+    print(f"   models    : {sorted(clues['models'])}")
 
-def test_select_relevant_code_context_plain_string():
-    """plain 문자열 컨텍스트는 줄 단위로 필터링한다."""
-    code_ctx = (
-        "app/payment_service.py:84 - commit 누락\n"
-        "app/user_service.py:10 - 일반 로직\n"
-        "app/payment_service.py:90 - rollback 처리\n"
-    )
+    # ── 4. 인덱스 검색 결과 미리 보기
+    code_context_raw = agent._load_from_codebase_index(clues, cross_check["error_code"])
+    if code_context_raw:
+        ctx = json.loads(code_context_raw)
+        print("\n④ 인덱스 검색 결과")
+        print(f"   endpoints : {len(ctx.get('endpoints', []))}개")
+        for ep in ctx.get("endpoints", [])[:3]:
+            print(f"     - {ep['method']} {ep['path']} ({ep['handler']})")
+        print(f"   models    : {len(ctx.get('models', []))}개")
+        for m in ctx.get("models", [])[:3]:
+            print(f"     - {m['name']}")
+        print(f"   callgraph : {len(ctx.get('callgraph', {}))}개 파일") 
 
-    filtered = RootCauseAgent._select_relevant_code_context(
-        code_ctx, error_code="PAYMENT_ERROR", summary="", mismatches=[]
-    )
+   
 
-    lines = [l for l in filtered.splitlines() if l.strip()]
-    assert all("payment" in l.lower() for l in lines)
-    assert len(lines) == 2
+async def test_full_pipeline_debug():
+    """실제 LLM으로 전체 흐름을 실행한다. -s 옵션으로 실행.
+
+    OPENAI_API_KEY 환경변수가 없으면 skip.
+    """
+    import os
+    env_file = Path(__file__).parents[2] / ".env"
+    if env_file.exists():
+        for line in env_file.read_text().splitlines():
+            if "=" in line and not line.startswith("#"):
+                k, v = line.split("=", 1)
+                os.environ.setdefault(k.strip(), v.strip())
+    if not os.getenv("OPENAI_API_KEY"):
+        pytest.skip("OPENAI_API_KEY 없음")
+
+    SYSTEM_UNDER_TEST = Path(__file__).parent.parent.parent.parent / "system-under-test"
+    if not SYSTEM_UNDER_TEST.exists():
+        pytest.skip("system-under-test 경로 없음")
+
+    from qapilot.shared.schemas import AgentInput
+
+    agent = RootCauseAgent(config=QApilotConfig(
+        project=ProjectConfig(repo_path=str(SYSTEM_UNDER_TEST))
+    ))
+
+    output = await agent.run(AgentInput(
+        trace_id="debug-001",
+        context={},
+        params={
+            "tc_id":        "TC-001",
+            "error_code":   "HTTP_500",
+            "summary":      "결제 처리 중 IntegrityError 발생",
+            "mismatches":   [{"field": "order_status", "ui_value": "completed", "api_value": "pending"}],
+            "has_mismatch": True,
+        },
+    ))
+
+    print("\n" + "=" * 60)
+    print(json.dumps({
+        "result":     output.result,
+        "confidence": output.confidence,
+        "metadata":   output.metadata.model_dump(),
+    }, ensure_ascii=False, indent=2))
+    print("=" * 60)
+
+    assert output.result["root_causes"]
