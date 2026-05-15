@@ -305,26 +305,81 @@ async def _domain_knowledge(state: PipelineState) -> dict:
 async def _requirement_extract(state: PipelineState) -> dict:
     """FR-024 RequirementExtractorAgent 호출.
 
-    run_options.user_input 이 있으면 PRD 텍스트로 사용. 없으면 skip (빈 requirements).
-    RequirementExtractorAgent 는 document_text 누락 시 AgentExecutionError 발생하므로
-    노드 측에서 미리 분기.
+    user_input이 있으면 사용자가 직접 입력한 시나리오 요구사항을 파싱한다.
+    user_input이 없으면 Qdrant에 임포트된 PRD 문서에서 요구사항을 검색한다.
     """
     user_input = (state["run_options"].get("user_input") or "").strip()
-    if not user_input:
-        return {"requirements": []}
+    if user_input:
+        from qapilot.agents.requirement_extractor_agent import RequirementExtractorAgent
+        from qapilot.shared.schemas import AgentInput
 
-    from qapilot.agents.requirement_extractor_agent import RequirementExtractorAgent
-    from qapilot.shared.schemas import AgentInput
-
-    agent = RequirementExtractorAgent(trace_id=state["trace_id"])
-    output = await agent.run(
-        AgentInput(
-            trace_id=state["trace_id"],
-            context={"domain_rules": state.get("domain_rules") or []},
-            params={"document_text": user_input, "existing_count": 0},
+        agent = RequirementExtractorAgent(trace_id=state["trace_id"])
+        output = await agent.run(
+            AgentInput(
+                trace_id=state["trace_id"],
+                context={"domain_rules": state.get("domain_rules") or []},
+                params={"document_text": user_input, "existing_count": 0},
+            )
         )
-    )
-    requirements = output.result.get("requirements", []) or []
+        requirements = output.result.get("requirements", []) or []
+        return {"requirements": requirements}
+
+    # user_input 없음: Qdrant에 저장된 PRD 문서에서 요구사항 검색
+    from qapilot.shared.schemas import ToolInput
+    from qapilot.tools.domain_knowledge import DomainKnowledgeTool
+
+    # docs/ 에서 최신 PRD 파일명만 추출 (버전 필터 적용)
+    from qapilot.shared.config import load_config
+    config = load_config()
+    proj = config.project
+    repo_root = Path(proj.root or proj.repo_path or ".")
+    docs_dir = repo_root / "docs"
+    latest_prd_sources: set[str] = set()
+    if docs_dir.exists():
+        all_docs = [p for p in docs_dir.rglob("*") if p.is_file() and p.suffix.lower() in _SUPPORTED_DOC_SUFFIXES]
+        latest_prd_sources = {
+            p.name for p in _filter_latest_doc_versions(all_docs)
+            if "prd" in p.name.lower()
+        }
+
+    tool = DomainKnowledgeTool(trace_id=state["trace_id"])
+    requirements = []
+    try:
+        result = await tool.run(
+            ToolInput(
+                trace_id=state["trace_id"],
+                params={"action": "search", "query": "기능 요구사항 시스템", "top_k": 30},
+            )
+        )
+        rules = result.result.get("rules", []) or []
+
+        # 최신 PRD 문서 청크만 필터링 (이전 버전 제외)
+        prd_rules = [
+            r for r in rules
+            if r.get("source", "") in latest_prd_sources
+        ] if latest_prd_sources else [
+            r for r in rules if "prd" in r.get("source", "").lower()
+        ]
+
+        _NON_FUNC_KEYWORDS = {"비기능", "성능", "보안", "가용성", "안정성", "확장성"}
+        for i, rule in enumerate(prd_rules, start=1):
+            section = rule.get("section", "")
+            req_type = (
+                "non_functional"
+                if any(k in section for k in _NON_FUNC_KEYWORDS)
+                else "functional"
+            )
+            domain_area = section or rule.get("source", "").replace(".md", "")
+            requirements.append({
+                "req_id": f"REQ-{i:03d}",
+                "req_type": req_type,
+                "content": rule["content"],
+                "priority": "medium",
+                "domain_area": domain_area,
+            })
+    except Exception:
+        pass
+
     return {"requirements": requirements}
 
 
