@@ -21,10 +21,45 @@ from qapilot.shared.schemas import ActionMapping, ActionStep, ExecuteResult
 MAX_TC_PER_BATCH = 50
 MAX_TS_PER_BATCH = 10
 
-_ALLOWED_ACTIONS = {"fill", "click", "assert", "navigate", "select", "wait"}
+_SELECTOR_REQUIRED_ACTIONS = {
+    "fill", "clear", "click", "dblclick", "hover", "select", "check", "uncheck",
+    "press", "upload", "assert", "assert_visible", "assert_hidden", "assert_text",
+    "assert_value", "assert_enabled", "assert_disabled", "assert_count",
+}
+_SELECTOR_OPTIONAL_ACTIONS = {
+    "navigate", "reload", "go_back", "go_forward", "wait", "wait_for_url",
+    "wait_for_load_state", "wait_for_response", "assert_url",
+}
+_ALLOWED_ACTIONS = _SELECTOR_REQUIRED_ACTIONS | _SELECTOR_OPTIONAL_ACTIONS
 _ALLOWED_SELECTOR_TYPES = {
     "role", "label", "placeholder", "text", "testid",
     "alttext", "title", "css", "xpath",
+}
+_ACTION_ALIASES = {
+    "input": "fill", "type": "fill", "enter_text": "fill",
+    "tap": "click", "press_button": "click", "submit": "click",
+    "double_click": "dblclick", "mouseover": "hover",
+    "verify": "assert", "expect": "assert", "should_see": "assert",
+    "check_text": "assert_text", "check_url": "assert_url",
+    "go": "navigate", "open": "navigate", "visit": "navigate",
+    "refresh": "reload", "back": "go_back", "forward": "go_forward",
+    "choose": "select", "dropdown": "select", "pause": "wait", "sleep": "wait",
+    "upload_file": "upload", "set_input_files": "upload",
+}
+_SELECTOR_TYPE_ALIASES = {
+    "aria": "role", "accessible_name": "role", "data-testid": "testid",
+    "data_testid": "testid", "data-test-id": "testid", "data_test_id": "testid",
+    "query": "css", "locator": "css", "id": "css", "class": "css",
+    "text_content": "text", "contains_text": "text", "alt": "alttext",
+    "alt_text": "alttext",
+}
+_VALUE_REQUIRED_ACTIONS = {
+    "fill", "select", "press", "upload", "navigate", "wait", "wait_for_url",
+    "wait_for_load_state", "wait_for_response",
+}
+_EXPECTED_REQUIRED_ACTIONS = {
+    "assert", "assert_visible", "assert_hidden", "assert_text", "assert_value",
+    "assert_url", "assert_enabled", "assert_disabled", "assert_count",
 }
 
 
@@ -182,33 +217,129 @@ class ActionMapperAgent(BaseAgent):
             raise ValueError(f"필수 필드 누락: {', '.join(missing)}")
         if not isinstance(item["steps"], list):
             raise ValueError("steps는 배열이어야 합니다.")
+        tc_id = str(item["tc_id"])
         return {
-            "tc_id": str(item["tc_id"]),
-            "steps": [self._validate_step(step) for step in item["steps"]],
+            "tc_id": tc_id,
+            "steps": [self._validate_step(step, tc_id) for step in item["steps"]],
             "selector_confidence": float(item["selector_confidence"]),
         }
 
-    def _validate_step(self, item: Any) -> ActionStep:
+    def _validate_step(self, item: Any, tc_id: str) -> ActionStep:
         """단일 ActionStep 구조와 enum 값을 검증한다."""
         required = ("step_no", "action", "selector", "selector_type")
         if not isinstance(item, dict):
             raise ValueError("ActionStep 항목은 객체여야 합니다.")
         missing = [field for field in required if field not in item]
         if missing:
-            raise ValueError(f"step 필수 필드 누락: {', '.join(missing)}")
-        if item["action"] not in _ALLOWED_ACTIONS:
-            raise ValueError(f"허용되지 않는 action: {item['action']}")
-        if item["selector_type"] not in _ALLOWED_SELECTOR_TYPES:
-            raise ValueError(f"허용되지 않는 selector_type: {item['selector_type']}")
+            raise ValueError(f"{tc_id} step 필수 필드 누락: {', '.join(missing)}")
+        step_no = int(item["step_no"])
+        action = self._normalize_action(item, tc_id, step_no)
+        selector = item.get("selector")
+        selector_type = self._normalize_selector_type(
+            item.get("selector_type"), selector, tc_id, step_no
+        )
+        selector, selector_type = self._normalize_selector_fields(
+            action, selector, selector_type, item, tc_id, step_no
+        )
+        value = self._normalize_value(action, item, selector, tc_id, step_no)
+        expected = self._normalize_expected(action, item, selector, value, tc_id, step_no)
         return {
-            "step_no": int(item["step_no"]),
-            "action": str(item["action"]),
-            "selector": str(item["selector"]),
-            "selector_type": str(item["selector_type"]),
-            "value": item.get("value"),
-            "expected": item.get("expected"),
+            "step_no": step_no,
+            "action": action,
+            "selector": selector,
+            "selector_type": selector_type,
+            "value": value,
+            "expected": expected,
             "api_endpoint": item.get("api_endpoint"),
         }
+
+    def _normalize_action(self, item: dict, tc_id: str, step_no: int) -> str:
+        """비표준 action을 표준 action vocabulary로 정규화한다."""
+        raw = str(item.get("action") or "").strip().lower().replace("-", "_")
+        action = _ACTION_ALIASES.get(raw, raw)
+        if action in _ALLOWED_ACTIONS:
+            if action != raw:
+                self._log_normalization(tc_id, step_no, "action", raw, action)
+            return action
+        fallback = self._infer_fallback_action(item)
+        self._log_normalization(tc_id, step_no, "action", raw, fallback)
+        return fallback
+
+    def _infer_fallback_action(self, item: dict) -> str:
+        """알 수 없는 action을 필드 단서 기반 fallback action으로 변환한다."""
+        if item.get("expected"):
+            return "assert"
+        if item.get("value") and not item.get("selector"):
+            return "navigate"
+        if item.get("value"):
+            return "fill"
+        return "click"
+
+    def _normalize_selector_type(
+        self, selector_type: Any, selector: Any, tc_id: str, step_no: int
+    ) -> str | None:
+        """selector_type을 표준 locator 타입으로 정규화한다."""
+        if selector_type is None:
+            return None
+        raw = str(selector_type).strip().lower().replace(" ", "_")
+        normalized = _SELECTOR_TYPE_ALIASES.get(raw, raw)
+        if normalized in _ALLOWED_SELECTOR_TYPES:
+            if normalized != raw:
+                self._log_normalization(tc_id, step_no, "selector_type", raw, normalized)
+            return normalized
+        fallback = "xpath" if str(selector or "").strip().startswith(("/", "(")) else "css"
+        self._log_normalization(tc_id, step_no, "selector_type", raw, fallback)
+        return fallback
+
+    def _normalize_selector_fields(
+        self, action: str, selector: Any, selector_type: str | None,
+        item: dict, tc_id: str, step_no: int
+    ) -> tuple[str | None, str | None]:
+        """action 성격에 따라 selector와 selector_type을 보정한다."""
+        if action in _SELECTOR_OPTIONAL_ACTIONS:
+            return None, None
+        if selector and selector_type:
+            return str(selector), selector_type
+        fallback = item.get("expected") or item.get("value") or action
+        self._log_normalization(tc_id, step_no, "selector", selector, fallback)
+        return str(fallback), selector_type or "text"
+
+    def _normalize_value(
+        self, action: str, item: dict, selector: str | None, tc_id: str, step_no: int
+    ) -> str | None:
+        """value 필수 action에서 실행 가능한 기본값을 보정한다."""
+        value = item.get("value")
+        if value is not None or action not in _VALUE_REQUIRED_ACTIONS:
+            return value
+        defaults = {"wait": "1000", "wait_for_load_state": "networkidle"}
+        fallback = defaults.get(action, item.get("expected") or selector or "")
+        self._log_normalization(tc_id, step_no, "value", value, fallback)
+        return str(fallback)
+
+    def _normalize_expected(
+        self, action: str, item: dict, selector: str | None,
+        value: str | None, tc_id: str, step_no: int
+    ) -> str | None:
+        """expected 필수 action에서 실행 가능한 기본값을 보정한다."""
+        expected = item.get("expected")
+        if expected is not None or action not in _EXPECTED_REQUIRED_ACTIONS:
+            return expected
+        fallback = "1" if action == "assert_count" else value or selector or ""
+        self._log_normalization(tc_id, step_no, "expected", expected, fallback)
+        return str(fallback)
+
+    def _log_normalization(
+        self, tc_id: str, step_no: int, field: str, original: Any, normalized: Any
+    ) -> None:
+        """정규화/fallback 발생을 로그로 남긴다."""
+        self.logger.warning(
+            "action_mapping_normalized",
+            tc_id=tc_id,
+            step_no=step_no,
+            field=field,
+            original=original,
+            normalized=normalized,
+        )
 
     def _calc_confidence(
         self, action_mappings: list[ActionMapping], has_scan_result: bool
@@ -220,10 +351,12 @@ class ActionMapperAgent(BaseAgent):
             sum(1 for step in all_steps if step.get("api_endpoint")) / len(all_steps)
             if all_steps else 0
         )
+        selector_steps = [step for step in all_steps if step.get("selector_type")]
         low_quality_types = {"css", "xpath"}
         low_quality = sum(
-            1 for step in all_steps if step.get("selector_type") in low_quality_types
+            1 for step in selector_steps
+            if step.get("selector_type") in low_quality_types
         )
-        quality_ratio = 1 - (low_quality / len(all_steps) if all_steps else 0)
+        quality_ratio = 1 - (low_quality / len(selector_steps) if selector_steps else 0)
         confidence = base * 0.5 + api_ratio * 0.3 + quality_ratio * 0.2
         return min(max(round(confidence, 2), 0.0), 1.0)
