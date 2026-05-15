@@ -26,6 +26,7 @@ _ALLOWED_SELECTOR_TYPES = {
     "role", "label", "placeholder", "text", "testid",
     "alttext", "title", "css", "xpath",
 }
+_SELECTOR_OPTIONAL_ACTIONS = {"navigate", "wait"}
 
 
 class ActionMapperAgent(BaseAgent):
@@ -182,29 +183,39 @@ class ActionMapperAgent(BaseAgent):
             raise ValueError(f"필수 필드 누락: {', '.join(missing)}")
         if not isinstance(item["steps"], list):
             raise ValueError("steps는 배열이어야 합니다.")
+        tc_id = str(item["tc_id"])
         return {
-            "tc_id": str(item["tc_id"]),
-            "steps": [self._validate_step(step) for step in item["steps"]],
+            "tc_id": tc_id,
+            "steps": [self._validate_step(step, tc_id) for step in item["steps"]],
             "selector_confidence": float(item["selector_confidence"]),
         }
 
-    def _validate_step(self, item: Any) -> ActionStep:
+    def _validate_step(self, item: Any, tc_id: str) -> ActionStep:
         """단일 ActionStep 구조와 enum 값을 검증한다."""
         required = ("step_no", "action", "selector", "selector_type")
         if not isinstance(item, dict):
             raise ValueError("ActionStep 항목은 객체여야 합니다.")
         missing = [field for field in required if field not in item]
         if missing:
-            raise ValueError(f"step 필수 필드 누락: {', '.join(missing)}")
-        if item["action"] not in _ALLOWED_ACTIONS:
-            raise ValueError(f"허용되지 않는 action: {item['action']}")
-        if item["selector_type"] not in _ALLOWED_SELECTOR_TYPES:
-            raise ValueError(f"허용되지 않는 selector_type: {item['selector_type']}")
+            raise ValueError(f"{tc_id} step 필수 필드 누락: {', '.join(missing)}")
+        step_no = int(item["step_no"])
+        action = item["action"]
+        selector_type = item["selector_type"]
+        if action not in _ALLOWED_ACTIONS:
+            raise ValueError(f"{tc_id} step {step_no}: 허용되지 않는 action: {action}")
+        if action not in _SELECTOR_OPTIONAL_ACTIONS and not item["selector"]:
+            raise ValueError(f"{tc_id} step {step_no}: selector는 필수입니다.")
+        if action not in _SELECTOR_OPTIONAL_ACTIONS and selector_type is None:
+            raise ValueError(f"{tc_id} step {step_no}: selector_type은 필수입니다.")
+        if selector_type is not None and selector_type not in _ALLOWED_SELECTOR_TYPES:
+            raise ValueError(
+                f"{tc_id} step {step_no}: 허용되지 않는 selector_type: {selector_type}"
+            )
         return {
-            "step_no": int(item["step_no"]),
-            "action": str(item["action"]),
-            "selector": str(item["selector"]),
-            "selector_type": str(item["selector_type"]),
+            "step_no": step_no,
+            "action": str(action),
+            "selector": item["selector"],
+            "selector_type": selector_type,
             "value": item.get("value"),
             "expected": item.get("expected"),
             "api_endpoint": item.get("api_endpoint"),
@@ -220,10 +231,12 @@ class ActionMapperAgent(BaseAgent):
             sum(1 for step in all_steps if step.get("api_endpoint")) / len(all_steps)
             if all_steps else 0
         )
+        selector_steps = [step for step in all_steps if step.get("selector_type")]
         low_quality_types = {"css", "xpath"}
         low_quality = sum(
-            1 for step in all_steps if step.get("selector_type") in low_quality_types
+            1 for step in selector_steps
+            if step.get("selector_type") in low_quality_types
         )
-        quality_ratio = 1 - (low_quality / len(all_steps) if all_steps else 0)
+        quality_ratio = 1 - (low_quality / len(selector_steps) if selector_steps else 0)
         confidence = base * 0.5 + api_ratio * 0.3 + quality_ratio * 0.2
         return min(max(round(confidence, 2), 0.0), 1.0)

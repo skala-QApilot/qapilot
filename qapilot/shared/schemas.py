@@ -207,8 +207,8 @@ class ActionStep(TypedDict):
 
     step_no: int
     action: str
-    selector: str
-    selector_type: str
+    selector: str | None
+    selector_type: str | None
     value: str | None
     expected: str | None
     api_endpoint: str | None
