@@ -329,16 +329,6 @@ class CrossCheckResult(TypedDict):
 # ── 장애 분석 ──
 
 
-class DefectClassification(TypedDict):
-    """결함 분류 결과."""
-
-    tc_id: str
-    defect_type: Literal["ui", "api", "data", "environment", "domain_rule"]
-    sub_type: str
-    description: str
-    rule_based: bool
-
-
 class Evidence(TypedDict):
     """원인 근거."""
 

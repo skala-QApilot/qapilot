@@ -20,7 +20,6 @@ from qapilot.shared.schemas import (
     APITraceResult,
     CrossCheckResult,
     DBTestResult,
-    DefectClassification,
     DomainRule,
     FixResult,
     GeneratedCode,
@@ -65,7 +64,6 @@ class PipelineState(TypedDict):
     has_mismatch: bool
 
     # ── Layer 3: 장애 분석 ──
-    defect_results: list[DefectClassification]
     root_cause_results: list[RootCauseResult]
     fix_results: list[FixResult]
 
