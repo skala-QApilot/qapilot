@@ -1,6 +1,6 @@
 """Layer 3 wire-up 단위 테스트.
 
-mock Agent 들로 `_defect_classify` / `_root_cause` / `_fix_recommend` / 확장된 `_report`
+mock Agent 들로 `_root_cause` / `_fix_recommend` / 확장된 `_report`
 의 wire-up 동작 검증. 실 LLM 의존은 통합 테스트로 분리.
 """
 from __future__ import annotations
@@ -29,63 +29,6 @@ def _state_with_mismatch() -> dict:
              "mismatches": [], "has_mismatch": False},
         ],
     }
-
-
-# ── _defect_classify ─────────────────────────────────────────────────────────
-
-
-@pytest.mark.asyncio
-async def test_defect_classify_only_mismatch_tcs():
-    """has_mismatch=True 인 TC 만 분류 대상."""
-    state = _state_with_mismatch()
-
-    with patch("qapilot.agents.defect_classifier_agent.DefectClassifierAgent") as MockAgent:
-        instance = MagicMock()
-        instance.run = AsyncMock(return_value=MagicMock(result={
-            "defect_classification": {
-                "tc_id": "TC-1", "defect_type": "ui", "sub_type": "locator",
-                "description": "test", "rule_based": True,
-            }
-        }))
-        MockAgent.return_value = instance
-
-        result = await P._defect_classify(state)  # type: ignore[arg-type]
-
-    assert len(result["defect_results"]) == 1
-    assert result["defect_results"][0]["tc_id"] == "TC-1"
-    assert result["defect_results"][0]["defect_type"] == "ui"
-
-
-@pytest.mark.asyncio
-async def test_defect_classify_graceful_on_stub():
-    """DefectClassifier stub (NotImplementedError) → fallback unknown."""
-    state = _state_with_mismatch()
-
-    with patch("qapilot.agents.defect_classifier_agent.DefectClassifierAgent") as MockAgent:
-        instance = MagicMock()
-        instance.run = AsyncMock(side_effect=NotImplementedError("stub"))
-        MockAgent.return_value = instance
-
-        result = await P._defect_classify(state)  # type: ignore[arg-type]
-
-    assert len(result["defect_results"]) == 1
-    assert result["defect_results"][0]["defect_type"] == "unknown"
-    assert "skip" in result["defect_results"][0]["description"].lower()
-
-
-@pytest.mark.asyncio
-async def test_defect_classify_skips_when_no_mismatch():
-    """전체 cross_check_results 가 has_mismatch=False 면 defect_results=[]."""
-    state = {
-        "trace_id": "t",
-        "ui_results": [],
-        "cross_check_results": [
-            {"tc_id": "TC-1", "has_mismatch": False},
-            {"tc_id": "TC-2", "has_mismatch": False},
-        ],
-    }
-    result = await P._defect_classify(state)  # type: ignore[arg-type]
-    assert result["defect_results"] == []
 
 
 # ── _root_cause ──────────────────────────────────────────────────────────────
@@ -195,10 +138,6 @@ async def test_report_includes_layer3_sections(tmp_path: Path, monkeypatch):
         "cross_check_results": [
             {"tc_id": "TC-1", "match_score": 0.0, "mismatched_fields": 2, "has_mismatch": True},
         ],
-        "defect_results": [
-            {"tc_id": "TC-1", "defect_type": "api", "sub_type": "5xx",
-             "description": "서버 500"},
-        ],
         "root_cause_results": [
             {"tc_id": "TC-1", "candidates": [
                 {"rank": 1, "cause": "Null pointer at line 42", "confidence": 0.85,
@@ -216,14 +155,12 @@ async def test_report_includes_layer3_sections(tmp_path: Path, monkeypatch):
     result = await P._report(state)  # type: ignore[arg-type]
 
     body = Path(result["report_path"]).read_text(encoding="utf-8")
-    # 5 섹션 모두 포함
+    # 4 섹션 모두 포함 (장애 분류 섹션은 제거됨)
     assert "## 1. 실패 케이스" in body
     assert "## 2. Cross-check" in body
-    assert "## 3. 장애 분류" in body
-    assert "## 4. 원인 분석" in body
-    assert "## 5. 해결 방안" in body
+    assert "## 3. 원인 분석" in body
+    assert "## 4. 해결 방안" in body
     # 콘텐츠 검증
-    assert "api" in body  # defect_type
     assert "Null pointer" in body  # cause
     assert "backend/app.py:42" in body  # 위치
     assert "None 체크 추가" in body  # fix description
@@ -244,6 +181,5 @@ async def test_report_omits_layer3_sections_when_empty(tmp_path: Path, monkeypat
     body = Path(result["report_path"]).read_text(encoding="utf-8")
     assert "## 1. 실패 케이스" in body
     assert "## 2. Cross-check" in body
-    assert "## 3. 장애 분류" not in body
-    assert "## 4. 원인 분석" not in body
-    assert "## 5. 해결 방안" not in body
+    assert "## 3. 원인 분석" not in body
+    assert "## 4. 해결 방안" not in body

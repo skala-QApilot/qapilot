@@ -69,7 +69,6 @@ def build_pipeline() -> StateGraph:
     graph.add_node("load_scenarios_for_test", _load_scenarios_for_test)
     graph.add_node("test_execution", _test_execution)
     graph.add_node("cross_check", _cross_check)
-    graph.add_node("defect_classify", _defect_classify)
     graph.add_node("root_cause", _root_cause)
     graph.add_node("fix_recommend", _fix_recommend)
     graph.add_node("report", _report)
@@ -78,9 +77,8 @@ def build_pipeline() -> StateGraph:
     graph.add_edge("test_execution", "cross_check")
     graph.add_conditional_edges(
         "cross_check",
-        lambda state: "defect_classify" if state["has_mismatch"] else "report",
+        lambda state: "root_cause" if state["has_mismatch"] else "report",
     )
-    graph.add_edge("defect_classify", "root_cause")
     graph.add_edge("root_cause", "fix_recommend")
     graph.add_edge("fix_recommend", "report")
     graph.add_edge("report", END)
@@ -919,6 +917,9 @@ async def _cross_check(state: PipelineState) -> dict:
             if tc_id in ui_failed_tc_ids:
                 cc["has_mismatch"] = True
                 cc.setdefault("ui_failed", True)
+            # RootCauseAgent에 직결되도록 error_code/summary를 cc에 보존
+            cc["error_code"] = output.result.get("error_code") or ""
+            cc["summary"] = output.result.get("summary") or ""
             cross_check_results.append(cc)
             if cc.get("has_mismatch"):
                 any_mismatch = True
@@ -929,91 +930,14 @@ async def _cross_check(state: PipelineState) -> dict:
                 "mismatched_fields": 0, "mismatches": [],
                 "has_mismatch": tc_id in ui_failed_tc_ids,
                 "ui_failed": tc_id in ui_failed_tc_ids,
+                "error_code": "",
+                "summary": "",
                 "error": f"CrossCheck skip: {type(e).__name__}: {e}",
             })
 
     return {
         "cross_check_results": cross_check_results,
         "has_mismatch": any_mismatch,
-    }
-
-
-async def _defect_classify(state: PipelineState) -> dict:
-    """Layer 3 첫 노드 — DefectClassifierAgent 호출 (FR-009).
-
-    본체 stub 상태 (NotImplementedError) — graceful 흡수 후 fallback `unknown` 카테고리.
-    cross_check_results 의 has_mismatch=True 인 TC 만 분류 대상.
-    DefectClassifier 본체 머지 시 자동 정상 동작.
-    """
-    from qapilot.shared.schemas import AgentInput
-
-    trace_id = state["trace_id"]
-    cross_check_results = state.get("cross_check_results") or []
-    ui_results = state.get("ui_results") or []
-    ui_map = {r.get("tc_id"): r for r in ui_results if r.get("tc_id")}
-
-    defect_results: list[dict] = []
-
-    for cc in cross_check_results:
-        if not cc.get("has_mismatch"):
-            continue
-        tc_id = cc.get("tc_id", "unknown")
-        ui_result = ui_map.get(tc_id, {})
-
-        defect_dict = await _classify_defect_safe(
-            trace_id=trace_id,
-            tc_id=tc_id,
-            cross_check=cc,
-            ui_result=ui_result,
-            AgentInput=AgentInput,
-        )
-        defect_results.append(defect_dict)
-
-    return {"defect_results": defect_results}
-
-
-async def _classify_defect_safe(*, trace_id, tc_id, cross_check, ui_result, AgentInput) -> dict:
-    """DefectClassifier graceful — stub raise 시 fallback unknown."""
-    from qapilot.agents.defect_classifier_agent import DefectClassifierAgent
-
-    try:
-        agent = DefectClassifierAgent(trace_id=trace_id)
-        output = await agent.run(
-            AgentInput(
-                trace_id=trace_id,
-                context={
-                    "cross_check": cross_check,
-                    "ui_result": ui_result,
-                },
-                params={
-                    "tc_id": tc_id,
-                    "mismatches": cross_check.get("mismatches") or [],
-                    "ui_steps": ui_result.get("steps") or [],
-                },
-            )
-        )
-        result = output.result
-        # 단일 결과 또는 list 모두 수용
-        if isinstance(result.get("defect_classification"), dict):
-            return dict(result["defect_classification"])
-        if isinstance(result.get("defect_results"), list) and result["defect_results"]:
-            return dict(result["defect_results"][0])
-    except Exception as e:
-        # stub NotImplementedError 또는 LLM 실패 graceful
-        return {
-            "tc_id": tc_id,
-            "defect_type": "unknown",
-            "sub_type": "",
-            "description": f"DefectClassifier skip: {type(e).__name__}: {e}",
-            "rule_based": False,
-        }
-
-    return {
-        "tc_id": tc_id,
-        "defect_type": "unknown",
-        "sub_type": "",
-        "description": "DefectClassifier 결과 형식 불명",
-        "rule_based": False,
     }
 
 
@@ -1120,11 +1044,10 @@ async def _fix_recommend(state: PipelineState) -> dict:
 async def _report(state: PipelineState) -> dict:
     """Layer 2/3 마지막 노드 — 임시 markdown summary (Report Tool 본체 stub 상태).
 
-    spec §6.1 의 .qapilot/reports/{trace_id}.md 저장. v1.5 의 단일 형식 spec FR-012:
+    spec §6.1 의 .qapilot/reports/{trace_id}.md 저장. FR-012:
     - 실행 요약
     - 실패 케이스 (step별 에러, TOOL_UI_* prefix)
     - Cross-check 요약
-    - 장애 분류 (FR-009, Layer 3)
     - 원인 분석 (FR-010, Top-N candidates)
     - 해결 방안 (FR-011, suggestions)
 
@@ -1133,7 +1056,6 @@ async def _report(state: PipelineState) -> dict:
     trace_id = state["trace_id"]
     ui_results = state.get("ui_results") or []
     cross_check_results = state.get("cross_check_results") or []
-    defect_results = state.get("defect_results") or []
     root_cause_results = state.get("root_cause_results") or []
     fix_results = state.get("fix_results") or []
 
@@ -1172,17 +1094,8 @@ async def _report(state: PipelineState) -> dict:
             f"mismatches={cc.get('mismatched_fields', 0)}"
         )
 
-    if defect_results:
-        lines.extend(["", "## 3. 장애 분류 (FR-009)"])
-        for d in defect_results:
-            lines.append(
-                f"- `{d.get('tc_id')}` → **{d.get('defect_type', 'unknown')}**"
-                + (f" / {d.get('sub_type')}" if d.get('sub_type') else "")
-                + (f" — {d.get('description', '')[:120]}" if d.get('description') else "")
-            )
-
     if root_cause_results:
-        lines.extend(["", "## 4. 원인 분석 (FR-010)"])
+        lines.extend(["", "## 3. 원인 분석 (FR-010)"])
         for rc in root_cause_results:
             tc_id = rc.get("tc_id")
             candidates = rc.get("candidates") or []
@@ -1199,7 +1112,7 @@ async def _report(state: PipelineState) -> dict:
                     lines.append(f"  - 위치: `{file_path}{suffix}`")
 
     if fix_results:
-        lines.extend(["", "## 5. 해결 방안 (FR-011)"])
+        lines.extend(["", "## 4. 해결 방안 (FR-011)"])
         for fr in fix_results:
             tc_id = fr.get("tc_id")
             suggestions = fr.get("suggestions") or []

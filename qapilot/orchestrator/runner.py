@@ -63,7 +63,6 @@ async def run_pipeline(options: RunOptions, trace_id: str | None = None) -> Pipe
         "cross_check_results": [],
         "has_mismatch": False,
         # Layer 3
-        "defect_results": [],
         "root_cause_results": [],
         "fix_results": [],
         # 리포트

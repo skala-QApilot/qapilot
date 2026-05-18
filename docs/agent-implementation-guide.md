@@ -132,41 +132,57 @@ class ScenarioGeneratorAgent(BaseAgent):
         )
 ```
 
-### 케이스 3: 규칙 1차 + LLM 2차 (장애 분류)
+### 케이스 3: 규칙 1차 + LLM 2차 (Cross-check)
 
 ```python
-class DefectClassifierAgent(BaseAgent):
+class CrossCheckAgent(BaseAgent):
     allowed_tools = []
 
     async def _execute(self, context, params, last_error=None) -> ExecuteResult:
-        defect = params["defect"]
+        ui_result = context["ui_result"]
+        api_trace = context["api_trace"]
+        db_result = context["db_result"]
 
-        # 규칙 기반 1차 분류 (LLM 미사용)
-        rule_based = self._classify_by_rules(defect)
-        if rule_based is not None:
+        # 규칙 기반 1차: UI/API 응답에서 명시적 에러 코드 추출 (LLM 미사용)
+        error_code = self._extract_error_code(ui_result, api_trace)
+        if error_code:
+            # 경로 A — 에러 코드 확정 시 LLM 분석 불필요
+            _, _, _, summary = await self._analyze_with_llm(
+                ui_result, api_trace, db_result, last_error
+            )
             return ExecuteResult(
-                result={"defect_type": rule_based, "rule_based": True},
-                confidence=1.0,  # 규칙 기반이므로 확정
+                result={
+                    "cross_check": {"has_mismatch": True, ...},
+                    "error_code": error_code,
+                    "summary": summary,
+                },
+                confidence=1.0,
             )
 
-        # 규칙 미분류 → LLM 보조 분류
-        user_prompt = self.with_correction_hint(
-            self.prompts.render(defect=json.dumps(defect)),
-            last_error,
+        # 경로 B — 규칙 미분류 → LLM으로 불일치 분석
+        mismatches, match_score, mismatch_code, summary = await self._analyze_with_llm(
+            ui_result, api_trace, db_result, last_error
         )
-        response = await self.llm.chat(self.prompts.system(), user_prompt)
-        parsed = json.loads(response.content)
         return ExecuteResult(
-            result={"defect_type": parsed["type"], "rule_based": False},
-            confidence=parsed["confidence"],
+            result={
+                "cross_check": {"has_mismatch": len(mismatches) > 0, ...},
+                "error_code": mismatch_code,
+                "summary": summary,
+            },
+            confidence=match_score,
         )
 
-    def _classify_by_rules(self, defect: dict) -> str | None:
+    def _extract_error_code(self, ui_result, api_trace) -> str | None:
         """LLM 호출 없는 결정적 규칙."""
-        if defect.get("status_code", 0) >= 500:
-            return "api"
-        if "selector not found" in defect.get("error", "").lower():
-            return "ui"
+        for step in ui_result.get("steps", []):
+            if step.get("status") == "fail":
+                err = step.get("error", "")
+                if err.startswith("UI_"):
+                    return err
+        for call in api_trace.get("calls", []):
+            if call.get("status_code", 200) >= 400:
+                body = call.get("response_body") or {}
+                return body.get("code") if isinstance(body, dict) else str(call["status_code"])
         return None
 ```
 

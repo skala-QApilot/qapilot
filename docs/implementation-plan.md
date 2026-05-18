@@ -1,6 +1,6 @@
 # QApilot 구현 플랜
 
-> **Version**: 1.6  
+> **Version**: 1.7  
 > **최종 수정일**: 2026-05-18  
 > **기반 문서**: 요구사항정의서 v0.4 / 개발표준정의서 v0.4  
 > **변경 이력**:  
@@ -10,7 +10,8 @@
 > - v1.3 (2026-05-13): §8.4 Interactive Shell Mode (REPL) 추가. `qapilot` 단독 실행 시 인터랙티브 셸 진입 (Claude Code 패턴 차용). 명령 히스토리는 휘발성 (Phase 2 에서 opt-in 영속화 검토).
 > - v1.4 (2026-05-15): §4.5 ActionMapper ↔ CodeGenerator ↔ UITestTool 공통 정책 명문화. §7.5 ErrorCode 체계에 UI Test 전용 7종 (`TOOL_UI_*`) 부록. 27종 action vocabulary 매핑 표 추가.
 > - v1.5 (2026-05-18): §6.1 디렉토리 구조에 `.qapilot/action-mappings/{TC-ID}.json` 추가 — ActionMapping 디스크 영속화. Layer 1B 의 `_save_codes` 노드가 저장, Layer 2 의 `_load_scenarios_for_test` 가 로드. spec 자기 일관성 회복 (scenarios/ + generated-code/ + results/ 와 동일한 디스크 자산 격상). 결정성·HITL 검토 가능성·비용 절감 동시 확보.
-> - v1.6 (2026-05-18): Orchestrator Layer 3 wire-up 완료 — `_defect_classify` (DefectClassifier stub graceful) / `_root_cause` (RootCauseAgent FR-010) / `_fix_recommend` (FixRecommenderAgent FR-011) 호출. `_report` 5 섹션 markdown 확장 (실패 / Cross-check / 장애 분류 / 원인 분석 / 해결 방안). 4-Layer 17 노드 완전 wire 상태 도달. 한계: DefectClassifier·ReportTool 본체 stub 잔존 (graceful), 본체 머지 시 자연 정상화.
+> - v1.6 (2026-05-18): Orchestrator Layer 3 wire-up 완료 — `_defect_classify` (DefectClassifier stub graceful) / `_root_cause` (RootCauseAgent FR-010) / `_fix_recommend` (FixRecommenderAgent FR-011) 호출. `_report` 5 섹션 markdown 확장. 4-Layer 17 노드 완전 wire 상태 도달.
+> - v1.7 (2026-05-18): **DefectClassifier 단계 제거**. CrossCheckAgent 가 이미 생산하는 `error_code`/`summary`/`mismatches` 가 분류 신호를 제공하므로 별도 분류 단계 불필요. `_cross_check` 노드에서 두 필드 보존 패치 + 그래프에서 `_defect_classify` 노드/엣지 제거 (cross_check → root_cause 직결). `defect_results` state 필드 / DefectClassifierAgent / 관련 프롬프트·스키마 모두 제거. `_report` 4 섹션 (실패 / Cross-check / 원인 / 해결) 로 재조정. FR-009 spec 갱신 별도 필요.
 
 ---
 
@@ -72,7 +73,7 @@ generate_scenarios, generate_code, test는 **독립된 파이프라인**으로 �
   → UI테스트Tool ─┐
     API추적Tool  ─┼─(병렬)─→ Cross-check Agent
     DB테스트Tool ─┘
-  → (불일치 시) 장애분류Agent → 원인추론Agent → 해결방안추천Agent
+  → (불일치 시) 원인추론Agent → 해결방안추천Agent
   → 리포트Tool (단일 형식)
 
 ═══════════════════════════════════════════════════════════════════════
@@ -113,9 +114,8 @@ graph.add_edge("load_scenarios_for_test", "test_execution")
 graph.add_edge("test_execution", "cross_check")
 graph.add_conditional_edges(
     "cross_check",
-    lambda state: "defect_classify" if state["has_mismatch"] else "report",
+    lambda state: "root_cause" if state["has_mismatch"] else "report",
 )
-graph.add_edge("defect_classify", "root_cause")
 graph.add_edge("root_cause", "fix_recommend")
 graph.add_edge("fix_recommend", "report")
 graph.add_edge("report", END)
@@ -154,7 +154,7 @@ Orchestrator     │ 실행  │ 실행  │ —
 |---|---|---|---|
 | FR-013 | Orchestrator | X | DAG 실행 관리, trace_id 발급, 순서/병렬화/재시도, 선택적 실행(--case/--failed/--affected/--tag) |
 
-### 3.2 Agent (LLM 사용) — 9개
+### 3.2 Agent (LLM 사용) — 8개
 
 | FR | 이름 | Layer | 핵심 역할 |
 |---|---|---|---|
@@ -163,10 +163,11 @@ Orchestrator     │ 실행  │ 실행  │ —
 | FR-003 | 자연어 요구사항 해석 Agent | L1A | 자연어 → Given/When/Then 구조화 |
 | FR-004 | 시나리오-액션 매핑 Agent | L1B | 시나리오 → UI액션+API매핑+검증포인트 분해 |
 | FR-005 | Playwright 코드 생성 Agent | L1B | 액션 시퀀스 → Playwright JS 코드 |
-| FR-008 | Cross-check Agent | L2 | UI↔API↔DB 데이터 정합성 검증, 정합성 점수 산출 |
-| FR-009 | 장애 분류 Agent | L3 | 규칙 1차 + LLM 보조 → 5개 카테고리 분류 |
-| FR-010 | 원인 추론 Agent | L3 | 로그+코드+Git → Top-N 원인 후보 + 근거 3종 |
+| FR-008 | Cross-check Agent | L2 | UI↔API↔DB 데이터 정합성 검증, 정합성 점수 산출, `error_code`/`summary` 도출 |
+| FR-010 | 원인 추론 Agent | L3 | Cross-check `error_code`/`summary`/`mismatches` + 코드 인덱스 → Top-N 원인 후보 + 근거 3종 |
 | FR-011 | 해결 방안 추천 Agent | L3 | 파일경로+담당자+수정 snippet 제시 |
+
+> **FR-009 장애 분류 Agent 는 구현하지 않는다.** Cross-check Agent (FR-008) 가 이미 `error_code`/`summary`/`mismatches` 를 생산하여 분류 신호를 제공하므로 별도 분류 단계가 불필요. 그래프는 `cross_check → root_cause` 로 직결.
 
 ### 3.3 Tool (결정적, LLM 미사용) — 6개
 
@@ -225,7 +226,7 @@ Orchestrator     │ 실행  │ 실행  │ —
 [qapilot generate code]
   → 저장된 시나리오 로드 → 액션 매핑 → 코드 생성 → 저장 → 끝
 
-[그 외 Agent: Cross-check, 장애분류, 원인추론, 해결추천 등]
+[그 외 Agent: Cross-check, 원인추론, 해결추천 등]
   → confidence < 임계값 → 자체 Fallback (재시도, 규칙 기반 등)
   → confidence는 리포트/로그에 기록
 ```
@@ -396,7 +397,7 @@ ActionMapper / CodeGenerator / UITestTool 모두 동일 vocabulary 공유.
 
 ```
 qapilot/
-├── agents/                          # Agent 모듈 (9개)
+├── agents/                          # Agent 모듈 (8개)
 │   ├── base_agent.py                # BaseAgent ABC
 │   ├── requirement_extractor_agent.py
 │   ├── scenario_generator_agent.py
@@ -404,7 +405,6 @@ qapilot/
 │   ├── action_mapper_agent.py
 │   ├── code_generator_agent.py
 │   ├── cross_check_agent.py
-│   ├── defect_classifier_agent.py
 │   ├── root_cause_agent.py
 │   └── fix_recommender_agent.py
 ├── tools/                           # Tool 모듈 (6개)
@@ -443,7 +443,6 @@ qapilot/
 │   │   └── template.md
 │   ├── action_mapper/
 │   ├── cross_check/
-│   ├── defect_classifier/
 │   ├── root_cause/
 │   ├── fix_recommender/
 │   ├── natural_language/
@@ -703,9 +702,10 @@ bye.
 
 | # | FR | 작업 | 검증 |
 |---|---|---|---|
-| 1 | FR-009 | 장애 분류 Agent: 규칙 1차 + LLM 보조, 5개 카테고리 | 실패 로그 → 정확한 분류 |
-| 2 | FR-010 | 원인 추론 Agent: 로그+코드+Git blame → Top-N + 근거 3종 | Top-3 정확도 60%+ |
-| 3 | FR-011 | 해결 방안 추천 Agent: 파일경로+담당자+수정 snippet | 원인 후보 → 해결 가이드 |
+| 1 | FR-010 | 원인 추론 Agent: Cross-check `error_code`/`summary`/`mismatches` + 코드 인덱스 → Top-N + 근거 3종 | Top-3 정확도 60%+ |
+| 2 | FR-011 | 해결 방안 추천 Agent: 파일경로+담당자+수정 snippet | 원인 후보 → 해결 가이드 |
+
+> FR-009 (장애 분류 Agent) 는 구현하지 않는다. Cross-check Agent 의 출력이 분류 신호를 대체.
 
 ### Phase 4: Orchestrator 통합 + 리포트 (Week 5)
 
@@ -733,7 +733,7 @@ bye.
 | 1 | E2E 통합 테스트 (generate scenarios → generate code → test 3단계 파이프라인) | 시나리오 1개 실행 2분 이내 |
 | 2 | 성능 튜닝 | 코드 스캔 diff 10초 이내, 대시보드 로딩 3초 이내 |
 | 3 | 보안 점검 | OWASP Top 10, 프롬프트 인젝션 방지, 민감정보 마스킹 |
-| 4 | 골든셋 인수 테스트 | 시나리오 정확도 75%+, 장애 분류 85%+, 원인 추론 Top-3 75%+ |
+| 4 | 골든셋 인수 테스트 | 시나리오 정확도 75%+, 원인 추론 Top-3 75%+ |
 | 5 | 문서 산출물 정리 | CHANGELOG, API 문서 (Swagger) |
 
 ---
@@ -743,8 +743,7 @@ bye.
 | No | 항목 | 합격 기준 | 검증 방법 |
 |---|---|---|---|
 | 1 | 시나리오 생성 정확도 | 골든셋 300건 기준 75%+ | 독립 골든셋 측정 |
-| 2 | 장애 분류 정확도 | 결함 라벨 데이터 기준 85%+ | 라벨 데이터 측정 |
-| 3 | 원인 추론 Top-3 | 결함 이력 200건 기준 75%+ | 이력 데이터 측정 |
+| 2 | 원인 추론 Top-3 | 결함 이력 200건 기준 75%+ | 이력 데이터 측정 |
 | 4 | 대시보드 API 응답 | p95 기준 500ms 이내 | JMeter 부하 테스트 |
 | 5 | 에이전트 안전성 | 비인가 Tool 호출 0건, 타임아웃 자동 회복률 95%+ | 시나리오 테스트 |
 | 6 | 무인 실행 | 5영업일 연속 성공 + 리포트 자동 생성 | 5일 연속 실행 로그 |
