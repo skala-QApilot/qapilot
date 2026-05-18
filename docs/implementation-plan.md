@@ -1,7 +1,7 @@
 # QApilot 구현 플랜
 
-> **Version**: 1.4  
-> **최종 수정일**: 2026-05-15  
+> **Version**: 1.5  
+> **최종 수정일**: 2026-05-18  
 > **기반 문서**: 요구사항정의서 v0.4 / 개발표준정의서 v0.4  
 > **변경 이력**:  
 > - v1.0 (2026-05-07): 최초 작성. Orchestrator 고정 DAG 전환, HITL 범위 축소, 리포트 단일 형식 반영
@@ -9,6 +9,7 @@
 > - v1.2 (2026-05-11): HITL 모듈 제거. generate를 generate_scenarios/generate_code 2단계로 추가 분리. 사용자는 두 명령 사이에서 시나리오를 자유롭게 수정·삭제 가능
 > - v1.3 (2026-05-13): §8.4 Interactive Shell Mode (REPL) 추가. `qapilot` 단독 실행 시 인터랙티브 셸 진입 (Claude Code 패턴 차용). 명령 히스토리는 휘발성 (Phase 2 에서 opt-in 영속화 검토).
 > - v1.4 (2026-05-15): §4.5 ActionMapper ↔ CodeGenerator ↔ UITestTool 공통 정책 명문화. §7.5 ErrorCode 체계에 UI Test 전용 7종 (`TOOL_UI_*`) 부록. 27종 action vocabulary 매핑 표 추가.
+> - v1.5 (2026-05-18): §6.1 디렉토리 구조에 `.qapilot/action-mappings/{TC-ID}.json` 추가 — ActionMapping 디스크 영속화. Layer 1B 의 `_save_codes` 노드가 저장, Layer 2 의 `_load_scenarios_for_test` 가 로드. spec 자기 일관성 회복 (scenarios/ + generated-code/ + results/ 와 동일한 디스크 자산 격상). 결정성·HITL 검토 가능성·비용 절감 동시 확보.
 
 ---
 
@@ -465,6 +466,8 @@ qapilot/
 │   ├── {시나리오ID}.json             # TS/TC/TV 3단계 구조
 │   ├── raw/                         # 자연어 원본
 │   └── regression/                  # 회귀 테스트 자산
+├── action-mappings/                 # generate_code 산출물: ActionMapping (v1.5 신규)
+│   └── {TC-ID}.json                 # TC별 ActionStep 시퀀스 (Layer 2 가 로드)
 ├── generated-code/                  # generate 산출물: Playwright 코드
 │   └── {TC-ID}.js                   # TC별 생성 코드
 ├── results/{trace_id}/              # 테스트 결과

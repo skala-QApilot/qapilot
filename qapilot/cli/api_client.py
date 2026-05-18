@@ -7,9 +7,11 @@ Created: 2026-05-07
 """
 
 import os
+from pathlib import Path
 from typing import Any, Dict
 
 import httpx
+
 from qapilot.shared.config import load_config
 from qapilot.shared.logger import get_logger
 
@@ -21,9 +23,11 @@ class ApiClient:
 
     def __init__(self, base_url: str | None = None, token: str | None = None):
         config = load_config()
-        # 환경변수 우선, 그다음 명시적 인자, 마지막으로 config.yaml 참조
-        self.base_url = os.getenv("SERVER_URL") or base_url or config.server.url
-        self.token = os.getenv("SERVER_TOKEN") or token or config.server.token
+        # 환경변수 우선, 없으면 config.yaml 참조
+        self.base_url = os.getenv("SERVER_URL") or config.server.url
+        self.token = os.getenv("SERVER_TOKEN") or config.server.token
+        self._target_root = Path(config.project.repo_path or ".").resolve()
+        self._qapilot_dir = self._target_root / ".qapilot"
 
         if not self.base_url:
             logger.warning("SERVER_URL이 설정되지 않았습니다. 서버 동기화가 불가능합니다.")
@@ -41,10 +45,11 @@ class ApiClient:
 
         async with httpx.AsyncClient() as client:
             try:
+                payload = self._sync_payload([scenario_data])
                 response = await client.post(
-                    f"{self.base_url}/api/scenarios",
-                    json=scenario_data,
-                    headers=self._get_headers()
+                    f"{self.base_url}/api/cli/sync/scenarios",
+                    json=payload,
+                    headers=self._get_headers(),
                 )
                 response.raise_for_status()
                 return True
@@ -59,15 +64,11 @@ class ApiClient:
 
         async with httpx.AsyncClient() as client:
             try:
-                # implementation-plan.md 사양에 따른 엔드포인트
-                payload = {
-                    "trace_id": trace_id,
-                    "data": results
-                }
+                payload = self._sync_payload([{"trace_id": trace_id, "data": results}])
                 response = await client.post(
-                    f"{self.base_url}/api/upload/results",
+                    f"{self.base_url}/api/cli/sync/results",
                     json=payload,
-                    headers=self._get_headers()
+                    headers=self._get_headers(),
                 )
                 response.raise_for_status()
                 return True
@@ -75,22 +76,23 @@ class ApiClient:
                 logger.error(f"테스트 결과 업로드 실패: {e}")
                 return False
 
-    async def upload_generated_code(self, tc_id: str, code: str) -> bool:
+    async def upload_generated_code(self, tc_id: str, code: str, path: str | None = None) -> bool:
         """생성된 Playwright 코드를 서버로 업로드한다."""
         if not self.base_url:
             return False
 
         async with httpx.AsyncClient() as client:
             try:
-                payload = {
+                item = {
                     "tc_id": tc_id,
-                    "code": code
+                    "path": path or f".qapilot/generated-code/{tc_id}.js",
+                    "code": code,
                 }
-                # 사양서 7.2절 기반 (코드 저장용 엔드포인트 제안)
+                payload = self._sync_payload([item])
                 response = await client.post(
-                    f"{self.base_url}/api/generated-code",
+                    f"{self.base_url}/api/cli/sync/generated-code",
                     json=payload,
-                    headers=self._get_headers()
+                    headers=self._get_headers(),
                 )
                 response.raise_for_status()
                 return True
@@ -123,7 +125,17 @@ class ApiClient:
 
         async with httpx.AsyncClient() as client:
             try:
-                response = await client.get(f"{self.base_url}/health")
+                response = await client.get(f"{self.base_url}/api/cli/health")
                 return response.status_code == 200
             except Exception:
                 return False
+
+    def _sync_payload(self, items: list[dict]) -> dict:
+        """CLI sync 공통 bulk payload를 생성한다."""
+        return {
+            "source": {
+                "target_root": str(self._target_root),
+                "qapilot_dir": str(self._qapilot_dir),
+            },
+            "items": items,
+        }
