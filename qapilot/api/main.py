@@ -4,8 +4,12 @@
 Created: 2026-05-07
 """
 
+from pathlib import Path
+
 import structlog
 from fastapi import FastAPI, Request
+from fastapi.responses import FileResponse, HTMLResponse, Response
+from fastapi.staticfiles import StaticFiles
 
 from qapilot.api.agent_router import router as agent_router
 from qapilot.api.response import fail
@@ -14,6 +18,8 @@ from qapilot.shared.errors import AuthError, QApilotError
 from qapilot.shared.logger import setup_logger
 
 _TRACE_HEADER = "X-Trace-Id"
+_UI_DIST_DIR = Path(__file__).resolve().parents[3] / "QApilot-UI" / "dist"
+_UI_INDEX_HTML = _UI_DIST_DIR / "index.html"
 
 
 async def _trace_id_middleware(request: Request, call_next):
