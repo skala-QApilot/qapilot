@@ -110,84 +110,33 @@ class ScenarioGeneratorAgent(BaseAgent):
         mismatches = detect_prd_code_mismatch(requirements, scan_result)
         mismatch_text = format_mismatches(mismatches)
 
-        _HEALTH_HANDLERS = {"health", "healthcheck", "ping"}
-        all_endpoints: list[dict] = self._read_index_json("endpoints.json")  # type: ignore[assignment]
-        all_endpoints = [ep for ep in all_endpoints if ep.get("handler", "") not in _HEALTH_HANDLERS]
-        if affected_files:
-            filtered = [ep for ep in all_endpoints if ep.get("file") in affected_files]
-            all_endpoints = filtered or all_endpoints
-
-        # 요구사항 없으면 라우터 기반 fallback
-        if not requirements:
-            self.logger.warning("no_requirements_fallback_to_router_based")
-            return await self._run_router_based(
-                scan_result, domain_rules, trigger, affected_files, mismatch_text, mismatches, last_error
-            )
-
-        # REQ↔API 매핑 (LLM 1회)
-        req_endpoint_map = await self._map_requirements_to_endpoints(requirements, all_endpoints)
-        if not req_endpoint_map:
-            self.logger.warning("req_mapping_failed_fallback_to_router_based")
-            return await self._run_router_based(
-                scan_result, domain_rules, trigger, affected_files, mismatch_text, mismatches, last_error
-            )
-
-        # 미구현 REQ → mismatches 추가
-        for req in requirements:
-            req_id = req["req_id"]
-            if not req_endpoint_map.get(req_id):
-                mismatches.append({
-                    "type": "unimplemented_requirement",
-                    "req_id": req_id,
-                    "content": req.get("content", ""),
-                })
-                self.logger.warning("unimplemented_requirement", req_id=req_id)
-
-        # 매핑 없는 REQ: 키워드 기반 보조 매칭 후 전체 폴백
-        for req in requirements:
-            req_id = req["req_id"]
-            if not req_endpoint_map.get(req_id):
-                content = req.get("content", "") + " " + req.get("domain_area", "")
-                keyword_eps = self._keyword_match_endpoints(content, all_endpoints)
-                req_endpoint_map[req_id] = keyword_eps if keyword_eps else all_endpoints
-
-        # 모든 REQ를 라우터 우선순위 순으로 정렬
-        def _req_sort_key(req_id: str) -> int:
-            min_p = len(_ROUTER_PRIORITY)
-            for ep in req_endpoint_map.get(req_id, []):
-                b = ep.get("file", "").split("/")[-1].replace(".py", "").replace(".ts", "").replace(".js", "")
-                try:
-                    min_p = min(min_p, _ROUTER_PRIORITY.index(b))
-                except ValueError:
-                    pass
-            return min_p
-
-        sorted_req_ids = sorted(
-            [req["req_id"] for req in requirements],
-            key=_req_sort_key,
-        )
-
         from qapilot.tools.domain_knowledge import DomainKnowledgeTool
+
+        # 라우터 기반 루프: 1 라우터 = 1 TS (기능 영역별 세분화)
+        router_map = self._sort_router_map(self._build_router_map(affected_files))
 
         all_scenarios: list = []
         confidence_sum = 0.0
 
-        for req_id in sorted_req_ids:
-            endpoints = req_endpoint_map[req_id]
-            req = next((r for r in requirements if r["req_id"] == req_id), {})
-            router_files = list(dict.fromkeys(ep.get("file", "") for ep in endpoints if ep.get("file")))
+        for router_file, endpoints in router_map.items():
+            basename = router_file.split("/")[-1].replace(".py", "").replace(".ts", "").replace(".js", "")
 
-            # 도메인 규칙: 요구사항 내용으로 Qdrant 검색
-            req_domain_rules = await self._fetch_domain_rules(req.get("content", req_id), top_k=5)
-            req_domain_rules_text = DomainKnowledgeTool.format_rules_for_prompt(req_domain_rules) or "없음"
+            # 이 라우터와 관련된 요구사항 필터링 (없으면 전체)
+            filtered_reqs = self._filter_requirements_for_router(requirements, basename) if requirements else []
+
+            # 도메인 규칙: 라우터 키워드로 검색
+            keywords = _ROUTER_KEYWORDS.get(basename, [])
+            query = " ".join(keywords) if keywords else basename
+            router_domain_rules = await self._fetch_domain_rules(query, top_k=5)
+            router_domain_rules_text = DomainKnowledgeTool.format_rules_for_prompt(router_domain_rules) or "없음"
 
             user_prompt = self.with_correction_hint(
                 self.prompts.render(
-                    domain_rules=req_domain_rules_text,
-                    requirements=self._format_single_requirement(req),
-                    scan_summary=self._format_scan_summary_for_requirement(req_id, req, endpoints),
-                    code_index=self._format_code_index_for_requirement(router_files, endpoints, scan_result),
-                    affected_files=", ".join(router_files),
+                    domain_rules=router_domain_rules_text,
+                    requirements=self._format_requirements(filtered_reqs),
+                    scan_summary=self._format_scan_summary_for_router(router_file, endpoints),
+                    code_index=self._format_code_index_for_router(router_file, scan_result),
+                    affected_files=router_file,
                     trigger=trigger,
                     mismatch_note=mismatch_text,
                 ),
@@ -200,14 +149,14 @@ class ScenarioGeneratorAgent(BaseAgent):
             )
 
             ts_scenarios, ts_confidence = parse_response(
-                response.content, trigger, router_files, domain_rules
+                response.content, trigger, [router_file], domain_rules
             )
 
             for s in ts_scenarios:
                 if len(s["test_cases"]) < 6:
                     self.logger.warning(
                         "tc_count_below_minimum",
-                        req_id=req_id,
+                        router=basename,
                         tc_count=len(s["test_cases"]),
                         minimum=6,
                     )
@@ -215,13 +164,13 @@ class ScenarioGeneratorAgent(BaseAgent):
             all_scenarios.extend(ts_scenarios)
             confidence_sum += ts_confidence
             self.logger.info(
-                "req_scenarios_generated",
-                req_id=req_id,
+                "router_scenarios_generated",
+                router=basename,
                 ts_count=len(ts_scenarios),
                 tc_count=sum(len(s["test_cases"]) for s in ts_scenarios),
             )
 
-        confidence = round(confidence_sum / len(sorted_req_ids), 3) if sorted_req_ids else 0.5
+        confidence = round(confidence_sum / len(router_map), 3) if router_map else 0.5
 
         all_scenarios = self._renumber_and_set_depends_on(all_scenarios)
         save_scenarios(all_scenarios)
