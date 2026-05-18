@@ -521,40 +521,383 @@ async def _code_generate(state: PipelineState) -> dict:
 
 
 async def _save_codes(state: PipelineState) -> dict:
-    """생성된 Playwright 코드를 .qapilot/generated-code/ 에 저장한다."""
+    """Layer 1B 산출물을 디스크에 저장한다.
+
+    spec §6.1 정합 + ActionMapping 영속화 (Layer 2 의 전제):
+    - .qapilot/generated-code/{tc_id}.js (기존)
+    - .qapilot/action-mappings/{tc_id}.json (신규, PR #87 — ActionMapping 디스크 영속화)
+
+    상세 의미·옵션 비교: 이슈 #87 / memory/project_qapilot_pipeline_persistence_layers.md
+    """
     import json
     from pathlib import Path
 
     generated_codes = state.get("generated_codes") or []
-    out_dir = Path(".qapilot") / "generated-code"
-    out_dir.mkdir(parents=True, exist_ok=True)
+    action_mappings = state.get("action_mappings") or []
 
-    saved_paths = []
+    code_dir = Path(".qapilot") / "generated-code"
+    am_dir = Path(".qapilot") / "action-mappings"
+    code_dir.mkdir(parents=True, exist_ok=True)
+    am_dir.mkdir(parents=True, exist_ok=True)
+
+    saved_code_paths: list[str] = []
     for code_obj in generated_codes:
         tc_id = code_obj.get("tc_id")
         if not tc_id:
             continue
-        path = out_dir / f"{tc_id}.js"
+        path = code_dir / f"{tc_id}.js"
         path.write_text(code_obj.get("code", ""), encoding="utf-8")
-        saved_paths.append(str(path))
+        saved_code_paths.append(str(path))
+
+    # 신규 — ActionMapping 디스크 영속화 (Layer 2 의 _load_scenarios_for_test 가 읽음)
+    for am in action_mappings:
+        tc_id = am.get("tc_id")
+        if not tc_id:
+            continue
+        path = am_dir / f"{tc_id}.json"
+        path.write_text(json.dumps(am, ensure_ascii=False, indent=2), encoding="utf-8")
 
     return {
-        "saved_code_paths": saved_paths,
+        "saved_code_paths": saved_code_paths,
         "status": "completed",
     }
 
 
+# ── Layer 2 헬퍼: 디스크 로드 + 토폴로지 정렬 ──────────────────────────────────
+
+
+def _load_json_files(directory: Path) -> list[dict]:
+    """디렉토리의 *.json 모두 로드 (정렬). 실패한 파일은 skip."""
+    if not directory.exists():
+        return []
+    items: list[dict] = []
+    for path in sorted(directory.glob("*.json")):
+        try:
+            items.append(json.loads(path.read_text(encoding="utf-8")))
+        except Exception:
+            continue
+    return items
+
+
+def _topo_sort_scenarios(scenarios: list[dict]) -> list[dict]:
+    """`depends_on` (PR #82 신규) 기반 토폴로지 정렬.
+
+    순환 의존 또는 unknown 의존은 graceful — 정렬 불가 항목은 마지막에 둠.
+    """
+    by_id = {s.get("ts_id"): s for s in scenarios if s.get("ts_id")}
+    sorted_list: list[dict] = []
+    visited: set[str] = set()
+
+    def visit(ts_id: str, stack: set[str]) -> None:
+        if ts_id in visited or ts_id not in by_id or ts_id in stack:
+            return
+        stack.add(ts_id)
+        for dep in by_id[ts_id].get("depends_on") or []:
+            visit(dep, stack)
+        stack.discard(ts_id)
+        visited.add(ts_id)
+        sorted_list.append(by_id[ts_id])
+
+    for ts in scenarios:
+        ts_id = ts.get("ts_id")
+        if ts_id:
+            visit(ts_id, set())
+    # 의존성 정보 없는 항목 (ts_id 없는 등) 도 마지막에 포함
+    for ts in scenarios:
+        if ts not in sorted_list:
+            sorted_list.append(ts)
+    return sorted_list
+
+
+def _collect_tc_tags(scenarios: list[dict]) -> dict[str, list[str]]:
+    """TC id → tag 목록 dict."""
+    result: dict[str, list[str]] = {}
+    for ts in scenarios:
+        for tc in ts.get("test_cases") or []:
+            tc_id = tc.get("tc_id")
+            if tc_id:
+                result[tc_id] = tc.get("tags") or []
+    return result
+
+
+def _ts_id_of_tc(tc_id: str, scenarios: list[dict]) -> str:
+    """TC id → 소속 TS id. 매칭 실패 시 'unknown'."""
+    for ts in scenarios:
+        for tc in ts.get("test_cases") or []:
+            if tc.get("tc_id") == tc_id:
+                return ts.get("ts_id") or "unknown"
+    return "unknown"
+
+
 async def _load_scenarios_for_test(state: PipelineState) -> dict:
-    """.qapilot/scenarios/ + .qapilot/generated-code/ 를 로드한다 (테스트용)."""
-    raise NotImplementedError
+    """Layer 2 진입 노드 — 디스크에서 scenarios + action_mappings + generated_codes 로드.
+
+    spec §6.1 정합. PipelineState 가 휘발성이므로 `qapilot test` 단독 실행 시 디스크에서 채움.
+    필터 적용: run_options.scenario_ids / tags. depends_on 기반 토폴로지 정렬.
+    """
+    import uuid as _uuid
+
+    trace_id = state.get("trace_id") or str(_uuid.uuid4())
+
+    scenarios = _load_json_files(Path(".qapilot") / "scenarios")
+    action_mappings = _load_json_files(Path(".qapilot") / "action-mappings")
+
+    # generated_codes 는 .js 파일 — 검증·디버그용 (실행에 필수 X)
+    codes_dir = Path(".qapilot") / "generated-code"
+    generated_codes: list[dict] = []
+    if codes_dir.exists():
+        for path in sorted(codes_dir.glob("*.js")):
+            generated_codes.append({
+                "tc_id": path.stem,
+                "code": path.read_text(encoding="utf-8"),
+                "syntax_valid": True,
+                "self_fix_count": 0,
+            })
+
+    # 필터 — run_options.scenario_ids (TS 단위)
+    scenario_ids = state["run_options"].get("scenario_ids") or []
+    if scenario_ids:
+        scenarios = [s for s in scenarios if s.get("ts_id") in scenario_ids]
+        valid_tc_ids = {
+            tc.get("tc_id")
+            for s in scenarios
+            for tc in s.get("test_cases") or []
+        }
+        action_mappings = [a for a in action_mappings if a.get("tc_id") in valid_tc_ids]
+        generated_codes = [c for c in generated_codes if c.get("tc_id") in valid_tc_ids]
+
+    # 필터 — run_options.tags (TC 단위)
+    tags = state["run_options"].get("tags") or []
+    if tags:
+        tc_tags_map = _collect_tc_tags(scenarios)
+        valid_tc_ids = {
+            tc_id for tc_id, tc_tags in tc_tags_map.items()
+            if any(t in tc_tags for t in tags)
+        }
+        action_mappings = [a for a in action_mappings if a.get("tc_id") in valid_tc_ids]
+        generated_codes = [c for c in generated_codes if c.get("tc_id") in valid_tc_ids]
+        # 시나리오는 그대로 두되 test_cases 필터링은 후속 단계가 alignment 처리
+
+    # depends_on 토폴로지 정렬 (PR #82)
+    scenarios = _topo_sort_scenarios(scenarios)
+
+    return {
+        "trace_id": trace_id,
+        "scenarios": scenarios,
+        "action_mappings": action_mappings,
+        "generated_codes": generated_codes,
+        "current_layer": "L2",
+    }
 
 
 async def _test_execution(state: PipelineState) -> dict:
-    raise NotImplementedError
+    """Layer 2 핵심 노드 — async_playwright + APITrace/UITest/DBTest 통합 호출.
+
+    spec §3.3 FR-006 의 X-Trace-Id 헤더 주입 (browser.new_context).
+    각 TC 별 결과를 .qapilot/results/{trace_id}/{ts_id}/{tc_id}/ 에 저장 (spec §6.1, L2 디스크 캐시).
+    DBTestTool 은 QAPILOT_MODULE_URL 미설정 시 graceful skip.
+    """
+    from playwright.async_api import async_playwright
+
+    from qapilot.shared.config import load_config
+    from qapilot.shared.schemas import ToolInput
+    from qapilot.tools.api_trace_tool import APITraceTool
+    from qapilot.tools.db_test_tool import DBTestTool
+    from qapilot.tools.ui_test_tool import UITestTool
+
+    trace_id = state["trace_id"]
+    scenarios = state.get("scenarios") or []
+    action_mappings = state.get("action_mappings") or []
+    cfg = load_config()
+    headless = bool(getattr(cfg.test, "headless", True)) if hasattr(cfg, "test") else True
+    target_url = getattr(cfg.project, "target_url", "") if hasattr(cfg, "project") else ""
+
+    results_root = Path(".qapilot") / "results" / trace_id
+
+    ui_results: list[dict] = []
+    api_results: list[dict] = []
+    db_results: list[dict] = []
+
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(headless=headless)
+        context = await browser.new_context(
+            extra_http_headers={"X-Trace-Id": trace_id}
+        )
+        page = await context.new_page()
+
+        try:
+            for am in action_mappings:
+                tc_id = am.get("tc_id") or "unknown"
+                ts_id = _ts_id_of_tc(tc_id, scenarios)
+                tc_dir = results_root / ts_id / tc_id
+                screenshots_dir = tc_dir / "screenshots"
+                tc_dir.mkdir(parents=True, exist_ok=True)
+
+                ui_res = await _run_ui_with_trace(
+                    page=page,
+                    tc_id=tc_id,
+                    action_mapping=am,
+                    target_url=target_url,
+                    screenshots_dir=screenshots_dir,
+                    trace_id=trace_id,
+                    UITestTool=UITestTool,
+                    APITraceTool=APITraceTool,
+                    ToolInput=ToolInput,
+                )
+                ui_results.append(ui_res["ui_result"])
+                api_results.append(ui_res["api_result"])
+
+                db_res = await _run_db_test_safe(
+                    tc_id=tc_id,
+                    trace_id=trace_id,
+                    DBTestTool=DBTestTool,
+                    ToolInput=ToolInput,
+                )
+                db_results.append(db_res)
+
+                # L2 디스크 저장 (spec §6.1)
+                (tc_dir / "ui_result.json").write_text(
+                    json.dumps(ui_res["ui_result"], ensure_ascii=False, indent=2), "utf-8"
+                )
+                (tc_dir / "api_result.json").write_text(
+                    json.dumps(ui_res["api_result"], ensure_ascii=False, indent=2), "utf-8"
+                )
+                (tc_dir / "db_result.json").write_text(
+                    json.dumps(db_res, ensure_ascii=False, indent=2), "utf-8"
+                )
+        finally:
+            await context.close()
+            await browser.close()
+
+    return {
+        "ui_results": ui_results,
+        "api_results": api_results,
+        "db_results": db_results,
+    }
+
+
+async def _run_ui_with_trace(
+    *,
+    page,
+    tc_id: str,
+    action_mapping: dict,
+    target_url: str,
+    screenshots_dir: Path,
+    trace_id: str,
+    UITestTool,
+    APITraceTool,
+    ToolInput,
+) -> dict:
+    """APITraceTool 의 listener 등록 (즉시 반환) + UITestTool 실행 후 api calls 재계산."""
+    apt = APITraceTool(trace_id=trace_id)
+    apt_out = await apt.run(ToolInput(trace_id=trace_id, params={"page": page, "tc_id": tc_id}))
+    api_trace = apt_out.result["api_trace"]
+
+    ui_tool = UITestTool(trace_id=trace_id)
+    ui_out = await ui_tool.run(
+        ToolInput(
+            trace_id=trace_id,
+            params={
+                "page": page,
+                "action_mapping": action_mapping,
+                "tc_id": tc_id,
+                "target_url": target_url,
+                "screenshot_dir": str(screenshots_dir),
+            },
+        )
+    )
+
+    # listener 가 누적한 calls 를 dict 로 강제 변환 (TypedDict 인스턴스 dict-like)
+    api_trace_dict = dict(api_trace)
+    api_trace_dict["total_calls"] = len(api_trace_dict.get("calls") or [])
+    api_trace_dict["error_calls"] = sum(
+        1 for c in (api_trace_dict.get("calls") or [])
+        if c.get("status_code", 0) >= 400
+    )
+
+    return {
+        "ui_result": ui_out.result["ui_result"],
+        "api_result": api_trace_dict,
+    }
+
+
+async def _run_db_test_safe(*, tc_id: str, trace_id: str, DBTestTool, ToolInput) -> dict:
+    """DBTestTool graceful — QAPILOT_MODULE_URL 미설정 또는 호출 실패 시 빈 결과."""
+    try:
+        tool = DBTestTool(trace_id=trace_id)
+        out = await tool.run(ToolInput(trace_id=trace_id, params={"tc_id": tc_id}))
+        return dict(out.result.get("db_test") or {
+            "tc_id": tc_id, "snapshots": [], "summary": "DB test 결과 비어있음",
+        })
+    except Exception as e:
+        return {
+            "tc_id": tc_id,
+            "snapshots": [],
+            "summary": f"DBTest skip: {type(e).__name__}: {e}",
+        }
 
 
 async def _cross_check(state: PipelineState) -> dict:
-    raise NotImplementedError
+    """Layer 2 정합성 검증 노드 — TC 별 CrossCheckAgent 호출.
+
+    UI/API/DB 결과를 TC id 기준 매칭하여 각 Agent 호출. has_mismatch 어느 하나라도 True 면
+    state["has_mismatch"]=True (Layer 3 분기 결정).
+    """
+    from qapilot.agents.cross_check_agent import CrossCheckAgent
+    from qapilot.shared.schemas import AgentInput
+
+    trace_id = state["trace_id"]
+    ui_results = state.get("ui_results") or []
+    api_results = state.get("api_results") or []
+    db_results = state.get("db_results") or []
+
+    # tc_id 별 인덱싱
+    ui_map = {r.get("tc_id"): r for r in ui_results if r.get("tc_id")}
+    api_map = {r.get("tc_id"): r for r in api_results if r.get("tc_id")}
+    db_map = {r.get("tc_id"): r for r in db_results if r.get("tc_id")}
+
+    cross_check_results: list[dict] = []
+    any_mismatch = False
+
+    for tc_id in ui_map.keys():
+        ui_result = ui_map.get(tc_id, {})
+        api_trace = api_map.get(tc_id, {})
+        db_result = db_map.get(tc_id, {})
+
+        agent = CrossCheckAgent(trace_id=trace_id)
+        try:
+            output = await agent.run(
+                AgentInput(
+                    trace_id=trace_id,
+                    context={
+                        "ui_result": ui_result,
+                        "api_trace": api_trace,
+                        "db_result": db_result,
+                    },
+                    params={"tc_id": tc_id},
+                )
+            )
+            cc = dict(output.result.get("cross_check") or {})
+            if not cc:
+                cc = {
+                    "tc_id": tc_id, "match_score": 0.0, "matched_fields": 0,
+                    "mismatched_fields": 0, "mismatches": [], "has_mismatch": False,
+                }
+            cross_check_results.append(cc)
+            if cc.get("has_mismatch"):
+                any_mismatch = True
+        except Exception as e:
+            cross_check_results.append({
+                "tc_id": tc_id, "match_score": 0.0, "matched_fields": 0,
+                "mismatched_fields": 0, "mismatches": [],
+                "has_mismatch": False,
+                "error": f"CrossCheck skip: {type(e).__name__}: {e}",
+            })
+
+    return {
+        "cross_check_results": cross_check_results,
+        "has_mismatch": any_mismatch,
+    }
 
 
 async def _defect_classify(state: PipelineState) -> dict:
@@ -570,4 +913,56 @@ async def _fix_recommend(state: PipelineState) -> dict:
 
 
 async def _report(state: PipelineState) -> dict:
-    raise NotImplementedError
+    """Layer 2/3 마지막 노드 — 임시 markdown summary (Report Tool 본체 stub 상태).
+
+    spec §6.1 의 .qapilot/reports/{trace_id}.md 저장. ReportTool 본체 머지 후
+    별도 PR 에서 호출로 교체 예정.
+    """
+    trace_id = state["trace_id"]
+    ui_results = state.get("ui_results") or []
+    cross_check_results = state.get("cross_check_results") or []
+
+    total = len(ui_results)
+    passed = sum(1 for r in ui_results if r.get("status") == "pass")
+    failed = total - passed
+
+    lines: list[str] = [
+        f"# QApilot 테스트 리포트",
+        f"",
+        f"- trace_id: `{trace_id}`",
+        f"- 총 TC: {total}",
+        f"- pass: {passed}",
+        f"- fail: {failed}",
+        f"",
+        f"## 실패 케이스",
+    ]
+    for ui in ui_results:
+        if ui.get("status") != "fail":
+            continue
+        lines.append(f"### {ui.get('tc_id')}")
+        for step in ui.get("steps") or []:
+            if step.get("status") != "fail":
+                continue
+            lines.append(
+                f"- step {step.get('step_no')} ({step.get('action')}): "
+                f"`{step.get('error') or ''}`"
+            )
+
+    lines.extend(["", "## Cross-check 요약"])
+    for cc in cross_check_results:
+        marker = "⚠️" if cc.get("has_mismatch") else "✅"
+        lines.append(
+            f"- {marker} `{cc.get('tc_id')}` "
+            f"match_score={cc.get('match_score', 0):.2f} "
+            f"mismatches={cc.get('mismatched_fields', 0)}"
+        )
+
+    reports_dir = Path(".qapilot") / "reports"
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    report_path = reports_dir / f"{trace_id}.md"
+    report_path.write_text("\n".join(lines), encoding="utf-8")
+
+    return {
+        "report_path": str(report_path),
+        "status": "completed",
+    }
