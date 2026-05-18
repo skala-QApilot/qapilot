@@ -4,8 +4,12 @@
 Created: 2026-05-07
 """
 
+from pathlib import Path
+
 import structlog
 from fastapi import FastAPI, Request
+from fastapi.responses import FileResponse, HTMLResponse, Response
+from fastapi.staticfiles import StaticFiles
 
 from qapilot.api.agent_router import router as agent_router
 from qapilot.api.auth_router import router as auth_router
@@ -14,6 +18,8 @@ from qapilot.api.cli_router import router as cli_router
 from qapilot.api.dashboard_extra_router import router as dashboard_extra_router
 from qapilot.api.dashboard_router import router as dashboard_router
 from qapilot.api.defect_router import router as defect_router
+from qapilot.api.project_dashboard import build_project_dashboard_html
+from qapilot.api.projects_router import router as projects_router
 from qapilot.api.evidences_router import router as evidences_router
 from qapilot.api.files_router import router as files_router
 from qapilot.api.graph_router import router as graph_router
@@ -37,6 +43,8 @@ from qapilot.shared.errors import AuthError, QApilotError
 from qapilot.shared.logger import setup_logger
 
 _TRACE_HEADER = "X-Trace-Id"
+_UI_DIST_DIR = Path(__file__).resolve().parents[3] / "QApilot-UI" / "dist"
+_UI_INDEX_HTML = _UI_DIST_DIR / "index.html"
 
 
 async def _trace_id_middleware(request: Request, call_next):
@@ -93,9 +101,32 @@ def create_app() -> FastAPI:
     app.include_router(scenario_router)
     app.include_router(defect_router)
     app.include_router(report_router)
+    app.include_router(projects_router)
 
-    # React 빌드 결과물 정적 서빙
-    # app.mount("/", StaticFiles(directory="qapilot/web/dist", html=True))
+    if _UI_DIST_DIR.is_dir():
+        app.mount("/assets", StaticFiles(directory=_UI_DIST_DIR / "assets"), name="ui-assets")
+
+    def _serve_ui_or_fallback(project_slug: str | None = None) -> Response:
+        if _UI_INDEX_HTML.is_file():
+            return FileResponse(_UI_INDEX_HTML)
+        if project_slug:
+            return build_project_dashboard_html(project_slug)
+        return HTMLResponse("<html><body><h1>QApilot UI build not found</h1></body></html>", status_code=503)
+
+    @app.get("/", response_class=HTMLResponse, response_model=None)
+    async def dashboard_root() -> Response:
+        """Serve the React app entry for the dashboard root."""
+        return _serve_ui_or_fallback()
+
+    @app.get("/{project_slug}", response_class=HTMLResponse, response_model=None)
+    async def project_dashboard(project_slug: str) -> Response:
+        """Serve the React app entry for browser project routes."""
+        return _serve_ui_or_fallback(project_slug)
+
+    @app.get("/{project_slug}/{subpath:path}", response_class=HTMLResponse, response_model=None)
+    async def project_subpage(project_slug: str, subpath: str) -> Response:
+        """Serve the React app entry for nested browser project routes."""
+        return _serve_ui_or_fallback(project_slug)
 
     return app
 
