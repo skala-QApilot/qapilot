@@ -6,7 +6,7 @@ Created: 2026-05-15
 
 import asyncio
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal, cast
 
 from fastapi import APIRouter, Depends, Query, Request
 from fastapi.responses import JSONResponse
@@ -32,6 +32,8 @@ router = APIRouter(
 logger = get_logger("api.agent")
 
 _SCENARIO_TRIGGERS = {"init", "natural_lang", "doc_update"}
+ScenarioTrigger = Literal["init", "natural_lang", "doc_update"]
+RunFilter = Literal["all", "failed", "affected"]
 
 
 @router.post("/scenario-generation")
@@ -44,7 +46,7 @@ async def scenario_generation(request: Request) -> Any:
 
     options: RunOptions = {
         "command": "generate_scenarios",
-        "trigger": str(body["trigger"]),
+        "trigger": _scenario_trigger(body),
         "user_input": _optional_str(body, "user_input"),
         "scenario_ids": _optional_list(body, "scenario_ids"),
         "filter": _optional_filter(body),
@@ -237,9 +239,15 @@ def _optional_list(body: dict[str, Any], key: str) -> list[str] | None:
     return [str(item) for item in value] if isinstance(value, list) else None
 
 
-def _optional_filter(body: dict[str, Any]) -> str | None:
+def _scenario_trigger(body: dict[str, Any]) -> ScenarioTrigger:
+    return cast(ScenarioTrigger, str(body["trigger"]))
+
+
+def _optional_filter(body: dict[str, Any]) -> RunFilter | None:
     value = _optional_str(body, "filter")
-    return value if value in {"all", "failed", "affected"} else None
+    if value in {"all", "failed", "affected"}:
+        return cast(RunFilter, value)
+    return None
 
 
 def _chat_reply(message: str, quick_action: str | None) -> str:
