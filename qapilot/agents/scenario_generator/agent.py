@@ -143,7 +143,15 @@ class ScenarioGeneratorAgent(BaseAgent):
                 })
                 self.logger.warning("unimplemented_requirement", req_id=req_id)
 
-        # 매핑된 REQ를 라우터 우선순위 순으로 정렬
+        # 매핑 없는 REQ: 키워드 기반 보조 매칭 후 전체 폴백
+        for req in requirements:
+            req_id = req["req_id"]
+            if not req_endpoint_map.get(req_id):
+                content = req.get("content", "") + " " + req.get("domain_area", "")
+                keyword_eps = self._keyword_match_endpoints(content, all_endpoints)
+                req_endpoint_map[req_id] = keyword_eps if keyword_eps else all_endpoints
+
+        # 모든 REQ를 라우터 우선순위 순으로 정렬
         def _req_sort_key(req_id: str) -> int:
             min_p = len(_ROUTER_PRIORITY)
             for ep in req_endpoint_map.get(req_id, []):
@@ -155,7 +163,7 @@ class ScenarioGeneratorAgent(BaseAgent):
             return min_p
 
         sorted_req_ids = sorted(
-            [req_id for req_id, eps in req_endpoint_map.items() if eps],
+            [req["req_id"] for req in requirements],
             key=_req_sort_key,
         )
 
@@ -481,6 +489,20 @@ class ScenarioGeneratorAgent(BaseAgent):
             return result.get("rules", [])
         except Exception:
             return []
+
+    def _keyword_match_endpoints(self, text: str, all_endpoints: list[dict]) -> list[dict]:
+        """요구사항 텍스트의 도메인 키워드로 관련 엔드포인트를 찾는다."""
+        matched_basenames: list[str] = []
+        for basename, keywords in _ROUTER_KEYWORDS.items():
+            if any(kw in text for kw in keywords):
+                matched_basenames.append(basename)
+        if not matched_basenames:
+            return []
+        return [
+            ep for ep in all_endpoints
+            if ep.get("file", "").split("/")[-1].replace(".py", "").replace(".ts", "").replace(".js", "")
+            in matched_basenames
+        ]
 
     def _filter_requirements_for_router(self, requirements: list, basename: str) -> list:
         """라우터 키워드와 매칭되는 요구사항만 반환한다. 매칭 없으면 전체의 앞 5개."""
