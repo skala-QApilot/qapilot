@@ -495,27 +495,56 @@ async def _action_mapping(state: PipelineState) -> dict:
 
 
 async def _code_generate(state: PipelineState) -> dict:
+    """CodeGenerator 호출. Agent 실패 시 generated_codes=[] 로 graceful — pipeline 계속.
+
+    이슈 #105: Agent 가 단일 LLM 호출로 78 TC 를 처리하다 JSON parse 실패 시 retry 4회
+    후 AgentExecutionError 가 pipeline 전체를 중단시켰음. 그 결과 직전 노드의
+    ActionMapping 78건이 `_save_codes` 미도달로 모두 휘발.
+
+    spec §4.5 (C/D 정책): UITestTool 은 ActionMapping 으로 직접 실행, .js 는 별도
+    deliverable. 따라서 CodeGen 실패해도 ActionMapping 만 디스크 저장되면 Layer 2~3
+    진행 가능. `_save_codes` 가 ActionMapping/generated_codes 둘 다 처리하므로 여기서는
+    fail 흡수만 한다.
+    """
     from qapilot.agents.code_generator_agent import CodeGeneratorAgent
     from qapilot.shared.schemas import AgentInput
 
-    agent = CodeGeneratorAgent(trace_id=state.get("trace_id"))
-    result = await agent.run(
-        AgentInput(
-            trace_id=state.get("trace_id") or "",
-            context={
-                "action_mappings": state.get("action_mappings", []),
-                "scenarios": state.get("scenarios", [])
-            },
-            params={},
+    import structlog
+    logger = structlog.get_logger("orchestrator")
+
+    action_mappings = state.get("action_mappings") or []
+    agent_logs = state.get("agent_logs", [])
+
+    try:
+        agent = CodeGeneratorAgent(trace_id=state.get("trace_id"))
+        result = await agent.run(
+            AgentInput(
+                trace_id=state.get("trace_id") or "",
+                context={
+                    "action_mappings": action_mappings,
+                    "scenarios": state.get("scenarios", [])
+                },
+                params={},
+            )
         )
-    )
-
-    agent_logs = state.get("agent_logs", []) + [result.metadata.model_dump()]
-
-    return {
-        "generated_codes": result.result.get("generated_codes", []),
-        "agent_logs": agent_logs,
-    }
+        generated_codes = result.result.get("generated_codes", [])
+        agent_logs = agent_logs + [result.metadata.model_dump()]
+        logger.info(
+            "code_generate_complete",
+            trace_id=state.get("trace_id"),
+            tc_count=len(action_mappings),
+            generated_count=len(generated_codes),
+        )
+        return {"generated_codes": generated_codes, "agent_logs": agent_logs}
+    except Exception as e:
+        logger.warning(
+            "code_generate_failed_graceful",
+            trace_id=state.get("trace_id"),
+            error=f"{type(e).__name__}: {e}",
+            action_mapping_count=len(action_mappings),
+            note="ActionMapping 만 디스크 저장됩니다 (spec §4.5 — UITestTool 은 ActionMapping 직접 실행)",
+        )
+        return {"generated_codes": [], "agent_logs": agent_logs}
 
 
 async def _save_codes(state: PipelineState) -> dict:
