@@ -17,14 +17,17 @@ _logger = get_logger("trace_store")
 
 
 def create_trace(
-    service: dict,
+    qapilot_dir: str | Path,
     trace_id: str,
     command: str,
     trigger: str | None,
+    service_id: str | None = None,
 ) -> dict:
     """실행 중 trace 파일을 생성한다."""
     trace = {
         "trace_id": trace_id,
+        "service_id": service_id,
+        "qapilot_dir": str(qapilot_dir),
         "command": command,
         "trigger": trigger,
         "status": "running",
@@ -36,13 +39,13 @@ def create_trace(
         "total_cost": 0.0,
         "result_summary": {},
     }
-    _save_trace(service, trace_id, trace)
+    _save_trace(qapilot_dir, trace_id, trace)
     return trace
 
 
-def update_trace(service: dict, trace_id: str, state: dict) -> None:
+def update_trace(qapilot_dir: str | Path, trace_id: str, state: dict) -> None:
     """파이프라인 완료 후 PipelineState 기반으로 trace를 갱신한다."""
-    trace = load_trace(service, trace_id) or {}
+    trace = load_trace(qapilot_dir, trace_id) or {}
     agent_logs = state.get("agent_logs", [])
     trace.update(
         {
@@ -55,12 +58,12 @@ def update_trace(service: dict, trace_id: str, state: dict) -> None:
             "result_summary": _result_summary(state),
         }
     )
-    _save_trace(service, trace_id, trace)
+    _save_trace(qapilot_dir, trace_id, trace)
 
 
-def update_trace_failed(service: dict, trace_id: str, error: str) -> None:
+def update_trace_failed(qapilot_dir: str | Path, trace_id: str, error: str) -> None:
     """파이프라인 실패 상태로 trace를 갱신한다."""
-    trace = load_trace(service, trace_id) or {"trace_id": trace_id}
+    trace = load_trace(qapilot_dir, trace_id) or {"trace_id": trace_id}
     trace.update(
         {
             "status": "failed",
@@ -68,12 +71,12 @@ def update_trace_failed(service: dict, trace_id: str, error: str) -> None:
             "error": error,
         }
     )
-    _save_trace(service, trace_id, trace)
+    _save_trace(qapilot_dir, trace_id, trace)
 
 
-def load_trace(service: dict, trace_id: str) -> dict | None:
+def load_trace(qapilot_dir: str | Path, trace_id: str) -> dict | None:
     """trace 파일을 읽어 반환한다."""
-    path = _trace_path(service, trace_id)
+    path = _trace_path(qapilot_dir, trace_id)
     if not path.exists():
         return None
     try:
@@ -84,9 +87,9 @@ def load_trace(service: dict, trace_id: str) -> dict | None:
     return data if isinstance(data, dict) else None
 
 
-def list_traces(service: dict) -> list[dict]:
+def list_traces(qapilot_dir: str | Path) -> list[dict]:
     """서비스 trace 목록을 최신순으로 반환한다."""
-    traces_dir = _traces_dir(service)
+    traces_dir = _traces_dir(qapilot_dir)
     if not traces_dir.exists():
         return []
 
@@ -98,8 +101,8 @@ def list_traces(service: dict) -> list[dict]:
     return sorted(traces, key=lambda item: item.get("started_at", ""), reverse=True)
 
 
-def _save_trace(service: dict, trace_id: str, trace: dict) -> None:
-    path = _trace_path(service, trace_id)
+def _save_trace(qapilot_dir: str | Path, trace_id: str, trace: dict) -> None:
+    path = _trace_path(qapilot_dir, trace_id)
     path.parent.mkdir(parents=True, exist_ok=True)
     content = json.dumps(trace, ensure_ascii=False, indent=2, default=str)
     path.write_text(content, encoding="utf-8")
@@ -113,12 +116,12 @@ def _load_trace_file(path: Path) -> dict | None:
     return data if isinstance(data, dict) else None
 
 
-def _traces_dir(service: dict) -> Path:
-    return Path(str(service["qapilot_dir"])) / "traces"
+def _traces_dir(qapilot_dir: str | Path) -> Path:
+    return Path(qapilot_dir) / "traces"
 
 
-def _trace_path(service: dict, trace_id: str) -> Path:
-    return _traces_dir(service) / f"{trace_id}.json"
+def _trace_path(qapilot_dir: str | Path, trace_id: str) -> Path:
+    return _traces_dir(qapilot_dir) / f"{trace_id}.json"
 
 
 def _utc_now() -> str:
