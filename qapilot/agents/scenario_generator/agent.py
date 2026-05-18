@@ -10,6 +10,7 @@ Created: 2026-05-07
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import Any
 
@@ -331,7 +332,8 @@ class ScenarioGeneratorAgent(BaseAgent):
 
         try:
             response = await self.llm.chat(system, user)
-            parsed = json.loads(response.content)
+            cleaned = re.sub(r"```(?:json)?\s*|\s*```", "", response.content).strip()
+            parsed = json.loads(cleaned)
 
             ep_lookup: dict[tuple[str, str], dict] = {
                 (ep.get("method", ""), ep.get("path", "")): ep for ep in all_endpoints
