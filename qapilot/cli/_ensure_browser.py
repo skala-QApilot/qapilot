@@ -26,16 +26,26 @@ _console = Console()
 
 
 def is_chromium_installed() -> bool:
-    """Playwright Chromium 바이너리 존재 여부 확인.
+    """Playwright Chromium 바이너리 존재 여부 확인 (sync 컨텍스트용).
 
-    `executable_path` 접근은 launch 안 함 — 빠른 stat. async_playwright 가 사용 가능해야
-    하므로 sync 컨텍스트에서 호출 시 asyncio.run 으로 감쌈.
+    asyncio.run 으로 async 함수 감쌈. 이미 이벤트 루프 안에서 호출되면
+    RuntimeError → coroutine 명시 close + sync 폴백 (RuntimeWarning 방지).
+    async 컨텍스트 (예: orchestrator 노드) 에서는 `is_chromium_installed_async()` 사용.
     """
+    coro = _check_chromium_path()
     try:
-        return asyncio.run(_check_chromium_path())
+        return asyncio.run(coro)
     except RuntimeError:
-        # 이미 이벤트 루프 안 (잘 안 나오는 경로) — sync 폴백
+        coro.close()  # 미await coroutine 명시 close — RuntimeWarning 방지
         return _check_chromium_path_sync()
+
+
+async def is_chromium_installed_async() -> bool:
+    """Playwright Chromium 바이너리 존재 여부 확인 (async 컨텍스트용).
+
+    이벤트 루프 안 (예: `_test_execution` 노드) 에서 직접 await — RuntimeWarning 0.
+    """
+    return await _check_chromium_path()
 
 
 async def _check_chromium_path() -> bool:
@@ -133,16 +143,30 @@ def _run_playwright_install(console: Console) -> bool:
 def ensure_chromium_for_test() -> bool:
     """`qapilot test` 의 _test_execution 노드용 — prompt 없이 자동 진행.
 
-    사용자 의도는 이미 `qapilot test` 입력으로 명확. 부재 시 자동 다운로드 + 안내.
+    sync 진입점 — async 컨텍스트에서 호출 시 RuntimeWarning 방지 fix 포함.
+    Orchestrator 노드처럼 async 컨텍스트는 `ensure_chromium_for_test_async()` 권장.
     """
     return ensure_chromium(prompt=False)
+
+
+async def ensure_chromium_for_test_async() -> bool:
+    """async 컨텍스트용 — 점검은 await, 다운로드는 subprocess 동기 실행.
+
+    Orchestrator `_test_execution` 노드 같은 async 함수 안에서 호출. coroutine 미await
+    RuntimeWarning 차단.
+    """
+    if await is_chromium_installed_async():
+        return True
+    return _run_playwright_install(_console)
 
 
 # CLI 의 init 마법사 호출용 (prompt=True)
 __all__ = [
     "is_chromium_installed",
+    "is_chromium_installed_async",
     "ensure_chromium",
     "ensure_chromium_for_test",
+    "ensure_chromium_for_test_async",
 ]
 
 
