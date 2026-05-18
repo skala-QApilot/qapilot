@@ -30,19 +30,16 @@ class CrossCheckAgent(BaseAgent):
     agent_name = "cross_check"
 
     def _extract_error_code(
-        self, ui_result: dict, api_trace: dict
+    self, ui_result: dict, api_trace: dict, db_result: dict
     ) -> str | None:
-        """UI/API 응답에서 에러 코드 추출.
-        
-        DB는 모듈 스펙 확정 후 추가 예정.
-        """
-        # UI 에러 코드 추출 (UI_ 접두사)
+        """UI/API/DB 응답에서 에러 코드 추출."""
+        # UI 에러 코드 추출 (TOOL_UI_ 접두사)
         steps = ui_result.get("steps", [])
         for step in steps:
             if step.get("status") == "fail":
                 error = step.get("error", "") or ""
-                if error.startswith("UI_"):
-                    return error
+                if error.startswith("TOOL_UI_"):
+                    return error.split(":")[0].strip()
 
         # API 에러 코드 추출
         calls = api_trace.get("calls", [])
@@ -53,6 +50,11 @@ class CrossCheckAgent(BaseAgent):
                 if isinstance(response_body, dict) and "code" in response_body:
                     return response_body["code"]
                 return str(status_code)
+
+        # DB 에러 코드 추출 (HTTP 상태 코드)
+        db_error = db_result.get("error_code")
+        if db_error:
+            return str(db_error)
 
         return None
 
@@ -113,8 +115,8 @@ class CrossCheckAgent(BaseAgent):
         api_trace = context.get("api_trace", {})
         db_result = context.get("db_result", {})
 
-        # 경로 A: UI 또는 API에서 에러 코드 있는 경우
-        error_code = self._extract_error_code(ui_result, api_trace)
+        # 경로 A: 에러 코드 있는 경우
+        error_code = self._extract_error_code(ui_result, api_trace, db_result)
         if error_code:
             result = CrossCheckResult(
                 tc_id=tc_id,

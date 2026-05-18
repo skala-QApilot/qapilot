@@ -12,6 +12,7 @@ from typing import Any
 
 import httpx
 
+from qapilot.shared.errors import ErrorCode, ToolExecutionError
 from qapilot.shared.schemas import DBSnapshot, DBTestResult
 from qapilot.tools.base_tool import BaseTool
 
@@ -32,40 +33,65 @@ class DBTestTool(BaseTool):
 
     async def _get_tables(self) -> list[str]:
         """DB 테이블 목록 조회."""
-        async with httpx.AsyncClient() as client:
-            response = await client.get(f"{MODULE_URL}/db/tables")
-            response.raise_for_status()
-            return response.json()["data"]["tables"]
+        try:
+            async with httpx.AsyncClient() as client:
+                response = await client.get(f"{MODULE_URL}/db/tables")
+                response.raise_for_status()
+                return response.json()["data"]["tables"]
+        except httpx.ConnectError as e:
+            raise ToolExecutionError(ErrorCode.TOOL_004, f"DB 스캔 모듈 연결 실패: {e}")
+        except httpx.HTTPStatusError as e:
+            raise ToolExecutionError(ErrorCode.TOOL_003, f"DB 테이블 조회 실패: {e.response.status_code}")
 
     async def _get_snapshot(self, table: str) -> dict:
         """테이블 스냅샷 조회."""
-        async with httpx.AsyncClient() as client:
-            response = await client.get(
-                f"{MODULE_URL}/db/snapshot", params={"table": table}
-            )
-            response.raise_for_status()
-            return response.json()["data"]
+        try:
+            async with httpx.AsyncClient() as client:
+                response = await client.get(
+                    f"{MODULE_URL}/db/snapshot", params={"table": table}
+                )
+                response.raise_for_status()
+                return response.json()["data"]
+        except httpx.ConnectError as e:
+            raise ToolExecutionError(ErrorCode.TOOL_004, f"DB 스캔 모듈 연결 실패: {e}")
+        except httpx.HTTPStatusError as e:
+            raise ToolExecutionError(ErrorCode.TOOL_003, f"스냅샷 조회 실패: {e.response.status_code}")
 
     async def _inject_seed(self, seed_sql: str) -> None:
         """시드 데이터 주입."""
-        async with httpx.AsyncClient() as client:
-            response = await client.post(
-                f"{MODULE_URL}/db/seed", json={"sql": seed_sql}
-            )
-            response.raise_for_status()
+        try:
+            async with httpx.AsyncClient() as client:
+                response = await client.post(
+                    f"{MODULE_URL}/db/seed", json={"sql": seed_sql}
+                )
+                response.raise_for_status()
+        except httpx.ConnectError as e:
+            raise ToolExecutionError(ErrorCode.TOOL_004, f"DB 스캔 모듈 연결 실패: {e}")
+        except httpx.HTTPStatusError as e:
+            raise ToolExecutionError(ErrorCode.TOOL_003, f"시드 주입 실패: {e.response.status_code}")
 
     async def _get_sql_logs(self) -> list[dict]:
         """SQL 쿼리 로그 조회."""
-        async with httpx.AsyncClient() as client:
-            response = await client.get(f"{MODULE_URL}/db/sql-logs")
-            response.raise_for_status()
-            return response.json()["data"]["logs"]
+        try:
+            async with httpx.AsyncClient() as client:
+                response = await client.get(f"{MODULE_URL}/db/sql-logs")
+                response.raise_for_status()
+                return response.json()["data"]["logs"]
+        except httpx.ConnectError as e:
+            raise ToolExecutionError(ErrorCode.TOOL_004, f"DB 스캔 모듈 연결 실패: {e}")
+        except httpx.HTTPStatusError as e:
+            raise ToolExecutionError(ErrorCode.TOOL_003, f"SQL 로그 조회 실패: {e.response.status_code}")
 
     async def _rollback(self) -> None:
         """롤백 수행."""
-        async with httpx.AsyncClient() as client:
-            response = await client.post(f"{MODULE_URL}/db/rollback")
-            response.raise_for_status()
+        try:
+            async with httpx.AsyncClient() as client:
+                response = await client.post(f"{MODULE_URL}/db/rollback")
+                response.raise_for_status()
+        except httpx.ConnectError as e:
+            raise ToolExecutionError(ErrorCode.TOOL_004, f"DB 스캔 모듈 연결 실패: {e}")
+        except httpx.HTTPStatusError as e:
+            raise ToolExecutionError(ErrorCode.TOOL_003, f"롤백 실패: {e.response.status_code}")
 
     async def _execute(self, params: dict[str, Any]) -> dict[str, Any]:
         """테스트 전후 DB 스냅샷 비교."""
@@ -75,31 +101,25 @@ class DBTestTool(BaseTool):
         if not MODULE_URL:
             raise ValueError("QAPILOT_MODULE_URL 환경변수가 설정되지 않았습니다.")
 
-        # 1. 테이블 목록 조회
         tables = await self._get_tables()
 
-        # 2. 테스트 전 스냅샷
         before = {}
         for table in tables:
             before[table] = await self._get_snapshot(table)
 
-        # 3. 시드 데이터 주입 (있을 경우)
         if seed_sql:
             await self._inject_seed(seed_sql)
 
-        # 4. SQL 로그 캡처
         sql_logs = []
         try:
             sql_logs = await self._get_sql_logs()
         except Exception as e:
             self.logger.warning(f"SQL 로그 캡처 실패: {e}")
 
-        # 5. 테스트 후 스냅샷
         after = {}
         for table in tables:
             after[table] = await self._get_snapshot(table)
 
-        # 6. 전후 비교
         snapshots: list[DBSnapshot] = []
         for table in tables:
             before_count = before[table].get("row_count", 0)
@@ -114,7 +134,6 @@ class DBTestTool(BaseTool):
                 modified=0,
             ))
 
-        # 7. 롤백
         await self._rollback()
 
         result = DBTestResult(

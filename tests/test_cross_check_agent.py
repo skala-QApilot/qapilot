@@ -34,7 +34,6 @@ async def test_route_a_api_error_code_detected(agent):
 
     with patch.object(agent, "_analyze_with_llm", new=AsyncMock(return_value=([], 1.0, "none", "모든 계층 데이터가 일치함."))):
         output = await agent.run(input)
-        print(output.result)
 
     assert output.result["route"] == "A"
     assert output.result["error_code"] == "AUTH_TOKEN_EXPIRED"
@@ -49,7 +48,7 @@ async def test_route_a_ui_error_code_detected(agent):
         context={
             "ui_result": {
                 "status": "fail",
-                "steps": [{"step_no": 1, "action": "click", "status": "fail", "error": "UI_REQUIRED_FIELD", "screenshot_path": None, "console_logs": [], "duration_ms": 100}]
+                "steps": [{"step_no": 1, "action": "click", "status": "fail", "error": "TOOL_UI_LOCATOR_NOT_FOUND: locator('#submit') timeout", "screenshot_path": None, "console_logs": [], "duration_ms": 100}]
             },
             "api_trace": {
                 "calls": [],
@@ -63,9 +62,34 @@ async def test_route_a_ui_error_code_detected(agent):
 
     with patch.object(agent, "_analyze_with_llm", new=AsyncMock(return_value=([], 1.0, "none", "모든 계층 데이터가 일치함."))):
         output = await agent.run(input)
-        print(output.result)
+
     assert output.result["route"] == "A"
-    assert output.result["error_code"] == "UI_REQUIRED_FIELD"
+    assert output.result["error_code"] == "TOOL_UI_LOCATOR_NOT_FOUND"
+    assert "summary" in output.result
+
+
+@pytest.mark.asyncio
+async def test_route_a_db_error_code_detected(agent):
+    """경로 A: DB 에러 코드 있을 때 Cross-check 건너뜀."""
+    input = AgentInput(
+        trace_id="test-trace-001",
+        context={
+            "ui_result": {"status": "pass", "steps": []},
+            "api_trace": {
+                "calls": [],
+                "total_calls": 0,
+                "error_calls": 0,
+            },
+            "db_result": {"snapshots": [], "error_code": 500},
+        },
+        params={"tc_id": "TC-001"}
+    )
+
+    with patch.object(agent, "_analyze_with_llm", new=AsyncMock(return_value=([], 1.0, "none", "모든 계층 데이터가 일치함."))):
+        output = await agent.run(input)
+
+    assert output.result["route"] == "A"
+    assert output.result["error_code"] == "500"
     assert "summary" in output.result
 
 
@@ -87,7 +111,6 @@ async def test_route_b_no_error_code(agent):
             params={"tc_id": "TC-001"}
         )
         output = await agent.run(input)
-        print(output.result)
 
     assert output.result["route"] == "B"
     assert output.result["error_code"] == "ui-api-mismatch"
