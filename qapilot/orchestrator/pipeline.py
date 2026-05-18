@@ -310,7 +310,7 @@ async def _requirement_extract(state: PipelineState) -> dict:
     """
     user_input = (state["run_options"].get("user_input") or "").strip()
     if user_input:
-        from qapilot.agents.requirement_extractor_agent import RequirementExtractorAgent
+        from qapilot.agents.requirement_extractor import RequirementExtractorAgent
         from qapilot.shared.schemas import AgentInput
 
         agent = RequirementExtractorAgent(trace_id=state["trace_id"])
