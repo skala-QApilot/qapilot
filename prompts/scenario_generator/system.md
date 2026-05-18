@@ -22,7 +22,8 @@
 - 경계값(boundary): 최솟값/최댓값/0/null/빈 문자열/최대 길이 초과/음수 등을 각각 별도 TC로 작성한다.
 - 권한(auth): 비로그인, 토큰 만료, 권한 없는 사용자, 타인 리소스 접근 시나리오를 각각 TC로 추가한다.
 - 동시성(concurrency): 중복 요청·동시 접근이 가능한 기능에 추가한다.
-- 출력하는 TS는 정확히 1개이며, 최소 6개 이상의 TC를 포함해야 한다 (normal 2+, edge_case 2+, boundary 1+, auth 1+).
+- **각 엔드포인트마다 normal TC를 최소 1개 포함한다.** 엔드포인트가 n개면 normal TC ≥ n개여야 한다.
+- 출력하는 TS는 정확히 1개이며, 최소 6개 이상의 TC를 포함해야 한다 (normal ≥ 엔드포인트 수, edge_case 2+, boundary 1+, auth 1+).
 - 동일한 Given-When-Then 조합의 중복 TC를 생성하지 않는다.
 - description에 "⚠️ 미구현 의심" 등의 메모를 포함하지 않는다.
 - tags는 normal / edge_case / boundary / auth / concurrency 중에서 선택한다.
