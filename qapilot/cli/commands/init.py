@@ -102,6 +102,15 @@ def init() -> None:
     models = {1: "gpt-4o-mini", 2: "gpt-4o", 3: "o3-mini"}
     selected_model = models[model_choice]
 
+    # [Step 4] 테스트 환경 사전 셋업 (Playwright Chromium) — 선택형
+    # 거절해도 qapilot test 시점에 자동 처리됨 (lazy)
+    console.print(
+        f"\n[bold {BRAND_PURPLE}]Step 4. 테스트 환경 사전 셋업 (선택)[/bold {BRAND_PURPLE}]"
+    )
+    from qapilot.cli._ensure_browser import ensure_chromium
+
+    ensure_chromium(prompt=True, console=console)
+
     config_data = {
         "server": {
             "url": server_url,
