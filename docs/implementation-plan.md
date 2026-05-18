@@ -1,6 +1,6 @@
 # QApilot 구현 플랜
 
-> **Version**: 1.5  
+> **Version**: 1.6  
 > **최종 수정일**: 2026-05-18  
 > **기반 문서**: 요구사항정의서 v0.4 / 개발표준정의서 v0.4  
 > **변경 이력**:  
@@ -10,6 +10,7 @@
 > - v1.3 (2026-05-13): §8.4 Interactive Shell Mode (REPL) 추가. `qapilot` 단독 실행 시 인터랙티브 셸 진입 (Claude Code 패턴 차용). 명령 히스토리는 휘발성 (Phase 2 에서 opt-in 영속화 검토).
 > - v1.4 (2026-05-15): §4.5 ActionMapper ↔ CodeGenerator ↔ UITestTool 공통 정책 명문화. §7.5 ErrorCode 체계에 UI Test 전용 7종 (`TOOL_UI_*`) 부록. 27종 action vocabulary 매핑 표 추가.
 > - v1.5 (2026-05-18): §6.1 디렉토리 구조에 `.qapilot/action-mappings/{TC-ID}.json` 추가 — ActionMapping 디스크 영속화. Layer 1B 의 `_save_codes` 노드가 저장, Layer 2 의 `_load_scenarios_for_test` 가 로드. spec 자기 일관성 회복 (scenarios/ + generated-code/ + results/ 와 동일한 디스크 자산 격상). 결정성·HITL 검토 가능성·비용 절감 동시 확보.
+> - v1.6 (2026-05-18): Orchestrator Layer 3 wire-up 완료 — `_defect_classify` (DefectClassifier stub graceful) / `_root_cause` (RootCauseAgent FR-010) / `_fix_recommend` (FixRecommenderAgent FR-011) 호출. `_report` 5 섹션 markdown 확장 (실패 / Cross-check / 장애 분류 / 원인 분석 / 해결 방안). 4-Layer 17 노드 완전 wire 상태 도달. 한계: DefectClassifier·ReportTool 본체 stub 잔존 (graceful), 본체 머지 시 자연 정상화.
 
 ---
 
