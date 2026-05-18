@@ -10,6 +10,7 @@ Created: 2026-05-07
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import Any
 
@@ -80,16 +81,14 @@ class ScenarioGeneratorAgent(BaseAgent):
         params: dict[str, Any],
         last_error: str | None = None,
     ) -> ExecuteResult:
-        """코드베이스·도메인 규칙·요구사항을 조합하여 TS/TC/TV 시나리오를 생성한다.
+        """요구사항 기반으로 TS/TC/TV 시나리오를 생성한다.
+
+        흐름: 요구사항 목록 → REQ↔API 매핑(LLM 1회) → REQ별 LLM 호출 → TS 생성
+        요구사항이 없으면 라우터 기반 fallback으로 전환한다.
 
         Args:
-            context: 파이프라인 컨텍스트.
-                scan_result: 코드베이스 스캔 결과 (없으면 Tool 호출).
-                domain_rules: 도메인 규칙 목록 (없으면 Tool 호출).
-                requirements: 요구사항 목록.
-            params:
-                trigger: 생성 트리거 (init/code_change/doc_update/natural_lang).
-                affected_only: True이면 Git diff 기반 영향 파일만 대상으로 함.
+            context: scan_result, domain_rules, requirements.
+            params: trigger, affected_only.
             last_error: 이전 시도 에러 (자가 수정 힌트).
 
         Returns:
@@ -113,7 +112,7 @@ class ScenarioGeneratorAgent(BaseAgent):
 
         from qapilot.tools.domain_knowledge import DomainKnowledgeTool
 
-        # 라우터 파일별로 LLM 호출을 분리한다 — 한 번에 전체를 생성하면 LLM이 중간에 중단함
+        # 라우터 기반 루프: 1 라우터 = 1 TS (기능 영역별 세분화)
         router_map = self._sort_router_map(self._build_router_map(affected_files))
 
         all_scenarios: list = []
@@ -122,20 +121,19 @@ class ScenarioGeneratorAgent(BaseAgent):
         for router_file, endpoints in router_map.items():
             basename = router_file.split("/")[-1].replace(".py", "").replace(".ts", "").replace(".js", "")
 
-            # 라우터별 도메인 규칙: 관련 키워드로 Qdrant 검색 (top_k=5)
+            # 이 라우터와 관련된 요구사항 필터링 (없으면 전체)
+            filtered_reqs = self._filter_requirements_for_router(requirements, basename) if requirements else []
+
+            # 도메인 규칙: 라우터 키워드로 검색
             keywords = _ROUTER_KEYWORDS.get(basename, [])
             query = " ".join(keywords) if keywords else basename
             router_domain_rules = await self._fetch_domain_rules(query, top_k=5)
             router_domain_rules_text = DomainKnowledgeTool.format_rules_for_prompt(router_domain_rules) or "없음"
 
-            # 라우터별 요구사항: 파이프라인에서 받은 목록을 키워드로 필터링
-            router_requirements = self._filter_requirements_for_router(requirements, basename)
-            router_requirements_text = self._format_requirements(router_requirements)
-
             user_prompt = self.with_correction_hint(
                 self.prompts.render(
                     domain_rules=router_domain_rules_text,
-                    requirements=router_requirements_text,
+                    requirements=self._format_requirements(filtered_reqs),
                     scan_summary=self._format_scan_summary_for_router(router_file, endpoints),
                     code_index=self._format_code_index_for_router(router_file, scan_result),
                     affected_files=router_file,
@@ -155,12 +153,11 @@ class ScenarioGeneratorAgent(BaseAgent):
             )
 
             for s in ts_scenarios:
-                tc_count = len(s["test_cases"])
-                if tc_count < 6:
+                if len(s["test_cases"]) < 6:
                     self.logger.warning(
                         "tc_count_below_minimum",
-                        router=router_file,
-                        tc_count=tc_count,
+                        router=basename,
+                        tc_count=len(s["test_cases"]),
                         minimum=6,
                     )
 
@@ -168,35 +165,14 @@ class ScenarioGeneratorAgent(BaseAgent):
             confidence_sum += ts_confidence
             self.logger.info(
                 "router_scenarios_generated",
-                router=router_file.split("/")[-1],
+                router=basename,
                 ts_count=len(ts_scenarios),
                 tc_count=sum(len(s["test_cases"]) for s in ts_scenarios),
             )
 
         confidence = round(confidence_sum / len(router_map), 3) if router_map else 0.5
 
-        # TS ID를 전체 순서로 재부여한다
-        for i, s in enumerate(all_scenarios):
-            old_ts_id = s["ts_id"]
-            new_ts_id = f"TS-{i + 1:03d}"
-            s["ts_id"] = new_ts_id
-            for tc in s["test_cases"]:
-                tc["tc_id"] = tc["tc_id"].replace(old_ts_id, new_ts_id)
-
-        # basename → ts_id 맵 구성 후 depends_on 설정
-        basename_to_tsid: dict[str, str] = {}
-        for s in all_scenarios:
-            files = s.get("affected_files") or []
-            if files:
-                basename = files[0].split("/")[-1].replace(".py", "").replace(".ts", "").replace(".js", "")
-                basename_to_tsid[basename] = s["ts_id"]
-
-        for s in all_scenarios:
-            files = s.get("affected_files") or []
-            basename = files[0].split("/")[-1].replace(".py", "").replace(".ts", "").replace(".js", "") if files else ""
-            dep_basenames = _ROUTER_DEPENDENCIES.get(basename, [])
-            s["depends_on"] = [basename_to_tsid[dep] for dep in dep_basenames if dep in basename_to_tsid]
-
+        all_scenarios = self._renumber_and_set_depends_on(all_scenarios)
         save_scenarios(all_scenarios)
 
         self.logger.info(
@@ -211,6 +187,241 @@ class ScenarioGeneratorAgent(BaseAgent):
             result={"scenarios": all_scenarios, "prd_code_mismatches": mismatches},
             confidence=confidence,
         )
+
+    async def _run_router_based(
+        self,
+        scan_result: dict,
+        domain_rules: list,
+        trigger: str,
+        affected_files: list[str],
+        mismatch_text: str,
+        mismatches: list,
+        last_error: str | None,
+    ) -> ExecuteResult:
+        """요구사항 없을 때의 라우터 기반 fallback."""
+        from qapilot.tools.domain_knowledge import DomainKnowledgeTool
+
+        router_map = self._sort_router_map(self._build_router_map(affected_files))
+        all_scenarios: list = []
+        confidence_sum = 0.0
+
+        for router_file, endpoints in router_map.items():
+            basename = router_file.split("/")[-1].replace(".py", "").replace(".ts", "").replace(".js", "")
+            keywords = _ROUTER_KEYWORDS.get(basename, [])
+            query = " ".join(keywords) if keywords else basename
+            router_domain_rules = await self._fetch_domain_rules(query, top_k=5)
+            router_domain_rules_text = DomainKnowledgeTool.format_rules_for_prompt(router_domain_rules) or "없음"
+
+            user_prompt = self.with_correction_hint(
+                self.prompts.render(
+                    domain_rules=router_domain_rules_text,
+                    requirements="없음",
+                    scan_summary=self._format_scan_summary_for_router(router_file, endpoints),
+                    code_index=self._format_code_index_for_router(router_file, scan_result),
+                    affected_files=router_file,
+                    trigger=trigger,
+                    mismatch_note=mismatch_text,
+                ),
+                last_error,
+            )
+
+            response = await self.llm.chat(
+                system_prompt=self.prompts.system(),
+                user_prompt=user_prompt,
+            )
+            ts_scenarios, ts_confidence = parse_response(
+                response.content, trigger, [router_file], domain_rules
+            )
+            all_scenarios.extend(ts_scenarios)
+            confidence_sum += ts_confidence
+
+        confidence = round(confidence_sum / len(router_map), 3) if router_map else 0.5
+        all_scenarios = self._renumber_and_set_depends_on(all_scenarios)
+        save_scenarios(all_scenarios)
+
+        return ExecuteResult(
+            result={"scenarios": all_scenarios, "prd_code_mismatches": mismatches},
+            confidence=confidence,
+        )
+
+    async def _map_requirements_to_endpoints(
+        self, requirements: list, all_endpoints: list[dict]
+    ) -> dict[str, list[dict]]:
+        """LLM 1회 호출로 REQ↔엔드포인트 매핑 테이블을 생성한다.
+
+        Returns:
+            {req_id: [endpoint_dict, ...]} — 매핑 없으면 빈 리스트.
+        """
+        req_text = "\n".join(
+            f"[{r['req_id']}] ({r.get('req_type', '')}/{r.get('priority', '')}) {r['content']}"
+            for r in requirements
+        )
+        ep_text = "\n".join(
+            f"{ep.get('method', '?')} {ep.get('path', '?')} "
+            f"[{ep.get('file', '').split('/')[-1]}] handler={ep.get('handler', '')}"
+            for ep in all_endpoints
+        )
+
+        system = (
+            "당신은 소프트웨어 요구사항과 API 엔드포인트를 매핑하는 전문가다. "
+            "요구사항 목록과 API 엔드포인트 목록을 분석하여 각 요구사항을 구현하는 엔드포인트를 정확히 찾아라."
+        )
+        user = f"""# 요구사항 목록
+{req_text}
+
+# API 엔드포인트 목록
+{ep_text}
+
+# 지시사항
+각 요구사항(REQ-XXX)에 대해 그 요구사항을 구현하는 엔드포인트를 매핑하라.
+하나의 요구사항이 여러 엔드포인트에 매핑될 수 있다. 구현 엔드포인트가 없으면 빈 배열로 표시하라.
+반드시 아래 JSON 형식으로만 출력하라:
+{{
+  "mappings": [
+    {{
+      "req_id": "REQ-001",
+      "endpoints": [
+        {{"method": "POST", "path": "/auth/login"}}
+      ]
+    }}
+  ]
+}}"""
+
+        try:
+            response = await self.llm.chat(system, user)
+            cleaned = re.sub(r"```(?:json)?\s*|\s*```", "", response.content).strip()
+            parsed = json.loads(cleaned)
+
+            ep_lookup: dict[tuple[str, str], dict] = {
+                (ep.get("method", ""), ep.get("path", "")): ep for ep in all_endpoints
+            }
+
+            result: dict[str, list[dict]] = {}
+            for mapping in parsed.get("mappings", []):
+                req_id = mapping["req_id"]
+                matched: list[dict] = []
+                for m in mapping.get("endpoints", []):
+                    ep = ep_lookup.get((m.get("method", ""), m.get("path", "")))
+                    if ep:
+                        matched.append(ep)
+                result[req_id] = matched
+
+            self.logger.info(
+                "req_endpoint_mapping_done",
+                total_reqs=len(requirements),
+                mapped=sum(1 for eps in result.values() if eps),
+                unmapped=sum(1 for eps in result.values() if not eps),
+            )
+            return result
+
+        except Exception as e:
+            self.logger.warning("req_endpoint_mapping_failed", error=str(e))
+            return {}
+
+    def _renumber_and_set_depends_on(self, all_scenarios: list) -> list:
+        """TS ID를 순서대로 재부여하고 depends_on을 설정한다."""
+        for i, s in enumerate(all_scenarios):
+            old_ts_id = s["ts_id"]
+            new_ts_id = f"TS-{i + 1:03d}"
+            s["ts_id"] = new_ts_id
+            for tc in s["test_cases"]:
+                tc["tc_id"] = tc["tc_id"].replace(old_ts_id, new_ts_id)
+
+        basename_to_tsid: dict[str, str] = {}
+        for s in all_scenarios:
+            for f in s.get("affected_files") or []:
+                b = f.split("/")[-1].replace(".py", "").replace(".ts", "").replace(".js", "")
+                basename_to_tsid.setdefault(b, s["ts_id"])
+
+        for s in all_scenarios:
+            dep_ids: list[str] = []
+            seen: set[str] = set()
+            for f in s.get("affected_files") or []:
+                b = f.split("/")[-1].replace(".py", "").replace(".ts", "").replace(".js", "")
+                for dep_b in _ROUTER_DEPENDENCIES.get(b, []):
+                    dep_ts = basename_to_tsid.get(dep_b)
+                    if dep_ts and dep_ts not in seen and dep_ts != s["ts_id"]:
+                        dep_ids.append(dep_ts)
+                        seen.add(dep_ts)
+            s["depends_on"] = dep_ids
+
+        return all_scenarios
+
+    def _format_single_requirement(self, req: dict) -> str:
+        if not req:
+            return "없음"
+        return (
+            f"[{req['req_id']}] ({req.get('req_type', '')}/{req.get('priority', '')}) "
+            f"{req['content']} [도메인: {req.get('domain_area', '')}]"
+        )
+
+    def _format_scan_summary_for_requirement(
+        self, req_id: str, req: dict, endpoints: list[dict]
+    ) -> str:
+        manifest: dict = self._read_index_json("manifest.json")  # type: ignore[assignment]
+        router_names = list(dict.fromkeys(
+            ep.get("file", "").split("/")[-1].replace(".py", "").replace(".ts", "").replace(".js", "")
+            for ep in endpoints if ep.get("file")
+        ))
+        ep_strs = [f"{ep.get('method', '?')} {ep.get('path', '?')}" for ep in endpoints]
+        lines = [
+            f"프레임워크: {manifest.get('framework', 'unknown')} ({manifest.get('language', 'unknown')})",
+            f"검증 요구사항: [{req_id}] {req.get('content', '')}",
+            f"구현 라우터: {', '.join(router_names)}",
+            f"관련 엔드포인트 ({len(endpoints)}개): {', '.join(ep_strs)}",
+        ]
+        return "\n".join(lines)
+
+    def _format_code_index_for_requirement(
+        self, router_files: list[str], endpoints: list[dict], scan_result: dict
+    ) -> str:
+        all_functions: list[dict] = self._read_index_json("functions.json")  # type: ignore[assignment]
+        all_models: list[dict] = self._read_index_json("models.json")  # type: ignore[assignment]
+
+        handler_names: set[str] = {ep.get("handler", "") for ep in endpoints if ep.get("handler")}
+        router_fns = [fn for fn in all_functions if fn.get("file") in router_files]
+        helper_names: set[str] = set()
+        for fn in router_fns:
+            if fn.get("name") in handler_names:
+                helper_names.update(fn.get("calls", []))
+
+        lines: list[str] = []
+
+        handler_fns = [fn for fn in router_fns if fn.get("name") in handler_names and fn.get("body_excerpt")]
+        if handler_fns:
+            lines.append("## 핸들러 소스 코드")
+            for fn in handler_fns:
+                lines.append(f"\n### {fn.get('file', '').split('/')[-1]} :: {fn['name']}{fn.get('params', '')}")
+                lines.append(fn["body_excerpt"])
+
+        helper_fns = [
+            fn for fn in all_functions
+            if fn.get("name") in helper_names
+            and fn.get("name") not in handler_names
+            and fn.get("body_excerpt")
+        ]
+        if helper_fns:
+            lines.append("\n## 헬퍼 함수 소스 코드")
+            for fn in helper_fns[:8]:
+                lines.append(f"\n### {fn.get('file', '').split('/')[-1]} :: {fn['name']}{fn.get('params', '')}")
+                lines.append(fn["body_excerpt"])
+
+        router_dirs = {"/".join(f.split("/")[:-1]) for f in router_files}
+        related_models = [md for md in all_models if "/".join(md.get("file", "").split("/")[:-1]) in router_dirs]
+        if related_models:
+            lines.append("\n## 데이터 모델 (스키마 필드)")
+            for md in related_models[:15]:
+                fields = ", ".join(md.get("fields", [])[:15])
+                lines.append(f"  {md['name']}: {fields}")
+
+        git_diff = scan_result.get("git_diff") or {}
+        diff_detail = [d for d in git_diff.get("diff_detail", []) if d.get("file") in router_files]
+        if diff_detail:
+            lines.append("\n## 변경 상세")
+            for d in diff_detail:
+                lines.append(f"  {d.get('file', '').split('/')[-1]}: +{d.get('added', 0)} -{d.get('deleted', 0)} lines")
+
+        return "\n".join(lines) if lines else "코드 인덱스 없음"
 
     async def _fetch_scan_result(self) -> dict:
         try:
@@ -227,6 +438,20 @@ class ScenarioGeneratorAgent(BaseAgent):
             return result.get("rules", [])
         except Exception:
             return []
+
+    def _keyword_match_endpoints(self, text: str, all_endpoints: list[dict]) -> list[dict]:
+        """요구사항 텍스트의 도메인 키워드로 관련 엔드포인트를 찾는다."""
+        matched_basenames: list[str] = []
+        for basename, keywords in _ROUTER_KEYWORDS.items():
+            if any(kw in text for kw in keywords):
+                matched_basenames.append(basename)
+        if not matched_basenames:
+            return []
+        return [
+            ep for ep in all_endpoints
+            if ep.get("file", "").split("/")[-1].replace(".py", "").replace(".ts", "").replace(".js", "")
+            in matched_basenames
+        ]
 
     def _filter_requirements_for_router(self, requirements: list, basename: str) -> list:
         """라우터 키워드와 매칭되는 요구사항만 반환한다. 매칭 없으면 전체의 앞 5개."""
