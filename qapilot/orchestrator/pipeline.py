@@ -696,14 +696,24 @@ async def _test_execution(state: PipelineState) -> dict:
     spec §3.3 FR-006 의 X-Trace-Id 헤더 주입 (browser.new_context).
     각 TC 별 결과를 .qapilot/results/{trace_id}/{ts_id}/{tc_id}/ 에 저장 (spec §6.1, L2 디스크 캐시).
     DBTestTool 은 QAPILOT_MODULE_URL 미설정 시 graceful skip.
+    Playwright Chromium 부재 시 자동 다운로드 (FR-006, 이슈 #97).
     """
     from playwright.async_api import async_playwright
 
+    from qapilot.cli._ensure_browser import ensure_chromium_for_test
     from qapilot.shared.config import load_config
+    from qapilot.shared.errors import ErrorCode, ToolExecutionError
     from qapilot.shared.schemas import ToolInput
     from qapilot.tools.api_trace_tool import APITraceTool
     from qapilot.tools.db_test_tool import DBTestTool
     from qapilot.tools.ui_test_tool import UITestTool
+
+    # Playwright Chromium 자동 셋업 (lazy) — 부재 시 다운로드, 실패 시 명확한 에러
+    if not ensure_chromium_for_test():
+        raise ToolExecutionError(
+            ErrorCode.TOOL_UI_NAVIGATION_FAIL,
+            "Playwright Chromium 설치 실패. 수동 명령: `python -m playwright install chromium`",
+        )
 
     trace_id = state["trace_id"]
     scenarios = state.get("scenarios") or []
