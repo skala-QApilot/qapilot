@@ -700,7 +700,7 @@ async def _test_execution(state: PipelineState) -> dict:
     """
     from playwright.async_api import async_playwright
 
-    from qapilot.cli._ensure_browser import ensure_chromium_for_test
+    from qapilot.cli._ensure_browser import ensure_chromium_for_test_async
     from qapilot.shared.config import load_config
     from qapilot.shared.errors import ErrorCode, ToolExecutionError
     from qapilot.shared.schemas import ToolInput
@@ -708,8 +708,8 @@ async def _test_execution(state: PipelineState) -> dict:
     from qapilot.tools.db_test_tool import DBTestTool
     from qapilot.tools.ui_test_tool import UITestTool
 
-    # Playwright Chromium 자동 셋업 (lazy) — 부재 시 다운로드, 실패 시 명확한 에러
-    if not ensure_chromium_for_test():
+    # Playwright Chromium 자동 셋업 (lazy, async 안전) — RuntimeWarning 차단
+    if not await ensure_chromium_for_test_async():
         raise ToolExecutionError(
             ErrorCode.TOOL_UI_NAVIGATION_FAIL,
             "Playwright Chromium 설치 실패. 수동 명령: `python -m playwright install chromium`",
@@ -832,7 +832,20 @@ async def _run_ui_with_trace(
 
 
 async def _run_db_test_safe(*, tc_id: str, trace_id: str, DBTestTool, ToolInput) -> dict:
-    """DBTestTool graceful — QAPILOT_MODULE_URL 미설정 또는 호출 실패 시 빈 결과."""
+    """DBTestTool graceful — env 부재 시 Tool 호출 자체 차단 (로그 노이즈 0).
+
+    DBTestTool 본체가 `QAPILOT_MODULE_URL` 미설정 시 ValueError raise + BaseTool 가
+    error 로그 출력. TC 별 노이즈 누적 방지를 위해 env 사전 점검으로 호출 자체를 skip.
+    """
+    import os
+
+    if not os.getenv("QAPILOT_MODULE_URL"):
+        return {
+            "tc_id": tc_id,
+            "snapshots": [],
+            "summary": "DBTest skip: QAPILOT_MODULE_URL 미설정 (env 사전 점검)",
+        }
+
     try:
         tool = DBTestTool(trace_id=trace_id)
         out = await tool.run(ToolInput(trace_id=trace_id, params={"tc_id": tc_id}))
@@ -869,6 +882,15 @@ async def _cross_check(state: PipelineState) -> dict:
     cross_check_results: list[dict] = []
     any_mismatch = False
 
+    # UI 단계 fail 도 mismatch 신호로 — CrossCheck 의 정합성 정의 (UI↔API↔DB) 만으론
+    # UI 전체 실패 (locator timeout 등) 케이스가 Layer 3 진입 못 함. 본인 노드에서 보강.
+    ui_failed_tc_ids = {
+        tc_id for tc_id, r in ui_map.items()
+        if r.get("status") == "fail"
+    }
+    if ui_failed_tc_ids:
+        any_mismatch = True
+
     for tc_id in ui_map.keys():
         ui_result = ui_map.get(tc_id, {})
         api_trace = api_map.get(tc_id, {})
@@ -893,14 +915,20 @@ async def _cross_check(state: PipelineState) -> dict:
                     "tc_id": tc_id, "match_score": 0.0, "matched_fields": 0,
                     "mismatched_fields": 0, "mismatches": [], "has_mismatch": False,
                 }
+            # UI 단계 fail 인 TC 는 Layer 3 진입 위해 has_mismatch 강제 True
+            if tc_id in ui_failed_tc_ids:
+                cc["has_mismatch"] = True
+                cc.setdefault("ui_failed", True)
             cross_check_results.append(cc)
             if cc.get("has_mismatch"):
                 any_mismatch = True
         except Exception as e:
+            # CrossCheck 실패 — UI fail TC 는 mismatch 신호 보존, 그 외는 False
             cross_check_results.append({
                 "tc_id": tc_id, "match_score": 0.0, "matched_fields": 0,
                 "mismatched_fields": 0, "mismatches": [],
-                "has_mismatch": False,
+                "has_mismatch": tc_id in ui_failed_tc_ids,
+                "ui_failed": tc_id in ui_failed_tc_ids,
                 "error": f"CrossCheck skip: {type(e).__name__}: {e}",
             })
 
