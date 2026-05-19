@@ -1,7 +1,7 @@
 # QApilot 구현 플랜
 
-> **Version**: 1.7  
-> **최종 수정일**: 2026-05-18  
+> **Version**: 1.8  
+> **최종 수정일**: 2026-05-19  
 > **기반 문서**: 요구사항정의서 v0.4 / 개발표준정의서 v0.4  
 > **변경 이력**:  
 > - v1.0 (2026-05-07): 최초 작성. Orchestrator 고정 DAG 전환, HITL 범위 축소, 리포트 단일 형식 반영
@@ -12,6 +12,7 @@
 > - v1.5 (2026-05-18): §6.1 디렉토리 구조에 `.qapilot/action-mappings/{TC-ID}.json` 추가 — ActionMapping 디스크 영속화. Layer 1B 의 `_save_codes` 노드가 저장, Layer 2 의 `_load_scenarios_for_test` 가 로드. spec 자기 일관성 회복 (scenarios/ + generated-code/ + results/ 와 동일한 디스크 자산 격상). 결정성·HITL 검토 가능성·비용 절감 동시 확보.
 > - v1.6 (2026-05-18): Orchestrator Layer 3 wire-up 완료 — `_defect_classify` (DefectClassifier stub graceful) / `_root_cause` (RootCauseAgent FR-010) / `_fix_recommend` (FixRecommenderAgent FR-011) 호출. `_report` 5 섹션 markdown 확장. 4-Layer 17 노드 완전 wire 상태 도달.
 > - v1.7 (2026-05-18): **DefectClassifier 단계 제거**. CrossCheckAgent 가 이미 생산하는 `error_code`/`summary`/`mismatches` 가 분류 신호를 제공하므로 별도 분류 단계 불필요. `_cross_check` 노드에서 두 필드 보존 패치 + 그래프에서 `_defect_classify` 노드/엣지 제거 (cross_check → root_cause 직결). `defect_results` state 필드 / DefectClassifierAgent / 관련 프롬프트·스키마 모두 제거. `_report` 4 섹션 (실패 / Cross-check / 원인 / 해결) 로 재조정. FR-009 spec 갱신 별도 필요.
+> - v1.8 (2026-05-19): **§4.5.4 UITestTool 측 의미적 chain 도입** (이슈 #111). `1-step fallback` 한정 → `selector_type 별 retry chain` 확장 — ActionMapper LLM 추론과 실제 SUT DOM mismatch 보완 (e2e 첫 완주 `721a4e4f` 의 UI 100% fail 원인 분석 결과). 1차 timeout 10s / 2차+ 5s 분배로 총 시간 폭증 회피. chain 적중 시 `ui_fallback_chain_success` 로그. 근본 해결 (CodebaseScannerTool frontend 스캔) 은 별도 트랙 — 상세 `docs/frontend-dom-scan-gap.md`.
 
 ---
 
@@ -339,22 +340,38 @@ ActionMapper / CodeGenerator / UITestTool 모두 동일 vocabulary 공유.
 | `css` | `page.locator(s)` | `page.locator(s)` |
 | `xpath` | `page.locator(f"xpath={s}")` | `page.locator(s)` |
 
-#### 4.5.4 Fallback 정책 (1-step 한정)
+#### 4.5.4 Fallback 정책
 
-**ActionMapper 측**:
+**ActionMapper 측 (1-step)**:
 - 비표준 action → alias dict 로 표준 변환 (예: `input` → `fill`, `verify` → `assert`)
 - selector 없는데 DOM action → `selector = expected or value or action`, `selector_type = text`, confidence 감점
 - 검증 실패는 JSON 구조 위반·필수 필드 누락만
 
-**CodeGenerator 측** (`prompts/code_generator/system.md` §일반 4):
+**CodeGenerator 측 (1-step)** (`prompts/code_generator/system.md` §일반 4):
 - unsupported action 도착 → `test.skip(true, 'unsupported action: <action>')` 또는 주석 처리
 - selector null + DOM action → `page.getByText(expected || value || action)`
 
-**UITestTool 측** (`qapilot/tools/ui_test_tool.py`):
+**UITestTool 측 (selector_type 별 의미적 chain, 이슈 #111)** (`qapilot/tools/ui_test_tool.py`):
 - `press` value 누락 → "Enter"
 - `wait_for_load_state` value 모호 → "networkidle"
 - `assert_count` expected 비숫자/None → 0
-- selector None + DOM action → `get_by_text(expected||value||action)` + `TOOL_UI_FALLBACK_USED` 경고
+- selector None + DOM action → `get_by_text` → `get_by_placeholder` → `get_by_label` 3-step chain + `TOOL_UI_FALLBACK_USED` 경고
+- DOM action 의 selector_type 별 retry chain — ActionMapper LLM 추론과 실제 SUT DOM mismatch 보완:
+
+| selector_type | chain order (1차 → ...) | timeout |
+|---|---|---|
+| `text` | `get_by_text` → `get_by_label` → `get_by_placeholder` → `get_by_test_id` | 1차 10s / 2차+ 5s |
+| `label` | `get_by_label` → `get_by_text` → `get_by_placeholder` | 1차 10s / 2차+ 5s |
+| `placeholder` | `get_by_placeholder` → `get_by_label` → `get_by_text` | 1차 10s / 2차+ 5s |
+| `testid` | `get_by_test_id` → `[data-testid=]` → `[data-test-id=]` | 1차 10s / 2차+ 5s |
+| `role` | `get_by_role` → `get_by_text` | 1차 10s / 2차+ 5s |
+| `alttext` | `get_by_alt_text` → `get_by_text` | 1차 10s / 2차+ 5s |
+| `title` | `get_by_title` → `get_by_text` | 1차 10s / 2차+ 5s |
+| `css` / `xpath` | 단일 시도 (정확한 selector 가정) | 1차 10s |
+
+chain 적중 시 `ui_fallback_chain_success` info 로그 (matched_at + attempt), 각 step 실패 시 `ui_fallback_chain_retry` warning, 모두 실패 시 마지막 PWTimeoutError raise → caller 가 `TOOL_UI_LOCATOR_NOT_FOUND` 분류.
+
+> **배경**: 본 chain 확장은 ActionMapper / ScenarioGen LLM 의 SUT DOM 추론 한계 보완. 근본 해결 (CodebaseScannerTool 의 frontend 스캔 + ActionMapper 인덱스 주입) 은 별도 트랙 (C 영역). 상세: `docs/frontend-dom-scan-gap.md`.
 
 #### 4.5.5 confidence 감점 요인 (ActionMapper)
 

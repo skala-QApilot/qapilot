@@ -12,7 +12,7 @@ mock Playwright Page 로 핵심 케이스 검증:
 from __future__ import annotations
 
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -133,9 +133,10 @@ async def test_fill_click_select_actions(tool):
              "selector_type": "css", "value": "pro"},
         ]},
     }))
-    locator.fill.assert_awaited_once_with("a@b.c")
+    # 이슈 #111: chain timeout 인자 추가됨 — 인자 검증은 첫 인자만, timeout 은 ANY
+    locator.fill.assert_awaited_once_with("a@b.c", timeout=ANY)
     locator.click.assert_awaited_once()
-    locator.select_option.assert_awaited_once_with("pro")
+    locator.select_option.assert_awaited_once_with("pro", timeout=ANY)
     assert out.result["ui_result"]["status"] == "pass"
 
 
@@ -262,7 +263,7 @@ async def test_assert_text_calls_to_have_text(tool):
             ]},
         }))
     exp.assert_called_once_with(locator)
-    fake_assertion.to_have_text.assert_awaited_once_with("OK")
+    fake_assertion.to_have_text.assert_awaited_once_with("OK", timeout=ANY)
 
 
 @pytest.mark.asyncio
@@ -312,7 +313,7 @@ async def test_assert_simple_variants(tool, action, expect_method, arg):
     if arg is None:
         method.assert_awaited_once()
     else:
-        method.assert_awaited_once_with(arg)
+        method.assert_awaited_once_with(arg, timeout=ANY)
 
 
 @pytest.mark.asyncio
@@ -330,7 +331,7 @@ async def test_assert_count_converts_to_int(tool):
                  "selector_type": "css", "expected": "3"},
             ]},
         }))
-    fake_assertion.to_have_count.assert_awaited_once_with(3)
+    fake_assertion.to_have_count.assert_awaited_once_with(3, timeout=ANY)
 
 
 @pytest.mark.asyncio
@@ -348,7 +349,7 @@ async def test_assert_count_fallback_to_zero_on_bad_value(tool):
                  "selector_type": "css", "expected": "abc"},
             ]},
         }))
-    fake_assertion.to_have_count.assert_awaited_once_with(0)
+    fake_assertion.to_have_count.assert_awaited_once_with(0, timeout=ANY)
 
 
 @pytest.mark.asyncio
@@ -471,8 +472,8 @@ async def test_dom_extended_actions(tool):
     locator.hover.assert_awaited_once()
     locator.check.assert_awaited_once()
     locator.uncheck.assert_awaited_once()
-    locator.press.assert_awaited_once_with("Enter")
-    locator.set_input_files.assert_awaited_once_with("/tmp/a.png")
+    locator.press.assert_awaited_once_with("Enter", timeout=ANY)
+    locator.set_input_files.assert_awaited_once_with("/tmp/a.png", timeout=ANY)
 
 
 @pytest.mark.asyncio
@@ -487,7 +488,7 @@ async def test_press_fallback_to_enter(tool):
             {"step_no": 1, "action": "press", "selector": "#x", "selector_type": "css"},
         ]},
     }))
-    locator.press.assert_awaited_once_with("Enter")
+    locator.press.assert_awaited_once_with("Enter", timeout=ANY)
 
 
 # ── selector None fallback (DOM action) ─────────────────────────────────────
