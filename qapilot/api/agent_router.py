@@ -74,6 +74,25 @@ async def code_change_detection(request: Request) -> Any:
     return _start_pipeline(request, body, options)
 
 
+@router.post("/code-generation")
+async def code_generation(request: Request) -> Any:
+    """코드 생성 파이프라인(Layer 1B)을 백그라운드로 실행한다."""
+    body = await _json_body(request)
+    error = _validate_common_body(body)
+    if error:
+        return error
+
+    options: RunOptions = {
+        "command": "generate_code",
+        "trigger": None,
+        "user_input": None,
+        "scenario_ids": _optional_list(body, "scenario_ids"),
+        "filter": None,
+        "tags": None,
+    }
+    return _start_pipeline(request, body, options)
+
+
 @router.post("/test-run")
 async def test_run(request: Request) -> Any:
     """테스트 실행 파이프라인을 백그라운드로 실행한다."""
