@@ -96,9 +96,13 @@ class ActionMapperAgent(BaseAgent):
         if not scenarios:
             return ExecuteResult(result={"action_mappings": []}, confidence=1.0)
 
+        # 이슈 #127: frontend DOM 인덱스 로드 — ActionMapper LLM 호출 컨텍스트에 주입.
+        # 디스크 (.qapilot/codebase-index/frontend.json) 또는 context 둘 다 지원.
+        frontend_dom = self._load_frontend_dom(context)
+
         all_mappings: list[ActionMapping] = []
         for batch in self._build_batches(scenarios):
-            mappings = await self._call_batch(batch, endpoints, last_error)
+            mappings = await self._call_batch(batch, endpoints, frontend_dom, last_error)
             all_mappings.extend(mappings)
 
         confidence = self._calc_confidence(all_mappings, scan_result is not None)
@@ -164,12 +168,21 @@ class ActionMapperAgent(BaseAgent):
         return batches
 
     async def _call_batch(
-        self, batch: list[dict], endpoints: list[dict], last_error: str | None
+        self,
+        batch: list[dict],
+        endpoints: list[dict],
+        frontend_dom: list[dict],
+        last_error: str | None,
     ) -> list[ActionMapping]:
-        """단일 배치를 LLM으로 ActionMapping 변환한다."""
+        """단일 배치를 LLM으로 ActionMapping 변환한다.
+
+        이슈 #127: frontend_dom 인덱스를 LLM 호출 컨텍스트에 주입 — selector 추측 대신
+        실제 DOM 정보 참조. 인덱스 부재 시 빈 안내 문자열 (LLM 이 기존 휴리스틱으로 fallback).
+        """
         user_prompt = self.prompts.render(
             scenarios=self._format_scenarios(batch),
             endpoints=self._format_endpoints(endpoints),
+            frontend_dom=self._format_frontend_dom(frontend_dom),
         )
         user_prompt = self.with_correction_hint(user_prompt, last_error)
         response = await self.llm.chat(
@@ -177,6 +190,60 @@ class ActionMapperAgent(BaseAgent):
             user_prompt=user_prompt,
         )
         return self._parse_action_mappings(response.content)
+
+    def _load_frontend_dom(self, context: dict[str, Any]) -> list[dict]:
+        """frontend DOM 인덱스 로드 — context 우선, 없으면 디스크 (.qapilot/codebase-index/frontend.json).
+
+        이슈 #127: `qapilot init` / `qapilot rescan` 시점에 디스크 저장된 frontend.json
+        을 LLM 호출 시점에 로드. context 에 직접 주입된 경우 (테스트/외부 caller) 도 지원.
+        """
+        from pathlib import Path
+
+        # 1) context 우선 (테스트/외부 caller 가 직접 전달 가능)
+        ctx_dom = context.get("frontend_dom")
+        if isinstance(ctx_dom, list):
+            return ctx_dom
+
+        # 2) 디스크 fallback
+        from qapilot.tools.frontend_dom_scanner import load_frontend_index
+        elements = load_frontend_index(Path(".qapilot") / "codebase-index" / "frontend.json")
+        if elements:
+            self.logger.info(
+                "frontend_dom_index_loaded",
+                element_count=len(elements),
+            )
+        else:
+            self.logger.debug(
+                "frontend_dom_index_empty",
+                hint="qapilot init 또는 rescan 으로 .qapilot/codebase-index/frontend.json 생성 권장",
+            )
+        return elements
+
+    def _format_frontend_dom(self, elements: list[dict]) -> str:
+        """frontend DOM element list 를 프롬프트용 문자열로 변환.
+
+        형식: 각 element 의 의미적 정보 (tag, text, placeholder, label, testid, name, id)
+        를 한 줄씩 표기. 최대 200 elements 제한 (LLM 토큰 폭증 방지).
+        """
+        if not elements:
+            return "인덱스 없음 (qapilot init/rescan 으로 .qapilot/codebase-index/frontend.json 생성 시 활용 가능)"
+
+        lines: list[str] = []
+        for el in elements[:200]:
+            parts: list[str] = []
+            tag = el.get("tag") or ""
+            if tag:
+                parts.append(f"<{tag}>")
+            for key in ("text", "placeholder", "label", "testid", "name", "id"):
+                val = (el.get(key) or "").strip()
+                if val:
+                    parts.append(f'{key}="{val}"')
+            file_label = el.get("file") or ""
+            if file_label:
+                parts.append(f"(from {file_label})")
+            if parts:
+                lines.append("- " + " ".join(parts))
+        return "\n".join(lines) if lines else "인덱스 없음"
 
     def _format_scenarios(self, batch: list[dict]) -> str:
         """시나리오 배치를 JSON 문자열로 직렬화한다."""

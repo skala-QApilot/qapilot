@@ -257,6 +257,24 @@ def init() -> None:
             f"[dim]스캔 및 인덱싱 완료 (파일: {len(scan_result['files'])}개, 엔드포인트: {scan_result['endpoint_count']}개, 프레임워크: {scan_result['framework']})[/dim]"
         )
 
+        # 이슈 #127: frontend DOM 정적 인덱싱 — ActionMapper LLM 호출 시 selector
+        # 추측 대신 실제 DOM 정보 참조. 상세 배경: docs/frontend-dom-scan-gap.md
+        from qapilot.tools.frontend_dom_scanner import (
+            scan_frontend_directory,
+            write_frontend_index,
+        )
+        fe_elements = scan_frontend_directory(project_root)
+        if fe_elements:
+            fe_index_path = index_dir / "frontend.json"
+            write_frontend_index(fe_elements, fe_index_path)
+            console.print(
+                f"[dim]frontend DOM 인덱싱 완료 (element: {len(fe_elements)}개 → {fe_index_path.relative_to(project_root)})[/dim]"
+            )
+        else:
+            console.print(
+                "[dim]frontend 디렉토리에서 스캔 가능한 .vue/.tsx/.jsx 파일이 발견되지 않았습니다 (생략).[/dim]"
+            )
+
         payload = {
             "project_slug": project_slug,
             "display_name": display_name,
