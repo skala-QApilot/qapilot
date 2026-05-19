@@ -528,13 +528,25 @@ async def _code_generate(state: PipelineState) -> dict:
             )
         )
         generated_codes = result.result.get("generated_codes", [])
+        failed_tcs = result.result.get("failed_tcs", [])
         agent_logs = agent_logs + [result.metadata.model_dump()]
         logger.info(
             "code_generate_complete",
             trace_id=state.get("trace_id"),
             tc_count=len(action_mappings),
             generated_count=len(generated_codes),
+            failed_count=len(failed_tcs),
         )
+        if failed_tcs:
+            # 이슈 #107: TC-별 분할 후 부분 실패 TC 의 가시성. spec §4.5.1 LENIENT 부분 성공.
+            logger.warning(
+                "code_generate_partial_failure",
+                trace_id=state.get("trace_id"),
+                failed_tc_ids=[ft.get("tc_id") for ft in failed_tcs],
+                note=f"{len(failed_tcs)}/{len(action_mappings)} TC 코드 생성 실패 — ActionMapping 으로 UITestTool 실행 가능 (spec §4.5)",
+            )
+        # failed_tcs 는 logging 만 활용 — PipelineState 에 별도 키 필요 없음 (다음 노드는
+        # generated_codes 의 유무로 처리. ActionMapping 은 _save_codes 가 따로 디스크 저장).
         return {"generated_codes": generated_codes, "agent_logs": agent_logs}
     except Exception as e:
         logger.warning(
