@@ -351,12 +351,12 @@ ActionMapper / CodeGenerator / UITestTool 모두 동일 vocabulary 공유.
 - unsupported action 도착 → `test.skip(true, 'unsupported action: <action>')` 또는 주석 처리
 - selector null + DOM action → `page.getByText(expected || value || action)`
 
-**UITestTool 측 (selector_type 별 의미적 chain, 이슈 #111)** (`qapilot/tools/ui_test_tool.py`):
+**UITestTool 측 (selector_type 별 의미적 chain 및 DOM Scan, 이슈 #111 & #115)** (`qapilot/tools/ui_test_tool.py`):
 - `press` value 누락 → "Enter"
 - `wait_for_load_state` value 모호 → "networkidle"
 - `assert_count` expected 비숫자/None → 0
 - selector None + DOM action → `get_by_text` → `get_by_placeholder` → `get_by_label` 3-step chain + `TOOL_UI_FALLBACK_USED` 경고
-- DOM action 의 selector_type 별 retry chain — ActionMapper LLM 추론과 실제 SUT DOM mismatch 보완:
+- DOM action 의 selector_type 별 retry chain (옵션 A) — ActionMapper LLM 추론과 실제 SUT DOM mismatch 보완:
 
 | selector_type | chain order (1차 → ...) | timeout |
 |---|---|---|
@@ -369,7 +369,8 @@ ActionMapper / CodeGenerator / UITestTool 모두 동일 vocabulary 공유.
 | `title` | `get_by_title` → `get_by_text` | 1차 10s / 2차+ 5s |
 | `css` / `xpath` | 단일 시도 (정확한 selector 가정) | 1차 10s |
 
-chain 적중 시 `ui_fallback_chain_success` info 로그 (matched_at + attempt), 각 step 실패 시 `ui_fallback_chain_retry` warning, 모두 실패 시 마지막 PWTimeoutError raise → caller 가 `TOOL_UI_LOCATOR_NOT_FOUND` 분류.
+- **런타임 DOM Scan + Fuzzy Match (옵션 B)**: 위 1차/2차 chain(옵션 A)이 모두 실패했을 경우, 런타임 시점의 실제 브라우저 DOM을 스캔(`page.evaluate`)하여 모든 대화형 요소(`input, button, a` 등)를 수집. 이후 Levenshtein Distance 기반의 Fuzzy Match 알고리즘(유사도 0.6 이상)을 사용해 가장 의도에 부합하는 요소를 찾아내어 마지막으로 1회 더 재시도.
+- chain 적중 시 `ui_fallback_chain_success` (옵션 A) 또는 `ui_fallback_dom_scan_success` (옵션 B) info 로그 기록. 모두 실패 시 마지막 에러 raise → caller 가 `TOOL_UI_LOCATOR_NOT_FOUND` 분류.
 
 > **배경**: 본 chain 확장은 ActionMapper / ScenarioGen LLM 의 SUT DOM 추론 한계 보완. 근본 해결 (CodebaseScannerTool 의 frontend 스캔 + ActionMapper 인덱스 주입) 은 별도 트랙 (C 영역). 상세: `docs/frontend-dom-scan-gap.md`.
 

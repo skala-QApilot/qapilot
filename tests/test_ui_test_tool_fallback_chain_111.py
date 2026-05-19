@@ -293,3 +293,63 @@ async def test_tool_execution_error_does_not_retry():
     from qapilot.shared.errors import ToolExecutionError
     with pytest.raises(ToolExecutionError):
         await tool._run_dom_action(page, "upload", step)
+
+
+# ── Option B: 런타임 DOM Scan + Fuzzy Match ─────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_fallback_dom_scan_success():
+    """모든 chain 실패 시 DOM scan 수행 후 fuzzy match로 성공."""
+    tool = _make_tool()
+    page = _mock_page_with_locators()
+    
+    # 1차 chain(get_by_text 등)은 모두 실패
+    for loc_mock in [page.get_by_text, page.get_by_label, page.get_by_placeholder, page.get_by_test_id]:
+        loc_mock.return_value.fill = AsyncMock(side_effect=PWTimeoutError("chain fail"))
+    
+    # page.evaluate 가 DOM 스캔 결과를 반환
+    page.evaluate = AsyncMock(return_value=[
+        {"tag": "input", "text": "", "placeholder": "example@email.com", "label": "이메일", "testid": "email", "id": "", "name": ""}
+    ])
+    
+    # fuzzy match 후 get_by_test_id 가 호출됨
+    # 첫 번째 호출(1차 체인)은 실패하고, 두 번째 호출(DOM 스캔 후)은 성공하도록 side_effect 설정
+    page.get_by_test_id.return_value.fill.side_effect = [PWTimeoutError("chain fail"), None]
+    
+    from qapilot.shared.errors import ErrorCode
+    step = {"selector": "이메일", "selector_type": "text", "action": "fill"}
+    await tool._run_dom_action(page, "fill", step)
+    
+    # evaluate 호출 확인
+    page.evaluate.assert_awaited_once()
+    
+    # fallback_locator 의 fill 호출 확인 (두 번 호출됨)
+    assert page.get_by_test_id.return_value.fill.call_count == 2
+    tool.logger.info.assert_called_with(
+        "ui_fallback_dom_scan_success",
+        action="fill",
+        selector_type="text",
+        selector="이메일",
+        code=ErrorCode.TOOL_UI_FALLBACK_USED,
+    )
+
+
+@pytest.mark.asyncio
+async def test_fallback_dom_scan_failed():
+    """DOM scan 결과에서도 match를 찾지 못하면 마지막 에러 발생."""
+    tool = _make_tool()
+    page = _mock_page_with_locators()
+    
+    for loc_mock in [page.get_by_text, page.get_by_label, page.get_by_placeholder, page.get_by_test_id]:
+        loc_mock.return_value.click = AsyncMock(side_effect=PWTimeoutError("chain fail"))
+    
+    # DOM 스캔 결과 무관한 요소만 있음
+    page.evaluate = AsyncMock(return_value=[
+        {"tag": "button", "text": "취소", "placeholder": "", "label": "", "testid": "", "id": "", "name": ""}
+    ])
+    
+    step = {"selector": "저장하기", "selector_type": "text", "action": "click"}
+    with pytest.raises(PWTimeoutError):
+        await tool._run_dom_action(page, "click", step)
+        
+    page.evaluate.assert_awaited_once()
