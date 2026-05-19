@@ -22,6 +22,7 @@ Created: 2026-05-15
 
 from __future__ import annotations
 
+import difflib
 import time
 from pathlib import Path
 from typing import Any
@@ -330,6 +331,27 @@ class UITestTool(BaseTool):
                 # 명시적 ToolExecutionError (예: upload value 누락) 는 chain 의미 없음 — 즉시 raise
                 raise
 
+        # 1차 chain 모두 실패 — 옵션 B (런타임 DOM scan + fuzzy match) 진행
+        fallback_locator = await self._fallback_dom_scan(page, step)
+        if fallback_locator is not None:
+            try:
+                await self._apply_action(fallback_locator, action, step, timeout_ms=_CHAIN_FALLBACK_TIMEOUT_MS)
+                self.logger.info(
+                    "ui_fallback_dom_scan_success",
+                    action=action,
+                    selector_type=step.get("selector_type"),
+                    selector=step.get("selector"),
+                    code=ErrorCode.TOOL_UI_FALLBACK_USED,
+                )
+                return
+            except Exception as e:
+                last_error = e
+                self.logger.warning(
+                    "ui_fallback_dom_scan_failed",
+                    action=action,
+                    error=str(e).splitlines()[0] if str(e) else type(e).__name__,
+                )
+
         # 모든 chain step 실패 — 마지막 에러 raise. caller (_run_step) 가 TOOL_UI_LOCATOR_NOT_FOUND 분류.
         if last_error is not None:
             raise last_error
@@ -337,6 +359,88 @@ class UITestTool(BaseTool):
             ErrorCode.TOOL_UI_LOCATOR_NOT_FOUND,
             "locator chain 0건 — selector 결정 불가",
         )
+
+    async def _fallback_dom_scan(self, page: Page, step: ActionStep) -> Locator | None:
+        """옵션 B: 런타임 DOM을 스캔하고 fuzzy match로 가장 유사한 요소를 찾는다."""
+        selector = str(step.get("selector") or step.get("expected") or step.get("value") or step.get("action") or "").strip()
+        if not selector:
+            return None
+
+        # DOM 스캔 JS 스크립트 실행 (보이는 요소만 추출)
+        js_code = """
+        () => {
+            const elements = document.querySelectorAll('input, textarea, select, button, a, label, [role="button"]');
+            const data = [];
+            for (const el of elements) {
+                const rect = el.getBoundingClientRect();
+                if (rect.width === 0 || rect.height === 0) continue;
+                
+                let text = el.innerText || el.textContent || '';
+                if (el.tagName === 'INPUT' && (el.type === 'submit' || el.type === 'button')) {
+                    text = el.value || text;
+                }
+                
+                data.push({
+                    tag: el.tagName.toLowerCase(),
+                    text: text.trim().substring(0, 100),
+                    placeholder: el.placeholder || '',
+                    label: el.getAttribute('aria-label') || '',
+                    testid: el.getAttribute('data-testid') || el.getAttribute('data-test-id') || '',
+                    id: el.id || '',
+                    name: el.name || ''
+                });
+            }
+            return data;
+        }
+        """
+        try:
+            dom_data = await page.evaluate(js_code)
+        except Exception as e:
+            self.logger.debug("dom_scan_evaluate_failed", error=str(e))
+            return None
+
+        best_match = None
+        best_score = 0.0
+        target = selector.lower()
+
+        # Fuzzy match 로직
+        for el in dom_data:
+            candidates = [
+                el.get("text", ""), el.get("placeholder", ""), el.get("label", ""),
+                el.get("testid", ""), el.get("name", ""), el.get("id", "")
+            ]
+            
+            for candidate in candidates:
+                cand = candidate.strip().lower()
+                if not cand:
+                    continue
+                    
+                score = difflib.SequenceMatcher(None, target, cand).ratio()
+                
+                # 완전 포함 관계면 가산점 부여
+                if target in cand or cand in target:
+                    score += 0.2
+                    
+                if score > best_score:
+                    best_score = score
+                    best_match = el
+
+        # 임계값(0.6) 이상인 경우만 매치 성공으로 간주
+        if best_match and best_score >= 0.6:
+            if best_match.get("testid"):
+                return page.get_by_test_id(best_match["testid"])
+            elif best_match.get("placeholder"):
+                return page.get_by_placeholder(best_match["placeholder"])
+            elif best_match.get("text"):
+                return page.get_by_text(best_match["text"])
+            elif best_match.get("label"):
+                return page.get_by_label(best_match["label"])
+            elif best_match.get("id"):
+                return page.locator(f"#{best_match['id']}")
+            elif best_match.get("name"):
+                return page.locator(f"[name=\"{best_match['name']}\"]")
+                
+        return None
 
     async def _apply_action(
         self,
