@@ -15,6 +15,7 @@
 > - v1.8 (2026-05-19): **§4.5.4 UITestTool 측 의미적 chain 도입** (이슈 #111). `1-step fallback` 한정 → `selector_type 별 retry chain` 확장 — ActionMapper LLM 추론과 실제 SUT DOM mismatch 보완 (e2e 첫 완주 `721a4e4f` 의 UI 100% fail 원인 분석 결과). 1차 timeout 10s / 2차+ 5s 분배로 총 시간 폭증 회피. chain 적중 시 `ui_fallback_chain_success` 로그. 근본 해결 (CodebaseScannerTool frontend 스캔) 은 별도 트랙 — 상세 `docs/frontend-dom-scan-gap.md`.
 > - v1.8.1 (2026-05-19): **§4.5.4 옵션 B 추가** (이슈 #115). 옵션 A chain 모두 실패 시 런타임 DOM 스캔 + fuzzy match — Python `difflib.SequenceMatcher.ratio()` + 포함관계 가산점 0.2 + 임계값 0.6. 반환 Locator 우선순위 testid > placeholder > text > label > id > name. **이슈 #119 (2026-05-19)**: §4.5.4 옵션 B 본문의 `Levenshtein Distance` 표기를 실제 알고리즘 (`difflib.SequenceMatcher`) 로 정정 + DOM scan 수집 element 와 후보 속성 정확히 명시. 코드 일관성 + docstring + 테스트 강화 동반.
 > - v1.8.2 (2026-05-19): **§4.5.4 옵션 C 추가** (이슈 #121). ActionMapping 첫 step 이 DOM action 일 때 `api_endpoint` 힌트로 frontend route 추론 + auto-navigate. e2e trace `e1796b43` 의 73/73 UI fail 원인 분석 결과 (옵션 A/B 가 잘못된 페이지에서 시도되어 적중 0) 보완. SUT vue-router redirect (예: `/` → `/plans`) 인식 안 하던 한계를 휴리스틱 추론으로 우회. 옵션 A/B 효과가 비로소 실측 가능. 상세: `docs/e2e-navigate-gap-analysis.md`.
+> - v1.8.3 (2026-05-19): **target_url UX + 옵션 C 견고함 강화** (이슈 #123). e2e trace `4e1d8d49` 의 옵션 C auto-navigate 36/36 fail (invalid URL `full_url=/login`) 원인 — (a) mini-bss-lite/qapilot.config.yaml 의 `target_url` 누락 (b) UITestTool 의 invalid URL 방어 부재 (c) 휴리스틱이 backend `/api/...` path 그대로 사용. 세 가지 fix: (1) `qapilot init` 마법사가 frontend dev server URL 자동 추론 (vite.config / next.config / package.json / docker-compose) + Prompt fallback (2) `_try_auto_navigate` 가 `target_url` 부재/scheme 부재 시 사전 skip (3) `_infer_target_route` v2 — `/api/` prefix 제거 + 1차 segment 만 사용.
 
 ---
 
@@ -373,7 +374,16 @@ ActionMapper / CodeGenerator / UITestTool 모두 동일 vocabulary 공유.
 
 - **런타임 DOM Scan + Fuzzy Match (옵션 B)**: 위 1차/2차 chain(옵션 A)이 모두 실패했을 경우, 런타임 시점의 실제 브라우저 DOM을 스캔(`page.evaluate`)하여 모든 대화형 요소(`input, textarea, select, button, a, label, [role="button"]` — visible 만)를 수집하고 각 요소의 `text / placeholder / aria-label / data-testid \| data-test-id / id / name` 을 후보로 추출. Python `difflib.SequenceMatcher.ratio()` (gestalt pattern matching 변형) 기반 fuzzy match 에 포함관계 가산점 (`target in cand or cand in target` 시 +0.2) 을 적용, 임계값 0.6 이상에서 가장 유사한 요소를 선택. 반환 Locator 우선순위 `testid > placeholder > text > label > id > name` 로 가장 안정적인 entry point 활용. 마지막으로 1회 더 재시도 (fallback timeout 5s).
 - chain 적중 시 `ui_fallback_chain_success` (옵션 A) 또는 `ui_fallback_dom_scan_success` (옵션 B) info 로그 기록. 모두 실패 시 마지막 에러 raise → caller 가 `TOOL_UI_LOCATOR_NOT_FOUND` 분류.
-- **Auto-navigate 보강 (옵션 C, 이슈 #121)**: ActionMapping 의 첫 step 이 navigate 가 아닌 DOM action (`fill`/`click`/`assert` 등) 일 때 SUT 의 잘못된 페이지에서 시작될 가능성 보완. `_run_steps` 진입 시 ActionMapping steps 의 `api_endpoint` 힌트를 검사해 frontend route 추론 (예: `POST /login` → `/login`, `GET /plans/{id}` → `/plans` — 경로 매개변수 제거). 추론 성공 시 `page.goto(target_url + route)` 자동 호출 + `ui_auto_navigate` info 로그. 추론 실패 (api_endpoint 부재) 시 `ui_auto_navigate_skipped` debug 후 기존 동작. goto 실패 시 `ui_auto_navigate_failed` warning + 후속 step 진행 (안전망). 옵션 A/B 가 올바른 페이지에서 시작되도록 보장. 상세 배경: `docs/e2e-navigate-gap-analysis.md`.
+- **Auto-navigate 보강 (옵션 C, 이슈 #121 + 강화 #123)**: ActionMapping 의 첫 step 이 navigate 가 아닌 DOM action (`fill`/`click`/`assert` 등) 일 때 SUT 의 잘못된 페이지에서 시작될 가능성 보완. `_run_steps` 진입 시 ActionMapping steps 의 `api_endpoint` 힌트를 검사해 frontend route 추론. **휴리스틱 v2 (이슈 #123)**:
+  - HTTP method prefix 제거 (`POST /login` → `/login`)
+  - 경로 매개변수 제거 (`GET /plans/{id}` → `/plans`)
+  - **`/api/` prefix 제거** (`POST /api/login` → `/login`, `DELETE /api/contracts/1/cancel` → `/contracts`)
+  - **1차 segment 만 사용** (frontend route 는 보통 단순 1-segment)
+  - 예시: `POST /api/family-group/join` → `/family-group`, `PATCH /api/orders/{id}/status` → `/orders`
+
+  추론 성공 시 `page.goto(target_url + route)` 자동 호출 + `ui_auto_navigate` info. **target_url 안전망 (이슈 #123 P2)**: `target_url` 이 None / empty / scheme 없는 path-only 시 invalid URL fail 방지 — `ui_auto_navigate_skipped` warning 후 기존 동작. api_endpoint 부재 시 `ui_auto_navigate_skipped` debug. goto 실패 시 `ui_auto_navigate_failed` warning + 후속 step 진행. 옵션 A/B 가 올바른 페이지에서 시작되도록 보장. 상세 배경: `docs/e2e-navigate-gap-analysis.md`.
+
+  **`qapilot init` 마법사 (이슈 #123 P1)**: `target_url` 누락 UX 결함 해결 — frontend dev server URL 자동 추론 (`<frontend_dir>/vite.config` → `next.config` → `package.json dev script port` → `docker-compose ports`) + 추론 실패 시 Prompt fallback. 추론 성공 시 사용자가 enter 만 눌러 default 채택 가능.
 
 > **배경**: 본 chain 확장은 ActionMapper / ScenarioGen LLM 의 SUT DOM 추론 한계 보완. 근본 해결 (CodebaseScannerTool 의 frontend 스캔 + ActionMapper 인덱스 주입) 은 별도 트랙 (C 영역). 상세: `docs/frontend-dom-scan-gap.md`.
 
