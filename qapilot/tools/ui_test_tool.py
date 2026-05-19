@@ -50,8 +50,11 @@ _PAGE_ACTIONS = {
 }
 _SUPPORTED_ACTIONS = _DOM_ACTIONS | _PAGE_ACTIONS
 
-# selector_type 7종 → Page.get_by_* 매핑. css/xpath 는 page.locator() 사용.
-_GET_BY_METHODS = {
+# spec §4.5.3 selector_type 9종 ↔ Playwright Page API 매핑표 (참조용).
+# 이슈 #111 (의미적 chain 도입) 후 chain 메서드가 selector_type 별 직접 호출로 dispatch
+# 하므로 이 dict 자체는 코드에서 미사용 (dead code). 단, spec §4.5.3 의 표와 1:1 매칭되어
+# 새 selector_type 추가 시 일관성 확인용 + 디버깅 참조용으로 보존.
+_GET_BY_METHODS = {  # noqa: F841 — spec §4.5.3 매핑표 참조용 (의미 보존)
     "role": "get_by_role",
     "label": "get_by_label",
     "placeholder": "get_by_placeholder",
@@ -60,6 +63,11 @@ _GET_BY_METHODS = {
     "alttext": "get_by_alt_text",
     "title": "get_by_title",
 }
+
+# Fallback chain timeout 분배 (이슈 #111). 1차는 ActionMapper 의 결정에 가까운 timeout 유지,
+# 2차 이상은 short timeout 으로 총 시간 폭증 방지. 1 × 10s + N × 5s ≈ 단일 30s default 와 비슷.
+_CHAIN_PRIMARY_TIMEOUT_MS = 10_000
+_CHAIN_FALLBACK_TIMEOUT_MS = 5_000
 
 
 class UITestTool(BaseTool):
@@ -278,100 +286,216 @@ class UITestTool(BaseTool):
     async def _run_dom_action(
         self, page: Page, action: str, step: ActionStep
     ) -> None:
-        """DOM action (selector 필요). selector None → fallback locator."""
+        """DOM action (selector 필요). spec §4.5.4 — selector_type 별 의미적 chain.
+
+        1차 시도는 ActionMapper 가 결정한 selector_type 그대로 (timeout 10s).
+        실패 시 2~N차 fallback chain (timeout 5s) 으로 적중 시도. 모두 실패 시 마지막
+        에러 raise. 이슈 #111 — `qapilot test` e2e 의 UI 100% fail 원인 (LLM 추론
+        selector ↔ SUT DOM mismatch) 보완. 자세한 배경: docs/frontend-dom-scan-gap.md
+        """
+        chain = self._build_locator_chain(page, step)
+        last_error: BaseException | None = None
+
+        for attempt, (label, locator) in enumerate(chain):
+            # 1차 = long (10s), 2차+ = short (5s). 단일 30s default 와 비슷한 총 시간.
+            timeout_ms = _CHAIN_PRIMARY_TIMEOUT_MS if attempt == 0 else _CHAIN_FALLBACK_TIMEOUT_MS
+            try:
+                await self._apply_action(locator, action, step, timeout_ms=timeout_ms)
+                if attempt > 0:
+                    self.logger.info(
+                        "ui_fallback_chain_success",
+                        action=action,
+                        selector_type=step.get("selector_type"),
+                        selector=step.get("selector"),
+                        matched_at=label,
+                        attempt=attempt + 1,
+                        code=ErrorCode.TOOL_UI_FALLBACK_USED,
+                    )
+                return
+            except (PWTimeoutError, AssertionError) as e:
+                last_error = e
+                next_label = chain[attempt + 1][0] if attempt + 1 < len(chain) else None
+                self.logger.warning(
+                    "ui_fallback_chain_retry",
+                    action=action,
+                    selector_type=step.get("selector_type"),
+                    selector=step.get("selector"),
+                    tried=label,
+                    attempt=attempt + 1,
+                    next=next_label,
+                    error=str(e).splitlines()[0] if str(e) else type(e).__name__,
+                )
+                continue
+            except ToolExecutionError:
+                # 명시적 ToolExecutionError (예: upload value 누락) 는 chain 의미 없음 — 즉시 raise
+                raise
+
+        # 모든 chain step 실패 — 마지막 에러 raise. caller (_run_step) 가 TOOL_UI_LOCATOR_NOT_FOUND 분류.
+        if last_error is not None:
+            raise last_error
+        raise ToolExecutionError(
+            ErrorCode.TOOL_UI_LOCATOR_NOT_FOUND,
+            "locator chain 0건 — selector 결정 불가",
+        )
+
+    async def _apply_action(
+        self,
+        locator: Locator,
+        action: str,
+        step: ActionStep,
+        *,
+        timeout_ms: int | None = None,
+    ) -> None:
+        """단일 Locator 에 action 27종 중 DOM action 18종 적용. timeout_ms 가 주어지면 그 timeout 사용.
+
+        chain 의 각 step 에서 호출. _run_dom_action 의 fallback 순회 헬퍼.
+        """
         value = step.get("value")
         expected = step.get("expected")
-        locator = self._build_locator(page, step)
+        kw: dict[str, Any] = {"timeout": timeout_ms} if timeout_ms is not None else {}
 
         if action == "fill":
-            await locator.fill(value or "")
+            await locator.fill(value or "", **kw)
             return
         if action == "clear":
-            await locator.clear()
+            await locator.clear(**kw)
             return
         if action == "click":
-            await locator.click()
+            await locator.click(**kw)
             return
         if action == "dblclick":
-            await locator.dblclick()
+            await locator.dblclick(**kw)
             return
         if action == "hover":
-            await locator.hover()
+            await locator.hover(**kw)
             return
         if action == "select":
-            await locator.select_option(value or "")
+            await locator.select_option(value or "", **kw)
             return
         if action == "check":
-            await locator.check()
+            await locator.check(**kw)
             return
         if action == "uncheck":
-            await locator.uncheck()
+            await locator.uncheck(**kw)
             return
         if action == "press":
-            await locator.press(value or "Enter")  # 1-step fallback: Enter
+            await locator.press(value or "Enter", **kw)  # 1-step fallback: Enter
             return
         if action == "upload":
             if not value:
                 raise ToolExecutionError(
                     ErrorCode.TOOL_UI_UNKNOWN, "upload 에는 value (파일 경로) 필요"
                 )
-            await locator.set_input_files(value)
+            await locator.set_input_files(value, **kw)
             return
 
-        # assert 계열 8종
+        # assert 계열 8종 — expect(locator) 는 timeout 인자 따로 받음
         if action == "assert" or action == "assert_visible":
-            await expect(locator).to_be_visible()
+            await expect(locator).to_be_visible(**kw)
             return
         if action == "assert_hidden":
-            await expect(locator).to_be_hidden()
+            await expect(locator).to_be_hidden(**kw)
             return
         if action == "assert_text":
-            await expect(locator).to_have_text(expected or "")
+            await expect(locator).to_have_text(expected or "", **kw)
             return
         if action == "assert_value":
-            await expect(locator).to_have_value(expected or "")
+            await expect(locator).to_have_value(expected or "", **kw)
             return
         if action == "assert_enabled":
-            await expect(locator).to_be_enabled()
+            await expect(locator).to_be_enabled(**kw)
             return
         if action == "assert_disabled":
-            await expect(locator).to_be_disabled()
+            await expect(locator).to_be_disabled(**kw)
             return
         if action == "assert_count":
-            # expected 가 숫자 문자열이어야 함. 변환 실패 시 fallback=0
             try:
                 count = int(str(expected).strip()) if expected is not None else 0
             except (ValueError, TypeError):
                 count = 0
-            await expect(locator).to_have_count(count)
+            await expect(locator).to_have_count(count, **kw)
             return
 
-    def _build_locator(self, page: Page, step: ActionStep) -> Locator:
-        """selector + selector_type → Locator.
+    def _build_locator_chain(self, page: Page, step: ActionStep) -> list[tuple[str, Locator]]:
+        """selector_type 별 의미적 chain (spec §4.5.4 확장).
 
-        selector None + DOM action (ActionMapper 의 fallback 통과 후 도착) →
-        expected/value 로 text fallback. 9종 type 모두 지원, 미지원은 css fallback.
+        1차는 ActionMapper 결정 존중, 2차 이상은 자연어 그룹 (text/label/placeholder) 사이의
+        다른 entry point 시도 + testid 안전망. selector=None 케이스 (ActionMapper 의 fallback
+        미작동) 도 chain 으로 확장.
+
+        chain 의 의미:
+        - text/label/placeholder 는 자연어 selector — 셋 다 시도해도 무해 (timeout 만 비용)
+        - testid 는 식별자 — get_by_test_id + data-testid/data-test-id css 직접 시도
+        - role/alttext/title 은 보조 → 실패 시 text fallback
+        - css/xpath 는 정확한 selector 가정 — chain 적용 안 함
+
+        Returns:
+            [(label, Locator)] 순서대로 1차→N차. 각 entry 는 log 표기용 label + locator.
         """
         selector = step.get("selector")
         selector_type = step.get("selector_type") or "css"
 
-        # selector None 도착 시 1-step fallback (ActionMapper 가 fallback 못 한 경우)
+        # selector 자체 부재 — ActionMapper 의 fallback 미작동 케이스
         if not selector:
             fallback = step.get("expected") or step.get("value") or step.get("action") or ""
+            text = str(fallback)
             self.logger.warning(
                 "ui_fallback_locator",
                 action=step.get("action"),
-                used=fallback,
+                used=text,
                 code=ErrorCode.TOOL_UI_FALLBACK_USED,
             )
-            return page.get_by_text(str(fallback))
+            return [
+                ("get_by_text", page.get_by_text(text)),
+                ("get_by_placeholder", page.get_by_placeholder(text)),
+                ("get_by_label", page.get_by_label(text)),
+            ]
 
-        if selector_type in _GET_BY_METHODS:
-            method = getattr(page, _GET_BY_METHODS[selector_type])
-            return method(selector)
-        if selector_type == "xpath" and not selector.startswith("xpath="):
-            return page.locator(f"xpath={selector}")
-        return page.locator(selector)
+        if selector_type == "text":
+            return [
+                ("get_by_text", page.get_by_text(selector)),
+                ("get_by_label", page.get_by_label(selector)),
+                ("get_by_placeholder", page.get_by_placeholder(selector)),
+                ("get_by_test_id", page.get_by_test_id(selector)),
+            ]
+        if selector_type == "label":
+            return [
+                ("get_by_label", page.get_by_label(selector)),
+                ("get_by_text", page.get_by_text(selector)),
+                ("get_by_placeholder", page.get_by_placeholder(selector)),
+            ]
+        if selector_type == "placeholder":
+            return [
+                ("get_by_placeholder", page.get_by_placeholder(selector)),
+                ("get_by_label", page.get_by_label(selector)),
+                ("get_by_text", page.get_by_text(selector)),
+            ]
+        if selector_type == "testid":
+            return [
+                ("get_by_test_id", page.get_by_test_id(selector)),
+                ("locator[data-testid]", page.locator(f'[data-testid="{selector}"]')),
+                ("locator[data-test-id]", page.locator(f'[data-test-id="{selector}"]')),
+            ]
+        if selector_type == "role":
+            return [
+                ("get_by_role", page.get_by_role(selector)),  # type: ignore[arg-type]
+                ("get_by_text", page.get_by_text(selector)),
+            ]
+        if selector_type == "alttext":
+            return [
+                ("get_by_alt_text", page.get_by_alt_text(selector)),
+                ("get_by_text", page.get_by_text(selector)),
+            ]
+        if selector_type == "title":
+            return [
+                ("get_by_title", page.get_by_title(selector)),
+                ("get_by_text", page.get_by_text(selector)),
+            ]
+        if selector_type == "xpath":
+            xpath = selector if selector.startswith("xpath=") else f"xpath={selector}"
+            return [("xpath", page.locator(xpath))]
+        # css 또는 알 수 없는 타입 — 단일 시도
+        return [("locator", page.locator(selector))]
 
     @staticmethod
     async def _capture_screenshot(
