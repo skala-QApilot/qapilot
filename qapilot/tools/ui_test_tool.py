@@ -331,7 +331,11 @@ class UITestTool(BaseTool):
                 # 명시적 ToolExecutionError (예: upload value 누락) 는 chain 의미 없음 — 즉시 raise
                 raise
 
-        # 1차 chain 모두 실패 — 옵션 B (런타임 DOM scan + fuzzy match) 진행
+        # 1차 chain 모두 실패 — 옵션 B (런타임 DOM scan + fuzzy match) 진행 (이슈 #115).
+        # 이슈 #119: 예외 분류를 옵션 A chain loop 와 일관성 맞춤. ToolExecutionError 는
+        # chain 의미 없이 즉시 raise, locator timeout / assertion 만 graceful 흡수.
+        # timeout_ms 는 chain 2차+ 와 동일한 _CHAIN_FALLBACK_TIMEOUT_MS — fallback 시도는
+        # 모두 short timeout 으로 e2e 총 시간 폭증 회피.
         fallback_locator = await self._fallback_dom_scan(page, step)
         if fallback_locator is not None:
             try:
@@ -344,13 +348,16 @@ class UITestTool(BaseTool):
                     code=ErrorCode.TOOL_UI_FALLBACK_USED,
                 )
                 return
-            except Exception as e:
+            except (PWTimeoutError, AssertionError) as e:
                 last_error = e
                 self.logger.warning(
                     "ui_fallback_dom_scan_failed",
                     action=action,
                     error=str(e).splitlines()[0] if str(e) else type(e).__name__,
                 )
+            except ToolExecutionError:
+                # ToolExecutionError (예: upload value 누락) 는 fallback 의미 없음 — 즉시 raise
+                raise
 
         # 모든 chain step 실패 — 마지막 에러 raise. caller (_run_step) 가 TOOL_UI_LOCATOR_NOT_FOUND 분류.
         if last_error is not None:
@@ -361,7 +368,45 @@ class UITestTool(BaseTool):
         )
 
     async def _fallback_dom_scan(self, page: Page, step: ActionStep) -> Locator | None:
-        """옵션 B: 런타임 DOM을 스캔하고 fuzzy match로 가장 유사한 요소를 찾는다."""
+        """옵션 B (이슈 #115): 런타임 SUT DOM 을 스캔하고 fuzzy match 로 가장 유사한 요소 반환.
+
+        옵션 A chain (selector_type 별 entry 다중 시도) 가 모두 실패한 후 호출되는 최후
+        보정 단계. ActionMapper / ScenarioGen LLM 의 selector 추론과 실제 SUT DOM 의
+        mismatch 가 chain 으로도 적중 안 될 때 실제 페이지의 DOM 정보로 보정한다.
+
+        spec §4.5.1 의 "UITestTool = 실제 유효성 판정자" 원칙과 부합 — 실행 시점에
+        SUT 가 살아있다는 사실을 활용해 인덱싱 시점 (CodebaseScannerTool) 의 frontend
+        DOM 정보 부재를 우회. 근본 해결 (C 영역 codebase-index/frontend-dom.json 신설)
+        은 별도 트랙 — 상세 `docs/frontend-dom-scan-gap.md`.
+
+        스캔 대상:
+        - `input, textarea, select, button, a, label, [role="button"]` — 의미적 element
+        - `rect.width === 0 || rect.height === 0` 인 invisible 요소는 skip
+
+        후보 속성 (element 당):
+        - `text` (innerText, INPUT type=submit/button 은 value), `placeholder`,
+          `aria-label`, `data-testid` / `data-test-id`, `id`, `name`
+
+        Fuzzy match:
+        - `target` = `step.selector or expected or value or action` (lower)
+        - `score = difflib.SequenceMatcher(None, target, cand).ratio()`
+        - 포함관계 가산점: `target in cand or cand in target` → `score += 0.2`
+        - 임계값: `best_score >= 0.6` 만 매치 인정
+
+        반환 Locator 우선순위 (가장 안정적 entry point 순):
+        1. `page.get_by_test_id(best.testid)` — testid 는 컨벤션상 변경 최소
+        2. `page.get_by_placeholder(best.placeholder)`
+        3. `page.get_by_text(best.text)`
+        4. `page.get_by_label(best.label)`
+        5. `page.locator(f"#{best.id}")` — id 폴백
+        6. `page.locator(f"[name=...]")` — name 최후 fallback
+
+        반환:
+        - 매치 element 찾으면 위 우선순위에 따라 Locator
+        - selector 비어있음 / page.evaluate 실패 / 임계값 미달 / 모든 후보 비어있음 → None
+
+        호출자 (`_run_dom_action`) 가 None 받으면 chain last_error 그대로 raise.
+        """
         selector = str(step.get("selector") or step.get("expected") or step.get("value") or step.get("action") or "").strip()
         if not selector:
             return None

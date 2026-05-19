@@ -13,6 +13,7 @@
 > - v1.6 (2026-05-18): Orchestrator Layer 3 wire-up 완료 — `_defect_classify` (DefectClassifier stub graceful) / `_root_cause` (RootCauseAgent FR-010) / `_fix_recommend` (FixRecommenderAgent FR-011) 호출. `_report` 5 섹션 markdown 확장. 4-Layer 17 노드 완전 wire 상태 도달.
 > - v1.7 (2026-05-18): **DefectClassifier 단계 제거**. CrossCheckAgent 가 이미 생산하는 `error_code`/`summary`/`mismatches` 가 분류 신호를 제공하므로 별도 분류 단계 불필요. `_cross_check` 노드에서 두 필드 보존 패치 + 그래프에서 `_defect_classify` 노드/엣지 제거 (cross_check → root_cause 직결). `defect_results` state 필드 / DefectClassifierAgent / 관련 프롬프트·스키마 모두 제거. `_report` 4 섹션 (실패 / Cross-check / 원인 / 해결) 로 재조정. FR-009 spec 갱신 별도 필요.
 > - v1.8 (2026-05-19): **§4.5.4 UITestTool 측 의미적 chain 도입** (이슈 #111). `1-step fallback` 한정 → `selector_type 별 retry chain` 확장 — ActionMapper LLM 추론과 실제 SUT DOM mismatch 보완 (e2e 첫 완주 `721a4e4f` 의 UI 100% fail 원인 분석 결과). 1차 timeout 10s / 2차+ 5s 분배로 총 시간 폭증 회피. chain 적중 시 `ui_fallback_chain_success` 로그. 근본 해결 (CodebaseScannerTool frontend 스캔) 은 별도 트랙 — 상세 `docs/frontend-dom-scan-gap.md`.
+> - v1.8.1 (2026-05-19): **§4.5.4 옵션 B 추가** (이슈 #115). 옵션 A chain 모두 실패 시 런타임 DOM 스캔 + fuzzy match — Python `difflib.SequenceMatcher.ratio()` + 포함관계 가산점 0.2 + 임계값 0.6. 반환 Locator 우선순위 testid > placeholder > text > label > id > name. **이슈 #119 (2026-05-19)**: §4.5.4 옵션 B 본문의 `Levenshtein Distance` 표기를 실제 알고리즘 (`difflib.SequenceMatcher`) 로 정정 + DOM scan 수집 element 와 후보 속성 정확히 명시. 코드 일관성 + docstring + 테스트 강화 동반.
 
 ---
 
@@ -369,7 +370,7 @@ ActionMapper / CodeGenerator / UITestTool 모두 동일 vocabulary 공유.
 | `title` | `get_by_title` → `get_by_text` | 1차 10s / 2차+ 5s |
 | `css` / `xpath` | 단일 시도 (정확한 selector 가정) | 1차 10s |
 
-- **런타임 DOM Scan + Fuzzy Match (옵션 B)**: 위 1차/2차 chain(옵션 A)이 모두 실패했을 경우, 런타임 시점의 실제 브라우저 DOM을 스캔(`page.evaluate`)하여 모든 대화형 요소(`input, button, a` 등)를 수집. 이후 Levenshtein Distance 기반의 Fuzzy Match 알고리즘(유사도 0.6 이상)을 사용해 가장 의도에 부합하는 요소를 찾아내어 마지막으로 1회 더 재시도.
+- **런타임 DOM Scan + Fuzzy Match (옵션 B)**: 위 1차/2차 chain(옵션 A)이 모두 실패했을 경우, 런타임 시점의 실제 브라우저 DOM을 스캔(`page.evaluate`)하여 모든 대화형 요소(`input, textarea, select, button, a, label, [role="button"]` — visible 만)를 수집하고 각 요소의 `text / placeholder / aria-label / data-testid \| data-test-id / id / name` 을 후보로 추출. Python `difflib.SequenceMatcher.ratio()` (gestalt pattern matching 변형) 기반 fuzzy match 에 포함관계 가산점 (`target in cand or cand in target` 시 +0.2) 을 적용, 임계값 0.6 이상에서 가장 유사한 요소를 선택. 반환 Locator 우선순위 `testid > placeholder > text > label > id > name` 로 가장 안정적인 entry point 활용. 마지막으로 1회 더 재시도 (fallback timeout 5s).
 - chain 적중 시 `ui_fallback_chain_success` (옵션 A) 또는 `ui_fallback_dom_scan_success` (옵션 B) info 로그 기록. 모두 실패 시 마지막 에러 raise → caller 가 `TOOL_UI_LOCATOR_NOT_FOUND` 분류.
 
 > **배경**: 본 chain 확장은 ActionMapper / ScenarioGen LLM 의 SUT DOM 추론 한계 보완. 근본 해결 (CodebaseScannerTool 의 frontend 스캔 + ActionMapper 인덱스 주입) 은 별도 트랙 (C 영역). 상세: `docs/frontend-dom-scan-gap.md`.
