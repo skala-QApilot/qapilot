@@ -62,6 +62,10 @@ class PipelineState(TypedDict):
     db_results: list[DBTestResult]
     cross_check_results: list[CrossCheckResult]
     has_mismatch: bool
+    # TC / TS 별 최종 status 요약 ('passed' | 'failed').
+    # trace.json 에 보존되어 Spring 이 시나리오별 last_run_status 도출 시 사용한다.
+    tc_results: dict[str, str]
+    scenario_results: dict[str, str]
 
     # ── Layer 3: 장애 분석 ──
     root_cause_results: list[RootCauseResult]

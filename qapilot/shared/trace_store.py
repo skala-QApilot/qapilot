@@ -44,20 +44,30 @@ def create_trace(
 
 
 def update_trace(qapilot_dir: str | Path, trace_id: str, state: dict) -> None:
-    """파이프라인 완료 후 PipelineState 기반으로 trace를 갱신한다."""
+    """파이프라인 완료 후 PipelineState 기반으로 trace를 갱신한다.
+
+    test 명령의 경우 TC / 시나리오 별 status 요약(tc_results / scenario_results)도
+    trace.json 에 보존하여, Spring 이 별도 디스크 스캔 없이 시나리오 카드에서
+    last_run_status 를 표시할 수 있도록 한다.
+    """
     trace = load_trace(qapilot_dir, trace_id) or {}
     agent_logs = state.get("agent_logs", [])
-    trace.update(
-        {
-            "status": state.get("status") or "completed",
-            "completed_at": _utc_now(),
-            "error": state.get("error"),
-            "confidence": _average_confidence(agent_logs),
-            "agent_logs": agent_logs,
-            "total_cost": state.get("total_cost", 0.0),
-            "result_summary": _result_summary(state),
-        }
-    )
+    payload: dict = {
+        "status": state.get("status") or "completed",
+        "completed_at": _utc_now(),
+        "error": state.get("error"),
+        "confidence": _average_confidence(agent_logs),
+        "agent_logs": agent_logs,
+        "total_cost": state.get("total_cost", 0.0),
+        "result_summary": _result_summary(state),
+    }
+    tc_results = state.get("tc_results")
+    if isinstance(tc_results, dict) and tc_results:
+        payload["tc_results"] = tc_results
+    scenario_results = state.get("scenario_results")
+    if isinstance(scenario_results, dict) and scenario_results:
+        payload["scenario_results"] = scenario_results
+    trace.update(payload)
     _save_trace(qapilot_dir, trace_id, trace)
 
 

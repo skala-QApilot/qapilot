@@ -818,11 +818,66 @@ async def _test_execution(state: PipelineState) -> dict:
             await context.close()
             await browser.close()
 
+    tc_results = _aggregate_tc_results(ui_results, api_results, db_results)
+    scenario_results = _aggregate_scenario_results(tc_results, scenarios)
+
     return {
         "ui_results": ui_results,
         "api_results": api_results,
         "db_results": db_results,
+        "tc_results": tc_results,
+        "scenario_results": scenario_results,
     }
+
+
+def _aggregate_tc_results(
+    ui_results: list[dict], api_results: list[dict], db_results: list[dict]
+) -> dict[str, str]:
+    """TC 별 종합 status 도출 — `passed` / `failed`.
+
+    판정 기준: UI 가 pass/skip/fallback_used 이고, API error_calls 0, DB error 없음 → passed.
+    하나라도 위반 → failed. spec §6 의 results/{trace}/{ts}/{tc}/*.json 과 정합.
+    """
+    ui_map = {r.get("tc_id"): r for r in ui_results if r.get("tc_id")}
+    api_map = {r.get("tc_id"): r for r in api_results if r.get("tc_id")}
+    db_map = {r.get("tc_id"): r for r in db_results if r.get("tc_id")}
+
+    tc_results: dict[str, str] = {}
+    for tc_id in ui_map.keys():
+        ui = ui_map.get(tc_id) or {}
+        api = api_map.get(tc_id) or {}
+        db = db_map.get(tc_id) or {}
+
+        ui_status = ui.get("status", "")
+        ui_ok = ui_status in ("pass", "skip", "fallback_used")
+        api_ok = int(api.get("error_calls") or 0) == 0
+        db_ok = not db.get("error")
+
+        tc_results[tc_id] = "passed" if (ui_ok and api_ok and db_ok) else "failed"
+    return tc_results
+
+
+def _aggregate_scenario_results(
+    tc_results: dict[str, str], scenarios: list[dict]
+) -> dict[str, str]:
+    """TS 별 status 도출 — 모든 TC passed → passed, 하나라도 failed → failed, TC 없으면 미수록.
+
+    Scenario 에 속한 TC 중 실행된 것만 봄. 실행 안 된 TC 는 무시
+    (selective 실행 시나리오 보존).
+    """
+    scenario_results: dict[str, str] = {}
+    for ts in scenarios or []:
+        ts_id = ts.get("ts_id")
+        if not ts_id:
+            continue
+        ts_tc_ids = [tc.get("tc_id") for tc in (ts.get("test_cases") or []) if tc.get("tc_id")]
+        ran = [tc_id for tc_id in ts_tc_ids if tc_id in tc_results]
+        if not ran:
+            continue
+        scenario_results[ts_id] = (
+            "failed" if any(tc_results[tc_id] == "failed" for tc_id in ran) else "passed"
+        )
+    return scenario_results
 
 
 async def _run_ui_with_trace(
