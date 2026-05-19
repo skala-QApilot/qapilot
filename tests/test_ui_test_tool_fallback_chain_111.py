@@ -351,5 +351,166 @@ async def test_fallback_dom_scan_failed():
     step = {"selector": "저장하기", "selector_type": "text", "action": "click"}
     with pytest.raises(PWTimeoutError):
         await tool._run_dom_action(page, "click", step)
-        
+
     page.evaluate.assert_awaited_once()
+
+
+# ── 이슈 #119: 옵션 B edge case + 우선순위 + 일관성 검증 ────────────────────
+
+
+@pytest.mark.asyncio
+async def test_fallback_dom_scan_returns_none_for_empty_selector():
+    """selector / expected / value / action 모두 비어있으면 DOM scan 자체 안 함 → None."""
+    tool = _make_tool()
+    page = _mock_page_with_locators()
+    page.evaluate = AsyncMock()
+
+    step = {"selector": "", "selector_type": "text", "action": ""}
+    result = await tool._fallback_dom_scan(page, step)
+
+    assert result is None
+    page.evaluate.assert_not_called()  # 스캔 자체 발화 안 함
+
+
+@pytest.mark.asyncio
+async def test_fallback_dom_scan_returns_none_when_evaluate_raises():
+    """page.evaluate 가 raise → debug log + None 반환 (호출자에 전파 X)."""
+    tool = _make_tool()
+    page = _mock_page_with_locators()
+    page.evaluate = AsyncMock(side_effect=RuntimeError("page closed"))
+
+    step = {"selector": "이메일", "selector_type": "text", "action": "fill"}
+    result = await tool._fallback_dom_scan(page, step)
+
+    assert result is None
+    tool.logger.debug.assert_called_once()
+    assert tool.logger.debug.call_args.args[0] == "dom_scan_evaluate_failed"
+
+
+@pytest.mark.asyncio
+async def test_fallback_dom_scan_returns_none_below_threshold():
+    """모든 후보의 score 가 임계값 0.6 미만 → None."""
+    tool = _make_tool()
+    page = _mock_page_with_locators()
+    # target='이메일' vs '주문하기' — SequenceMatcher ratio ~0 + 포함관계 없음
+    page.evaluate = AsyncMock(return_value=[
+        {"tag": "button", "text": "주문하기", "placeholder": "", "label": "",
+         "testid": "", "id": "", "name": ""}
+    ])
+
+    step = {"selector": "이메일", "selector_type": "text", "action": "fill"}
+    result = await tool._fallback_dom_scan(page, step)
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_fallback_dom_scan_returns_none_when_dom_empty():
+    """DOM 스캔 결과 빈 list → None."""
+    tool = _make_tool()
+    page = _mock_page_with_locators()
+    page.evaluate = AsyncMock(return_value=[])
+
+    step = {"selector": "이메일", "selector_type": "text", "action": "fill"}
+    result = await tool._fallback_dom_scan(page, step)
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_fallback_dom_scan_returns_testid_first():
+    """반환 우선순위 — 매치 element 에 testid + placeholder + text 모두 있어도 testid 우선."""
+    tool = _make_tool()
+    page = _mock_page_with_locators()
+    page.evaluate = AsyncMock(return_value=[
+        {"tag": "input",
+         "text": "이메일 텍스트",
+         "placeholder": "이메일 입력",
+         "label": "이메일 라벨",
+         "testid": "email-input",
+         "id": "email",
+         "name": "email"}
+    ])
+
+    step = {"selector": "이메일", "selector_type": "text", "action": "fill"}
+    result = await tool._fallback_dom_scan(page, step)
+    assert result is not None
+    page.get_by_test_id.assert_called_once_with("email-input")
+    page.get_by_placeholder.assert_not_called()
+    page.get_by_text.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_fallback_dom_scan_falls_back_to_name_when_other_attrs_empty():
+    """testid/placeholder/text/label/id 모두 빈 문자열 → name 최후 fallback."""
+    tool = _make_tool()
+    page = _mock_page_with_locators()
+    page.evaluate = AsyncMock(return_value=[
+        {"tag": "input",
+         "text": "", "placeholder": "", "label": "", "testid": "", "id": "",
+         "name": "username"}
+    ])
+
+    step = {"selector": "username", "selector_type": "text", "action": "fill"}
+    result = await tool._fallback_dom_scan(page, step)
+    assert result is not None
+    page.locator.assert_called_once_with('[name="username"]')
+
+
+@pytest.mark.asyncio
+async def test_fallback_dom_scan_substring_match_bonus_breaks_threshold():
+    """포함관계 가산점 (+0.2) 로 임계값 통과 — target='이메일' vs cand='이메일을 입력하세요'."""
+    tool = _make_tool()
+    page = _mock_page_with_locators()
+    page.evaluate = AsyncMock(return_value=[
+        {"tag": "input",
+         "text": "", "placeholder": "이메일을 입력하세요",
+         "label": "", "testid": "", "id": "", "name": ""}
+    ])
+
+    step = {"selector": "이메일", "selector_type": "text", "action": "fill"}
+    result = await tool._fallback_dom_scan(page, step)
+    assert result is not None
+    page.get_by_placeholder.assert_called_once_with("이메일을 입력하세요")
+
+
+@pytest.mark.asyncio
+async def test_fallback_dom_scan_uses_expected_when_selector_none():
+    """selector=None 일 때 expected 를 target 으로 fuzzy match."""
+    tool = _make_tool()
+    page = _mock_page_with_locators()
+    page.evaluate = AsyncMock(return_value=[
+        {"tag": "div", "text": "가입 완료", "placeholder": "",
+         "label": "", "testid": "", "id": "", "name": ""}
+    ])
+
+    step = {"selector": None, "selector_type": None, "action": "assert_visible",
+            "expected": "가입 완료"}
+    result = await tool._fallback_dom_scan(page, step)
+    assert result is not None
+    page.get_by_text.assert_called_once_with("가입 완료")
+
+
+@pytest.mark.asyncio
+async def test_option_b_does_not_swallow_tool_execution_error():
+    """이슈 #119 P2 — 옵션 B 분기에서 ToolExecutionError 는 즉시 raise (chain 의미 없음, 옵션 A 와 일관성)."""
+    from qapilot.shared.errors import ErrorCode
+    from qapilot.shared.errors import ToolExecutionError as TEE
+
+    tool = _make_tool()
+    page = _mock_page_with_locators()
+    # 옵션 A chain 모두 timeout — fallback 진입
+    for loc_mock in [page.get_by_text, page.get_by_label, page.get_by_placeholder, page.get_by_test_id]:
+        loc_mock.return_value.click = AsyncMock(side_effect=PWTimeoutError("chain fail"))
+
+    page.evaluate = AsyncMock(return_value=[
+        {"tag": "button", "text": "이메일", "placeholder": "",
+         "label": "", "testid": "", "id": "", "name": ""}
+    ])
+    # 옵션 B 가 반환한 Locator 의 click 시도가 ToolExecutionError
+    # (1차 chain 호출도 동일 mock 이라 first call 은 PWTimeoutError, 두번째 = TEE)
+    page.get_by_text.return_value.click = AsyncMock(
+        side_effect=[PWTimeoutError("chain fail"), TEE(ErrorCode.TOOL_UI_UNKNOWN, "kaboom")]
+    )
+
+    step = {"selector": "이메일", "selector_type": "text", "action": "click"}
+    with pytest.raises(TEE):
+        await tool._run_dom_action(page, "click", step)
