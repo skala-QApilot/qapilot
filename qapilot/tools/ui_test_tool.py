@@ -23,6 +23,7 @@ Created: 2026-05-15
 from __future__ import annotations
 
 import difflib
+import re
 import time
 from pathlib import Path
 from typing import Any
@@ -69,6 +70,13 @@ _GET_BY_METHODS = {  # noqa: F841 — spec §4.5.3 매핑표 참조용 (의미 �
 # 2차 이상은 short timeout 으로 총 시간 폭증 방지. 1 × 10s + N × 5s ≈ 단일 30s default 와 비슷.
 _CHAIN_PRIMARY_TIMEOUT_MS = 10_000
 _CHAIN_FALLBACK_TIMEOUT_MS = 5_000
+
+# 이슈 #121 (옵션 C): auto-navigate 의 api_endpoint 파싱 패턴.
+# 형식 예: "POST /login" / "GET /plans/{id}" / "/signup".
+# group(1) = 경로 부분 (/login, /plans/{id}, /signup).
+_API_ENDPOINT_PATTERN = re.compile(r'^(?:[A-Z]+\s+)?(/[^\s?]*)')
+# 경로 매개변수 제거 — `/plans/{id}` → `/plans`, `/orders/:id` → `/orders`.
+_ROUTE_PARAM_PATTERN = re.compile(r'/[:{][^/}]*[}]?')
 
 
 class UITestTool(BaseTool):
@@ -154,6 +162,14 @@ class UITestTool(BaseTool):
         total_start = time.monotonic()
         tc_status = "pass"
 
+        # 이슈 #121 (옵션 C): ActionMapping 에 navigate step 부재 시 auto-navigate.
+        # 첫 step 이 DOM action 인 경우 SUT 가 잘못된 페이지 (예: vue-router redirect)
+        # 일 가능성 — api_endpoint 힌트로 frontend route 추론 + page.goto 자동 호출.
+        # 옵션 A chain / 옵션 B DOM scan 이 올바른 페이지에서 시작되도록 보장. 상세
+        # 배경: docs/e2e-navigate-gap-analysis.md
+        if steps and steps[0].get("action") in _DOM_ACTIONS:
+            await self._try_auto_navigate(page, steps, target_url)
+
         for idx, step in enumerate(steps):
             step_no = int(step.get("step_no") or idx + 1)
             action = step.get("action", "")
@@ -209,6 +225,88 @@ class UITestTool(BaseTool):
 
         total_duration_ms = int((time.monotonic() - total_start) * 1000)
         return step_results, tc_status, total_duration_ms
+
+    async def _try_auto_navigate(
+        self, page: Page, steps: list[ActionStep], target_url: str
+    ) -> None:
+        """이슈 #121 (옵션 C): 첫 step 이 DOM action 일 때 api_endpoint 기반 auto-navigate.
+
+        ActionMapping 에 navigate step 이 없는 경우 SUT 의 잘못된 페이지에서 첫 DOM
+        action 이 시도되어 옵션 A chain / 옵션 B DOM scan 까지 모두 fail 하는 사슬을
+        끊는다 (e2e trace `e1796b43` 의 73/73 fail 원인 분석 결과).
+
+        추론 정책:
+        - ActionMapping steps 를 순회하며 첫 발견 `api_endpoint` 의 path 사용
+        - HTTP method prefix (`POST `, `GET ` 등) 제거
+        - 경로 매개변수 (`:id`, `{id}`) 제거 (frontend route 는 보통 동일 prefix)
+        - 예시:
+          - `"POST /login"` → `/login`
+          - `"GET /plans/{id}"` → `/plans`
+          - `"/signup"` → `/signup`
+
+        실패 graceful:
+        - api_endpoint 부재 → debug log + 기존 동작 (auto-navigate 안 함)
+        - page.goto 실패 → warning log + 후속 step 진행 (안전망)
+        - backend API path 와 frontend route 가 불일치하는 경우 (예: `POST /orders`
+          ↔ `/order/new`) — 잘못된 URL 진입 후 기존 옵션 A/B fallback 으로 복구 시도
+
+        spec §4.5.1 의 \"UITestTool = 실제 유효성 판정자\" 원칙과 부합 — 실행 시점에
+        SUT 상태를 활용한 보정.
+        """
+        route = self._infer_target_route(steps)
+        if not route:
+            self.logger.debug(
+                "ui_auto_navigate_skipped",
+                reason="no_api_endpoint_hint",
+                first_action=steps[0].get("action") if steps else None,
+            )
+            return
+
+        full_url = (target_url.rstrip("/") if target_url else "") + route
+        self.logger.info(
+            "ui_auto_navigate",
+            route=route,
+            full_url=full_url,
+            reason="first_step_is_dom_action",
+        )
+        try:
+            await page.goto(full_url)
+        except Exception as e:
+            self.logger.warning(
+                "ui_auto_navigate_failed",
+                route=route,
+                full_url=full_url,
+                error=str(e).splitlines()[0] if str(e) else type(e).__name__,
+            )
+
+    def _infer_target_route(self, steps: list[ActionStep]) -> str | None:
+        """ActionMapping steps 의 `api_endpoint` 에서 frontend route 추론.
+
+        backend API path 와 frontend route 가 비슷한 prefix 라는 휴리스틱. 매핑이
+        1:1 가 아닌 경우 (예: `POST /orders` ↔ `/order/new`) 부정확하나, 다음 두
+        조건으로 손해 최소:
+        1. 추론 실패 시 기존 동작 (auto-navigate 안 함) 으로 fallback
+        2. 잘못된 route 추론 시 옵션 A/B chain 으로 복구 시도 (잘못된 페이지에서도
+           동일하게 시도되므로 본 PR 이전과 동일한 결과)
+
+        정교화는 후속 — ActionMapper 가 직접 navigate step prepend (C 영역) 또는
+        frontend codebase 인덱싱 (C 영역) 권장.
+
+        Returns:
+            추론된 frontend route (예: `/login`) 또는 추론 불가 시 None
+        """
+        for s in steps:
+            ep = s.get("api_endpoint")
+            if not ep or not isinstance(ep, str):
+                continue
+            m = _API_ENDPOINT_PATTERN.match(ep.strip())
+            if not m:
+                continue
+            path = m.group(1)
+            cleaned = _ROUTE_PARAM_PATTERN.sub("", path).rstrip("/")
+            if cleaned:
+                return cleaned
+        return None
 
     async def _run_step(self, page: Page, step: ActionStep, target_url: str) -> None:
         """단일 ActionStep 을 실행한다. 27종 action 분기 + 1-step fallback."""
