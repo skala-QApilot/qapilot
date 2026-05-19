@@ -37,15 +37,32 @@ def _mock_page() -> MagicMock:
     ("/plans", "/plans"),  # HTTP method 없는 형식
     ("GET /plans/{id}", "/plans"),  # {id} 제거
     ("DELETE /orders/:id", "/orders"),  # :id 제거
-    ("GET /family/members/{member_id}", "/family/members"),  # 중첩 param
+    # 이슈 #123 v2: 깊은 path → 1차 segment 만
+    ("GET /family/members/{member_id}", "/family"),  # 1-segment 휴리스틱
     ("POST  /signup", "/signup"),  # 공백 여러 칸
     ("PATCH /profile", "/profile"),
+    # 이슈 #123 v2: /api/ prefix 제거
+    ("POST /api/login", "/login"),
+    ("GET /api/plans", "/plans"),
+    ("DELETE /api/contracts/1/cancel", "/contracts"),
+    ("GET /api/family-group/join", "/family-group"),
+    ("PATCH /api/orders/{id}/status", "/orders"),
 ])
 def test_infer_target_route_various_formats(api_endpoint, expected):
     tool = _make_tool()
     steps = [{"action": "fill", "selector": "x", "selector_type": "css",
               "api_endpoint": api_endpoint}]
     assert tool._infer_target_route(steps) == expected
+
+
+def test_infer_target_route_api_only_skips():
+    """`/api` 단독은 의미 없는 prefix — skip 후 다음 step 시도."""
+    tool = _make_tool()
+    steps = [
+        {"action": "fill", "api_endpoint": "GET /api"},  # 의미 없음 → skip
+        {"action": "click", "api_endpoint": "POST /api/login"},  # 다음 사용
+    ]
+    assert tool._infer_target_route(steps) == "/login"
 
 
 def test_infer_target_route_uses_first_endpoint():
@@ -222,3 +239,34 @@ async def test_run_steps_skips_auto_navigate_for_empty_steps():
     await tool._run_steps(page, [], "http://localhost:3000", None, [])
 
     tool._try_auto_navigate.assert_not_called()
+
+
+# ── 이슈 #123 P2 — invalid URL 방어 ─────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("target_url", [None, "", "/login", "localhost:3000", "//foo.com"])
+async def test_try_auto_navigate_skips_invalid_target_url(target_url):
+    """target_url 가 None / empty / path-only / scheme 부재 → page.goto 안 함 + warning."""
+    tool = _make_tool()
+    page = _mock_page()
+    steps = [{"action": "fill", "api_endpoint": "POST /login"}]
+
+    await tool._try_auto_navigate(page, steps, target_url)
+
+    page.goto.assert_not_called()
+    warning_calls = [c for c in tool.logger.warning.call_args_list if c.args and c.args[0] == "ui_auto_navigate_skipped"]
+    assert len(warning_calls) == 1
+    assert warning_calls[0].kwargs["reason"] == "target_url_missing_or_not_absolute"
+
+
+@pytest.mark.asyncio
+async def test_try_auto_navigate_accepts_https_target_url():
+    """https://... target_url 도 정상 처리."""
+    tool = _make_tool()
+    page = _mock_page()
+    steps = [{"action": "fill", "api_endpoint": "POST /login"}]
+
+    await tool._try_auto_navigate(page, steps, "https://staging.example.com")
+
+    page.goto.assert_awaited_once_with("https://staging.example.com/login")

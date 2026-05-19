@@ -253,6 +253,17 @@ class UITestTool(BaseTool):
         spec §4.5.1 의 \"UITestTool = 실제 유효성 판정자\" 원칙과 부합 — 실행 시점에
         SUT 상태를 활용한 보정.
         """
+        # 이슈 #123 P2: target_url 가 absolute URL 아니면 invalid URL 으로 page.goto
+        # 실패하므로 사전 skip. None / empty / scheme 부재 모두 안전망.
+        if not target_url or not target_url.startswith(("http://", "https://")):
+            self.logger.warning(
+                "ui_auto_navigate_skipped",
+                reason="target_url_missing_or_not_absolute",
+                target_url=target_url,
+                hint="qapilot.config.yaml 의 project.target_url 을 절대 URL (http://... 또는 https://...) 로 설정하세요. qapilot init 마법사로 재설정 가능.",
+            )
+            return
+
         route = self._infer_target_route(steps)
         if not route:
             self.logger.debug(
@@ -262,7 +273,7 @@ class UITestTool(BaseTool):
             )
             return
 
-        full_url = (target_url.rstrip("/") if target_url else "") + route
+        full_url = target_url.rstrip("/") + route
         self.logger.info(
             "ui_auto_navigate",
             route=route,
@@ -283,11 +294,22 @@ class UITestTool(BaseTool):
         """ActionMapping steps 의 `api_endpoint` 에서 frontend route 추론.
 
         backend API path 와 frontend route 가 비슷한 prefix 라는 휴리스틱. 매핑이
-        1:1 가 아닌 경우 (예: `POST /orders` ↔ `/order/new`) 부정확하나, 다음 두
-        조건으로 손해 최소:
-        1. 추론 실패 시 기존 동작 (auto-navigate 안 함) 으로 fallback
-        2. 잘못된 route 추론 시 옵션 A/B chain 으로 복구 시도 (잘못된 페이지에서도
-           동일하게 시도되므로 본 PR 이전과 동일한 결과)
+        1:1 가 아닌 경우 (예: `POST /orders` ↔ `/order/new`) 부정확하나, 추론 실패
+        시 기존 동작 (auto-navigate 안 함) fallback.
+
+        이슈 #123 P3 — 휴리스틱 v2:
+        - `/api/` prefix 제거 (backend API path 가 보통 `/api/...` 로 시작, frontend
+          route 는 `/api/` 없음)
+        - 1차 segment 만 사용 (frontend route 는 보통 단순 1-segment — `/login`,
+          `/plans`, `/orders`). 깊은 path (`/api/contracts/1/cancel`) 를 모두 사용
+          하면 부정확.
+
+        예시 변환:
+        - `"POST /login"` → `/login`
+        - `"GET /api/plans"` → `/plans`
+        - `"DELETE /api/contracts/1/cancel"` → `/contracts`
+        - `"GET /api/family-group/join"` → `/family-group`
+        - `"POST /signup"` → `/signup`
 
         정교화는 후속 — ActionMapper 가 직접 navigate step prepend (C 영역) 또는
         frontend codebase 인덱싱 (C 영역) 권장.
@@ -303,9 +325,17 @@ class UITestTool(BaseTool):
             if not m:
                 continue
             path = m.group(1)
+            # 경로 매개변수 (:id, {id}) 제거
             cleaned = _ROUTE_PARAM_PATTERN.sub("", path).rstrip("/")
-            if cleaned:
-                return cleaned
+            # 이슈 #123 P3: /api/ prefix 제거
+            if cleaned.startswith("/api/"):
+                cleaned = cleaned[4:]  # "/api/contracts" → "/contracts"
+            elif cleaned == "/api":
+                continue  # 의미 없는 /api 단독은 skip, 다음 step 시도
+            # 이슈 #123 P3: 1차 segment 만 사용 (frontend route 단순화 휴리스틱)
+            segments = [seg for seg in cleaned.split("/") if seg]
+            if segments:
+                return "/" + segments[0]
         return None
 
     async def _run_step(self, page: Page, step: ActionStep, target_url: str) -> None:

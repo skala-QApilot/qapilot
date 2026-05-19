@@ -7,6 +7,7 @@ Created: 2026-05-12
 """
 
 import asyncio
+import re
 import uuid
 import webbrowser
 from pathlib import Path
@@ -23,11 +24,81 @@ from qapilot.shared.project_slug import project_slug_from_path
 from qapilot.shared.schemas import ToolInput
 from qapilot.tools.codebase_scanner_tool import CodebaseScannerTool
 
+# 이슈 #123 — frontend dev server URL 자동 추론용 휴리스틱.
+_FE_DIR_CANDIDATES = ("frontend", "web", "client", "ui", "app")
+_VITE_CONFIG_NAMES = ("vite.config.js", "vite.config.ts", "vite.config.mjs", "vite.config.cjs")
+_VITE_PORT_PATTERN = re.compile(r"\bport\s*:\s*(\d+)")
+_PKG_DEV_PORT_PATTERN = re.compile(r'"(?:dev|start)"\s*:\s*"[^"]*?(?:--port|-p)\s+(\d+)')
+_COMPOSE_FE_PORTS_PATTERN = re.compile(
+    r"(?:frontend|web|client|ui)[\s\S]{0,300}?ports:[\s\S]{0,200}?[\"']?(\d+):\d+"
+)
+
 
 def _build_project_identity(project_root: Path) -> tuple[str, str]:
     """Derive the project slug and display name from the current directory."""
     display_name = project_root.name or "project"
     return project_slug_from_path(project_root), display_name
+
+
+def _infer_target_url(project_root: Path) -> tuple[str | None, str | None]:
+    """frontend dev server URL 자동 추론 (이슈 #123).
+
+    탐색 순서 (적중 시 즉시 반환):
+    1. `<frontend_dir>/vite.config.{js,ts,mjs,cjs}` 의 `server.port: NNNN`
+    2. `<frontend_dir>/next.config.{js,mjs}` 존재 → Next.js default 3000
+    3. `<frontend_dir>/package.json` 의 `scripts.dev` 또는 `scripts.start` 의
+       `--port NNNN` 또는 `-p NNNN`
+    4. `docker-compose.{yml,yaml}` 또는 `compose.yml` 의 frontend/web/client/ui
+       service 의 `ports: "NNNN:..."`
+
+    `<frontend_dir>` 후보: `frontend`, `web`, `client`, `ui`, `app`.
+
+    Returns:
+        (url, source_file_label) 또는 (None, None) 추론 실패 시.
+        url 은 `http://localhost:PORT` 형식. source_file_label 은 사용자에게
+        보여줄 상대 경로.
+    """
+    # 1~3) frontend dir 후보 순회
+    for fe_name in _FE_DIR_CANDIDATES:
+        fe_root = project_root / fe_name
+        if not fe_root.is_dir():
+            continue
+        # 1) vite.config 파싱
+        for cfg_name in _VITE_CONFIG_NAMES:
+            cfg = fe_root / cfg_name
+            if cfg.is_file():
+                try:
+                    text = cfg.read_text(encoding="utf-8", errors="replace")
+                except OSError:
+                    continue
+                m = _VITE_PORT_PATTERN.search(text)
+                if m:
+                    return f"http://localhost:{m.group(1)}", f"{fe_name}/{cfg_name}"
+        # 2) Next.js default 3000
+        if (fe_root / "next.config.js").is_file() or (fe_root / "next.config.mjs").is_file():
+            return "http://localhost:3000", f"{fe_name}/next.config (Next.js default 3000)"
+        # 3) package.json dev/start script
+        pkg = fe_root / "package.json"
+        if pkg.is_file():
+            try:
+                text = pkg.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            m = _PKG_DEV_PORT_PATTERN.search(text)
+            if m:
+                return f"http://localhost:{m.group(1)}", f"{fe_name}/package.json"
+    # 4) docker-compose 의 frontend service ports
+    for compose_name in ("docker-compose.yml", "docker-compose.yaml", "compose.yml"):
+        compose = project_root / compose_name
+        if compose.is_file():
+            try:
+                text = compose.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            m = _COMPOSE_FE_PORTS_PATTERN.search(text)
+            if m:
+                return f"http://localhost:{m.group(1)}", compose_name
+    return None, None
 
 
 def _open_dashboard(url: str) -> None:
@@ -76,6 +147,26 @@ def init() -> None:
     server_url = Prompt.ask("중앙 서버 URL", default="http://localhost:8080")
     server_token = Prompt.ask("서버 인증 토큰 (옵션)", default="", show_default=False)
 
+    # [Step 1.5] 테스트 대상 SUT URL — 이슈 #123 (target_url UX 강화).
+    # 자동 추론 (frontend dev server config) 우선 → 실패 시 사용자 입력.
+    # PR #122 의 auto-navigate (옵션 C) 가 작동하려면 target_url 필수.
+    console.print(
+        f"\n[bold {BRAND_PURPLE}]Step 1-2. 테스트 대상 (SUT) URL[/bold {BRAND_PURPLE}]"
+    )
+    inferred_url, inferred_src = _infer_target_url(project_root)
+    if inferred_url:
+        console.print(
+            f"[dim]'{inferred_src}' 에서 dev server URL 을 감지했습니다.[/dim]"
+        )
+        target_url = Prompt.ask("SUT URL", default=inferred_url)
+    else:
+        console.print(
+            "[dim]frontend dev server URL 을 자동 추론하지 못했습니다.\n"
+            "QApilot 이 브라우저로 접속할 대상 서비스의 base URL 을 입력해주세요.\n"
+            "예: http://localhost:3000 (로컬 dev) / https://staging.example.com (스테이징)[/dim]"
+        )
+        target_url = Prompt.ask("SUT URL", default="http://localhost:3000")
+
     # [Step 2] 프로젝트 유형 선택 (메뉴형)
     console.print(f"\n[bold {BRAND_PURPLE}]Step 2. 대상 프로젝트 유형 선택[/bold {BRAND_PURPLE}]")
     project_table = Table(show_header=False, box=None, padding=(0, 2))
@@ -122,6 +213,7 @@ def init() -> None:
             "repo_path": str(project_root),
             "framework": framework,
             "language": language,
+            "target_url": target_url,
         },
         "llm": {
             "default_model": selected_model,
@@ -133,6 +225,7 @@ def init() -> None:
     console.print(f" - 프로젝트: {display_name}")
     console.print(f" - slug: {project_slug}")
     console.print(f" - 서버: {server_url}")
+    console.print(f" - SUT URL: {target_url}")
     console.print(f" - 유형: {framework}")
     console.print(f" - 모델: {selected_model}")
 
