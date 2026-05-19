@@ -1,6 +1,6 @@
 # QApilot 구현 플랜
 
-> **Version**: 1.8  
+> **Version**: 1.9  
 > **최종 수정일**: 2026-05-19  
 > **기반 문서**: 요구사항정의서 v0.4 / 개발표준정의서 v0.4  
 > **변경 이력**:  
@@ -16,6 +16,7 @@
 > - v1.8.1 (2026-05-19): **§4.5.4 옵션 B 추가** (이슈 #115). 옵션 A chain 모두 실패 시 런타임 DOM 스캔 + fuzzy match — Python `difflib.SequenceMatcher.ratio()` + 포함관계 가산점 0.2 + 임계값 0.6. 반환 Locator 우선순위 testid > placeholder > text > label > id > name. **이슈 #119 (2026-05-19)**: §4.5.4 옵션 B 본문의 `Levenshtein Distance` 표기를 실제 알고리즘 (`difflib.SequenceMatcher`) 로 정정 + DOM scan 수집 element 와 후보 속성 정확히 명시. 코드 일관성 + docstring + 테스트 강화 동반.
 > - v1.8.2 (2026-05-19): **§4.5.4 옵션 C 추가** (이슈 #121). ActionMapping 첫 step 이 DOM action 일 때 `api_endpoint` 힌트로 frontend route 추론 + auto-navigate. e2e trace `e1796b43` 의 73/73 UI fail 원인 분석 결과 (옵션 A/B 가 잘못된 페이지에서 시도되어 적중 0) 보완. SUT vue-router redirect (예: `/` → `/plans`) 인식 안 하던 한계를 휴리스틱 추론으로 우회. 옵션 A/B 효과가 비로소 실측 가능. 상세: `docs/e2e-navigate-gap-analysis.md`.
 > - v1.8.3 (2026-05-19): **target_url UX + 옵션 C 견고함 강화** (이슈 #123). e2e trace `4e1d8d49` 의 옵션 C auto-navigate 36/36 fail (invalid URL `full_url=/login`) 원인 — (a) mini-bss-lite/qapilot.config.yaml 의 `target_url` 누락 (b) UITestTool 의 invalid URL 방어 부재 (c) 휴리스틱이 backend `/api/...` path 그대로 사용. 세 가지 fix: (1) `qapilot init` 마법사가 frontend dev server URL 자동 추론 (vite.config / next.config / package.json / docker-compose) + Prompt fallback (2) `_try_auto_navigate` 가 `target_url` 부재/scheme 부재 시 사전 skip (3) `_infer_target_route` v2 — `/api/` prefix 제거 + 1차 segment 만 사용.
+> - v1.9 (2026-05-19): **frontend DOM 정적 인덱싱 + ActionMapper LLM 컨텍스트 주입** (이슈 #127). e2e trace `e1796b43`/`4e1d8d49` 의 UI 100% fail 근본 원인 (LLM 환각 — selector="HTTP 401" 같은 API 응답을 UI 텍스트로 추측) 해결. §6.1 codebase-index/ 에 `frontend.json` 추가. `.vue/.tsx/.jsx` 의 의미적 element (input/button/textarea/select/label/a + `[role="button"]`) + 속성 (text/placeholder/aria-label/data-testid/data-test-id/id/name) regex 휴리스틱 추출. `qapilot init` 마지막 + `qapilot rescan` 시 디스크 저장. ActionMapper `_call_batch` 가 디스크 로드 + prompt 의 `{{frontend_dom}}` 변수로 LLM 컨텍스트 주입. LLM 이 추측 대신 실제 DOM 정보 참조 → 옵션 A/B/C 효과 비로소 발현 가능.
 
 ---
 
@@ -491,6 +492,7 @@ qapilot/
 │   ├── endpoints.json
 │   ├── models.json
 │   ├── callgraph.json
+│   ├── frontend.json                # 이슈 #127: frontend DOM 정적 인덱스 (.vue/.tsx/.jsx)
 │   └── manifest.json                # Git commit hash 기준
 ├── domain/                          # FR-001 도메인 지식 인덱스
 ├── scenarios/                       # generate 산출물: 시나리오
