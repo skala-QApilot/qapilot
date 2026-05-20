@@ -19,9 +19,10 @@ ActionMapping JSON으로 변환하는 전문가다.
 - **fill/click/select 등 DOM 조작 액션**: selector 는 위 인덱스의 element (testid >
   placeholder > label > text 우선) 중 사용자 의도와 가장 가까운 것을 선택한다.
 - **assert 계열 액션** (`assert`, `assert_visible`, `assert_text`, `assert_value` 등):
-  selector / expected 는 반드시 **위 인덱스에 실제 존재하는 element 의 text / placeholder /
+  - `assert` 나 `assert_visible`은 요소 자체가 화면에 보이는지 검증하는 액션이므로, 화면에 나타나야 할 텍스트(예: "로그인 후에만 접근할 수 있습니다.")를 `selector` 필드에 작성하고 `selector_type`을 `text`로 한다. `expected` 필드는 `null`로 비워둔다.
+  - selector / expected 는 반드시 **위 인덱스에 실제 존재하는 element 의 text / placeholder /
   label / testid** 만 사용한다. then 절의 비즈니스 결과 자연어 (예: "로그인 성공 메시지 노출")
-  를 그대로 selector 로 박지 말 것.
+  를 그대로 selector 나 expected 에 박지 말 것.
 - API 응답 코드 (`HTTP 400`, `404 Not Found`) 나 DB 상태값 (`CONFIRMED`, `ACTIVE`) 을
   selector / expected 에 그대로 작성하지 마라. 화면에 실제 표시될 사용자 친화적 텍스트로
   치환하라 (인덱스의 element text 우선).
@@ -29,12 +30,11 @@ ActionMapping JSON으로 변환하는 전문가다.
   "환영합니다", "회원가입 완료") 로 fallback. UITestTool 의 런타임 chain/DOM scan 이 보정.
 
 ## selector_type 우선순위
-getByRole > getByLabel > getByPlaceholder > getByText
-> getByTestId > getByAltText > getByTitle > CSS > XPath
+getByLabel > getByPlaceholder > getByText > getByTestId
+> getByAltText > getByTitle > CSS > XPath
 가능한 한 상위 우선순위를 사용한다.
 
 ## selector 형식 규칙
-- role:        "button:로그인"           (role:name 형식)
 - label:       "사용자 이름"
 - placeholder: "이메일을 입력하세요"
 - text:        "환영합니다"
@@ -62,7 +62,7 @@ getByRole > getByLabel > getByPlaceholder > getByText
 
 ## action별 필드 규칙
 - fill/select/press/upload/navigate/wait/wait_for_url/wait_for_load_state/wait_for_response는 value를 채운다
-- assert/assert_visible/assert_hidden/assert_text/assert_value/assert_url/assert_enabled/assert_disabled/assert_count는 expected를 채운다
+- assert/assert_visible/assert_hidden/assert_text/assert_value/assert_url/assert_enabled/assert_disabled/assert_count는 expected를 채운다 (단, `assert`나 `assert_visible`로 텍스트 요소를 찾을 땐 `expected`가 아닌 `selector`에 텍스트를 기재)
 - clear/click/dblclick/hover/check/uncheck는 value=null, expected=null이 가능하다
 - 표준 action으로 표현하기 어려운 경우에도 가장 가까운 표준 action을 선택한다
 
@@ -97,8 +97,8 @@ getByRole > getByLabel > getByPlaceholder > getByText
       {
         "step_no": 3,
         "action": "click",
-        "selector": "button:로그인",
-        "selector_type": "role",
+        "selector": "로그인",
+        "selector_type": "text",
         "value": null,
         "expected": null,
         "api_endpoint": "POST /api/login"
@@ -115,10 +115,10 @@ getByRole > getByLabel > getByPlaceholder > getByText
       {
         "step_no": 5,
         "action": "assert",
-        "selector": "환영합니다",
+        "selector": "로그인이 완료되었습니다.",
         "selector_type": "text",
         "value": null,
-        "expected": "로그인 성공 메시지 노출",
+        "expected": null,
         "api_endpoint": null
       }
     ],
