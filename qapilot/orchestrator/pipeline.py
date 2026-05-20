@@ -911,6 +911,14 @@ async def _run_ui_with_trace(
         )
     )
 
+    # 이슈 #131 후속: APITraceTool listener cleanup.
+    # 현재 TC 의 UI 조작이 끝났으므로, 다음 TC 에 현재 listener 가 반응하지 않도록 해제.
+    try:
+        page.remove_listener("request", apt._on_request)
+        page.remove_listener("response", apt._on_response)
+    except Exception:
+        pass
+
     # listener 가 누적한 calls 를 dict 로 강제 변환 (TypedDict 인스턴스 dict-like)
     api_trace_dict = dict(api_trace)
     api_trace_dict["total_calls"] = len(api_trace_dict.get("calls") or [])

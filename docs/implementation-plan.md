@@ -1,6 +1,6 @@
 # QApilot 구현 플랜
 
-> **Version**: 1.10  
+> **Version**: 1.11  
 > **최종 수정일**: 2026-05-20  
 > **기반 문서**: 요구사항정의서 v0.4 / 개발표준정의서 v0.4  
 > **변경 이력**:  
@@ -18,6 +18,7 @@
 > - v1.8.3 (2026-05-19): **target_url UX + 옵션 C 견고함 강화** (이슈 #123). e2e trace `4e1d8d49` 의 옵션 C auto-navigate 36/36 fail (invalid URL `full_url=/login`) 원인 — (a) mini-bss-lite/qapilot.config.yaml 의 `target_url` 누락 (b) UITestTool 의 invalid URL 방어 부재 (c) 휴리스틱이 backend `/api/...` path 그대로 사용. 세 가지 fix: (1) `qapilot init` 마법사가 frontend dev server URL 자동 추론 (vite.config / next.config / package.json / docker-compose) + Prompt fallback (2) `_try_auto_navigate` 가 `target_url` 부재/scheme 부재 시 사전 skip (3) `_infer_target_route` v2 — `/api/` prefix 제거 + 1차 segment 만 사용.
 > - v1.9 (2026-05-19): **frontend DOM 정적 인덱싱 + ActionMapper LLM 컨텍스트 주입** (이슈 #127). e2e trace `e1796b43`/`4e1d8d49` 의 UI 100% fail 근본 원인 (LLM 환각 — selector="HTTP 401" 같은 API 응답을 UI 텍스트로 추측) 해결. §6.1 codebase-index/ 에 `frontend.json` 추가. `.vue/.tsx/.jsx` 의 의미적 element (input/button/textarea/select/label/a + `[role="button"]`) + 속성 (text/placeholder/aria-label/data-testid/data-test-id/id/name) regex 휴리스틱 추출. `qapilot init` 마지막 + `qapilot rescan` 시 디스크 저장. ActionMapper `_call_batch` 가 디스크 로드 + prompt 의 `{{frontend_dom}}` 변수로 LLM 컨텍스트 주입. LLM 이 추측 대신 실제 DOM 정보 참조 → 옵션 A/B/C 효과 비로소 발현 가능.
 > - v1.10 (2026-05-20): **ActionMapper TC-별 LLM 호출 분할 + assert step 환각 차단** (이슈 #129). e2e trace `a86603b9` 에서 PR #128 효과로 step 1/2/3 직접 PASS 도달했으나 두 가지 신규 결함 노출 — (a) ActionMapper 단일 batch 호출이 frontend.json 컨텍스트 추가로 token 한계 도달, 78 TC → 21 TC 매핑 (75% 누락) (b) assert step 의 selector 가 then 절 자연어 환각 (예: `testid="로그인 성공 메시지 노출"`) 잔존. Step A: `_execute` 의 batch loop → TC-별 `asyncio.gather` + `Semaphore(5)` + 부분 graceful (이슈 #107 의 CodeGenerator 패턴 확장). 한 TC LLM 실패가 다른 TC 차단 X. Step B: `_normalize_selector_fields` 가 assert 계열 action 의 selector 에 frontend.json 인덱스 fuzzy match (UITestTool 옵션 B 와 동일 `difflib.SequenceMatcher` + 임계값 0.6 + 포함관계 +0.2) 적용 후 testid > placeholder > label > text 우선순위로 정규화 (Agent 정적 정규화 + Tool 런타임 보정 의 이중 방어). prompt §CRITICAL 강화 — assert 계열은 인덱스 element 만 사용 명시. spec §4.5.1 의 \"ActionMapper 가능한 한 실패하지 않고 표준화\" 정신 전체 layer 확장.
+> - v1.11 (2026-05-20): **CrossCheck LLM input 압축** (이슈 #131). e2e trace `db24608c` 에서 CrossCheck 호출이 285K tokens (gpt-4o-mini 128K 한계의 2.2배) `context_length_exceeded` × 21회 fail (PR #128 + #130 효과로 매핑 21→61 증가하면서 노출). 정합성 분석의 핵심 정보 (UI status/url/status_code/error_code prefix) 는 보존하되 거대 페이로드 정제: (a) `ui_result.steps[].screenshot_path` 제거 + `error/console_logs` 1000 chars cap (b) `api_trace.calls[].request/response_body` 첫 500 chars + headers 제거 + 실패(>=400) 호출 우선 보존 + 30개 슬라이스 (c) `db_result.snapshots` 20개 + row 10개 슬라이스 + `_truncated_*` 메타. 압축 후에도 80K chars (~20K tokens) 초과 시 hard cut + `cross_check_context_hard_truncated` warning. 285K → ~5-20K tokens 수준으로 정규화. APITraceTool listener cleanup 은 별도 후속 이슈 (calls 누적 의혹).
 
 ---
 
