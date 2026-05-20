@@ -9,6 +9,8 @@ Created: 2026-05-07
 
 from __future__ import annotations
 
+import asyncio
+import difflib
 import json
 import re
 from typing import Any
@@ -20,6 +22,23 @@ from qapilot.shared.schemas import ActionMapping, ActionStep, ExecuteResult
 
 MAX_TC_PER_BATCH = 50
 MAX_TS_PER_BATCH = 10
+
+# 이슈 #129 Step A — TC-별 LLM 호출 분할. 이슈 #107 (CodeGenerator) 의 동일 패턴.
+# OpenAI rate limit + 토큰 사용량 균형. 이전 단일 batch 호출의 token 한계로 인한 부분
+# 잘림 (78 TC → 21 TC 누락) 사례 (trace `a86603b9`) 해결.
+_MAX_CONCURRENT_LLM_CALLS = 5
+
+# 이슈 #129 Step B — assert step 의 then 절 환각 차단용 fuzzy match.
+# UITestTool 옵션 B (이슈 #115) 의 difflib.SequenceMatcher + 임계값 0.6 + 포함관계 +0.2
+# 와 동일 알고리즘 — Agent 단 정규화 + Tool 런타임 보정 의 일관성.
+_FUZZY_MATCH_THRESHOLD = 0.6
+_FUZZY_MATCH_SUBSTRING_BONUS = 0.2
+
+# assert 계열 action — Step B 의 frontend.json 매칭 적용 대상.
+_ASSERT_ACTIONS = {
+    "assert", "assert_visible", "assert_hidden", "assert_text",
+    "assert_value", "assert_enabled", "assert_disabled", "assert_count",
+}
 
 _SELECTOR_REQUIRED_ACTIONS = {
     "fill", "clear", "click", "dblclick", "hover", "select", "check", "uncheck",
@@ -74,6 +93,10 @@ class ActionMapperAgent(BaseAgent):
 
     allowed_tools: list[str] = []
 
+    # 이슈 #129 Step B — _normalize_selector_fields 가 _execute 외 직접 호출되는 경우 (단위
+    # 테스트 등) 의 AttributeError 방지. 정상 흐름에서는 _execute 진입 시 갱신.
+    _frontend_dom_index: list[dict] = []
+
     async def _execute(
         self,
         context: dict[str, Any],
@@ -94,25 +117,77 @@ class ActionMapperAgent(BaseAgent):
         endpoints = self._extract_endpoints(scan_result)
         scenarios = context.get("scenarios") or []
         if not scenarios:
-            return ExecuteResult(result={"action_mappings": []}, confidence=1.0)
+            return ExecuteResult(
+                result={"action_mappings": [], "failed_tcs": []}, confidence=1.0
+            )
 
-        # 이슈 #127: frontend DOM 인덱스 로드 — ActionMapper LLM 호출 컨텍스트에 주입.
-        # 디스크 (.qapilot/codebase-index/frontend.json) 또는 context 둘 다 지원.
+        # 이슈 #127: frontend DOM 인덱스 로드 — LLM 호출 컨텍스트 주입 + Step B 정규화 활용.
         frontend_dom = self._load_frontend_dom(context)
+        # 이슈 #129 Step B: _normalize_selector_fields 가 instance state 로 접근.
+        self._frontend_dom_index = frontend_dom
+
+        # 이슈 #129 Step A: TC-별 LLM 호출 분할 — 이전 batch 호출의 token 한계로 인한
+        # 부분 잘림 (trace `a86603b9` 의 78→21 누락) 해결. spec §4.5.1 의 ActionMapper
+        # "가능한 한 실패하지 않고 표준화" 정신 확장 — 한 TC LLM 실패가 다른 TC 차단 X.
+        sem = asyncio.Semaphore(_MAX_CONCURRENT_LLM_CALLS)
+        tc_jobs: list[tuple[dict, dict]] = [
+            (ts, tc)
+            for ts in scenarios
+            for tc in (ts.get("test_cases") or [])
+        ]
+        if not tc_jobs:
+            return ExecuteResult(
+                result={"action_mappings": [], "failed_tcs": []}, confidence=1.0
+            )
+
+        tasks = [
+            self._call_single_tc(sem, ts, tc, endpoints, frontend_dom, last_error)
+            for ts, tc in tc_jobs
+        ]
+        outcomes = await asyncio.gather(*tasks, return_exceptions=True)
 
         all_mappings: list[ActionMapping] = []
-        for batch in self._build_batches(scenarios):
-            mappings = await self._call_batch(batch, endpoints, frontend_dom, last_error)
-            all_mappings.extend(mappings)
+        failed_tcs: list[dict] = []
+        for (ts, tc), outcome in zip(tc_jobs, outcomes):
+            tc_id = tc.get("tc_id") or "unknown"
+            if isinstance(outcome, BaseException):
+                failed_tcs.append({
+                    "tc_id": tc_id,
+                    "ts_id": ts.get("ts_id") or "",
+                    "error_type": type(outcome).__name__,
+                    "error": str(outcome),
+                })
+                self.logger.warning(
+                    "action_mapping_tc_skip",
+                    tc_id=tc_id,
+                    ts_id=ts.get("ts_id") or "",
+                    error_type=type(outcome).__name__,
+                    error=str(outcome),
+                )
+                continue
+            if outcome is None:
+                # LLM 응답이 비어 ActionMapping 0건 — silent skip 도 fail 카운트.
+                failed_tcs.append({
+                    "tc_id": tc_id,
+                    "ts_id": ts.get("ts_id") or "",
+                    "error_type": "EmptyMapping",
+                    "error": "LLM 응답에서 단일 ActionMapping 추출 실패",
+                })
+                continue
+            all_mappings.append(outcome)
 
         confidence = self._calc_confidence(all_mappings, scan_result is not None)
+        if failed_tcs:
+            confidence = confidence * len(all_mappings) / max(len(tc_jobs), 1)
+
         self.logger.info(
             "action_mappings_generated",
             mappings=len(all_mappings),
-            confidence=confidence,
+            failed=len(failed_tcs),
+            confidence=round(confidence, 3),
         )
         return ExecuteResult(
-            result={"action_mappings": all_mappings},
+            result={"action_mappings": all_mappings, "failed_tcs": failed_tcs},
             confidence=confidence,
         )
 
@@ -176,8 +251,10 @@ class ActionMapperAgent(BaseAgent):
     ) -> list[ActionMapping]:
         """단일 배치를 LLM으로 ActionMapping 변환한다.
 
-        이슈 #127: frontend_dom 인덱스를 LLM 호출 컨텍스트에 주입 — selector 추측 대신
-        실제 DOM 정보 참조. 인덱스 부재 시 빈 안내 문자열 (LLM 이 기존 휴리스틱으로 fallback).
+        이슈 #127: frontend_dom 인덱스를 LLM 호출 컨텍스트에 주입.
+
+        주: 이슈 #129 Step A 이후 `_execute` 는 TC-별 분할 (`_call_single_tc`) 을 사용.
+        본 메서드는 하위 호환·외부 caller 가능성·테스트 참조용으로 유지.
         """
         user_prompt = self.prompts.render(
             scenarios=self._format_scenarios(batch),
@@ -190,6 +267,50 @@ class ActionMapperAgent(BaseAgent):
             user_prompt=user_prompt,
         )
         return self._parse_action_mappings(response.content)
+
+    async def _call_single_tc(
+        self,
+        sem: asyncio.Semaphore,
+        ts: dict,
+        tc: dict,
+        endpoints: list[dict],
+        frontend_dom: list[dict],
+        last_error: str | None,
+    ) -> ActionMapping | None:
+        """단일 TC 를 LLM 으로 ActionMapping 변환 (이슈 #129 Step A).
+
+        한 TC 의 LLM 응답 실패가 다른 TC 의 매핑을 차단하지 않음. spec §4.5.1 의
+        \"ActionMapper 가능한 한 실패하지 않고 표준화\" 정신 확장 — batch 차원의
+        부분 잘림 (trace `a86603b9` 의 78→21) 을 TC 차원의 부분 graceful 로 해결.
+
+        scenario 는 TS slice (단일 TC 만 포함) 로 전달 — LLM 호출당 토큰 절감 +
+        해당 TC 의 비즈니스 의도 (given/when/then, name) 보존.
+
+        반환:
+            ActionMapping (성공) / None (LLM 응답 빈 result). raise (LLM/JSON 실패) 시
+            `_execute` 의 asyncio.gather(return_exceptions=True) 가 흡수.
+        """
+        sliced_ts = dict(ts)
+        sliced_ts["test_cases"] = [tc]
+        batch = [sliced_ts]
+
+        async with sem:
+            user_prompt = self.prompts.render(
+                scenarios=self._format_scenarios(batch),
+                endpoints=self._format_endpoints(endpoints),
+                frontend_dom=self._format_frontend_dom(frontend_dom),
+            )
+            user_prompt = self.with_correction_hint(user_prompt, last_error)
+            response = await self.llm.chat(
+                system_prompt=self.prompts.system(),
+                user_prompt=user_prompt,
+            )
+            mappings = self._parse_action_mappings(response.content)
+
+        if not mappings:
+            return None
+        # 단일 TC 입력 — 응답도 단일 mapping. 다중 시 첫 항목.
+        return mappings[0]
 
     def _load_frontend_dom(self, context: dict[str, Any]) -> list[dict]:
         """frontend DOM 인덱스 로드 — context 우선, 없으면 디스크 (.qapilot/codebase-index/frontend.json).
@@ -362,14 +483,108 @@ class ActionMapperAgent(BaseAgent):
         self, action: str, selector: Any, selector_type: str | None,
         item: dict, tc_id: str, step_no: int
     ) -> tuple[str | None, str | None]:
-        """action 성격에 따라 selector와 selector_type을 보정한다."""
+        """action 성격에 따라 selector와 selector_type을 보정한다.
+
+        이슈 #129 Step B: assert step 의 selector 가 frontend.json 인덱스의 element
+        와 매치 안 하면 가장 유사한 element 로 정규화 — then 절 환각 (예:
+        `testid="로그인 성공 메시지 노출"`) 의 결정적 차단. LLM 컨텍스트 주입 (#127)
+        의 차상위 안전망.
+        """
         if action in _SELECTOR_OPTIONAL_ACTIONS:
             return None, None
         if selector and selector_type:
+            # 이슈 #129 Step B — assert 계열 + 인덱스 보유 시 정규화 적용
+            if action in _ASSERT_ACTIONS and self._frontend_dom_index:
+                normalized = self._normalize_assert_selector_via_index(
+                    str(selector), selector_type, tc_id, step_no
+                )
+                if normalized is not None:
+                    return normalized
             return str(selector), selector_type
         fallback = item.get("expected") or item.get("value") or action
         self._log_normalization(tc_id, step_no, "selector", selector, fallback)
         return str(fallback), selector_type or "text"
+
+    def _normalize_assert_selector_via_index(
+        self, selector: str, selector_type: str, tc_id: str, step_no: int
+    ) -> tuple[str, str] | None:
+        """assert step 의 selector 를 frontend.json 인덱스로 정규화 (이슈 #129 Step B).
+
+        매칭 단계:
+        1. **정확 매치** — 인덱스의 element 의 testid/text/label/placeholder/aria-label
+           중 selector 와 정확 일치 → 정규화 불필요 (그대로 반환 None — 호출자가 원본 유지)
+        2. **fuzzy match** — UITestTool 옵션 B 와 동일 알고리즘 (difflib.SequenceMatcher
+           + 포함관계 가산점 0.2 + 임계값 0.6) 로 가장 유사한 element 발견
+        3. **정규화** — 매칭된 element 의 testid > placeholder > label > text 우선순위로
+           selector / selector_type 치환 (가장 안정적인 entry point)
+        4. **매치 실패** — None 반환 (호출자가 원본 유지). UITestTool 의 옵션 A/B chain
+           이 런타임에 추가 보정 시도.
+
+        매칭 알고리즘 일관성:
+        - Agent 정적 정규화 (본 메서드) + Tool 런타임 보정 (UITestTool `_fallback_dom_scan`)
+        - 동일 difflib.SequenceMatcher + 동일 임계값 — 이중 방어
+        """
+        target = selector.strip().lower()
+        if not target:
+            return None
+
+        # 1) 정확 매치 — 인덱스에 이미 그 텍스트 존재 시 정규화 불필요
+        for el in self._frontend_dom_index:
+            for key in ("testid", "text", "label", "placeholder"):
+                val = (el.get(key) or "").strip()
+                if val and val.lower() == target:
+                    return None  # 원본 유지
+
+        # 2) Fuzzy match — UITestTool 옵션 B 와 동일 알고리즘
+        best_el: dict | None = None
+        best_score = 0.0
+        for el in self._frontend_dom_index:
+            candidates = [
+                el.get("text", ""), el.get("placeholder", ""), el.get("label", ""),
+                el.get("testid", ""), el.get("name", ""), el.get("id", ""),
+            ]
+            for candidate in candidates:
+                cand = (candidate or "").strip().lower()
+                if not cand:
+                    continue
+                score = difflib.SequenceMatcher(None, target, cand).ratio()
+                if target in cand or cand in target:
+                    score += _FUZZY_MATCH_SUBSTRING_BONUS
+                if score > best_score:
+                    best_score = score
+                    best_el = el
+
+        if not best_el or best_score < _FUZZY_MATCH_THRESHOLD:
+            # 매치 실패 — 원본 유지 (UITestTool 런타임 보정에 위임)
+            return None
+
+        # 3) 정규화 — testid > placeholder > label > text 우선순위
+        if best_el.get("testid"):
+            new_selector, new_type = best_el["testid"], "testid"
+        elif best_el.get("placeholder"):
+            new_selector, new_type = best_el["placeholder"], "placeholder"
+        elif best_el.get("label"):
+            new_selector, new_type = best_el["label"], "label"
+        elif best_el.get("text"):
+            new_selector, new_type = best_el["text"], "text"
+        else:
+            return None  # 식별자 모두 빈 element — 정규화 불가
+
+        # 원본과 동일하면 그대로
+        if new_selector == selector and new_type == selector_type:
+            return None
+
+        self.logger.info(
+            "assert_selector_normalized_via_index",
+            tc_id=tc_id,
+            step_no=step_no,
+            original=selector,
+            original_type=selector_type,
+            normalized=new_selector,
+            normalized_type=new_type,
+            score=round(best_score, 3),
+        )
+        return new_selector, new_type
 
     def _normalize_value(
         self, action: str, item: dict, selector: str | None, tc_id: str, step_no: int
