@@ -754,10 +754,17 @@ class UITestTool(BaseTool):
                 ("locator[data-test-id]", page.locator(f'[data-test-id="{selector}"]')),
             ]
         if selector_type == "role":
-            return [
-                ("get_by_role", page.get_by_role(selector)),  # type: ignore[arg-type]
-                ("get_by_text", page.get_by_text(selector)),
-            ]
+            if ":" in selector:
+                role, name = selector.split(":", 1)
+                return [
+                    ("get_by_role", page.get_by_role(role, name=name)),  # type: ignore[arg-type]
+                    ("get_by_text", page.get_by_text(name)),
+                ]
+            else:
+                return [
+                    ("get_by_role", page.get_by_role(selector)),  # type: ignore[arg-type]
+                    ("get_by_text", page.get_by_text(selector)),
+                ]
         if selector_type == "alttext":
             return [
                 ("get_by_alt_text", page.get_by_alt_text(selector)),
