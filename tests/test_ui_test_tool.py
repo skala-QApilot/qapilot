@@ -425,16 +425,19 @@ async def test_wait_for_load_state_default_networkidle(tool):
 
 
 @pytest.mark.asyncio
-async def test_wait_for_response(tool):
+async def test_wait_for_response_graceful_to_networkidle(tool):
+    """이슈 #138: Playwright Page 에 wait_for_response 가 없으므로
+    networkidle 대기로 graceful 변환. value (URL 패턴) 는 무시됨."""
     page = _mock_page()
-    page.wait_for_response = AsyncMock()
     await tool.run(_input({
         "page": page, "tc_id": "TC-1",
         "action_mapping": {"steps": [
             {"step_no": 1, "action": "wait_for_response", "value": "**/api/login"},
         ]},
     }))
-    page.wait_for_response.assert_awaited_once_with("**/api/login")
+    # value 무시하고 networkidle 호출. (_mock_page 의 default networkidle 호출 + step 1)
+    calls = [c.args[0] for c in page.wait_for_load_state.await_args_list]
+    assert "networkidle" in calls
 
 
 # ── 신규 DOM action ─────────────────────────────────────────────────────────

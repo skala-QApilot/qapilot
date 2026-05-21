@@ -400,7 +400,10 @@ class UITestTool(BaseTool):
             await page.wait_for_load_state(state)  # type: ignore[arg-type]
             return
         if action == "wait_for_response":
-            await page.wait_for_response(value or "**/*")
+            # 이슈 #138: Playwright Python 의 Page 에는 wait_for_response 메서드가 없음
+            # (expect_response 컨텍스트 매니저만 존재). 단독 step 으로 호출 시 트리거할
+            # 선행 동작이 없어 의미 약함 → networkidle 로 graceful 변환 (모든 응답 정착 대기).
+            await page.wait_for_load_state("networkidle")
             return
 
         if action == "assert_url":
