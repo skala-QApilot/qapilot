@@ -243,12 +243,30 @@ async def _doc_import(state: PipelineState) -> dict:
 
 
 async def _codebase_scan(state: PipelineState) -> dict:
-    """FR-000 GitCodebaseScannerTool 호출 + spec §6.1 디스크 캐시."""
+    """FR-000 코드베이스 스캔 + spec §6.1 디스크 캐시.
+
+    이슈 #156 (2026-05-21): **임시 분기** — `run_options.repo_url` / `repos`
+    유무로 두 Tool 선택. 회의 결정 (\"CLI 로컬 vs Git 분기 도입\") 반영.
+
+    - Git 모드 (`repo_url` 또는 `repos` 제공): GitCodebaseScannerTool (PR #154)
+      - GitHub/GitLab REST API 기반 스캔
+      - CI/CD / 외부 사용자 / 멀티 레포 시나리오
+    - 로컬 모드 (둘 다 부재): CodebaseScannerTool (`qapilot init` / `rescan`
+      에서 이미 사용 중)
+      - 로컬 디렉토리 walk
+      - 개발자 로컬 e2e (mini-bss-lite 등) 시나리오
+      - **테스트용 임시 유지** — 추후 Git REST API 전용 전환 시 본 분기 제거
+
+    제거 조건 (후속): CLI `generate scenarios` 가 `--local-path` 옵션 지원 +
+    GitCodebaseScannerTool 이 file:// 또는 로컬 디렉토리 어댑터 내장 →
+    본 분기 삭제 + 모든 호출이 GitCodebaseScannerTool 로 통일.
+    """
     from qapilot.shared.schemas import ToolInput
-    from qapilot.tools.git_codebase_scanner_tool import GitCodebaseScannerTool
 
     trace_id = state.get("trace_id") or str(_uuid.uuid4())
     run_options = state["run_options"]
+
+    is_git_mode = bool(run_options.get("repo_url") or run_options.get("repos"))
 
     params: dict[str, Any] = {"trigger": run_options.get("trigger") or "init"}
     for key in ("repo_url", "token", "branch", "local_path", "repos"):
@@ -256,7 +274,14 @@ async def _codebase_scan(state: PipelineState) -> dict:
         if val is not None:
             params[key] = val
 
-    tool = GitCodebaseScannerTool(trace_id=trace_id)
+    if is_git_mode:
+        from qapilot.tools.git_codebase_scanner_tool import GitCodebaseScannerTool
+        tool = GitCodebaseScannerTool(trace_id=trace_id)
+    else:
+        # 이슈 #156: 로컬 모드 임시 fallback — 추후 Git 전용 전환 시 제거
+        from qapilot.tools.codebase_scanner_tool import CodebaseScannerTool
+        tool = CodebaseScannerTool(trace_id=trace_id)
+
     result = await tool.run(
         ToolInput(trace_id=trace_id, params=params)
     )
