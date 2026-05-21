@@ -270,3 +270,66 @@ async def test_try_auto_navigate_accepts_https_target_url():
     await tool._try_auto_navigate(page, steps, "https://staging.example.com")
 
     page.goto.assert_awaited_once_with("https://staging.example.com/login")
+
+
+# ── 이슈 #147: AUTO_NAVIGATE / TARGET_UNREACHABLE 메타 코드 발행 검증 ─────
+
+
+@pytest.mark.asyncio
+async def test_auto_navigate_emits_auto_navigate_code():
+    """이슈 #147: auto-navigate 성공 시 TOOL_UI_AUTO_NAVIGATE 메타 코드 발행."""
+    from qapilot.shared.errors import ErrorCode
+    tool = _make_tool()
+    tool.logger = MagicMock()
+    page = _mock_page()
+
+    steps = [
+        {"step_no": 1, "action": "fill", "selector": "x", "selector_type": "css",
+         "api_endpoint": "POST /api/login"},
+    ]
+    await tool._try_auto_navigate(page, steps, "http://localhost:3000")
+
+    info_calls = [c for c in tool.logger.info.call_args_list
+                  if c.args and c.args[0] == "ui_auto_navigate"]
+    assert len(info_calls) == 1
+    assert info_calls[0].kwargs.get("code") == ErrorCode.TOOL_UI_AUTO_NAVIGATE
+
+
+@pytest.mark.asyncio
+async def test_auto_navigate_invalid_target_url_emits_target_unreachable():
+    """이슈 #147: target_url 부재/scheme 부재 → TOOL_UI_TARGET_UNREACHABLE 발행."""
+    from qapilot.shared.errors import ErrorCode
+    tool = _make_tool()
+    tool.logger = MagicMock()
+    page = _mock_page()
+    steps = [
+        {"step_no": 1, "action": "fill", "selector": "x", "selector_type": "css",
+         "api_endpoint": "POST /login"},
+    ]
+    # target_url 빈 값
+    await tool._try_auto_navigate(page, steps, "")
+
+    warning_calls = [c for c in tool.logger.warning.call_args_list
+                     if c.args and c.args[0] == "ui_auto_navigate_skipped"]
+    assert len(warning_calls) == 1
+    assert warning_calls[0].kwargs.get("code") == ErrorCode.TOOL_UI_TARGET_UNREACHABLE
+
+
+@pytest.mark.asyncio
+async def test_auto_navigate_page_goto_failure_emits_target_unreachable():
+    """이슈 #147: page.goto 실패 → TOOL_UI_TARGET_UNREACHABLE 발행."""
+    from qapilot.shared.errors import ErrorCode
+    tool = _make_tool()
+    tool.logger = MagicMock()
+    page = _mock_page()
+    page.goto = AsyncMock(side_effect=Exception("net::ERR_CONNECTION_REFUSED"))
+    steps = [
+        {"step_no": 1, "action": "fill", "selector": "x", "selector_type": "css",
+         "api_endpoint": "POST /login"},
+    ]
+    await tool._try_auto_navigate(page, steps, "http://localhost:3000")
+
+    warning_calls = [c for c in tool.logger.warning.call_args_list
+                     if c.args and c.args[0] == "ui_auto_navigate_failed"]
+    assert len(warning_calls) == 1
+    assert warning_calls[0].kwargs.get("code") == ErrorCode.TOOL_UI_TARGET_UNREACHABLE

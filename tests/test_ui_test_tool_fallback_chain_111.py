@@ -330,7 +330,7 @@ async def test_fallback_dom_scan_success():
         action="fill",
         selector_type="text",
         selector="이메일",
-        code=ErrorCode.TOOL_UI_FALLBACK_USED,
+        code=ErrorCode.TOOL_UI_DOM_SCAN_FALLBACK,
     )
 
 

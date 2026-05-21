@@ -75,7 +75,11 @@ class ErrorCode:
     TOOL_UI_ASSERTION_FAIL = "TOOL_UI_ASSERTION_FAIL"  # expect(...) 실패
     TOOL_UI_NAVIGATION_FAIL = "TOOL_UI_NAVIGATION_FAIL"  # navigate URL 접속 실패
     TOOL_UI_UNSUPPORTED_ACTION = "TOOL_UI_UNSUPPORTED_ACTION"  # 정규화 통과 후 미지원
-    TOOL_UI_FALLBACK_USED = "TOOL_UI_FALLBACK_USED"  # 1-step fallback 적용 (모호 케이스)
+    TOOL_UI_FALLBACK_USED = "TOOL_UI_FALLBACK_USED"  # 옵션 A retry chain 적중 (selector_type 별 entry)
+    TOOL_UI_DOM_SCAN_FALLBACK = "TOOL_UI_DOM_SCAN_FALLBACK"  # 옵션 B DOM scan fuzzy 적중 (PR #115/#119, 이슈 #147 정합)
+    TOOL_UI_AUTO_NAVIGATE = "TOOL_UI_AUTO_NAVIGATE"  # 옵션 C auto-navigate 발동 (PR #121, 이슈 #147 정합)
+    TOOL_UI_TARGET_UNREACHABLE = "TOOL_UI_TARGET_UNREACHABLE"  # target_url 부재/scheme 부재/page.goto 실패 (PR #124 약속, 이슈 #147)
+    TOOL_UI_INVALID_SELECTOR = "TOOL_UI_INVALID_SELECTOR"  # role:name 같은 파싱 오류 형식 (PR #134 fail-safe 메타, 이슈 #147)
     TOOL_UI_UNKNOWN = "TOOL_UI_UNKNOWN"  # 분류 외 일반 예외
 
     # System
