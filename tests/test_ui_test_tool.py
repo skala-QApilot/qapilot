@@ -547,3 +547,42 @@ async def test_error_code_prefix_for_assertion_fail(tool):
         }))
     err = out.result["ui_result"]["steps"][0]["error"]
     assert err is not None and err.startswith("TOOL_UI_ASSERTION_FAIL")
+
+
+# ── 이슈 #147: TOOL_UI_* 에러 코드 4종 신설 검증 ──────────────────────────
+
+
+def test_tool_ui_new_error_codes_defined_in_enum():
+    """이슈 #147: errors.py 에 4종 (TARGET_UNREACHABLE / INVALID_SELECTOR /
+    DOM_SCAN_FALLBACK / AUTO_NAVIGATE) 정의 검증.
+
+    PR #124 / #134 본문 약속 ↔ errors.py 갭 해소 + 본인 메모리
+    `project_qapilot_ui_test_tool_design.md` 의 11종 표 정합.
+    """
+    from qapilot.shared.errors import ErrorCode
+    assert ErrorCode.TOOL_UI_TARGET_UNREACHABLE == "TOOL_UI_TARGET_UNREACHABLE"
+    assert ErrorCode.TOOL_UI_INVALID_SELECTOR == "TOOL_UI_INVALID_SELECTOR"
+    assert ErrorCode.TOOL_UI_DOM_SCAN_FALLBACK == "TOOL_UI_DOM_SCAN_FALLBACK"
+    assert ErrorCode.TOOL_UI_AUTO_NAVIGATE == "TOOL_UI_AUTO_NAVIGATE"
+
+
+@pytest.mark.asyncio
+async def test_role_name_selector_emits_invalid_selector_code(tool):
+    """이슈 #147: `role:name` 형식 selector 처리 시 TOOL_UI_INVALID_SELECTOR
+    메타 코드 발행 (PR #134 fail-safe 의 분류 신호)."""
+    page = _mock_page()
+    locator = page.get_by_role.return_value
+    locator.click = AsyncMock()
+    tool.logger = MagicMock()
+    await tool.run(_input({
+        "page": page, "tc_id": "TC-1",
+        "action_mapping": {"steps": [
+            {"step_no": 1, "action": "click", "selector": "button:로그인", "selector_type": "role"},
+        ]},
+    }))
+    # role:name 진입 시 warning 로그 + code=TOOL_UI_INVALID_SELECTOR
+    from qapilot.shared.errors import ErrorCode
+    warning_calls = [c for c in tool.logger.warning.call_args_list
+                     if c.args and c.args[0] == "ui_invalid_selector_fallback"]
+    assert len(warning_calls) == 1
+    assert warning_calls[0].kwargs.get("code") == ErrorCode.TOOL_UI_INVALID_SELECTOR

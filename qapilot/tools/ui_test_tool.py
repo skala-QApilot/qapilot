@@ -260,6 +260,7 @@ class UITestTool(BaseTool):
                 "ui_auto_navigate_skipped",
                 reason="target_url_missing_or_not_absolute",
                 target_url=target_url,
+                code=ErrorCode.TOOL_UI_TARGET_UNREACHABLE,
                 hint="qapilot.config.yaml 의 project.target_url 을 절대 URL (http://... 또는 https://...) 로 설정하세요. qapilot init 마법사로 재설정 가능.",
             )
             return
@@ -279,6 +280,7 @@ class UITestTool(BaseTool):
             route=route,
             full_url=full_url,
             reason="first_step_is_dom_action",
+            code=ErrorCode.TOOL_UI_AUTO_NAVIGATE,
         )
         try:
             await page.goto(full_url)
@@ -288,6 +290,7 @@ class UITestTool(BaseTool):
                 route=route,
                 full_url=full_url,
                 error=str(e).splitlines()[0] if str(e) else type(e).__name__,
+                code=ErrorCode.TOOL_UI_TARGET_UNREACHABLE,
             )
 
     def _infer_target_route(self, steps: list[ActionStep]) -> str | None:
@@ -476,7 +479,7 @@ class UITestTool(BaseTool):
                     action=action,
                     selector_type=step.get("selector_type"),
                     selector=step.get("selector"),
-                    code=ErrorCode.TOOL_UI_FALLBACK_USED,
+                    code=ErrorCode.TOOL_UI_DOM_SCAN_FALLBACK,
                 )
                 return
             except (PWTimeoutError, AssertionError) as e:
@@ -758,7 +761,16 @@ class UITestTool(BaseTool):
             ]
         if selector_type == "role":
             if ":" in selector:
+                # PR #134 fail-safe: ActionMapper LLM 환각으로 `role:name` 형식 생성
+                # (예: "button:로그인") → role 과 name 으로 분리. 이슈 #147: 메타 코드 발행.
                 role, name = selector.split(":", 1)
+                self.logger.warning(
+                    "ui_invalid_selector_fallback",
+                    selector=selector,
+                    selector_type="role",
+                    code=ErrorCode.TOOL_UI_INVALID_SELECTOR,
+                    hint="ActionMapper 가 `role:name` 형식의 selector 를 생성. role 과 name 분리하여 처리.",
+                )
                 return [
                     ("get_by_role", page.get_by_role(role, name=name)),  # type: ignore[arg-type]
                     ("get_by_text", page.get_by_text(name)),
