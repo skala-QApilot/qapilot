@@ -110,82 +110,15 @@ class ScenarioGeneratorAgent(BaseAgent):
         mismatches = detect_prd_code_mismatch(requirements, scan_result)
         mismatch_text = format_mismatches(mismatches)
 
-        from qapilot.tools.domain_knowledge import DomainKnowledgeTool
-
-        # 라우터 기반 루프: 1 라우터 = 1 TS (기능 영역별 세분화)
-        router_map = self._sort_router_map(self._build_router_map(affected_files))
-
-        all_scenarios: list = []
-        confidence_sum = 0.0
-
-        for router_file, endpoints in router_map.items():
-            basename = router_file.split("/")[-1].replace(".py", "").replace(".ts", "").replace(".js", "")
-
-            # 이 라우터와 관련된 요구사항 필터링 (없으면 전체)
-            filtered_reqs = self._filter_requirements_for_router(requirements, basename) if requirements else []
-
-            # 도메인 규칙: 라우터 키워드로 검색
-            keywords = _ROUTER_KEYWORDS.get(basename, [])
-            query = " ".join(keywords) if keywords else basename
-            router_domain_rules = await self._fetch_domain_rules(query, top_k=5)
-            router_domain_rules_text = DomainKnowledgeTool.format_rules_for_prompt(router_domain_rules) or "없음"
-
-            user_prompt = self.with_correction_hint(
-                self.prompts.render(
-                    domain_rules=router_domain_rules_text,
-                    requirements=self._format_requirements(filtered_reqs),
-                    scan_summary=self._format_scan_summary_for_router(router_file, endpoints),
-                    code_index=self._format_code_index_for_router(router_file, scan_result),
-                    affected_files=router_file,
-                    trigger=trigger,
-                    mismatch_note=mismatch_text,
-                ),
-                last_error,
+        if requirements:
+            return await self._run_domain_based(
+                scan_result, domain_rules, requirements, trigger,
+                mismatch_text, mismatches, last_error,
             )
 
-            response = await self.llm.chat(
-                system_prompt=self.prompts.system(),
-                user_prompt=user_prompt,
-            )
-
-            ts_scenarios, ts_confidence = parse_response(
-                response.content, trigger, [router_file], domain_rules
-            )
-
-            for s in ts_scenarios:
-                if len(s["test_cases"]) < 6:
-                    self.logger.warning(
-                        "tc_count_below_minimum",
-                        router=basename,
-                        tc_count=len(s["test_cases"]),
-                        minimum=6,
-                    )
-
-            all_scenarios.extend(ts_scenarios)
-            confidence_sum += ts_confidence
-            self.logger.info(
-                "router_scenarios_generated",
-                router=basename,
-                ts_count=len(ts_scenarios),
-                tc_count=sum(len(s["test_cases"]) for s in ts_scenarios),
-            )
-
-        confidence = round(confidence_sum / len(router_map), 3) if router_map else 0.5
-
-        all_scenarios = self._renumber_and_set_depends_on(all_scenarios)
-        save_scenarios(all_scenarios)
-
-        self.logger.info(
-            "scenarios_generated",
-            count=len(all_scenarios),
-            tc_count=sum(len(s["test_cases"]) for s in all_scenarios),
-            mismatch_count=len(mismatches),
-            confidence=confidence,
-        )
-
-        return ExecuteResult(
-            result={"scenarios": all_scenarios, "prd_code_mismatches": mismatches},
-            confidence=confidence,
+        return await self._run_router_based(
+            scan_result, domain_rules, trigger,
+            affected_files, mismatch_text, mismatches, last_error,
         )
 
     async def _run_router_based(
@@ -243,6 +176,176 @@ class ScenarioGeneratorAgent(BaseAgent):
             result={"scenarios": all_scenarios, "prd_code_mismatches": mismatches},
             confidence=confidence,
         )
+
+    async def _run_domain_based(
+        self,
+        scan_result: dict,
+        domain_rules: list,
+        requirements: list,
+        trigger: str,
+        mismatch_text: str,
+        mismatches: list,
+        last_error: str | None,
+    ) -> ExecuteResult:
+        """요구사항 기반 도메인별 시나리오 생성 — 1 domain_area = 1 TS."""
+        from qapilot.tools.domain_knowledge import DomainKnowledgeTool
+
+        all_scenarios: list = []
+        confidence_sum = 0.0
+
+        for req in requirements:
+            domain_area = req.get("domain_area") or "기타"
+            router_files = self._find_router_files_for_domain(domain_area, [req])
+            area_domain_rules = await self._fetch_domain_rules(domain_area, top_k=5)
+            area_domain_rules_text = DomainKnowledgeTool.format_rules_for_prompt(area_domain_rules) or "없음"
+
+            user_prompt = self.with_correction_hint(
+                self.prompts.render(
+                    domain_rules=area_domain_rules_text,
+                    requirements=self._format_requirements([req]),
+                    scan_summary=self._format_scan_summary_for_domain(domain_area, router_files),
+                    code_index=self._format_code_index_for_domain(router_files, scan_result),
+                    affected_files=", ".join(router_files) if router_files else domain_area,
+                    trigger=trigger,
+                    mismatch_note=mismatch_text,
+                ),
+                last_error,
+            )
+
+            response = await self.llm.chat(
+                system_prompt=self.prompts.system(),
+                user_prompt=user_prompt,
+            )
+
+            ts_scenarios, ts_confidence = parse_response(
+                response.content, trigger, router_files, domain_rules
+            )
+
+            for s in ts_scenarios:
+                if len(s["test_cases"]) < 6:
+                    self.logger.warning(
+                        "tc_count_below_minimum",
+                        req_id=req.get("req_id"),
+                        domain=domain_area,
+                        tc_count=len(s["test_cases"]),
+                        minimum=6,
+                    )
+
+            all_scenarios.extend(ts_scenarios)
+            confidence_sum += ts_confidence
+            self.logger.info(
+                "requirement_scenario_generated",
+                req_id=req.get("req_id"),
+                domain=domain_area,
+                ts_count=len(ts_scenarios),
+                tc_count=sum(len(s["test_cases"]) for s in ts_scenarios),
+            )
+
+        confidence = round(confidence_sum / len(requirements), 3) if requirements else 0.5
+        all_scenarios = self._renumber_and_set_depends_on(all_scenarios)
+        save_scenarios(all_scenarios)
+
+        self.logger.info(
+            "scenarios_generated",
+            count=len(all_scenarios),
+            tc_count=sum(len(s["test_cases"]) for s in all_scenarios),
+            mismatch_count=len(mismatches),
+            confidence=confidence,
+        )
+
+        return ExecuteResult(
+            result={"scenarios": all_scenarios, "prd_code_mismatches": mismatches},
+            confidence=confidence,
+        )
+
+    def _find_router_files_for_domain(self, domain_area: str, reqs: list[dict]) -> list[str]:
+        """도메인 영역명과 요구사항 내용 키워드로 관련 라우터 파일 목록을 반환한다."""
+        all_endpoints: list[dict] = self._read_index_json("endpoints.json")  # type: ignore[assignment]
+        search_text = domain_area + " " + " ".join(r.get("content", "") for r in reqs)
+        matched_basenames: set[str] = set()
+        for basename, keywords in _ROUTER_KEYWORDS.items():
+            if any(k in search_text for k in keywords):
+                matched_basenames.add(basename)
+        return list(dict.fromkeys(
+            ep.get("file", "")
+            for ep in all_endpoints
+            if ep.get("file", "").split("/")[-1]
+                .replace(".py", "").replace(".ts", "").replace(".js", "")
+            in matched_basenames
+            and ep.get("file", "")
+        ))
+
+    def _format_scan_summary_for_domain(self, domain_area: str, router_files: list[str]) -> str:
+        """도메인 영역 기준 scan summary를 반환한다."""
+        manifest: dict = self._read_index_json("manifest.json")  # type: ignore[assignment]
+        all_endpoints: list[dict] = self._read_index_json("endpoints.json")  # type: ignore[assignment]
+        domain_eps = [ep for ep in all_endpoints if ep.get("file", "") in router_files]
+        ep_strs = [f"{ep.get('method', '?')} {ep.get('path', '?')}" for ep in domain_eps]
+        short_files = [
+            f.split("/")[-1].replace(".py", "").replace(".ts", "").replace(".js", "")
+            for f in router_files
+        ]
+        lines = [
+            f"프레임워크: {manifest.get('framework', 'unknown')} ({manifest.get('language', 'unknown')})",
+            f"도메인 영역: {domain_area}",
+            f"관련 라우터: {', '.join(short_files) or '없음'}",
+            f"엔드포인트 ({len(domain_eps)}개): {', '.join(ep_strs) or '없음'}",
+        ]
+        return "\n".join(lines)
+
+    def _format_code_index_for_domain(self, router_files: list[str], scan_result: dict) -> str:
+        """여러 라우터 파일의 핸들러·헬퍼·모델을 통합해서 반환한다."""
+        if not router_files:
+            return "코드 인덱스 없음"
+        all_functions: list[dict] = self._read_index_json("functions.json")  # type: ignore[assignment]
+        all_models: list[dict] = self._read_index_json("models.json")  # type: ignore[assignment]
+        all_endpoints: list[dict] = self._read_index_json("endpoints.json")  # type: ignore[assignment]
+
+        domain_eps = [ep for ep in all_endpoints if ep.get("file") in router_files]
+        handler_names: set[str] = {ep.get("handler", "") for ep in domain_eps if ep.get("handler")}
+        router_fns = [fn for fn in all_functions if fn.get("file") in router_files]
+        helper_names: set[str] = set()
+        for fn in router_fns:
+            if fn.get("name") in handler_names:
+                helper_names.update(fn.get("calls", []))
+
+        lines: list[str] = []
+
+        handler_fns = [fn for fn in router_fns if fn.get("name") in handler_names and fn.get("body_excerpt")]
+        if handler_fns:
+            lines.append("## 핸들러 소스 코드")
+            for fn in handler_fns[:20]:
+                lines.append(f"\n### {fn.get('file', '').split('/')[-1]} :: {fn['name']}{fn.get('params', '')}")
+                lines.append(fn["body_excerpt"])
+
+        helper_fns = [
+            fn for fn in all_functions
+            if fn.get("name") in helper_names
+            and fn.get("name") not in handler_names
+            and fn.get("body_excerpt")
+        ]
+        if helper_fns:
+            lines.append("\n## 헬퍼 함수 소스 코드")
+            for fn in helper_fns[:8]:
+                lines.append(f"\n### {fn.get('file', '').split('/')[-1]} :: {fn['name']}{fn.get('params', '')}")
+                lines.append(fn["body_excerpt"])
+
+        router_dirs = {"/".join(f.split("/")[:-1]) for f in router_files}
+        related_models = [md for md in all_models if "/".join(md.get("file", "").split("/")[:-1]) in router_dirs]
+        if related_models:
+            lines.append("\n## 데이터 모델 (스키마 필드)")
+            for md in related_models[:15]:
+                fields = ", ".join(md.get("fields", [])[:15])
+                lines.append(f"  {md['name']}: {fields}")
+
+        git_diff = scan_result.get("git_diff") or {}
+        diff_detail = [d for d in git_diff.get("diff_detail", []) if d.get("file") in router_files]
+        if diff_detail:
+            lines.append("\n## 변경 상세")
+            for d in diff_detail:
+                lines.append(f"  {d.get('file', '').split('/')[-1]}: +{d.get('added', 0)} -{d.get('deleted', 0)} lines")
+
+        return "\n".join(lines) if lines else "코드 인덱스 없음"
 
     async def _map_requirements_to_endpoints(
         self, requirements: list, all_endpoints: list[dict]
