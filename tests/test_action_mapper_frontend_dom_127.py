@@ -19,10 +19,25 @@ def _make_agent() -> ActionMapperAgent:
     agent.logger = MagicMock()
     agent.llm = MagicMock()
     agent.llm.chat = AsyncMock(return_value=MagicMock(content="[]"))
+    agent.llm.total_input_tokens = 0
+    agent.llm.total_output_tokens = 0
+    agent.llm.total_cost_usd = 0.0
     agent.prompts = MagicMock()
     agent.prompts.system = MagicMock(return_value="SYSTEM")
     agent.prompts.render = MagicMock(side_effect=lambda **kw: f"USER<scenarios={kw.get('scenarios','')[:40]}|endpoints={kw.get('endpoints','')[:40]}|frontend_dom={kw.get('frontend_dom','')[:80]}>")
     agent.with_correction_hint = MagicMock(side_effect=lambda p, e: p)
+
+    # 이슈 #140: per-TC LLMClient 분리 후 _create_tc_llm 이 매 호출마다 mock 반환.
+    # 반환된 mock 의 chat 은 agent.llm.chat 와 동일 AsyncMock 공유.
+    def _mock_create_tc_llm():
+        tc_llm = MagicMock()
+        tc_llm.chat = agent.llm.chat
+        tc_llm.total_input_tokens = 0
+        tc_llm.total_output_tokens = 0
+        tc_llm.total_cost_usd = 0.0
+        return tc_llm
+    agent._create_tc_llm = _mock_create_tc_llm
+
     return agent
 
 

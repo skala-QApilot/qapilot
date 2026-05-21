@@ -17,6 +17,7 @@ from typing import Any
 
 from qapilot.agents.base_agent import BaseAgent
 from qapilot.shared.errors import AgentExecutionError, ErrorCode
+from qapilot.shared.llm_client import LLMClient
 from qapilot.shared.schemas import ActionMapping, ActionStep, ExecuteResult
 
 
@@ -268,6 +269,14 @@ class ActionMapperAgent(BaseAgent):
         )
         return self._parse_action_mappings(response.content)
 
+    def _create_tc_llm(self) -> LLMClient:
+        """이슈 #140: per-TC subtask LLM client. 테스트 override point.
+
+        `self.llm` 의 누적 토큰이 다른 TC 호출에 누적되어 SYSTEM_002 임계 도달 시
+        후반 TC 전체 skip 되던 문제 차단. PR #130 의 \"한 TC = 1 task\" 의도 정합.
+        """
+        return LLMClient(self._config.llm, trace_id=self.trace_id)
+
     async def _call_single_tc(
         self,
         sem: asyncio.Semaphore,
@@ -286,6 +295,13 @@ class ActionMapperAgent(BaseAgent):
         scenario 는 TS slice (단일 TC 만 포함) 로 전달 — LLM 호출당 토큰 절감 +
         해당 TC 의 비즈니스 의도 (given/when/then, name) 보존.
 
+        이슈 #140 (2026-05-21): per-TC LLMClient 인스턴스 분리.
+        `self.llm` 의 `total_tokens` 누적이 다른 TC 호출에 누적되어
+        `max_tokens_per_task` (config 200000) 임계 도달 시 후반 TC 전체가
+        SYSTEM_002 로 skip 되던 문제 해결 (trace `42919a33` 의 TS-007~010 27 TC).
+        PR #130 의 \"한 TC = 1 task\" 의도와 LLMClient 의 \"한 agent = 한 task\"
+        누적 정책 충돌 해소. self.llm 은 agent_complete 보고용 누적 합산만 유지.
+
         반환:
             ActionMapping (성공) / None (LLM 응답 빈 result). raise (LLM/JSON 실패) 시
             `_execute` 의 asyncio.gather(return_exceptions=True) 가 흡수.
@@ -294,6 +310,9 @@ class ActionMapperAgent(BaseAgent):
         sliced_ts["test_cases"] = [tc]
         batch = [sliced_ts]
 
+        # 이슈 #140: TC 마다 새 LLMClient — 누적 정책 충돌 해결
+        tc_llm = self._create_tc_llm()
+
         async with sem:
             user_prompt = self.prompts.render(
                 scenarios=self._format_scenarios(batch),
@@ -301,11 +320,16 @@ class ActionMapperAgent(BaseAgent):
                 frontend_dom=self._format_frontend_dom(frontend_dom),
             )
             user_prompt = self.with_correction_hint(user_prompt, last_error)
-            response = await self.llm.chat(
+            response = await tc_llm.chat(
                 system_prompt=self.prompts.system(),
                 user_prompt=user_prompt,
             )
             mappings = self._parse_action_mappings(response.content)
+
+        # agent_complete 보고용 누적 합산 (이슈 #140)
+        self.llm.total_input_tokens += tc_llm.total_input_tokens
+        self.llm.total_output_tokens += tc_llm.total_output_tokens
+        self.llm.total_cost_usd = round(self.llm.total_cost_usd + tc_llm.total_cost_usd, 6)
 
         if not mappings:
             return None
