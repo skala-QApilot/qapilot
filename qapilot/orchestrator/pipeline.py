@@ -133,15 +133,16 @@ def _save_codebase_index_to_disk(scan: dict) -> None:
             models.append({"file": file_path, **md})
         for fn in fi.get("functions", []) or []:
             fn_dict = {"file": file_path, **fn}
-            line_start = fn.get("line_start", 0)
-            line_end = fn.get("line_end", line_start)
-            if file_path and line_start:
-                try:
-                    src_lines = Path(file_path).read_text(encoding="utf-8", errors="replace").splitlines()
-                    excerpt = src_lines[line_start - 1 : min(line_end, line_start + 40) - 1]
-                    fn_dict["body_excerpt"] = "\n".join(excerpt)
-                except Exception:
-                    pass
+            if not fn_dict.get("body_excerpt"):
+                line_start = fn.get("line_start", 0)
+                line_end = fn.get("line_end", line_start)
+                if file_path and line_start:
+                    try:
+                        src_lines = Path(file_path).read_text(encoding="utf-8", errors="replace").splitlines()
+                        excerpt = src_lines[line_start - 1 : min(line_end, line_start + 40) - 1]
+                        fn_dict["body_excerpt"] = "\n".join(excerpt)
+                    except Exception:
+                        pass
             functions.append(fn_dict)
         callgraph[file_path] = list(fi.get("dependencies", []) or [])
 
@@ -242,16 +243,22 @@ async def _doc_import(state: PipelineState) -> dict:
 
 
 async def _codebase_scan(state: PipelineState) -> dict:
-    """FR-000 CodebaseScannerTool 호출 + spec §6.1 디스크 캐시."""
+    """FR-000 GitCodebaseScannerTool 호출 + spec §6.1 디스크 캐시."""
     from qapilot.shared.schemas import ToolInput
-    from qapilot.tools.codebase_scanner_tool import CodebaseScannerTool
+    from qapilot.tools.git_codebase_scanner_tool import GitCodebaseScannerTool
 
     trace_id = state.get("trace_id") or str(_uuid.uuid4())
-    trigger = state["run_options"].get("trigger") or "init"
+    run_options = state["run_options"]
 
-    tool = CodebaseScannerTool(trace_id=trace_id)
+    params: dict[str, Any] = {"trigger": run_options.get("trigger") or "init"}
+    for key in ("repo_url", "token", "branch", "local_path", "repos"):
+        val = run_options.get(key)
+        if val is not None:
+            params[key] = val
+
+    tool = GitCodebaseScannerTool(trace_id=trace_id)
     result = await tool.run(
-        ToolInput(trace_id=trace_id, params={"trigger": trigger})
+        ToolInput(trace_id=trace_id, params=params)
     )
     scan: dict[str, Any] = result.result["scan_result"]
 

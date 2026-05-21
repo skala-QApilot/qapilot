@@ -32,9 +32,12 @@ from qapilot.tools.base_tool import BaseTool
 
 # ── 상수 ──────────────────────────────────────────────────────────────────────
 
-_EXCLUDE_DIRS = frozenset(
-    {"node_modules", ".git", "__pycache__", "dist", "build", "venv", ".venv"}
-)
+_EXCLUDE_DIRS = frozenset({
+    "node_modules", ".git", "__pycache__",
+    "dist", "build", "venv", ".venv",
+    ".qapilot",
+    ".pytest_cache",
+})
 _EXCLUDE_PATTERNS = frozenset({
     "*.min.js", "*.lock",
     "test_*.py", "*_test.py",
@@ -743,6 +746,13 @@ class GitCodebaseScannerTool(BaseTool):
             tree = parser.parse(content)
             endpoints, functions, deps = self._dispatch_parse(file_path_str, language, tree)
             models = self._dispatch_extract_models(language, tree)
+            src_lines = content.decode("utf-8", errors="replace").splitlines()
+            for fn in functions:
+                line_start = fn.get("line_start", 0)
+                line_end = fn.get("line_end", line_start)
+                if line_start:
+                    excerpt = src_lines[line_start - 1 : min(line_end, line_start + 40) - 1]
+                    fn["body_excerpt"] = "\n".join(excerpt)
             return FileInfo(
                 path=file_path_str, language=language,
                 endpoints=endpoints, functions=functions,

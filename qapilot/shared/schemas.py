@@ -95,6 +95,12 @@ class RunOptions(TypedDict):
     scenario_ids: list[str] | None
     filter: Literal["all", "failed", "affected"] | None
     tags: list[str] | None
+    # git_codebase_scanner 전용 — Git 접속 정보
+    repo_url: str
+    token: str
+    branch: str
+    local_path: str
+    repos: list[dict]
 
 
 # ── 코드베이스 스캔 ──
