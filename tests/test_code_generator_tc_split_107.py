@@ -25,11 +25,26 @@ def _make_agent() -> CodeGeneratorAgent:
     agent = CodeGeneratorAgent.__new__(CodeGeneratorAgent)
     agent.llm = MagicMock()
     agent.llm.chat = AsyncMock()
+    agent.llm.total_input_tokens = 0
+    agent.llm.total_output_tokens = 0
+    agent.llm.total_cost_usd = 0.0
     agent.prompts = MagicMock()
     agent.prompts.system = MagicMock(return_value="SYSTEM")
     agent.prompts.render = MagicMock(side_effect=lambda **kw: f"USER<{kw.get('action_mappings','')}>")
     agent.logger = MagicMock()
     agent.with_correction_hint = MagicMock(side_effect=lambda p, e: p)
+
+    # 이슈 #140: per-TC LLMClient 분리 후 _create_tc_llm 이 매 호출마다 mock 반환.
+    # 반환된 mock 의 chat 은 agent.llm.chat 와 동일 AsyncMock 공유.
+    def _mock_create_tc_llm():
+        tc_llm = MagicMock()
+        tc_llm.chat = agent.llm.chat
+        tc_llm.total_input_tokens = 0
+        tc_llm.total_output_tokens = 0
+        tc_llm.total_cost_usd = 0.0
+        return tc_llm
+    agent._create_tc_llm = _mock_create_tc_llm
+
     return agent
 
 
@@ -222,3 +237,49 @@ async def test_execute_passes_scenario_slice_to_prompt():
     # 호출별 TC id 매칭
     tc_ids_in_calls = [s[0]["test_cases"][0]["tc_id"] for s in rendered_scenarios]
     assert sorted(tc_ids_in_calls) == ["TC-A", "TC-B"]
+
+
+# ── 이슈 #140: per-TC LLMClient 분리 검증 ─────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_per_tc_llm_client_created_for_each_tc_codegen():
+    """이슈 #140: CodeGenerator 도 ActionMapper 와 동일한 per-TC LLMClient 분리."""
+    agent = _make_agent()
+    agent.llm.chat = AsyncMock(side_effect=[
+        _ok_response("TC-A"), _ok_response("TC-B"), _ok_response("TC-C"),
+    ])
+    call_count = {"n": 0}
+    original = agent._create_tc_llm
+    def _counting_create():
+        call_count["n"] += 1
+        return original()
+    agent._create_tc_llm = _counting_create
+
+    action_mappings = [{"tc_id": "TC-A"}, {"tc_id": "TC-B"}, {"tc_id": "TC-C"}]
+    await agent._execute({"action_mappings": action_mappings, "scenarios": []}, {})
+
+    assert call_count["n"] == 3
+
+
+@pytest.mark.asyncio
+async def test_per_tc_llm_accumulates_to_agent_llm_for_reporting_codegen():
+    """CodeGenerator per-TC LLMClient 의 토큰/비용 누적 합산 검증."""
+    agent = _make_agent()
+    agent.llm.chat = AsyncMock(return_value=_ok_response("TC-A"))
+    def _mock_create_tc_llm_with_usage():
+        tc_llm = MagicMock()
+        tc_llm.chat = agent.llm.chat
+        tc_llm.total_input_tokens = 500
+        tc_llm.total_output_tokens = 100
+        tc_llm.total_cost_usd = 0.0005
+        return tc_llm
+    agent._create_tc_llm = _mock_create_tc_llm_with_usage
+
+    action_mappings = [{"tc_id": "TC-A"}, {"tc_id": "TC-B"}]
+    await agent._execute({"action_mappings": action_mappings, "scenarios": []}, {})
+
+    # 2 TC × (500, 100, 0.0005) = (1000, 200, 0.001)
+    assert agent.llm.total_input_tokens == 1000
+    assert agent.llm.total_output_tokens == 200
+    assert agent.llm.total_cost_usd == 0.001

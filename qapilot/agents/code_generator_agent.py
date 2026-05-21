@@ -18,6 +18,7 @@ import tree_sitter_javascript as tsjs
 from tree_sitter import Language, Parser
 
 from qapilot.agents.base_agent import BaseAgent
+from qapilot.shared.llm_client import LLMClient
 from qapilot.shared.schemas import ExecuteResult
 
 # OpenAI rate limit 안전 동시 호출 제한. gpt-4o-mini 의 TPM 한도 + 토큰 사용량 고려.
@@ -93,6 +94,15 @@ class CodeGeneratorAgent(BaseAgent):
             confidence=confidence,
         )
 
+    def _create_tc_llm(self) -> LLMClient:
+        """이슈 #140: per-TC subtask LLM client. 테스트 override point.
+
+        ActionMapper 와 동일 패턴 — `self.llm` 의 누적 토큰이 다른 TC 호출에
+        누적되어 SYSTEM_002 임계 도달 시 후반 TC skip 되던 잠재 문제 차단.
+        PR #130 / 이슈 #107 의 \"한 TC = 1 task\" 의도 정합.
+        """
+        return LLMClient(self._config.llm, trace_id=self.trace_id)
+
     async def _generate_single(
         self,
         sem: asyncio.Semaphore,
@@ -101,10 +111,21 @@ class CodeGeneratorAgent(BaseAgent):
         tc_to_scenario: dict[str, dict],
         last_error: str | None,
     ) -> dict[str, Any]:
-        """단일 TC 의 ActionMapping → Playwright JS 코드. 부분 응답 graceful 흡수."""
+        """단일 TC 의 ActionMapping → Playwright JS 코드. 부분 응답 graceful 흡수.
+
+        이슈 #140 (2026-05-21): per-TC LLMClient 인스턴스 분리.
+        ActionMapper 와 동일 패턴 — `self.llm.total_tokens` 누적이 다른 TC 호출에
+        누적되어 `max_tokens_per_task` (config 200000) 임계 도달 시 SYSTEM_002 로
+        후반 TC skip 되던 잠재 문제 차단 (본 e2e 에선 136K 로 미발현, 단 시나리오
+        규모 증가 시 ActionMapper 와 동일 사례 발생 잠재). self.llm 은
+        agent_complete 보고용 누적 합산만 유지.
+        """
         tc_id = action_mapping.get("tc_id") or "unknown"
         scenario_slice = tc_to_scenario.get(tc_id)
         scenarios_for_prompt: list[dict] = [scenario_slice] if scenario_slice else []
+
+        # 이슈 #140: TC 마다 새 LLMClient — 누적 정책 충돌 해결
+        tc_llm = self._create_tc_llm()
 
         async with sem:
             user_prompt = self.with_correction_hint(
@@ -114,8 +135,13 @@ class CodeGeneratorAgent(BaseAgent):
                 ),
                 last_error,
             )
-            response = await self.llm.chat(system_prompt, user_prompt)
+            response = await tc_llm.chat(system_prompt, user_prompt)
             parsed = json.loads(response.content)
+
+        # agent_complete 보고용 누적 합산 (이슈 #140)
+        self.llm.total_input_tokens += tc_llm.total_input_tokens
+        self.llm.total_output_tokens += tc_llm.total_output_tokens
+        self.llm.total_cost_usd = round(self.llm.total_cost_usd + tc_llm.total_cost_usd, 6)
 
         codes = parsed.get("generated_codes") or []
         if not codes:

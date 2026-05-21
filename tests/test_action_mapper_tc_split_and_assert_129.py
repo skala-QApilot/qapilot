@@ -33,6 +33,9 @@ def _make_agent() -> ActionMapperAgent:
     agent.logger = MagicMock()
     agent.llm = MagicMock()
     agent.llm.chat = AsyncMock()
+    agent.llm.total_input_tokens = 0
+    agent.llm.total_output_tokens = 0
+    agent.llm.total_cost_usd = 0.0
     agent.prompts = MagicMock()
     agent.prompts.system = MagicMock(return_value="SYSTEM")
     agent.prompts.render = MagicMock(
@@ -40,6 +43,19 @@ def _make_agent() -> ActionMapperAgent:
     )
     agent.with_correction_hint = MagicMock(side_effect=lambda p, e: p)
     agent._frontend_dom_index = []
+
+    # 이슈 #140: per-TC LLMClient 분리 후 _create_tc_llm 이 매 호출마다 mock 반환.
+    # 반환된 mock 의 chat 은 agent.llm.chat 와 동일 AsyncMock 공유 — 기존 테스트의
+    # side_effect 시퀀스 / await_count 검증 그대로 동작.
+    def _mock_create_tc_llm():
+        tc_llm = MagicMock()
+        tc_llm.chat = agent.llm.chat
+        tc_llm.total_input_tokens = 0
+        tc_llm.total_output_tokens = 0
+        tc_llm.total_cost_usd = 0.0
+        return tc_llm
+    agent._create_tc_llm = _mock_create_tc_llm
+
     return agent
 
 
@@ -321,3 +337,64 @@ def test_assert_action_constants_cover_all_assert_variants():
     expected = {"assert", "assert_visible", "assert_hidden", "assert_text",
                 "assert_value", "assert_enabled", "assert_disabled", "assert_count"}
     assert _ASSERT_ACTIONS == expected
+
+
+# ── 이슈 #140: per-TC LLMClient 분리 검증 ─────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_per_tc_llm_client_created_for_each_tc():
+    """이슈 #140: TC 마다 _create_tc_llm 호출 — agent 의 self.llm 누적 정책 우회.
+
+    PR #130 의 'TC-별 분할 = 한 TC = 1 task' 의도가 LLMClient 의 'agent = 1 task'
+    누적과 충돌해서 SYSTEM_002 로 후반 TC skip 되던 문제 회피 검증.
+    """
+    agent = _make_agent()
+    agent.llm.chat = AsyncMock(side_effect=[
+        _llm_response_with_mapping("TC-A"),
+        _llm_response_with_mapping("TC-B"),
+        _llm_response_with_mapping("TC-C"),
+    ])
+    # _create_tc_llm 호출 횟수 추적
+    call_count = {"n": 0}
+    original = agent._create_tc_llm
+    def _counting_create():
+        call_count["n"] += 1
+        return original()
+    agent._create_tc_llm = _counting_create
+
+    scenarios = [{
+        "ts_id": "TS-1",
+        "test_cases": [{"tc_id": "TC-A"}, {"tc_id": "TC-B"}, {"tc_id": "TC-C"}],
+    }]
+    await agent._execute({"scenarios": scenarios, "scan_result": None}, {})
+
+    # 3 TC = 3 회 _create_tc_llm 호출 = 3 개의 독립 LLMClient 인스턴스
+    assert call_count["n"] == 3
+
+
+@pytest.mark.asyncio
+async def test_per_tc_llm_accumulates_to_agent_llm_for_reporting():
+    """per-TC LLMClient 의 토큰/비용이 agent.llm 에 누적 합산 (agent_complete 보고용)."""
+    agent = _make_agent()
+    agent.llm.chat = AsyncMock(return_value=_llm_response_with_mapping("TC-A"))
+    # _create_tc_llm 이 반환한 mock 의 토큰/비용 시뮬레이션
+    def _mock_create_tc_llm_with_usage():
+        tc_llm = MagicMock()
+        tc_llm.chat = agent.llm.chat
+        tc_llm.total_input_tokens = 1000
+        tc_llm.total_output_tokens = 200
+        tc_llm.total_cost_usd = 0.001
+        return tc_llm
+    agent._create_tc_llm = _mock_create_tc_llm_with_usage
+
+    scenarios = [{
+        "ts_id": "TS-1",
+        "test_cases": [{"tc_id": "TC-A"}, {"tc_id": "TC-B"}, {"tc_id": "TC-C"}],
+    }]
+    await agent._execute({"scenarios": scenarios, "scan_result": None}, {})
+
+    # 3 TC × (input 1000 + output 200 + cost 0.001) = 누적 (3000, 600, 0.003)
+    assert agent.llm.total_input_tokens == 3000
+    assert agent.llm.total_output_tokens == 600
+    assert agent.llm.total_cost_usd == 0.003

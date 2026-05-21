@@ -53,7 +53,9 @@ async def test_generate_code_valid_syntax(agent):
         "confidence": 0.9
     })
     agent.llm.chat = AsyncMock(return_value=_llm_resp(mock_response))
-    
+    # 이슈 #140: per-TC LLMClient 분리 후 self.llm 단일 인스턴스 reuse 시 override
+    agent._create_tc_llm = lambda: agent.llm
+
     action_mappings = [{"tc_id": "TC-001", "steps": []}]
     result = await agent.run(
         AgentInput(trace_id="test", context={"action_mappings": action_mappings})
@@ -80,7 +82,9 @@ async def test_generate_code_invalid_syntax(agent):
         "confidence": 0.5
     })
     agent.llm.chat = AsyncMock(return_value=_llm_resp(mock_response))
-    
+    # 이슈 #140: per-TC LLMClient 분리 후 self.llm 단일 인스턴스 reuse 시 override
+    agent._create_tc_llm = lambda: agent.llm
+
     action_mappings = [{"tc_id": "TC-002", "steps": []}]
     result = await agent.run(
         AgentInput(trace_id="test", context={"action_mappings": action_mappings})
