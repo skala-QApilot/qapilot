@@ -28,9 +28,12 @@ from qapilot.tools.base_tool import BaseTool
 
 # ── 상수 ──────────────────────────────────────────────────────────────────────
 
-_EXCLUDE_DIRS = frozenset(
-    {"node_modules", ".git", "__pycache__", "dist", "build", "venv", ".venv"}
-)
+_EXCLUDE_DIRS = frozenset({
+    "node_modules", ".git", "__pycache__",
+    "dist", "build", "venv", ".venv",
+    ".qapilot",       # QApilot 자체 산출물 제외 (시나리오, 생성 코드 등)
+    ".pytest_cache",
+})
 _EXCLUDE_PATTERNS = frozenset({
     "*.min.js", "*.lock",
     "test_*.py", "*_test.py",
