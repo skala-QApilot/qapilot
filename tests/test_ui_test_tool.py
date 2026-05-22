@@ -26,30 +26,6 @@ def tool() -> UITestTool:
     return UITestTool(trace_id="test-trace-001")
 
 
-def _mock_page() -> MagicMock:
-    """모든 비동기 메서드가 AsyncMock 인 Playwright Page 모킹."""
-    page = MagicMock()
-    page.on = MagicMock()
-    page.goto = AsyncMock()
-    page.wait_for_timeout = AsyncMock()
-    page.wait_for_load_state = AsyncMock()
-    page.screenshot = AsyncMock()
-
-    # locator + get_by_* 메서드들 — 모두 같은 mock locator 반환
-    mock_locator = MagicMock()
-    mock_locator.fill = AsyncMock()
-    mock_locator.click = AsyncMock()
-    mock_locator.select_option = AsyncMock()
-
-    page.locator = MagicMock(return_value=mock_locator)
-    for name in [
-        "get_by_role", "get_by_label", "get_by_placeholder", "get_by_text",
-        "get_by_test_id", "get_by_alt_text", "get_by_title",
-    ]:
-        setattr(page, name, MagicMock(return_value=mock_locator))
-
-    return page
-
 
 def _input(params: dict) -> ToolInput:
     return ToolInput(trace_id="test-trace-001", params=params)
@@ -66,19 +42,19 @@ async def test_missing_page_raises(tool):
 
 
 @pytest.mark.asyncio
-async def test_empty_steps_raises(tool):
+async def test_empty_steps_raises(tool, mock_page):
     """steps 비어있을 때 ToolExecutionError."""
     with pytest.raises(ToolExecutionError):
-        await tool.run(_input({"page": _mock_page(), "action_mapping": {"steps": []}}))
+        await tool.run(_input({"page": mock_page, "action_mapping": {"steps": []}}))
 
 
 # ── action 6종 분기 ──────────────────────────────────────────────────────────
 
 
 @pytest.mark.asyncio
-async def test_navigate_relative_url_uses_target_url(tool):
+async def test_navigate_relative_url_uses_target_url(tool, mock_page):
     """navigate 의 relative path 가 target_url 과 결합."""
-    page = _mock_page()
+    page = mock_page
     out = await tool.run(_input({
         "page": page, "tc_id": "TC-1", "target_url": "http://localhost:3000",
         "action_mapping": {"steps": [
@@ -90,9 +66,9 @@ async def test_navigate_relative_url_uses_target_url(tool):
 
 
 @pytest.mark.asyncio
-async def test_navigate_absolute_url_kept(tool):
+async def test_navigate_absolute_url_kept(tool, mock_page):
     """절대 URL 은 그대로 사용."""
-    page = _mock_page()
+    page = mock_page
     await tool.run(_input({
         "page": page, "tc_id": "TC-1", "target_url": "http://localhost:3000",
         "action_mapping": {"steps": [
@@ -103,9 +79,9 @@ async def test_navigate_absolute_url_kept(tool):
 
 
 @pytest.mark.asyncio
-async def test_wait_with_digit_uses_timeout(tool):
+async def test_wait_with_digit_uses_timeout(tool, mock_page):
     """wait value 가 숫자면 wait_for_timeout, 아니면 networkidle."""
-    page = _mock_page()
+    page = mock_page
     await tool.run(_input({
         "page": page, "tc_id": "TC-1",
         "action_mapping": {"steps": [
@@ -118,9 +94,9 @@ async def test_wait_with_digit_uses_timeout(tool):
 
 
 @pytest.mark.asyncio
-async def test_fill_click_select_actions(tool):
+async def test_fill_click_select_actions(tool, mock_page):
     """fill / click / select 가 locator 의 해당 메서드 호출."""
-    page = _mock_page()
+    page = mock_page
     locator = page.locator.return_value
     out = await tool.run(_input({
         "page": page, "tc_id": "TC-1",
@@ -141,9 +117,9 @@ async def test_fill_click_select_actions(tool):
 
 
 @pytest.mark.asyncio
-async def test_unsupported_action_fails_and_skips(tool):
+async def test_unsupported_action_fails_and_skips(tool, mock_page):
     """지원 안 하는 action → fail + 후속 skip."""
-    page = _mock_page()
+    page = mock_page
     out = await tool.run(_input({
         "page": page, "tc_id": "TC-1",
         "action_mapping": {"steps": [
@@ -170,9 +146,9 @@ async def test_unsupported_action_fails_and_skips(tool):
     ("alttext", "get_by_alt_text"),
     ("title", "get_by_title"),
 ])
-async def test_selector_type_get_by_methods(tool, selector_type, attr):
+async def test_selector_type_get_by_methods(tool, mock_page, selector_type, attr):
     """7개 get_by_* 메서드 매핑."""
-    page = _mock_page()
+    page = mock_page
     await tool.run(_input({
         "page": page, "tc_id": "TC-1",
         "action_mapping": {"steps": [
@@ -184,9 +160,9 @@ async def test_selector_type_get_by_methods(tool, selector_type, attr):
 
 
 @pytest.mark.asyncio
-async def test_selector_type_css(tool):
+async def test_selector_type_css(tool, mock_page):
     """css 는 page.locator() 호출."""
-    page = _mock_page()
+    page = mock_page
     await tool.run(_input({
         "page": page, "tc_id": "TC-1",
         "action_mapping": {"steps": [
@@ -197,9 +173,9 @@ async def test_selector_type_css(tool):
 
 
 @pytest.mark.asyncio
-async def test_selector_type_xpath_prefixed(tool):
+async def test_selector_type_xpath_prefixed(tool, mock_page):
     """xpath 는 'xpath=' prefix 자동 추가."""
-    page = _mock_page()
+    page = mock_page
     await tool.run(_input({
         "page": page, "tc_id": "TC-1",
         "action_mapping": {"steps": [
@@ -214,9 +190,9 @@ async def test_selector_type_xpath_prefixed(tool):
 
 
 @pytest.mark.asyncio
-async def test_screenshot_saved_when_dir_provided(tool, tmp_path: Path):
+async def test_screenshot_saved_when_dir_provided(tool, mock_page, tmp_path: Path):
     """screenshot_dir 지정 시 page.screenshot 호출 + 결과에 경로 포함."""
-    page = _mock_page()
+    page = mock_page
     out = await tool.run(_input({
         "page": page, "tc_id": "TC-1",
         "screenshot_dir": str(tmp_path),
@@ -230,9 +206,9 @@ async def test_screenshot_saved_when_dir_provided(tool, tmp_path: Path):
 
 
 @pytest.mark.asyncio
-async def test_no_screenshot_when_dir_omitted(tool):
+async def test_no_screenshot_when_dir_omitted(tool, mock_page):
     """screenshot_dir 미지정 시 page.screenshot 호출 X."""
-    page = _mock_page()
+    page = mock_page
     await tool.run(_input({
         "page": page, "tc_id": "TC-1",
         "action_mapping": {"steps": [
@@ -246,9 +222,9 @@ async def test_no_screenshot_when_dir_omitted(tool):
 
 
 @pytest.mark.asyncio
-async def test_assert_text_calls_to_have_text(tool):
+async def test_assert_text_calls_to_have_text(tool, mock_page):
     """assert_text + expected → expect(locator).to_have_text(expected)."""
-    page = _mock_page()
+    page = mock_page
     locator = page.locator.return_value
 
     fake_assertion = MagicMock()
@@ -267,9 +243,9 @@ async def test_assert_text_calls_to_have_text(tool):
 
 
 @pytest.mark.asyncio
-async def test_assert_alias_uses_to_be_visible(tool):
+async def test_assert_alias_uses_to_be_visible(tool, mock_page):
     """assert (별칭) → expect(locator).to_be_visible() — selector 단순 존재 검증."""
-    page = _mock_page()
+    page = mock_page
     locator = page.locator.return_value
 
     fake_assertion = MagicMock()
@@ -294,9 +270,9 @@ async def test_assert_alias_uses_to_be_visible(tool):
     ("assert_disabled", "to_be_disabled", None),
     ("assert_value", "to_have_value", "abc"),
 ])
-async def test_assert_simple_variants(tool, action, expect_method, arg):
+async def test_assert_simple_variants(tool, mock_page, action, expect_method, arg):
     """assert_visible/hidden/enabled/disabled/value 5종."""
-    page = _mock_page()
+    page = mock_page
     fake_assertion = MagicMock()
     setattr(fake_assertion, expect_method, AsyncMock())
 
@@ -317,9 +293,9 @@ async def test_assert_simple_variants(tool, action, expect_method, arg):
 
 
 @pytest.mark.asyncio
-async def test_assert_count_converts_to_int(tool):
+async def test_assert_count_converts_to_int(tool, mock_page):
     """assert_count expected 문자열 '3' → to_have_count(3)."""
-    page = _mock_page()
+    page = mock_page
     fake_assertion = MagicMock()
     fake_assertion.to_have_count = AsyncMock()
 
@@ -335,9 +311,9 @@ async def test_assert_count_converts_to_int(tool):
 
 
 @pytest.mark.asyncio
-async def test_assert_count_fallback_to_zero_on_bad_value(tool):
+async def test_assert_count_fallback_to_zero_on_bad_value(tool, mock_page):
     """assert_count expected 가 비숫자/None → fallback 0."""
-    page = _mock_page()
+    page = mock_page
     fake_assertion = MagicMock()
     fake_assertion.to_have_count = AsyncMock()
 
@@ -353,9 +329,9 @@ async def test_assert_count_fallback_to_zero_on_bad_value(tool):
 
 
 @pytest.mark.asyncio
-async def test_assert_url_uses_page(tool):
+async def test_assert_url_uses_page(tool, mock_page):
     """assert_url → expect(page).to_have_url(expected) — selector 불필요."""
-    page = _mock_page()
+    page = mock_page
     fake_assertion = MagicMock()
     fake_assertion.to_have_url = AsyncMock()
 
@@ -376,9 +352,9 @@ async def test_assert_url_uses_page(tool):
 
 
 @pytest.mark.asyncio
-async def test_reload_go_back_forward(tool):
+async def test_reload_go_back_forward(tool, mock_page):
     """reload / go_back / go_forward — selector null OK."""
-    page = _mock_page()
+    page = mock_page
     page.reload = AsyncMock()
     page.go_back = AsyncMock()
     page.go_forward = AsyncMock()
@@ -396,8 +372,8 @@ async def test_reload_go_back_forward(tool):
 
 
 @pytest.mark.asyncio
-async def test_wait_for_url(tool):
-    page = _mock_page()
+async def test_wait_for_url(tool, mock_page):
+    page = mock_page
     page.wait_for_url = AsyncMock()
     await tool.run(_input({
         "page": page, "tc_id": "TC-1",
@@ -409,9 +385,9 @@ async def test_wait_for_url(tool):
 
 
 @pytest.mark.asyncio
-async def test_wait_for_load_state_default_networkidle(tool):
+async def test_wait_for_load_state_default_networkidle(tool, mock_page):
     """value 미지정 / 잘못된 값 → fallback 'networkidle'."""
-    page = _mock_page()
+    page = mock_page
     await tool.run(_input({
         "page": page, "tc_id": "TC-1",
         "action_mapping": {"steps": [
@@ -425,10 +401,10 @@ async def test_wait_for_load_state_default_networkidle(tool):
 
 
 @pytest.mark.asyncio
-async def test_wait_for_response_graceful_to_networkidle(tool):
+async def test_wait_for_response_graceful_to_networkidle(tool, mock_page):
     """이슈 #138: Playwright Page 에 wait_for_response 가 없으므로
     networkidle 대기로 graceful 변환. value (URL 패턴) 는 무시됨."""
-    page = _mock_page()
+    page = mock_page
     await tool.run(_input({
         "page": page, "tc_id": "TC-1",
         "action_mapping": {"steps": [
@@ -444,9 +420,9 @@ async def test_wait_for_response_graceful_to_networkidle(tool):
 
 
 @pytest.mark.asyncio
-async def test_dom_extended_actions(tool):
+async def test_dom_extended_actions(tool, mock_page):
     """clear/dblclick/hover/check/uncheck/press/upload — locator 메서드 호출 검증."""
-    page = _mock_page()
+    page = mock_page
     locator = page.locator.return_value
     locator.clear = AsyncMock()
     locator.dblclick = AsyncMock()
@@ -480,9 +456,9 @@ async def test_dom_extended_actions(tool):
 
 
 @pytest.mark.asyncio
-async def test_press_fallback_to_enter(tool):
+async def test_press_fallback_to_enter(tool, mock_page):
     """press value 누락 → 1-step fallback 'Enter'."""
-    page = _mock_page()
+    page = mock_page
     locator = page.locator.return_value
     locator.press = AsyncMock()
     await tool.run(_input({
@@ -498,9 +474,9 @@ async def test_press_fallback_to_enter(tool):
 
 
 @pytest.mark.asyncio
-async def test_selector_none_dom_action_falls_back_to_text(tool):
+async def test_selector_none_dom_action_falls_back_to_text(tool, mock_page):
     """selector None + DOM action → expected/value/action 으로 text fallback."""
-    page = _mock_page()
+    page = mock_page
     await tool.run(_input({
         "page": page, "tc_id": "TC-1",
         "action_mapping": {"steps": [
@@ -517,9 +493,9 @@ async def test_selector_none_dom_action_falls_back_to_text(tool):
 
 
 @pytest.mark.asyncio
-async def test_error_code_prefix_for_unsupported(tool):
+async def test_error_code_prefix_for_unsupported(tool, mock_page):
     """unsupported action → error 가 TOOL_UI_UNSUPPORTED_ACTION prefix."""
-    page = _mock_page()
+    page = mock_page
     out = await tool.run(_input({
         "page": page, "tc_id": "TC-1",
         "action_mapping": {"steps": [
@@ -531,9 +507,9 @@ async def test_error_code_prefix_for_unsupported(tool):
 
 
 @pytest.mark.asyncio
-async def test_error_code_prefix_for_assertion_fail(tool):
+async def test_error_code_prefix_for_assertion_fail(tool, mock_page):
     """AssertionError → error 가 TOOL_UI_ASSERTION_FAIL prefix."""
-    page = _mock_page()
+    page = mock_page
     fake_assertion = MagicMock()
     fake_assertion.to_be_visible = AsyncMock(side_effect=AssertionError("not visible"))
 
@@ -567,10 +543,10 @@ def test_tool_ui_new_error_codes_defined_in_enum():
 
 
 @pytest.mark.asyncio
-async def test_role_name_selector_emits_invalid_selector_code(tool):
+async def test_role_name_selector_emits_invalid_selector_code(tool, mock_page):
     """이슈 #147: `role:name` 형식 selector 처리 시 TOOL_UI_INVALID_SELECTOR
     메타 코드 발행 (PR #134 fail-safe 의 분류 신호)."""
-    page = _mock_page()
+    page = mock_page
     locator = page.get_by_role.return_value
     locator.click = AsyncMock()
     tool.logger = MagicMock()
@@ -608,10 +584,10 @@ def _patch_chain_all_fail(page):
 
 
 @pytest.mark.asyncio
-async def test_optionC_assert_substring_match_in_page_text_recovers(tool):
+async def test_optionC_assert_substring_match_in_page_text_recovers(tool, mock_page):
     """이슈 #141 옵션 C: chain + 옵션 B 모두 fail 후 page-wide substring 매칭 → pass."""
     from playwright.async_api import TimeoutError as PWTimeoutError
-    page = _mock_page()
+    page = mock_page
     page.evaluate = AsyncMock(return_value="환영합니다 김주환님\n홈 페이지")
     tool.logger = MagicMock()
 
@@ -639,10 +615,10 @@ async def test_optionC_assert_substring_match_in_page_text_recovers(tool):
 
 
 @pytest.mark.asyncio
-async def test_optionC_assert_fuzzy_match_above_threshold_recovers(tool):
+async def test_optionC_assert_fuzzy_match_above_threshold_recovers(tool, mock_page):
     """옵션 C: substring 매칭 X 인데 fuzzy ratio 0.6+ 줄 적중 → pass."""
     from playwright.async_api import TimeoutError as PWTimeoutError
-    page = _mock_page()
+    page = mock_page
     page.evaluate = AsyncMock(return_value="홈\n로그인 완료 — 환영합니다\n메뉴")
     tool.logger = MagicMock()
 
@@ -666,10 +642,10 @@ async def test_optionC_assert_fuzzy_match_above_threshold_recovers(tool):
 
 
 @pytest.mark.asyncio
-async def test_optionC_assert_text_uses_expected_as_target(tool):
+async def test_optionC_assert_text_uses_expected_as_target(tool, mock_page):
     """옵션 C: assert_text 액션은 expected (selector 대신) 를 target_text 로 사용."""
     from playwright.async_api import TimeoutError as PWTimeoutError
-    page = _mock_page()
+    page = mock_page
     page.evaluate = AsyncMock(return_value="환영합니다\n로그인이 완료되었습니다")
     tool.logger = MagicMock()
 
@@ -694,10 +670,10 @@ async def test_optionC_assert_text_uses_expected_as_target(tool):
 
 
 @pytest.mark.asyncio
-async def test_optionC_no_match_below_threshold_raises(tool):
+async def test_optionC_no_match_below_threshold_raises(tool, mock_page):
     """옵션 C: substring 매칭 X + fuzzy 임계값 미달 → 마지막 에러 그대로 raise (fail)."""
     from playwright.async_api import TimeoutError as PWTimeoutError
-    page = _mock_page()
+    page = mock_page
     page.evaluate = AsyncMock(return_value="완전히 다른 내용\n관련 없는 텍스트")
     tool.logger = MagicMock()
 
@@ -722,10 +698,10 @@ async def test_optionC_no_match_below_threshold_raises(tool):
 
 
 @pytest.mark.asyncio
-async def test_optionC_skipped_for_non_assert_actions(tool):
+async def test_optionC_skipped_for_non_assert_actions(tool, mock_page):
     """옵션 C: assert 계열이 아닌 action (click 등) 은 옵션 C 무관 — page.evaluate 호출 X."""
     from playwright.async_api import TimeoutError as PWTimeoutError
-    page = _mock_page()
+    page = mock_page
     page.evaluate = AsyncMock(return_value="anything")
     page.locator.return_value.click = AsyncMock(side_effect=PWTimeoutError("not found"))
     tool.logger = MagicMock()

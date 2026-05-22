@@ -14,14 +14,11 @@ import pytest
 from qapilot.agents.action_mapper_agent import ActionMapperAgent
 
 
-def _make_agent() -> ActionMapperAgent:
+def _make_agent(mock_llm_client: MagicMock) -> ActionMapperAgent:
     agent = ActionMapperAgent.__new__(ActionMapperAgent)
     agent.logger = MagicMock()
-    agent.llm = MagicMock()
-    agent.llm.chat = AsyncMock(return_value=MagicMock(content="[]"))
-    agent.llm.total_input_tokens = 0
-    agent.llm.total_output_tokens = 0
-    agent.llm.total_cost_usd = 0.0
+    agent.llm = mock_llm_client
+    agent.llm.chat.return_value = MagicMock(content="[]")
     agent.prompts = MagicMock()
     agent.prompts.system = MagicMock(return_value="SYSTEM")
     agent.prompts.render = MagicMock(side_effect=lambda **kw: f"USER<scenarios={kw.get('scenarios','')[:40]}|endpoints={kw.get('endpoints','')[:40]}|frontend_dom={kw.get('frontend_dom','')[:80]}>")
@@ -44,15 +41,15 @@ def _make_agent() -> ActionMapperAgent:
 # ── _load_frontend_dom ──────────────────────────────────────────────────────
 
 
-def test_load_frontend_dom_from_context_priority():
+def test_load_frontend_dom_from_context_priority(mock_llm_client):
     """context 에 직접 주입된 frontend_dom 우선 — 디스크 무시."""
-    agent = _make_agent()
+    agent = _make_agent(mock_llm_client)
     ctx_dom = [{"tag": "input", "placeholder": "이메일"}]
     result = agent._load_frontend_dom({"frontend_dom": ctx_dom})
     assert result == ctx_dom
 
 
-def test_load_frontend_dom_from_disk_fallback(tmp_path: Path, monkeypatch):
+def test_load_frontend_dom_from_disk_fallback(mock_llm_client, tmp_path: Path, monkeypatch):
     """context 없음 → 디스크 (.qapilot/codebase-index/frontend.json) 로드."""
     monkeypatch.chdir(tmp_path)
     (tmp_path / ".qapilot" / "codebase-index").mkdir(parents=True)
@@ -63,16 +60,16 @@ def test_load_frontend_dom_from_disk_fallback(tmp_path: Path, monkeypatch):
         encoding="utf-8",
     )
 
-    agent = _make_agent()
+    agent = _make_agent(mock_llm_client)
     result = agent._load_frontend_dom({})
     assert len(result) == 1
     assert result[0]["text"] == "이메일"
 
 
-def test_load_frontend_dom_returns_empty_when_no_source(tmp_path: Path, monkeypatch):
+def test_load_frontend_dom_returns_empty_when_no_source(mock_llm_client, tmp_path: Path, monkeypatch):
     """context 와 디스크 모두 없음 → 빈 list."""
     monkeypatch.chdir(tmp_path)
-    agent = _make_agent()
+    agent = _make_agent(mock_llm_client)
     result = agent._load_frontend_dom({})
     assert result == []
 
@@ -80,9 +77,9 @@ def test_load_frontend_dom_returns_empty_when_no_source(tmp_path: Path, monkeypa
 # ── _format_frontend_dom ────────────────────────────────────────────────────
 
 
-def test_format_frontend_dom_basic():
+def test_format_frontend_dom_basic(mock_llm_client):
     """element 의 핵심 속성을 한 줄로 표기."""
-    agent = _make_agent()
+    agent = _make_agent(mock_llm_client)
     elements = [
         {"tag": "input", "placeholder": "이메일", "testid": "email", "id": "email",
          "label": "이메일", "name": "email", "text": "", "file": "Login.vue"},
@@ -100,17 +97,17 @@ def test_format_frontend_dom_basic():
     assert '(from Login.vue)' in out
 
 
-def test_format_frontend_dom_empty_returns_placeholder():
+def test_format_frontend_dom_empty_returns_placeholder(mock_llm_client):
     """빈 list → 안내 문자열 (LLM 이 fallback)."""
-    agent = _make_agent()
+    agent = _make_agent(mock_llm_client)
     out = agent._format_frontend_dom([])
     assert "인덱스 없음" in out
     assert "qapilot init" in out  # hint
 
 
-def test_format_frontend_dom_limits_200():
+def test_format_frontend_dom_limits_200(mock_llm_client):
     """element 200 초과 시 잘림 (LLM 토큰 폭증 방지)."""
-    agent = _make_agent()
+    agent = _make_agent(mock_llm_client)
     elements = [
         {"tag": "input", "placeholder": f"item-{i}", "text": "", "label": "",
          "testid": "", "name": "", "id": "", "file": "x.vue"}
@@ -121,9 +118,9 @@ def test_format_frontend_dom_limits_200():
     assert len(lines) == 200  # 최대 200
 
 
-def test_format_frontend_dom_skips_empty_element():
+def test_format_frontend_dom_skips_empty_element(mock_llm_client):
     """모든 식별자 빈 element 는 라인 제외."""
-    agent = _make_agent()
+    agent = _make_agent(mock_llm_client)
     elements = [
         {"tag": "input", "text": "", "placeholder": "", "label": "", "testid": "",
          "name": "", "id": "", "file": "x.vue"},  # 모두 빈
@@ -143,9 +140,9 @@ def test_format_frontend_dom_skips_empty_element():
 
 
 @pytest.mark.asyncio
-async def test_call_batch_passes_frontend_dom_to_prompt_render():
+async def test_call_batch_passes_frontend_dom_to_prompt_render(mock_llm_client):
     """_call_batch 가 prompts.render(..., frontend_dom=...) 로 인자 전달 검증."""
-    agent = _make_agent()
+    agent = _make_agent(mock_llm_client)
     batch = [{"ts_id": "TS-1", "test_cases": []}]
     endpoints = [{"method": "POST", "path": "/login"}]
     frontend_dom = [{"tag": "input", "placeholder": "이메일", "file": "Login.vue",
@@ -162,10 +159,10 @@ async def test_call_batch_passes_frontend_dom_to_prompt_render():
 
 
 @pytest.mark.asyncio
-async def test_execute_loads_frontend_dom_from_context(tmp_path: Path, monkeypatch):
+async def test_execute_loads_frontend_dom_from_context(mock_llm_client, tmp_path: Path, monkeypatch):
     """_execute 시작 시 _load_frontend_dom 호출 + frontend_dom 이 _call_batch 에 전달."""
     monkeypatch.chdir(tmp_path)
-    agent = _make_agent()
+    agent = _make_agent(mock_llm_client)
 
     scenarios = [{
         "ts_id": "TS-1",
@@ -186,10 +183,10 @@ async def test_execute_loads_frontend_dom_from_context(tmp_path: Path, monkeypat
 
 
 @pytest.mark.asyncio
-async def test_execute_falls_back_to_empty_when_no_frontend_dom(monkeypatch, tmp_path: Path):
+async def test_execute_falls_back_to_empty_when_no_frontend_dom(mock_llm_client, monkeypatch, tmp_path: Path):
     """frontend_dom 없으면 안내 문자열로 prompt 렌더."""
     monkeypatch.chdir(tmp_path)
-    agent = _make_agent()
+    agent = _make_agent(mock_llm_client)
 
     scenarios = [{
         "ts_id": "TS-1",

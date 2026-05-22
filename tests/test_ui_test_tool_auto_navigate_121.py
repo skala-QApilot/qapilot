@@ -22,11 +22,6 @@ def _make_tool() -> UITestTool:
     return tool
 
 
-def _mock_page() -> MagicMock:
-    page = MagicMock()
-    page.goto = AsyncMock()
-    return page
-
 
 # ── _infer_target_route — 순수 함수 단위 검증 ────────────────────────────────
 
@@ -112,10 +107,10 @@ def test_infer_target_route_malformed_endpoint_returns_none():
 
 
 @pytest.mark.asyncio
-async def test_try_auto_navigate_calls_page_goto_on_inferred_route():
+async def test_try_auto_navigate_calls_page_goto_on_inferred_route(mock_page):
     """api_endpoint 있음 → page.goto(target_url + route) + info log."""
     tool = _make_tool()
-    page = _mock_page()
+    page = mock_page
     steps = [
         {"action": "fill", "selector": "이메일", "api_endpoint": None},
         {"action": "click", "selector": "로그인", "api_endpoint": "POST /login"},
@@ -130,20 +125,20 @@ async def test_try_auto_navigate_calls_page_goto_on_inferred_route():
 
 
 @pytest.mark.asyncio
-async def test_try_auto_navigate_strips_trailing_slash_from_target_url():
+async def test_try_auto_navigate_strips_trailing_slash_from_target_url(mock_page):
     """target_url 의 trailing slash 제거 후 route prefix 부착."""
     tool = _make_tool()
-    page = _mock_page()
+    page = mock_page
     steps = [{"action": "fill", "api_endpoint": "POST /login"}]
     await tool._try_auto_navigate(page, steps, "http://localhost:3000/")
     page.goto.assert_awaited_once_with("http://localhost:3000/login")
 
 
 @pytest.mark.asyncio
-async def test_try_auto_navigate_skips_when_no_api_endpoint():
+async def test_try_auto_navigate_skips_when_no_api_endpoint(mock_page):
     """api_endpoint 부재 → page.goto 호출 X + debug log."""
     tool = _make_tool()
-    page = _mock_page()
+    page = mock_page
     steps = [{"action": "fill", "selector": "이메일"}]
 
     await tool._try_auto_navigate(page, steps, "http://localhost:3000")
@@ -155,10 +150,10 @@ async def test_try_auto_navigate_skips_when_no_api_endpoint():
 
 
 @pytest.mark.asyncio
-async def test_try_auto_navigate_graceful_on_goto_failure():
+async def test_try_auto_navigate_graceful_on_goto_failure(mock_page):
     """page.goto 가 raise 해도 후속 진행 — warning log + 예외 흡수."""
     tool = _make_tool()
-    page = _mock_page()
+    page = mock_page
     page.goto = AsyncMock(side_effect=RuntimeError("network unreachable"))
     steps = [{"action": "fill", "api_endpoint": "POST /login"}]
 
@@ -246,10 +241,10 @@ async def test_run_steps_skips_auto_navigate_for_empty_steps():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("target_url", [None, "", "/login", "localhost:3000", "//foo.com"])
-async def test_try_auto_navigate_skips_invalid_target_url(target_url):
+async def test_try_auto_navigate_skips_invalid_target_url(mock_page, target_url):
     """target_url 가 None / empty / path-only / scheme 부재 → page.goto 안 함 + warning."""
     tool = _make_tool()
-    page = _mock_page()
+    page = mock_page
     steps = [{"action": "fill", "api_endpoint": "POST /login"}]
 
     await tool._try_auto_navigate(page, steps, target_url)
@@ -261,10 +256,10 @@ async def test_try_auto_navigate_skips_invalid_target_url(target_url):
 
 
 @pytest.mark.asyncio
-async def test_try_auto_navigate_accepts_https_target_url():
+async def test_try_auto_navigate_accepts_https_target_url(mock_page):
     """https://... target_url 도 정상 처리."""
     tool = _make_tool()
-    page = _mock_page()
+    page = mock_page
     steps = [{"action": "fill", "api_endpoint": "POST /login"}]
 
     await tool._try_auto_navigate(page, steps, "https://staging.example.com")
@@ -276,12 +271,12 @@ async def test_try_auto_navigate_accepts_https_target_url():
 
 
 @pytest.mark.asyncio
-async def test_auto_navigate_emits_auto_navigate_code():
+async def test_auto_navigate_emits_auto_navigate_code(mock_page):
     """이슈 #147: auto-navigate 성공 시 TOOL_UI_AUTO_NAVIGATE 메타 코드 발행."""
     from qapilot.shared.errors import ErrorCode
     tool = _make_tool()
     tool.logger = MagicMock()
-    page = _mock_page()
+    page = mock_page
 
     steps = [
         {"step_no": 1, "action": "fill", "selector": "x", "selector_type": "css",
@@ -296,12 +291,12 @@ async def test_auto_navigate_emits_auto_navigate_code():
 
 
 @pytest.mark.asyncio
-async def test_auto_navigate_invalid_target_url_emits_target_unreachable():
+async def test_auto_navigate_invalid_target_url_emits_target_unreachable(mock_page):
     """이슈 #147: target_url 부재/scheme 부재 → TOOL_UI_TARGET_UNREACHABLE 발행."""
     from qapilot.shared.errors import ErrorCode
     tool = _make_tool()
     tool.logger = MagicMock()
-    page = _mock_page()
+    page = mock_page
     steps = [
         {"step_no": 1, "action": "fill", "selector": "x", "selector_type": "css",
          "api_endpoint": "POST /login"},
@@ -316,12 +311,12 @@ async def test_auto_navigate_invalid_target_url_emits_target_unreachable():
 
 
 @pytest.mark.asyncio
-async def test_auto_navigate_page_goto_failure_emits_target_unreachable():
+async def test_auto_navigate_page_goto_failure_emits_target_unreachable(mock_page):
     """이슈 #147: page.goto 실패 → TOOL_UI_TARGET_UNREACHABLE 발행."""
     from qapilot.shared.errors import ErrorCode
     tool = _make_tool()
     tool.logger = MagicMock()
-    page = _mock_page()
+    page = mock_page
     page.goto = AsyncMock(side_effect=Exception("net::ERR_CONNECTION_REFUSED"))
     steps = [
         {"step_no": 1, "action": "fill", "selector": "x", "selector_type": "css",

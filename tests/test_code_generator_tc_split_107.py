@@ -20,14 +20,10 @@ from qapilot.agents.code_generator_agent import (
 )
 
 
-def _make_agent() -> CodeGeneratorAgent:
+def _make_agent(mock_llm_client: MagicMock) -> CodeGeneratorAgent:
     """LLM / prompts / logger 만 mock 한 Agent — _execute 직접 호출."""
     agent = CodeGeneratorAgent.__new__(CodeGeneratorAgent)
-    agent.llm = MagicMock()
-    agent.llm.chat = AsyncMock()
-    agent.llm.total_input_tokens = 0
-    agent.llm.total_output_tokens = 0
-    agent.llm.total_cost_usd = 0.0
+    agent.llm = mock_llm_client
     agent.prompts = MagicMock()
     agent.prompts.system = MagicMock(return_value="SYSTEM")
     agent.prompts.render = MagicMock(side_effect=lambda **kw: f"USER<{kw.get('action_mappings','')}>")
@@ -86,9 +82,9 @@ def test_tc_index_empty_when_no_scenarios():
 
 
 @pytest.mark.asyncio
-async def test_execute_all_success():
+async def test_execute_all_success(mock_llm_client):
     """3 TC 모두 LLM 응답 정상 → generated_codes 3건 / failed_tcs 0건."""
-    agent = _make_agent()
+    agent = _make_agent(mock_llm_client)
     agent.llm.chat = AsyncMock(side_effect=[
         _ok_response("TS-001-TC-01"),
         _ok_response("TS-001-TC-02"),
@@ -113,9 +109,9 @@ async def test_execute_all_success():
 
 
 @pytest.mark.asyncio
-async def test_execute_partial_failure_skips_only_failed_tc():
+async def test_execute_partial_failure_skips_only_failed_tc(mock_llm_client):
     """3 TC 중 가운데 TC LLM JSON parse 실패 → 나머지 2 TC 정상."""
-    agent = _make_agent()
+    agent = _make_agent(mock_llm_client)
     agent.llm.chat = AsyncMock(side_effect=[
         _ok_response("TS-001-TC-01"),
         MagicMock(content='{"generated_codes": [{invalid \\escape'),  # JSON parse 실패
@@ -138,9 +134,9 @@ async def test_execute_partial_failure_skips_only_failed_tc():
 
 
 @pytest.mark.asyncio
-async def test_execute_all_failure_returns_empty_with_failed_tcs():
+async def test_execute_all_failure_returns_empty_with_failed_tcs(mock_llm_client):
     """모든 TC 가 JSON parse 실패 → generated 0건 / failed N건. confidence=0."""
-    agent = _make_agent()
+    agent = _make_agent(mock_llm_client)
     agent.llm.chat = AsyncMock(side_effect=[
         MagicMock(content="invalid"),
         MagicMock(content="also invalid"),
@@ -154,9 +150,9 @@ async def test_execute_all_failure_returns_empty_with_failed_tcs():
 
 
 @pytest.mark.asyncio
-async def test_execute_empty_input_returns_clean_result():
+async def test_execute_empty_input_returns_clean_result(mock_llm_client):
     """ActionMapping 비어있으면 LLM 호출 없이 정상 종료."""
-    agent = _make_agent()
+    agent = _make_agent(mock_llm_client)
     agent.llm.chat = AsyncMock(side_effect=AssertionError("LLM 호출 되면 안 됨"))
     result = await agent._execute({"action_mappings": [], "scenarios": []}, {})
     assert result.result["generated_codes"] == []
@@ -166,9 +162,9 @@ async def test_execute_empty_input_returns_clean_result():
 
 
 @pytest.mark.asyncio
-async def test_execute_empty_generated_codes_response_creates_stub():
+async def test_execute_empty_generated_codes_response_creates_stub(mock_llm_client):
     """LLM 이 generated_codes=[] 만 반환해도 stub 결과 (code='') 반환 — pipeline 진행."""
-    agent = _make_agent()
+    agent = _make_agent(mock_llm_client)
     agent.llm.chat = AsyncMock(return_value=MagicMock(content='{"generated_codes": [], "confidence": 0}'))
     action_mappings = [{"tc_id": "TC-X"}]
     result = await agent._execute({"action_mappings": action_mappings, "scenarios": []}, {})
@@ -180,11 +176,11 @@ async def test_execute_empty_generated_codes_response_creates_stub():
 
 
 @pytest.mark.asyncio
-async def test_execute_concurrency_respects_semaphore():
+async def test_execute_concurrency_respects_semaphore(mock_llm_client):
     """동시 LLM 호출이 _MAX_CONCURRENT_LLM_CALLS 초과하지 않음."""
     from qapilot.agents.code_generator_agent import _MAX_CONCURRENT_LLM_CALLS
 
-    agent = _make_agent()
+    agent = _make_agent(mock_llm_client)
     in_flight = 0
     max_in_flight = 0
 
@@ -207,9 +203,9 @@ async def test_execute_concurrency_respects_semaphore():
 
 
 @pytest.mark.asyncio
-async def test_execute_passes_scenario_slice_to_prompt():
+async def test_execute_passes_scenario_slice_to_prompt(mock_llm_client):
     """각 TC LLM 호출에 해당 TC 의 scenario slice 만 전달 (다른 TC 의 비즈니스 의도 누락 X)."""
-    agent = _make_agent()
+    agent = _make_agent(mock_llm_client)
     agent.llm.chat = AsyncMock(side_effect=[
         _ok_response("TC-A"), _ok_response("TC-B"),
     ])
@@ -243,9 +239,9 @@ async def test_execute_passes_scenario_slice_to_prompt():
 
 
 @pytest.mark.asyncio
-async def test_per_tc_llm_client_created_for_each_tc_codegen():
+async def test_per_tc_llm_client_created_for_each_tc_codegen(mock_llm_client):
     """이슈 #140: CodeGenerator 도 ActionMapper 와 동일한 per-TC LLMClient 분리."""
-    agent = _make_agent()
+    agent = _make_agent(mock_llm_client)
     agent.llm.chat = AsyncMock(side_effect=[
         _ok_response("TC-A"), _ok_response("TC-B"), _ok_response("TC-C"),
     ])
@@ -263,9 +259,9 @@ async def test_per_tc_llm_client_created_for_each_tc_codegen():
 
 
 @pytest.mark.asyncio
-async def test_per_tc_llm_accumulates_to_agent_llm_for_reporting_codegen():
+async def test_per_tc_llm_accumulates_to_agent_llm_for_reporting_codegen(mock_llm_client):
     """CodeGenerator per-TC LLMClient 의 토큰/비용 누적 합산 검증."""
-    agent = _make_agent()
+    agent = _make_agent(mock_llm_client)
     agent.llm.chat = AsyncMock(return_value=_ok_response("TC-A"))
     def _mock_create_tc_llm_with_usage():
         tc_llm = MagicMock()
