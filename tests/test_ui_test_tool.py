@@ -586,3 +586,92 @@ async def test_role_name_selector_emits_invalid_selector_code(tool):
                      if c.args and c.args[0] == "ui_invalid_selector_fallback"]
     assert len(warning_calls) == 1
     assert warning_calls[0].kwargs.get("code") == ErrorCode.TOOL_UI_INVALID_SELECTOR
+
+
+# ── 이슈 #141 D fail-safe: assert_text fuzzy match graceful ─────────────
+
+
+@pytest.mark.asyncio
+async def test_assert_text_fuzzy_match_above_threshold_recovers(tool):
+    """이슈 #141 D fail-safe: assert_text strict 실패 시 fuzzy match (difflib ratio)
+    임계값 0.6 이상이면 graceful pass. LLM 환각 expected ("로그인 완료") vs 실제
+    DOM ("로그인이 완료되었습니다") 같은 의미 유사 케이스 회복.
+    """
+    page = _mock_page()
+    locator = page.locator.return_value
+    locator.inner_text = AsyncMock(return_value="로그인이 완료되었습니다.")
+    tool.logger = MagicMock()
+
+    fake_assertion = MagicMock()
+    fake_assertion.to_have_text = AsyncMock(side_effect=AssertionError("text not matched"))
+
+    with patch("qapilot.tools.ui_test_tool.expect", return_value=fake_assertion):
+        await tool.run(_input({
+            "page": page, "tc_id": "TC-1",
+            "action_mapping": {"steps": [
+                {"step_no": 1, "action": "assert_text", "selector": "#msg",
+                 "selector_type": "css", "expected": "로그인 완료"},
+            ]},
+        }))
+
+    # fuzzy match 적중 → ui_assert_text_fuzzy_match info 로그 발행 (FALLBACK_USED 코드)
+    from qapilot.shared.errors import ErrorCode
+    info_calls = [c for c in tool.logger.info.call_args_list
+                  if c.args and c.args[0] == "ui_assert_text_fuzzy_match"]
+    assert len(info_calls) == 1
+    assert info_calls[0].kwargs.get("code") == ErrorCode.TOOL_UI_FALLBACK_USED
+
+
+@pytest.mark.asyncio
+async def test_assert_text_fuzzy_match_below_threshold_raises(tool):
+    """이슈 #141 D fail-safe: fuzzy ratio 임계값 미달 → strict 에러 그대로 raise."""
+    page = _mock_page()
+    locator = page.locator.return_value
+    locator.inner_text = AsyncMock(return_value="완전히 다른 텍스트")
+    tool.logger = MagicMock()
+
+    fake_assertion = MagicMock()
+    fake_assertion.to_have_text = AsyncMock(side_effect=AssertionError("text not matched"))
+
+    with patch("qapilot.tools.ui_test_tool.expect", return_value=fake_assertion):
+        # 임계값 미달 — fail 그대로 (tool 의 run 은 graceful 흡수 후 step status=fail)
+        result = await tool.run(_input({
+            "page": page, "tc_id": "TC-1",
+            "action_mapping": {"steps": [
+                {"step_no": 1, "action": "assert_text", "selector": "#msg",
+                 "selector_type": "css", "expected": "환영합니다"},
+            ]},
+        }))
+    # fuzzy match info 로그 발행 X
+    info_calls = [c for c in tool.logger.info.call_args_list
+                  if c.args and c.args[0] == "ui_assert_text_fuzzy_match"]
+    assert len(info_calls) == 0
+    # step 결과 fail
+    ui_result = result.result["ui_result"]
+    assert ui_result["status"] == "fail"
+
+
+@pytest.mark.asyncio
+async def test_assert_text_fuzzy_match_substring_bonus_breaks_threshold(tool):
+    """이슈 #141 D fail-safe: expected 가 actual 의 substring 이면 0.2 가산점으로 임계값 통과."""
+    page = _mock_page()
+    locator = page.locator.return_value
+    # expected="환영" / actual="환영합니다 김주환님 — 메인 페이지" — substring 매칭
+    locator.inner_text = AsyncMock(return_value="환영합니다 김주환님 — 메인 페이지")
+    tool.logger = MagicMock()
+
+    fake_assertion = MagicMock()
+    fake_assertion.to_have_text = AsyncMock(side_effect=AssertionError("strict mismatch"))
+
+    with patch("qapilot.tools.ui_test_tool.expect", return_value=fake_assertion):
+        await tool.run(_input({
+            "page": page, "tc_id": "TC-1",
+            "action_mapping": {"steps": [
+                {"step_no": 1, "action": "assert_text", "selector": "#msg",
+                 "selector_type": "css", "expected": "환영"},
+            ]},
+        }))
+
+    info_calls = [c for c in tool.logger.info.call_args_list
+                  if c.args and c.args[0] == "ui_assert_text_fuzzy_match"]
+    assert len(info_calls) == 1

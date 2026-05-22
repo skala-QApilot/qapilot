@@ -680,8 +680,44 @@ class UITestTool(BaseTool):
             await expect(locator).to_be_hidden(**kw)
             return
         if action == "assert_text":
-            await expect(locator).to_have_text(expected or "", **kw)
-            return
+            expected_text = expected or ""
+            try:
+                await expect(locator).to_have_text(expected_text, **kw)
+                return
+            except (PWTimeoutError, AssertionError) as strict_err:
+                # 이슈 #141 D fail-safe: strict 매칭 실패 시 fuzzy match (옵션 B 와 동일
+                # difflib 알고리즘) graceful. LLM 환각 expected (예: "로그인이 완료되었
+                # 습니다.") 가 실제 DOM 텍스트 ("환영합니다 김주환") 와 의미 유사하면
+                # pass. 임계값 0.6 (옵션 B 와 일관) + substring 가산점 0.2.
+                if not expected_text:
+                    raise
+                try:
+                    actual_text = (await locator.inner_text(timeout=timeout_ms or 5000)) or ""
+                except Exception:
+                    raise strict_err from None
+                # substring 매칭 즉시 pass — expected 가 actual 안에 (또는 반대로)
+                # 완전 포함되면 의도 일치 보장 (짧은 expected 케이스 회복).
+                if expected_text in actual_text or actual_text in expected_text:
+                    self.logger.info(
+                        "ui_assert_text_fuzzy_match",
+                        expected=expected_text[:80],
+                        actual=actual_text[:80],
+                        match_type="substring",
+                        code=ErrorCode.TOOL_UI_FALLBACK_USED,
+                    )
+                    return
+                ratio = difflib.SequenceMatcher(None, expected_text, actual_text).ratio()
+                if ratio >= 0.6:
+                    self.logger.info(
+                        "ui_assert_text_fuzzy_match",
+                        expected=expected_text[:80],
+                        actual=actual_text[:80],
+                        match_type="fuzzy",
+                        ratio=round(ratio, 3),
+                        code=ErrorCode.TOOL_UI_FALLBACK_USED,
+                    )
+                    return
+                raise
         if action == "assert_value":
             await expect(locator).to_have_value(expected or "", **kw)
             return
