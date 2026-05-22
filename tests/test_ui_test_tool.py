@@ -675,3 +675,94 @@ async def test_assert_text_fuzzy_match_substring_bonus_breaks_threshold(tool):
     info_calls = [c for c in tool.logger.info.call_args_list
                   if c.args and c.args[0] == "ui_assert_text_fuzzy_match"]
     assert len(info_calls) == 1
+
+
+# ── 이슈 #141 D fail-safe (확장): assert/assert_visible fuzzy match ─────
+
+
+@pytest.mark.asyncio
+async def test_assert_visible_substring_match_in_page_text_recovers(tool):
+    """이슈 #141 D fail-safe 확장: strict to_be_visible 실패 시 selector 텍스트가
+    페이지 textContent 안에 substring 으로 존재하면 graceful pass.
+
+    LLM 환각 selector="환영" 와 실제 페이지 textContent="환영합니다 김주환님" 매칭.
+    """
+    page = _mock_page()
+    locator = page.locator.return_value
+    locator.evaluate = AsyncMock(return_value="환영합니다 김주환님\n홈 페이지")
+    tool.logger = MagicMock()
+
+    fake_assertion = MagicMock()
+    fake_assertion.to_be_visible = AsyncMock(side_effect=AssertionError("element(s) not found"))
+
+    with patch("qapilot.tools.ui_test_tool.expect", return_value=fake_assertion):
+        await tool.run(_input({
+            "page": page, "tc_id": "TC-1",
+            "action_mapping": {"steps": [
+                {"step_no": 1, "action": "assert", "selector": "환영",
+                 "selector_type": "text"},
+            ]},
+        }))
+
+    from qapilot.shared.errors import ErrorCode
+    info_calls = [c for c in tool.logger.info.call_args_list
+                  if c.args and c.args[0] == "ui_assert_visible_fuzzy_match"]
+    assert len(info_calls) == 1
+    assert info_calls[0].kwargs.get("match_type") == "substring"
+    assert info_calls[0].kwargs.get("code") == ErrorCode.TOOL_UI_FALLBACK_USED
+
+
+@pytest.mark.asyncio
+async def test_assert_visible_fuzzy_match_above_threshold_recovers(tool):
+    """이슈 #141 D fail-safe 확장: 페이지 줄 단위 fuzzy ratio 0.6+ 적중 시 pass.
+
+    LLM 환각 selector="로그인이 완료되었습니다" vs 페이지 줄 "로그인 완료 — 환영합니다" — fuzzy 일치.
+    """
+    page = _mock_page()
+    locator = page.locator.return_value
+    locator.evaluate = AsyncMock(return_value="홈\n로그인 완료 — 환영합니다\n메뉴")
+    tool.logger = MagicMock()
+
+    fake_assertion = MagicMock()
+    fake_assertion.to_be_visible = AsyncMock(side_effect=AssertionError("not found"))
+
+    with patch("qapilot.tools.ui_test_tool.expect", return_value=fake_assertion):
+        await tool.run(_input({
+            "page": page, "tc_id": "TC-1",
+            "action_mapping": {"steps": [
+                {"step_no": 1, "action": "assert_visible", "selector": "로그인 완료되었습니다",
+                 "selector_type": "text"},
+            ]},
+        }))
+
+    info_calls = [c for c in tool.logger.info.call_args_list
+                  if c.args and c.args[0] == "ui_assert_visible_fuzzy_match"]
+    assert len(info_calls) == 1
+    assert info_calls[0].kwargs.get("match_type") == "fuzzy"
+
+
+@pytest.mark.asyncio
+async def test_assert_visible_no_match_raises(tool):
+    """이슈 #141 D fail-safe 확장: 페이지 어디서도 매칭 안 되면 strict fail 그대로."""
+    page = _mock_page()
+    locator = page.locator.return_value
+    locator.evaluate = AsyncMock(return_value="완전히 다른 내용\n다른 줄")
+    tool.logger = MagicMock()
+
+    fake_assertion = MagicMock()
+    fake_assertion.to_be_visible = AsyncMock(side_effect=AssertionError("not found"))
+
+    with patch("qapilot.tools.ui_test_tool.expect", return_value=fake_assertion):
+        result = await tool.run(_input({
+            "page": page, "tc_id": "TC-1",
+            "action_mapping": {"steps": [
+                {"step_no": 1, "action": "assert", "selector": "환영합니다",
+                 "selector_type": "text"},
+            ]},
+        }))
+
+    info_calls = [c for c in tool.logger.info.call_args_list
+                  if c.args and c.args[0] == "ui_assert_visible_fuzzy_match"]
+    assert len(info_calls) == 0
+    ui_result = result.result["ui_result"]
+    assert ui_result["status"] == "fail"
