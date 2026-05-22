@@ -507,3 +507,150 @@ async def test_gitlab_project_id_encoded():
     """org/repo 경로가 URL 인코딩되어 API 호출에 사용된다."""
     adapter = GitLabAdapter("https://gitlab.example.com/org/my-repo", "tok")
     assert adapter._project_id == "org%2Fmy-repo"
+
+
+# ── #161 수정 항목 테스트 ──────────────────────────────────────────────────────
+
+# 1. framework 감지 버그
+async def test_detect_python_framework_uses_full_path(tool):
+    """all_paths가 전체 경로일 때 main.py를 정확히 찾아 fastapi를 감지한다."""
+    adapter = AsyncMock()
+    adapter.get_file_content.return_value = b"from fastapi import FastAPI\napp = FastAPI()"
+    all_paths = ["backend/app/main.py", "backend/app/config.py"]
+    result = await tool._detect_python_framework(adapter, "main", all_paths)
+    assert result == "fastapi"
+    adapter.get_file_content.assert_called_once_with("backend/app/main.py", "main")
+
+
+async def test_detect_python_framework_returns_unknown_when_no_entry(tool):
+    """main.py / app.py가 없으면 unknown을 반환한다."""
+    adapter = AsyncMock()
+    result = await tool._detect_python_framework(adapter, "main", ["backend/utils.py"])
+    assert result == "unknown"
+    adapter.get_file_content.assert_not_called()
+
+
+# 2. scan_status 필드
+async def test_execute_metadata_has_scan_status_full(tool):
+    """trigger=init이면 scan_status가 full이다."""
+    with patch.object(tool, "_scan_single_repo", new=AsyncMock(return_value={
+        "file_infos": [{"path": "r/a.py", "language": "python", "endpoints": [],
+                        "functions": [], "dependencies": [], "models": []}],
+        "git_diff": None, "language": "python", "framework": "fastapi",
+    })):
+        output = await tool._execute({"trigger": "init", "repo_url": "https://github.com/o/r", "token": "t"})
+    assert output["_metadata"]["scan_status"] == "full"
+
+
+async def test_execute_metadata_has_scan_status_incremental(tool):
+    """trigger=code_change + last_commit_hash 있으면 scan_status가 incremental이다."""
+    with patch.object(tool, "_scan_single_repo", new=AsyncMock(return_value={
+        "file_infos": [{"path": "r/a.py", "language": "python", "endpoints": [],
+                        "functions": [], "dependencies": [], "models": []}],
+        "git_diff": None, "language": "python", "framework": "fastapi",
+    })):
+        output = await tool._execute({
+            "trigger": "code_change",
+            "repo_url": "https://github.com/o/r",
+            "token": "t",
+            "last_commit_hash": "abc123",
+        })
+    assert output["_metadata"]["scan_status"] == "incremental"
+
+
+# 3. endpoint 스키마
+def test_extract_py_endpoint_has_required_fields(tool):
+    """Python endpoint 추출 결과에 file·params·response_model 필드가 있다."""
+    from tree_sitter import Language, Parser
+    import tree_sitter_python as tspython
+
+    src = b"""
+@router.post("/signup", response_model=TokenOut)
+def signup(body: SignupRequest, db: Session = Depends(get_db)):
+    pass
+"""
+    lang = Language(tspython.language())
+    parser = Parser(lang)
+    tree = parser.parse(src)
+    endpoints, _, _ = tool._parse_python(tree)
+    assert len(endpoints) == 1
+    ep = endpoints[0]
+    assert ep["method"] == "POST"
+    assert ep["path"] == "/signup"
+    assert "params" in ep
+    assert isinstance(ep["params"], list)
+    assert "response_model" in ep
+    assert "TokenOut" in ep["response_model"]
+
+
+def test_parse_file_injects_file_field(tool):
+    """_parse_file_from_content 후 endpoint와 function에 file 필드가 주입된다."""
+    src = b"""
+@router.get("/items")
+def list_items():
+    pass
+"""
+    fi = tool._parse_file_from_content("role/app/routers/items.py", "python", src)
+    for ep in fi["endpoints"]:
+        assert ep["file"] == "role/app/routers/items.py"
+    for fn in fi["functions"]:
+        assert fn["file"] == "role/app/routers/items.py"
+
+
+# 4. function params list
+def test_extract_py_function_params_is_list(tool):
+    """Python 함수 params가 list[str]로 반환된다."""
+    from tree_sitter import Language, Parser
+    import tree_sitter_python as tspython
+
+    src = b"def my_func(self, x: int, y: str = 'hello'):\n    pass\n"
+    lang = Language(tspython.language())
+    parser = Parser(lang)
+    tree = parser.parse(src)
+    _, functions, _ = tool._parse_python(tree)
+    assert len(functions) == 1
+    assert isinstance(functions[0]["params"], list)
+    assert len(functions[0]["params"]) > 0
+
+
+# 5. 라우터 prefix
+async def test_build_router_prefix_map(tool):
+    """main.py의 include_router 호출에서 prefix 맵을 추출한다."""
+    main_py = b"""
+from fastapi import FastAPI
+from app.routers import auth, orders
+
+app = FastAPI()
+app.include_router(auth.router, prefix="/api/auth")
+app.include_router(orders.router, prefix="/api/orders")
+"""
+    adapter = AsyncMock()
+    adapter.get_file_content.return_value = main_py
+    all_paths = ["app/main.py", "app/routers/auth.py", "app/routers/orders.py"]
+    prefix_map = await tool._build_router_prefix_map(adapter, "main", all_paths)
+    assert prefix_map.get("auth") == "/api/auth"
+    assert prefix_map.get("orders") == "/api/orders"
+
+
+def test_apply_router_prefixes_updates_endpoint_paths(tool):
+    """prefix_map이 있으면 해당 파일의 endpoint path에 prefix가 붙는다."""
+    file_infos = [
+        {"path": "role/app/routers/auth.py", "language": "python",
+         "endpoints": [{"method": "POST", "path": "/login", "handler": "login",
+                        "params": [], "response_model": "", "file": "role/app/routers/auth.py"}],
+         "functions": [], "dependencies": [], "models": []},
+        {"path": "role/app/routers/auth.py", "language": "python",
+         "endpoints": [{"method": "GET", "path": "", "handler": "me",
+                        "params": [], "response_model": "", "file": "role/app/routers/auth.py"}],
+         "functions": [], "dependencies": [], "models": []},
+    ]
+    tool._apply_router_prefixes(file_infos, {"auth": "/api/auth"})
+    assert file_infos[0]["endpoints"][0]["path"] == "/api/auth/login"
+    assert file_infos[1]["endpoints"][0]["path"] == "/api/auth"
+
+
+# 6. alembic 제외
+def test_should_scan_path_excludes_alembic(tool):
+    """alembic 디렉토리 하위 파일은 스캔 대상에서 제외된다."""
+    assert tool._should_scan_path("backend/alembic/env.py") is False
+    assert tool._should_scan_path("backend/alembic/versions/0001_init.py") is False
