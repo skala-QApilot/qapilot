@@ -632,6 +632,23 @@ app.include_router(orders.router, prefix="/api/orders")
     assert prefix_map.get("orders") == "/api/orders"
 
 
+@pytest.mark.asyncio
+async def test_build_router_prefix_map_alias(tool):
+    """from X import Y as Z alias 패턴에서도 prefix를 올바르게 추출한다."""
+    main_py = b"""
+from fastapi import FastAPI
+from app.routers import router as contracts_router
+
+app = FastAPI()
+app.include_router(contracts_router, prefix="/api/contracts")
+"""
+    adapter = AsyncMock()
+    adapter.get_file_content.return_value = main_py
+    all_paths = ["app/main.py", "app/routers.py"]
+    prefix_map = await tool._build_router_prefix_map(adapter, "main", all_paths)
+    assert prefix_map.get("routers") == "/api/contracts"
+
+
 def test_apply_router_prefixes_updates_endpoint_paths(tool):
     """prefix_map이 있으면 해당 파일의 endpoint path에 prefix가 붙는다."""
     file_infos = [
@@ -647,6 +664,56 @@ def test_apply_router_prefixes_updates_endpoint_paths(tool):
     tool._apply_router_prefixes(file_infos, {"auth": "/api/auth"})
     assert file_infos[0]["endpoints"][0]["path"] == "/api/auth/login"
     assert file_infos[1]["endpoints"][0]["path"] == "/api/auth"
+
+
+# Git Diff — HEAD~1 fallback
+async def test_extract_git_diff_uses_parent_when_no_last_hash(tool):
+    """last_commit_hash 없으면 HEAD~1을 prev_hash로 사용해 diff를 계산한다."""
+    adapter = _make_adapter(
+        head_hash="head111",
+        commits=[
+            {"hash": "head111", "author": "Alice", "author_email": "a@x.com", "timestamp": "2026-05-22T00:00:00Z"},
+            {"hash": "parent000", "author": "Bob", "author_email": "b@x.com", "timestamp": "2026-05-21T00:00:00Z"},
+        ],
+        diff=[{"file": "app/main.py", "added": 5, "deleted": 2}],
+    )
+    result = await tool._extract_git_diff(adapter, "main", "")
+    assert result is not None
+    assert result["prev_hash"] == "parent000"
+    assert result["changed_files"] == ["app/main.py"]
+    assert result["added_lines"] == 5
+    assert result["deleted_lines"] == 2
+    adapter.get_diff.assert_called_once_with("parent000", "head111")
+
+
+async def test_extract_git_diff_uses_last_hash_when_provided(tool):
+    """last_commit_hash가 있으면 그것을 기준으로 diff를 계산한다."""
+    adapter = _make_adapter(
+        head_hash="head111",
+        commits=[
+            {"hash": "head111", "author": "Alice", "author_email": "a@x.com", "timestamp": "2026-05-22T00:00:00Z"},
+            {"hash": "parent000", "author": "Bob", "author_email": "b@x.com", "timestamp": "2026-05-21T00:00:00Z"},
+        ],
+        diff=[{"file": "app/config.py", "added": 3, "deleted": 1}],
+    )
+    result = await tool._extract_git_diff(adapter, "main", "custom_base_hash")
+    assert result["prev_hash"] == "custom_base_hash"
+    adapter.get_diff.assert_called_once_with("custom_base_hash", "head111")
+
+
+async def test_extract_git_diff_empty_prev_when_single_commit(tool):
+    """커밋이 1개뿐이면 prev_hash가 빈 문자열이고 diff도 없다."""
+    adapter = _make_adapter(
+        head_hash="first111",
+        commits=[
+            {"hash": "first111", "author": "Alice", "author_email": "a@x.com", "timestamp": "2026-05-22T00:00:00Z"},
+        ],
+    )
+    result = await tool._extract_git_diff(adapter, "main", "")
+    assert result is not None
+    assert result["prev_hash"] == ""
+    assert result["changed_files"] == []
+    adapter.get_diff.assert_not_called()
 
 
 # 6. alembic 제외

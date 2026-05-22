@@ -426,12 +426,15 @@ class GitCodebaseScannerTool(BaseTool):
         languages: list[str] = []
         frameworks: list[str] = []
         skipped_count = 0
+        scan_errors: list[str] = []
 
         for repo, result in zip(repos, results):
             if isinstance(result, BaseException):
+                err_msg = str(result)
                 self.logger.warning(
-                    "repo_scan_failed", repo=repo["repo_url"], error=str(result)
+                    "repo_scan_failed", repo=repo["repo_url"], error=err_msg
                 )
+                scan_errors.append(f"{repo['repo_url']}: {err_msg}")
                 continue
             if result.get("skipped"):
                 skipped_count += 1
@@ -445,7 +448,8 @@ class GitCodebaseScannerTool(BaseTool):
         if not file_infos_all:
             if skipped_count == len(repos):
                 return {"scan_result": None, "_metadata": {"skipped": True, "reason": "no_code_change"}}
-            raise ToolExecutionError(ErrorCode.TOOL_001, "모든 레포 스캔 실패")
+            detail = "; ".join(scan_errors) if scan_errors else "파일 없음"
+            raise ToolExecutionError(ErrorCode.TOOL_001, f"모든 레포 스캔 실패: {detail}")
 
         scan_result: ScanResult = {
             "files": file_infos_all,
@@ -607,42 +611,60 @@ class GitCodebaseScannerTool(BaseTool):
         Returns:
             {module_stem: prefix} — 예: {"auth": "/api/auth", "orders": "/api/orders"}
         """
-        name_to_path = {PurePosixPath(p).name: p for p in all_paths}
+        name_to_paths: dict[str, list[str]] = {}
+        for p in all_paths:
+            name_to_paths.setdefault(PurePosixPath(p).name, []).append(p)
+
         prefix_map: dict[str, str] = {}
         for entry in ("main.py", "app.py"):
-            full_path = name_to_path.get(entry)
-            if full_path is None:
-                continue
-            try:
-                content = await adapter.get_file_content(full_path, branch)
-                parser = self._get_parser("python")
-                if parser is None:
-                    continue
-                tree = parser.parse(content)
-                for call_node in _find_nodes(tree.root_node, "call"):
-                    func_node = call_node.child_by_field_name("function")
-                    if not func_node or func_node.type != "attribute":
+            for full_path in name_to_paths.get(entry, []):
+                try:
+                    content = await adapter.get_file_content(full_path, branch)
+                    parser = self._get_parser("python")
+                    if parser is None:
                         continue
-                    if _node_text(func_node.child_by_field_name("attribute")) != "include_router":
-                        continue
-                    args = call_node.child_by_field_name("arguments")
-                    if not args:
-                        continue
-                    positional = [c for c in args.named_children if c.type != "keyword_argument"]
-                    if not positional:
-                        continue
-                    # "auth.router" → "auth", "auth_router" → "auth_router"
-                    router_ref = _node_text(positional[0])
-                    module_stem = router_ref.split(".")[0]
-                    prefix = ""
-                    for kw in args.named_children:
-                        if kw.type == "keyword_argument":
-                            if _node_text(kw.child_by_field_name("name")) == "prefix":
-                                prefix = _node_text(kw.child_by_field_name("value")).strip("\"'")
-                    if prefix and module_stem:
-                        prefix_map[module_stem] = prefix
-            except Exception as e:
-                self.logger.warning("router_prefix_parse_failed", entry=entry, error=str(e))
+                    tree = parser.parse(content)
+
+                    # import alias 역추적: "from X.Y import Z as W" → alias_map[W] = Y
+                    alias_map: dict[str, str] = {}
+                    for imp in _find_nodes(tree.root_node, "import_from_statement"):
+                        parent_mod = _node_text(imp.child_by_field_name("module_name") or imp.children[1])
+                        parent_stem = PurePosixPath(parent_mod.replace(".", "/")).name
+                        for child in imp.named_children:
+                            if child.type == "aliased_import":
+                                orig = _node_text(child.child_by_field_name("name"))
+                                alias = _node_text(child.child_by_field_name("alias"))
+                                alias_map[alias] = parent_stem
+                                alias_map[orig] = parent_stem
+                            elif child.type == "dotted_name":
+                                alias_map[_node_text(child)] = parent_stem
+
+                    for call_node in _find_nodes(tree.root_node, "call"):
+                        func_node = call_node.child_by_field_name("function")
+                        if not func_node or func_node.type != "attribute":
+                            continue
+                        if _node_text(func_node.child_by_field_name("attribute")) != "include_router":
+                            continue
+                        args = call_node.child_by_field_name("arguments")
+                        if not args:
+                            continue
+                        positional = [c for c in args.named_children if c.type != "keyword_argument"]
+                        if not positional:
+                            continue
+                        # "auth.router" → "auth", plain alias → alias_map 역추적
+                        router_ref = _node_text(positional[0])
+                        module_stem = router_ref.split(".")[0]
+                        if "." not in router_ref:
+                            module_stem = alias_map.get(module_stem, module_stem)
+                        prefix = ""
+                        for kw in args.named_children:
+                            if kw.type == "keyword_argument":
+                                if _node_text(kw.child_by_field_name("name")) == "prefix":
+                                    prefix = _node_text(kw.child_by_field_name("value")).strip("\"'")
+                        if prefix and module_stem:
+                            prefix_map[module_stem] = prefix
+                except Exception as e:
+                    self.logger.warning("router_prefix_parse_failed", path=full_path, error=str(e))
         return prefix_map
 
     @staticmethod
@@ -885,7 +907,9 @@ class GitCodebaseScannerTool(BaseTool):
         Args:
             adapter: Git 플랫폼 어댑터.
             branch: 대상 브랜치.
-            last_commit_hash: 이전 commit hash. 빈 문자열이면 diff 없이 HEAD 정보만 반환.
+            last_commit_hash: 이전 commit hash.
+                제공되면 last_commit_hash..HEAD 증분 diff,
+                없으면 HEAD~1..HEAD (가장 최근 커밋의 변경 내역)를 사용한다.
 
         Returns:
             GitDiff 또는 None (오류 시).
@@ -900,13 +924,20 @@ class GitCodebaseScannerTool(BaseTool):
             author_email = latest.get("author_email", "")
             commit_timestamp = latest.get("timestamp", "")
 
+            # last_commit_hash 없으면 HEAD~1을 기준으로 사용
+            parent_hash = (
+                last_commit_hash
+                if last_commit_hash and last_commit_hash != head_hash
+                else (commits[1]["hash"] if len(commits) > 1 else "")
+            )
+
             diff_detail: list[dict] = []
             changed_files: list[str] = []
             added_lines = 0
             deleted_lines = 0
 
-            if last_commit_hash and last_commit_hash != head_hash:
-                diff_detail = await adapter.get_diff(last_commit_hash, head_hash)
+            if parent_hash:
+                diff_detail = await adapter.get_diff(parent_hash, head_hash)
                 changed_files = [d["file"] for d in diff_detail]
                 added_lines = sum(d["added"] for d in diff_detail)
                 deleted_lines = sum(d["deleted"] for d in diff_detail)
@@ -927,7 +958,7 @@ class GitCodebaseScannerTool(BaseTool):
 
             return GitDiff(
                 commit_hash=head_hash,
-                prev_hash=last_commit_hash,
+                prev_hash=parent_hash,
                 changed_files=changed_files,
                 added_lines=added_lines,
                 deleted_lines=deleted_lines,
