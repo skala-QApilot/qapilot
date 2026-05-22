@@ -52,6 +52,7 @@ async def scenario_generation(request: Request) -> Any:
         "filter": _optional_filter(body),
         "tags": _optional_list(body, "tags"),
     }
+    _inject_git_options(body, options)
     return _start_pipeline(request, body, options)
 
 
@@ -71,6 +72,7 @@ async def code_change_detection(request: Request) -> Any:
         "filter": None,
         "tags": None,
     }
+    _inject_git_options(body, options)
     return _start_pipeline(request, body, options)
 
 
@@ -90,6 +92,7 @@ async def code_generation(request: Request) -> Any:
         "filter": None,
         "tags": None,
     }
+    _inject_git_options(body, options)
     return _start_pipeline(request, body, options)
 
 
@@ -109,6 +112,7 @@ async def test_run(request: Request) -> Any:
         "filter": _optional_filter(body) or "all",
         "tags": _optional_list(body, "tags"),
     }
+    _inject_git_options(body, options)
     return _start_pipeline(request, body, options)
 
 
@@ -167,7 +171,7 @@ async def _run_pipeline_task(
 ) -> None:
     """백그라운드에서 파이프라인을 실행하고 trace를 갱신한다."""
     try:
-        state = await run_pipeline(options, trace_id=trace_id)
+        state = await run_pipeline(options, qapilot_dir, trace_id=trace_id)
         update_trace(qapilot_dir, trace_id, dict(state))
     except Exception as e:
         error = f"{type(e).__name__}: {e}"
@@ -267,6 +271,39 @@ def _optional_filter(body: dict[str, Any]) -> RunFilter | None:
     if value in {"all", "failed", "affected"}:
         return cast(RunFilter, value)
     return None
+
+
+def _inject_git_options(body: dict[str, Any], options: RunOptions) -> RunOptions:
+    """Body 의 GitHub/GitLab 스캔 필드를 RunOptions 에 주입한다.
+
+    pipeline._codebase_scan 은 ``run_options.repo_url`` 또는 ``run_options.repos`` 가 있으면
+    GitCodebaseScannerTool(REST API 스캔) 로 분기한다. 둘 다 없으면 로컬 CodebaseScannerTool
+    로 fallback. 본 helper 는 body 에 해당 필드가 들어왔을 때만 options 에 추가하여
+    분기를 활성화한다.
+
+    필드:
+        - ``repo_url`` (str): 단일 레포 URL
+        - ``token`` (str): read-only 액세스 토큰 (PAT)
+        - ``branch`` (str): 스캔 대상 브랜치 (기본 main)
+        - ``local_path`` (str): 로컬 디렉토리 경로 (file:// 어댑터용, 선택)
+        - ``repos`` (list[dict]): 멀티 레포 형태
+    """
+    repo_url = _optional_str(body, "repo_url")
+    if repo_url:
+        options["repo_url"] = repo_url
+    token = _optional_str(body, "token")
+    if token:
+        options["token"] = token
+    branch = _optional_str(body, "branch")
+    if branch:
+        options["branch"] = branch
+    local_path = _optional_str(body, "local_path")
+    if local_path:
+        options["local_path"] = local_path
+    repos = body.get("repos")
+    if isinstance(repos, list) and repos:
+        options["repos"] = repos
+    return options
 
 
 def _chat_reply(message: str, quick_action: str | None) -> str:
