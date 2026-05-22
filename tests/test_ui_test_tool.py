@@ -588,114 +588,38 @@ async def test_role_name_selector_emits_invalid_selector_code(tool):
     assert warning_calls[0].kwargs.get("code") == ErrorCode.TOOL_UI_INVALID_SELECTOR
 
 
-# ── 이슈 #141 D fail-safe: assert_text fuzzy match graceful ─────────────
+# ── 이슈 #141 D fail-safe: 옵션 C — _run_dom_action 끝의 page-wide fuzzy ───
+# 본질 fix 2단계: _apply_action 안의 fail-safe → _run_dom_action 끝으로 이동.
+# chain attempt 마다 page.evaluate 호출 X (1회만), timeout 5s 명시.
 
 
-@pytest.mark.asyncio
-async def test_assert_text_fuzzy_match_above_threshold_recovers(tool):
-    """이슈 #141 D fail-safe: assert_text strict 실패 시 fuzzy match (difflib ratio)
-    임계값 0.6 이상이면 graceful pass. LLM 환각 expected ("로그인 완료") vs 실제
-    DOM ("로그인이 완료되었습니다") 같은 의미 유사 케이스 회복.
+def _patch_chain_all_fail(page):
+    """chain (옵션 A) + 옵션 B 모두 fail 시키는 mock 헬퍼.
+
+    selector_type 별 get_by_* 와 locator 의 click/fill 모두 fail (TimeoutError),
+    expect(...).to_be_visible/to_have_text 모두 fail. 결과적으로 _run_dom_action 의
+    chain loop 와 _fallback_dom_scan 모두 통과 못하고 옵션 C 도달.
     """
-    page = _mock_page()
-    locator = page.locator.return_value
-    locator.inner_text = AsyncMock(return_value="로그인이 완료되었습니다.")
-    tool.logger = MagicMock()
-
-    fake_assertion = MagicMock()
-    fake_assertion.to_have_text = AsyncMock(side_effect=AssertionError("text not matched"))
-
-    with patch("qapilot.tools.ui_test_tool.expect", return_value=fake_assertion):
-        await tool.run(_input({
-            "page": page, "tc_id": "TC-1",
-            "action_mapping": {"steps": [
-                {"step_no": 1, "action": "assert_text", "selector": "#msg",
-                 "selector_type": "css", "expected": "로그인 완료"},
-            ]},
-        }))
-
-    # fuzzy match 적중 → ui_assert_text_fuzzy_match info 로그 발행 (FALLBACK_USED 코드)
-    from qapilot.shared.errors import ErrorCode
-    info_calls = [c for c in tool.logger.info.call_args_list
-                  if c.args and c.args[0] == "ui_assert_text_fuzzy_match"]
-    assert len(info_calls) == 1
-    assert info_calls[0].kwargs.get("code") == ErrorCode.TOOL_UI_FALLBACK_USED
+    from playwright.async_api import TimeoutError as PWTimeoutError
+    # locator action 들 모두 timeout fail (옵션 A chain 의 _apply_action 진입 시)
+    mock_locator = page.locator.return_value
+    mock_locator.click = AsyncMock(side_effect=PWTimeoutError("not found"))
+    mock_locator.fill = AsyncMock(side_effect=PWTimeoutError("not found"))
 
 
 @pytest.mark.asyncio
-async def test_assert_text_fuzzy_match_below_threshold_raises(tool):
-    """이슈 #141 D fail-safe: fuzzy ratio 임계값 미달 → strict 에러 그대로 raise."""
+async def test_optionC_assert_substring_match_in_page_text_recovers(tool):
+    """이슈 #141 옵션 C: chain + 옵션 B 모두 fail 후 page-wide substring 매칭 → pass."""
+    from playwright.async_api import TimeoutError as PWTimeoutError
     page = _mock_page()
-    locator = page.locator.return_value
-    locator.inner_text = AsyncMock(return_value="완전히 다른 텍스트")
+    page.evaluate = AsyncMock(return_value="환영합니다 김주환님\n홈 페이지")
     tool.logger = MagicMock()
 
     fake_assertion = MagicMock()
-    fake_assertion.to_have_text = AsyncMock(side_effect=AssertionError("text not matched"))
+    fake_assertion.to_be_visible = AsyncMock(side_effect=PWTimeoutError("not found"))
 
-    with patch("qapilot.tools.ui_test_tool.expect", return_value=fake_assertion):
-        # 임계값 미달 — fail 그대로 (tool 의 run 은 graceful 흡수 후 step status=fail)
-        result = await tool.run(_input({
-            "page": page, "tc_id": "TC-1",
-            "action_mapping": {"steps": [
-                {"step_no": 1, "action": "assert_text", "selector": "#msg",
-                 "selector_type": "css", "expected": "환영합니다"},
-            ]},
-        }))
-    # fuzzy match info 로그 발행 X
-    info_calls = [c for c in tool.logger.info.call_args_list
-                  if c.args and c.args[0] == "ui_assert_text_fuzzy_match"]
-    assert len(info_calls) == 0
-    # step 결과 fail
-    ui_result = result.result["ui_result"]
-    assert ui_result["status"] == "fail"
-
-
-@pytest.mark.asyncio
-async def test_assert_text_fuzzy_match_substring_bonus_breaks_threshold(tool):
-    """이슈 #141 D fail-safe: expected 가 actual 의 substring 이면 0.2 가산점으로 임계값 통과."""
-    page = _mock_page()
-    locator = page.locator.return_value
-    # expected="환영" / actual="환영합니다 김주환님 — 메인 페이지" — substring 매칭
-    locator.inner_text = AsyncMock(return_value="환영합니다 김주환님 — 메인 페이지")
-    tool.logger = MagicMock()
-
-    fake_assertion = MagicMock()
-    fake_assertion.to_have_text = AsyncMock(side_effect=AssertionError("strict mismatch"))
-
-    with patch("qapilot.tools.ui_test_tool.expect", return_value=fake_assertion):
-        await tool.run(_input({
-            "page": page, "tc_id": "TC-1",
-            "action_mapping": {"steps": [
-                {"step_no": 1, "action": "assert_text", "selector": "#msg",
-                 "selector_type": "css", "expected": "환영"},
-            ]},
-        }))
-
-    info_calls = [c for c in tool.logger.info.call_args_list
-                  if c.args and c.args[0] == "ui_assert_text_fuzzy_match"]
-    assert len(info_calls) == 1
-
-
-# ── 이슈 #141 D fail-safe (확장): assert/assert_visible fuzzy match ─────
-
-
-@pytest.mark.asyncio
-async def test_assert_visible_substring_match_in_page_text_recovers(tool):
-    """이슈 #141 D fail-safe 확장: strict to_be_visible 실패 시 selector 텍스트가
-    페이지 textContent 안에 substring 으로 존재하면 graceful pass.
-
-    LLM 환각 selector="환영" 와 실제 페이지 textContent="환영합니다 김주환님" 매칭.
-    """
-    page = _mock_page()
-    locator = page.locator.return_value
-    locator.evaluate = AsyncMock(return_value="환영합니다 김주환님\n홈 페이지")
-    tool.logger = MagicMock()
-
-    fake_assertion = MagicMock()
-    fake_assertion.to_be_visible = AsyncMock(side_effect=AssertionError("element(s) not found"))
-
-    with patch("qapilot.tools.ui_test_tool.expect", return_value=fake_assertion):
+    with patch("qapilot.tools.ui_test_tool.expect", return_value=fake_assertion), \
+         patch.object(tool, "_fallback_dom_scan", AsyncMock(return_value=None)):
         await tool.run(_input({
             "page": page, "tc_id": "TC-1",
             "action_mapping": {"steps": [
@@ -706,27 +630,27 @@ async def test_assert_visible_substring_match_in_page_text_recovers(tool):
 
     from qapilot.shared.errors import ErrorCode
     info_calls = [c for c in tool.logger.info.call_args_list
-                  if c.args and c.args[0] == "ui_assert_visible_fuzzy_match"]
+                  if c.args and c.args[0] == "ui_assert_pagewide_fuzzy_match"]
     assert len(info_calls) == 1
     assert info_calls[0].kwargs.get("match_type") == "substring"
     assert info_calls[0].kwargs.get("code") == ErrorCode.TOOL_UI_FALLBACK_USED
+    # 핵심 검증: page.evaluate 1회만 호출 (chain attempt 마다 호출 안 됨)
+    page.evaluate.assert_awaited_once()
 
 
 @pytest.mark.asyncio
-async def test_assert_visible_fuzzy_match_above_threshold_recovers(tool):
-    """이슈 #141 D fail-safe 확장: 페이지 줄 단위 fuzzy ratio 0.6+ 적중 시 pass.
-
-    LLM 환각 selector="로그인이 완료되었습니다" vs 페이지 줄 "로그인 완료 — 환영합니다" — fuzzy 일치.
-    """
+async def test_optionC_assert_fuzzy_match_above_threshold_recovers(tool):
+    """옵션 C: substring 매칭 X 인데 fuzzy ratio 0.6+ 줄 적중 → pass."""
+    from playwright.async_api import TimeoutError as PWTimeoutError
     page = _mock_page()
-    locator = page.locator.return_value
-    locator.evaluate = AsyncMock(return_value="홈\n로그인 완료 — 환영합니다\n메뉴")
+    page.evaluate = AsyncMock(return_value="홈\n로그인 완료 — 환영합니다\n메뉴")
     tool.logger = MagicMock()
 
     fake_assertion = MagicMock()
-    fake_assertion.to_be_visible = AsyncMock(side_effect=AssertionError("not found"))
+    fake_assertion.to_be_visible = AsyncMock(side_effect=PWTimeoutError("not found"))
 
-    with patch("qapilot.tools.ui_test_tool.expect", return_value=fake_assertion):
+    with patch("qapilot.tools.ui_test_tool.expect", return_value=fake_assertion), \
+         patch.object(tool, "_fallback_dom_scan", AsyncMock(return_value=None)):
         await tool.run(_input({
             "page": page, "tc_id": "TC-1",
             "action_mapping": {"steps": [
@@ -736,23 +660,52 @@ async def test_assert_visible_fuzzy_match_above_threshold_recovers(tool):
         }))
 
     info_calls = [c for c in tool.logger.info.call_args_list
-                  if c.args and c.args[0] == "ui_assert_visible_fuzzy_match"]
+                  if c.args and c.args[0] == "ui_assert_pagewide_fuzzy_match"]
     assert len(info_calls) == 1
     assert info_calls[0].kwargs.get("match_type") == "fuzzy"
 
 
 @pytest.mark.asyncio
-async def test_assert_visible_no_match_raises(tool):
-    """이슈 #141 D fail-safe 확장: 페이지 어디서도 매칭 안 되면 strict fail 그대로."""
+async def test_optionC_assert_text_uses_expected_as_target(tool):
+    """옵션 C: assert_text 액션은 expected (selector 대신) 를 target_text 로 사용."""
+    from playwright.async_api import TimeoutError as PWTimeoutError
     page = _mock_page()
-    locator = page.locator.return_value
-    locator.evaluate = AsyncMock(return_value="완전히 다른 내용\n다른 줄")
+    page.evaluate = AsyncMock(return_value="환영합니다\n로그인이 완료되었습니다")
     tool.logger = MagicMock()
 
     fake_assertion = MagicMock()
-    fake_assertion.to_be_visible = AsyncMock(side_effect=AssertionError("not found"))
+    fake_assertion.to_have_text = AsyncMock(side_effect=PWTimeoutError("not matched"))
 
-    with patch("qapilot.tools.ui_test_tool.expect", return_value=fake_assertion):
+    with patch("qapilot.tools.ui_test_tool.expect", return_value=fake_assertion), \
+         patch.object(tool, "_fallback_dom_scan", AsyncMock(return_value=None)):
+        await tool.run(_input({
+            "page": page, "tc_id": "TC-1",
+            "action_mapping": {"steps": [
+                {"step_no": 1, "action": "assert_text", "selector": "#msg",
+                 "selector_type": "css", "expected": "로그인이 완료"},
+            ]},
+        }))
+
+    info_calls = [c for c in tool.logger.info.call_args_list
+                  if c.args and c.args[0] == "ui_assert_pagewide_fuzzy_match"]
+    assert len(info_calls) == 1
+    # expected ("로그인이 완료") 가 page_text ("로그인이 완료되었습니다") 의 substring
+    assert info_calls[0].kwargs.get("target") == "로그인이 완료"
+
+
+@pytest.mark.asyncio
+async def test_optionC_no_match_below_threshold_raises(tool):
+    """옵션 C: substring 매칭 X + fuzzy 임계값 미달 → 마지막 에러 그대로 raise (fail)."""
+    from playwright.async_api import TimeoutError as PWTimeoutError
+    page = _mock_page()
+    page.evaluate = AsyncMock(return_value="완전히 다른 내용\n관련 없는 텍스트")
+    tool.logger = MagicMock()
+
+    fake_assertion = MagicMock()
+    fake_assertion.to_be_visible = AsyncMock(side_effect=PWTimeoutError("not found"))
+
+    with patch("qapilot.tools.ui_test_tool.expect", return_value=fake_assertion), \
+         patch.object(tool, "_fallback_dom_scan", AsyncMock(return_value=None)):
         result = await tool.run(_input({
             "page": page, "tc_id": "TC-1",
             "action_mapping": {"steps": [
@@ -762,7 +715,29 @@ async def test_assert_visible_no_match_raises(tool):
         }))
 
     info_calls = [c for c in tool.logger.info.call_args_list
-                  if c.args and c.args[0] == "ui_assert_visible_fuzzy_match"]
+                  if c.args and c.args[0] == "ui_assert_pagewide_fuzzy_match"]
     assert len(info_calls) == 0
     ui_result = result.result["ui_result"]
     assert ui_result["status"] == "fail"
+
+
+@pytest.mark.asyncio
+async def test_optionC_skipped_for_non_assert_actions(tool):
+    """옵션 C: assert 계열이 아닌 action (click 등) 은 옵션 C 무관 — page.evaluate 호출 X."""
+    from playwright.async_api import TimeoutError as PWTimeoutError
+    page = _mock_page()
+    page.evaluate = AsyncMock(return_value="anything")
+    page.locator.return_value.click = AsyncMock(side_effect=PWTimeoutError("not found"))
+    tool.logger = MagicMock()
+
+    with patch.object(tool, "_fallback_dom_scan", AsyncMock(return_value=None)):
+        await tool.run(_input({
+            "page": page, "tc_id": "TC-1",
+            "action_mapping": {"steps": [
+                {"step_no": 1, "action": "click", "selector": "로그인",
+                 "selector_type": "text"},
+            ]},
+        }))
+
+    # click action — 옵션 C 진입 안 됨, page.evaluate 호출 0
+    page.evaluate.assert_not_awaited()

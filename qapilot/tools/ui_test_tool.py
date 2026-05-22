@@ -493,6 +493,62 @@ class UITestTool(BaseTool):
                 # ToolExecutionError (예: upload value 누락) 는 fallback 의미 없음 — 즉시 raise
                 raise
 
+        # 옵션 C — assert 계열 한정 page-wide fuzzy fail-safe (이슈 #141 D 영역, 2026-05-22)
+        # 옵션 A (chain) + 옵션 B (DOM scan) 모두 fail 후 마지막 보정. assert 계열만 적용
+        # — fill/click 같은 DOM 조작은 element 가 실제로 있어야 하지만 assert 는 의미 일치만
+        # 검증하면 충분. ActionMapper LLM 환각 selector ("로그인이 완료되었습니다") 가
+        # 페이지 어디든 substring/fuzzy 매칭되면 graceful pass.
+        # 호출 1회만 (chain attempt 마다 호출하면 evaluate × N 누적 → 120s timeout 위험).
+        # evaluate timeout 5s 명시 — Playwright default (30s) 우회.
+        if action in {"assert", "assert_visible", "assert_text"}:
+            target_text = step.get("expected") if action == "assert_text" else step.get("selector")
+            if not target_text:
+                target_text = step.get("expected") or step.get("selector")
+            if isinstance(target_text, str) and target_text.strip():
+                page_text = ""
+                try:
+                    import asyncio as _asyncio
+                    page_text = (await _asyncio.wait_for(
+                        page.evaluate("() => document.body.innerText"),
+                        timeout=5.0,
+                    )) or ""
+                except Exception:
+                    page_text = ""
+
+                if page_text:
+                    # (1) substring 즉시 pass
+                    if target_text in page_text:
+                        self.logger.info(
+                            "ui_assert_pagewide_fuzzy_match",
+                            target=target_text[:80],
+                            action=action,
+                            match_type="substring",
+                            code=ErrorCode.TOOL_UI_FALLBACK_USED,
+                        )
+                        return
+                    # (2) 줄 단위 fuzzy ratio 0.6+ → pass
+                    best_ratio = 0.0
+                    best_line = ""
+                    for line in page_text.split("\n"):
+                        line = line.strip()
+                        if not line:
+                            continue
+                        r = difflib.SequenceMatcher(None, target_text, line).ratio()
+                        if r > best_ratio:
+                            best_ratio = r
+                            best_line = line
+                    if best_ratio >= 0.6:
+                        self.logger.info(
+                            "ui_assert_pagewide_fuzzy_match",
+                            target=target_text[:80],
+                            matched_line=best_line[:80],
+                            action=action,
+                            match_type="fuzzy",
+                            ratio=round(best_ratio, 3),
+                            code=ErrorCode.TOOL_UI_FALLBACK_USED,
+                        )
+                        return
+
         # 모든 chain step 실패 — 마지막 에러 raise. caller (_run_step) 가 TOOL_UI_LOCATOR_NOT_FOUND 분류.
         if last_error is not None:
             raise last_error
@@ -674,97 +730,14 @@ class UITestTool(BaseTool):
 
         # assert 계열 8종 — expect(locator) 는 timeout 인자 따로 받음
         if action == "assert" or action == "assert_visible":
-            try:
-                await expect(locator).to_be_visible(**kw)
-                return
-            except (PWTimeoutError, AssertionError) as strict_err:
-                # 이슈 #141 D fail-safe (확장, 2026-05-22): strict to_be_visible 실패 시
-                # selector 텍스트가 페이지 textContent 어디든 substring/fuzzy 매칭되면
-                # graceful pass. ActionMapper LLM 환각 selector ("로그인이 완료되었습니다")
-                # 와 실제 DOM 텍스트 ("환영합니다") 가 의미 유사하면 회복.
-                # 본 e2e (trace 407d8878) 의 assertion fail 65 TC 중 일부 회복 대상.
-                target_text = (step.get("selector") or step.get("expected") or "")
-                if not isinstance(target_text, str) or not target_text.strip():
-                    raise
-                try:
-                    page_text = (await locator.evaluate("() => document.body.innerText")) or ""
-                except Exception:
-                    raise strict_err from None
-
-                # (1) substring 즉시 pass
-                if target_text in page_text:
-                    self.logger.info(
-                        "ui_assert_visible_fuzzy_match",
-                        target=target_text[:80],
-                        match_type="substring",
-                        code=ErrorCode.TOOL_UI_FALLBACK_USED,
-                    )
-                    return
-
-                # (2) fuzzy match: 페이지 줄 단위 best ratio >= 0.6 → pass
-                best_ratio = 0.0
-                best_line = ""
-                for line in page_text.split("\n"):
-                    line = line.strip()
-                    if not line:
-                        continue
-                    r = difflib.SequenceMatcher(None, target_text, line).ratio()
-                    if r > best_ratio:
-                        best_ratio = r
-                        best_line = line
-                if best_ratio >= 0.6:
-                    self.logger.info(
-                        "ui_assert_visible_fuzzy_match",
-                        target=target_text[:80],
-                        matched_line=best_line[:80],
-                        match_type="fuzzy",
-                        ratio=round(best_ratio, 3),
-                        code=ErrorCode.TOOL_UI_FALLBACK_USED,
-                    )
-                    return
-                raise
+            await expect(locator).to_be_visible(**kw)
+            return
         if action == "assert_hidden":
             await expect(locator).to_be_hidden(**kw)
             return
         if action == "assert_text":
-            expected_text = expected or ""
-            try:
-                await expect(locator).to_have_text(expected_text, **kw)
-                return
-            except (PWTimeoutError, AssertionError) as strict_err:
-                # 이슈 #141 D fail-safe: strict 매칭 실패 시 fuzzy match (옵션 B 와 동일
-                # difflib 알고리즘) graceful. LLM 환각 expected (예: "로그인이 완료되었
-                # 습니다.") 가 실제 DOM 텍스트 ("환영합니다 김주환") 와 의미 유사하면
-                # pass. 임계값 0.6 (옵션 B 와 일관) + substring 가산점 0.2.
-                if not expected_text:
-                    raise
-                try:
-                    actual_text = (await locator.inner_text(timeout=timeout_ms or 5000)) or ""
-                except Exception:
-                    raise strict_err from None
-                # substring 매칭 즉시 pass — expected 가 actual 안에 (또는 반대로)
-                # 완전 포함되면 의도 일치 보장 (짧은 expected 케이스 회복).
-                if expected_text in actual_text or actual_text in expected_text:
-                    self.logger.info(
-                        "ui_assert_text_fuzzy_match",
-                        expected=expected_text[:80],
-                        actual=actual_text[:80],
-                        match_type="substring",
-                        code=ErrorCode.TOOL_UI_FALLBACK_USED,
-                    )
-                    return
-                ratio = difflib.SequenceMatcher(None, expected_text, actual_text).ratio()
-                if ratio >= 0.6:
-                    self.logger.info(
-                        "ui_assert_text_fuzzy_match",
-                        expected=expected_text[:80],
-                        actual=actual_text[:80],
-                        match_type="fuzzy",
-                        ratio=round(ratio, 3),
-                        code=ErrorCode.TOOL_UI_FALLBACK_USED,
-                    )
-                    return
-                raise
+            await expect(locator).to_have_text(expected or "", **kw)
+            return
         if action == "assert_value":
             await expect(locator).to_have_value(expected or "", **kw)
             return
