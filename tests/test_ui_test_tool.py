@@ -586,3 +586,158 @@ async def test_role_name_selector_emits_invalid_selector_code(tool):
                      if c.args and c.args[0] == "ui_invalid_selector_fallback"]
     assert len(warning_calls) == 1
     assert warning_calls[0].kwargs.get("code") == ErrorCode.TOOL_UI_INVALID_SELECTOR
+
+
+# ── 이슈 #141 D fail-safe: 옵션 C — _run_dom_action 끝의 page-wide fuzzy ───
+# 본질 fix 2단계: _apply_action 안의 fail-safe → _run_dom_action 끝으로 이동.
+# chain attempt 마다 page.evaluate 호출 X (1회만), timeout 5s 명시.
+
+
+def _patch_chain_all_fail(page):
+    """chain (옵션 A) + 옵션 B 모두 fail 시키는 mock 헬퍼.
+
+    selector_type 별 get_by_* 와 locator 의 click/fill 모두 fail (TimeoutError),
+    expect(...).to_be_visible/to_have_text 모두 fail. 결과적으로 _run_dom_action 의
+    chain loop 와 _fallback_dom_scan 모두 통과 못하고 옵션 C 도달.
+    """
+    from playwright.async_api import TimeoutError as PWTimeoutError
+    # locator action 들 모두 timeout fail (옵션 A chain 의 _apply_action 진입 시)
+    mock_locator = page.locator.return_value
+    mock_locator.click = AsyncMock(side_effect=PWTimeoutError("not found"))
+    mock_locator.fill = AsyncMock(side_effect=PWTimeoutError("not found"))
+
+
+@pytest.mark.asyncio
+async def test_optionC_assert_substring_match_in_page_text_recovers(tool):
+    """이슈 #141 옵션 C: chain + 옵션 B 모두 fail 후 page-wide substring 매칭 → pass."""
+    from playwright.async_api import TimeoutError as PWTimeoutError
+    page = _mock_page()
+    page.evaluate = AsyncMock(return_value="환영합니다 김주환님\n홈 페이지")
+    tool.logger = MagicMock()
+
+    fake_assertion = MagicMock()
+    fake_assertion.to_be_visible = AsyncMock(side_effect=PWTimeoutError("not found"))
+
+    with patch("qapilot.tools.ui_test_tool.expect", return_value=fake_assertion), \
+         patch.object(tool, "_fallback_dom_scan", AsyncMock(return_value=None)):
+        await tool.run(_input({
+            "page": page, "tc_id": "TC-1",
+            "action_mapping": {"steps": [
+                {"step_no": 1, "action": "assert", "selector": "환영",
+                 "selector_type": "text"},
+            ]},
+        }))
+
+    from qapilot.shared.errors import ErrorCode
+    info_calls = [c for c in tool.logger.info.call_args_list
+                  if c.args and c.args[0] == "ui_assert_pagewide_fuzzy_match"]
+    assert len(info_calls) == 1
+    assert info_calls[0].kwargs.get("match_type") == "substring"
+    assert info_calls[0].kwargs.get("code") == ErrorCode.TOOL_UI_FALLBACK_USED
+    # 핵심 검증: page.evaluate 1회만 호출 (chain attempt 마다 호출 안 됨)
+    page.evaluate.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_optionC_assert_fuzzy_match_above_threshold_recovers(tool):
+    """옵션 C: substring 매칭 X 인데 fuzzy ratio 0.6+ 줄 적중 → pass."""
+    from playwright.async_api import TimeoutError as PWTimeoutError
+    page = _mock_page()
+    page.evaluate = AsyncMock(return_value="홈\n로그인 완료 — 환영합니다\n메뉴")
+    tool.logger = MagicMock()
+
+    fake_assertion = MagicMock()
+    fake_assertion.to_be_visible = AsyncMock(side_effect=PWTimeoutError("not found"))
+
+    with patch("qapilot.tools.ui_test_tool.expect", return_value=fake_assertion), \
+         patch.object(tool, "_fallback_dom_scan", AsyncMock(return_value=None)):
+        await tool.run(_input({
+            "page": page, "tc_id": "TC-1",
+            "action_mapping": {"steps": [
+                {"step_no": 1, "action": "assert_visible", "selector": "로그인 완료되었습니다",
+                 "selector_type": "text"},
+            ]},
+        }))
+
+    info_calls = [c for c in tool.logger.info.call_args_list
+                  if c.args and c.args[0] == "ui_assert_pagewide_fuzzy_match"]
+    assert len(info_calls) == 1
+    assert info_calls[0].kwargs.get("match_type") == "fuzzy"
+
+
+@pytest.mark.asyncio
+async def test_optionC_assert_text_uses_expected_as_target(tool):
+    """옵션 C: assert_text 액션은 expected (selector 대신) 를 target_text 로 사용."""
+    from playwright.async_api import TimeoutError as PWTimeoutError
+    page = _mock_page()
+    page.evaluate = AsyncMock(return_value="환영합니다\n로그인이 완료되었습니다")
+    tool.logger = MagicMock()
+
+    fake_assertion = MagicMock()
+    fake_assertion.to_have_text = AsyncMock(side_effect=PWTimeoutError("not matched"))
+
+    with patch("qapilot.tools.ui_test_tool.expect", return_value=fake_assertion), \
+         patch.object(tool, "_fallback_dom_scan", AsyncMock(return_value=None)):
+        await tool.run(_input({
+            "page": page, "tc_id": "TC-1",
+            "action_mapping": {"steps": [
+                {"step_no": 1, "action": "assert_text", "selector": "#msg",
+                 "selector_type": "css", "expected": "로그인이 완료"},
+            ]},
+        }))
+
+    info_calls = [c for c in tool.logger.info.call_args_list
+                  if c.args and c.args[0] == "ui_assert_pagewide_fuzzy_match"]
+    assert len(info_calls) == 1
+    # expected ("로그인이 완료") 가 page_text ("로그인이 완료되었습니다") 의 substring
+    assert info_calls[0].kwargs.get("target") == "로그인이 완료"
+
+
+@pytest.mark.asyncio
+async def test_optionC_no_match_below_threshold_raises(tool):
+    """옵션 C: substring 매칭 X + fuzzy 임계값 미달 → 마지막 에러 그대로 raise (fail)."""
+    from playwright.async_api import TimeoutError as PWTimeoutError
+    page = _mock_page()
+    page.evaluate = AsyncMock(return_value="완전히 다른 내용\n관련 없는 텍스트")
+    tool.logger = MagicMock()
+
+    fake_assertion = MagicMock()
+    fake_assertion.to_be_visible = AsyncMock(side_effect=PWTimeoutError("not found"))
+
+    with patch("qapilot.tools.ui_test_tool.expect", return_value=fake_assertion), \
+         patch.object(tool, "_fallback_dom_scan", AsyncMock(return_value=None)):
+        result = await tool.run(_input({
+            "page": page, "tc_id": "TC-1",
+            "action_mapping": {"steps": [
+                {"step_no": 1, "action": "assert", "selector": "환영합니다",
+                 "selector_type": "text"},
+            ]},
+        }))
+
+    info_calls = [c for c in tool.logger.info.call_args_list
+                  if c.args and c.args[0] == "ui_assert_pagewide_fuzzy_match"]
+    assert len(info_calls) == 0
+    ui_result = result.result["ui_result"]
+    assert ui_result["status"] == "fail"
+
+
+@pytest.mark.asyncio
+async def test_optionC_skipped_for_non_assert_actions(tool):
+    """옵션 C: assert 계열이 아닌 action (click 등) 은 옵션 C 무관 — page.evaluate 호출 X."""
+    from playwright.async_api import TimeoutError as PWTimeoutError
+    page = _mock_page()
+    page.evaluate = AsyncMock(return_value="anything")
+    page.locator.return_value.click = AsyncMock(side_effect=PWTimeoutError("not found"))
+    tool.logger = MagicMock()
+
+    with patch.object(tool, "_fallback_dom_scan", AsyncMock(return_value=None)):
+        await tool.run(_input({
+            "page": page, "tc_id": "TC-1",
+            "action_mapping": {"steps": [
+                {"step_no": 1, "action": "click", "selector": "로그인",
+                 "selector_type": "text"},
+            ]},
+        }))
+
+    # click action — 옵션 C 진입 안 됨, page.evaluate 호출 0
+    page.evaluate.assert_not_awaited()
