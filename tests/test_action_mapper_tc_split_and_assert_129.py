@@ -28,14 +28,10 @@ from qapilot.agents.action_mapper_agent import (
 )
 
 
-def _make_agent() -> ActionMapperAgent:
+def _make_agent(mock_llm_client: MagicMock) -> ActionMapperAgent:
     agent = ActionMapperAgent.__new__(ActionMapperAgent)
     agent.logger = MagicMock()
-    agent.llm = MagicMock()
-    agent.llm.chat = AsyncMock()
-    agent.llm.total_input_tokens = 0
-    agent.llm.total_output_tokens = 0
-    agent.llm.total_cost_usd = 0.0
+    agent.llm = mock_llm_client
     agent.prompts = MagicMock()
     agent.prompts.system = MagicMock(return_value="SYSTEM")
     agent.prompts.render = MagicMock(
@@ -75,9 +71,9 @@ def _llm_response_with_mapping(tc_id: str, steps: list[dict] | None = None) -> M
 
 
 @pytest.mark.asyncio
-async def test_execute_splits_into_per_tc_calls():
+async def test_execute_splits_into_per_tc_calls(mock_llm_client):
     """N TS × M TC = N*M 개 LLM 호출 (TC-별 분할)."""
-    agent = _make_agent()
+    agent = _make_agent(mock_llm_client)
     agent.llm.chat = AsyncMock(side_effect=[
         _llm_response_with_mapping("TS-001-TC-01"),
         _llm_response_with_mapping("TS-001-TC-02"),
@@ -96,10 +92,10 @@ async def test_execute_splits_into_per_tc_calls():
 
 
 @pytest.mark.asyncio
-async def test_execute_partial_failure_skips_only_failed_tc():
+async def test_execute_partial_failure_skips_only_failed_tc(mock_llm_client):
     """가운데 TC LLM 응답 JSON parse 실패 → 그 TC 만 skip, 나머지 정상."""
     import json as _json
-    agent = _make_agent()
+    agent = _make_agent(mock_llm_client)
     agent.llm.chat = AsyncMock(side_effect=[
         _llm_response_with_mapping("TC-A"),
         MagicMock(content="not valid json"),  # JSON parse 실패
@@ -120,9 +116,9 @@ async def test_execute_partial_failure_skips_only_failed_tc():
 
 
 @pytest.mark.asyncio
-async def test_execute_all_failure_returns_empty_with_failed_tcs():
+async def test_execute_all_failure_returns_empty_with_failed_tcs(mock_llm_client):
     """모든 TC LLM 실패 → mappings 빈 list / failed_tcs N건."""
-    agent = _make_agent()
+    agent = _make_agent(mock_llm_client)
     agent.llm.chat = AsyncMock(side_effect=[
         MagicMock(content="invalid 1"),
         MagicMock(content="invalid 2"),
@@ -136,9 +132,9 @@ async def test_execute_all_failure_returns_empty_with_failed_tcs():
 
 
 @pytest.mark.asyncio
-async def test_execute_empty_scenarios_or_tcs():
+async def test_execute_empty_scenarios_or_tcs(mock_llm_client):
     """scenarios 비어있음 또는 모든 TS 의 test_cases 빈 list → 빈 결과 + LLM 호출 X."""
-    agent = _make_agent()
+    agent = _make_agent(mock_llm_client)
     agent.llm.chat = AsyncMock(side_effect=AssertionError("호출되면 안 됨"))
 
     result1 = await agent._execute({"scenarios": [], "scan_result": None}, {})
@@ -155,9 +151,9 @@ async def test_execute_empty_scenarios_or_tcs():
 
 
 @pytest.mark.asyncio
-async def test_execute_concurrency_respects_semaphore():
+async def test_execute_concurrency_respects_semaphore(mock_llm_client):
     """동시 LLM 호출이 _MAX_CONCURRENT_LLM_CALLS 초과하지 않음."""
-    agent = _make_agent()
+    agent = _make_agent(mock_llm_client)
     in_flight = 0
     max_in_flight = 0
 
@@ -181,10 +177,10 @@ async def test_execute_concurrency_respects_semaphore():
 
 
 @pytest.mark.asyncio
-async def test_call_single_tc_passes_scenario_slice():
+async def test_call_single_tc_passes_scenario_slice(mock_llm_client):
     """_call_single_tc 가 단일 TC slice 만 prompt 에 전달 (다른 TC 의 의도 누락 X)."""
     import asyncio
-    agent = _make_agent()
+    agent = _make_agent(mock_llm_client)
     agent.llm.chat = AsyncMock(return_value=_llm_response_with_mapping("TC-A"))
     sem = asyncio.Semaphore(1)
 
@@ -208,9 +204,9 @@ async def test_call_single_tc_passes_scenario_slice():
 # ── Step B: assert step 환각 차단 (frontend.json 인덱스 매칭) ────────────────
 
 
-def test_normalize_assert_selector_exact_match_returns_none():
+def test_normalize_assert_selector_exact_match_returns_none(mock_llm_client):
     """selector 가 인덱스 element text 와 정확 일치 → 정규화 불필요 (None 반환 = 원본 유지)."""
-    agent = _make_agent()
+    agent = _make_agent(mock_llm_client)
     agent._frontend_dom_index = [
         {"tag": "div", "text": "회원가입 완료", "testid": "", "placeholder": "", "label": "",
          "name": "", "id": "", "file": "Signup.vue"}
@@ -221,9 +217,9 @@ def test_normalize_assert_selector_exact_match_returns_none():
     assert result is None  # 원본 유지
 
 
-def test_normalize_assert_selector_fuzzy_match_to_testid():
+def test_normalize_assert_selector_fuzzy_match_to_testid(mock_llm_client):
     """fuzzy match 적중 → testid 우선순위로 정규화."""
-    agent = _make_agent()
+    agent = _make_agent(mock_llm_client)
     agent._frontend_dom_index = [
         {"tag": "div", "text": "회원가입 완료 페이지로 이동", "placeholder": "",
          "label": "", "testid": "signup-success", "name": "", "id": "", "file": "Signup.vue"}
@@ -236,9 +232,9 @@ def test_normalize_assert_selector_fuzzy_match_to_testid():
     assert result == ("signup-success", "testid")
 
 
-def test_normalize_assert_selector_below_threshold_returns_none():
+def test_normalize_assert_selector_below_threshold_returns_none(mock_llm_client):
     """fuzzy score 임계값 미달 → None (UITestTool 런타임 보정에 위임)."""
-    agent = _make_agent()
+    agent = _make_agent(mock_llm_client)
     agent._frontend_dom_index = [
         {"tag": "button", "text": "주문하기", "testid": "", "placeholder": "",
          "label": "", "name": "", "id": "", "file": "Plans.vue"}
@@ -249,9 +245,9 @@ def test_normalize_assert_selector_below_threshold_returns_none():
     assert result is None
 
 
-def test_normalize_assert_selector_empty_index_returns_none():
+def test_normalize_assert_selector_empty_index_returns_none(mock_llm_client):
     """인덱스 빈 list → None."""
-    agent = _make_agent()
+    agent = _make_agent(mock_llm_client)
     agent._frontend_dom_index = []
     result = agent._normalize_assert_selector_via_index(
         "회원가입 완료", "text", "TC-1", 1
@@ -259,13 +255,13 @@ def test_normalize_assert_selector_empty_index_returns_none():
     assert result is None
 
 
-def test_normalize_assert_selector_priority_testid_over_placeholder():
+def test_normalize_assert_selector_priority_testid_over_placeholder(mock_llm_client):
     """fuzzy 매치 element 에 testid + placeholder + label 모두 있으면 testid 우선.
 
     정확 매치 시에는 원본 유지가 의도된 동작. fuzzy match (target 이 element 의 어떤
     candidate 와도 정확히 일치 안 하나 ratio 임계값 통과) 케이스에서만 정규화 발화.
     """
-    agent = _make_agent()
+    agent = _make_agent(mock_llm_client)
     agent._frontend_dom_index = [
         {"tag": "input", "text": "", "placeholder": "이메일 입력", "label": "이메일 라벨",
          "testid": "email-input", "name": "", "id": "", "file": "Login.vue"}
@@ -275,9 +271,9 @@ def test_normalize_assert_selector_priority_testid_over_placeholder():
     assert result == ("email-input", "testid")
 
 
-def test_normalize_assert_selector_falls_back_to_label_when_no_testid():
+def test_normalize_assert_selector_falls_back_to_label_when_no_testid(mock_llm_client):
     """testid 없으면 placeholder → label → text 순서."""
-    agent = _make_agent()
+    agent = _make_agent(mock_llm_client)
     agent._frontend_dom_index = [
         {"tag": "label", "text": "비밀번호", "placeholder": "", "label": "비밀번호",
          "testid": "", "name": "", "id": "", "file": "Login.vue"}
@@ -286,9 +282,9 @@ def test_normalize_assert_selector_falls_back_to_label_when_no_testid():
     assert result is None  # text 정확 매치이므로 원본 유지
 
 
-def test_normalize_assert_selector_called_only_for_assert_actions():
+def test_normalize_assert_selector_called_only_for_assert_actions(mock_llm_client):
     """_normalize_selector_fields 는 assert action 에서만 인덱스 정규화 호출."""
-    agent = _make_agent()
+    agent = _make_agent(mock_llm_client)
     agent._frontend_dom_index = [
         {"tag": "button", "text": "환영합니다", "testid": "welcome-banner",
          "placeholder": "", "label": "", "name": "", "id": "", "file": "x.vue"}
@@ -308,9 +304,9 @@ def test_normalize_assert_selector_called_only_for_assert_actions():
     assert st2 == "testid"
 
 
-def test_normalize_assert_selector_substring_bonus_breaks_threshold():
+def test_normalize_assert_selector_substring_bonus_breaks_threshold(mock_llm_client):
     """포함관계 가산점 (+0.2) 으로 임계값 (0.6) 통과 케이스."""
-    agent = _make_agent()
+    agent = _make_agent(mock_llm_client)
     agent._frontend_dom_index = [
         {"tag": "input", "text": "", "placeholder": "이메일을 입력하세요",
          "label": "", "testid": "", "name": "", "id": "", "file": "Login.vue"}
@@ -321,9 +317,9 @@ def test_normalize_assert_selector_substring_bonus_breaks_threshold():
     assert result == ("이메일을 입력하세요", "placeholder")
 
 
-def test_normalize_assert_selector_empty_target_returns_none():
+def test_normalize_assert_selector_empty_target_returns_none(mock_llm_client):
     """selector 가 빈 문자열 → None."""
-    agent = _make_agent()
+    agent = _make_agent(mock_llm_client)
     agent._frontend_dom_index = [
         {"tag": "button", "text": "확인", "testid": "ok", "placeholder": "",
          "label": "", "name": "", "id": "", "file": "x.vue"}
@@ -343,13 +339,13 @@ def test_assert_action_constants_cover_all_assert_variants():
 
 
 @pytest.mark.asyncio
-async def test_per_tc_llm_client_created_for_each_tc():
+async def test_per_tc_llm_client_created_for_each_tc(mock_llm_client):
     """이슈 #140: TC 마다 _create_tc_llm 호출 — agent 의 self.llm 누적 정책 우회.
 
     PR #130 의 'TC-별 분할 = 한 TC = 1 task' 의도가 LLMClient 의 'agent = 1 task'
     누적과 충돌해서 SYSTEM_002 로 후반 TC skip 되던 문제 회피 검증.
     """
-    agent = _make_agent()
+    agent = _make_agent(mock_llm_client)
     agent.llm.chat = AsyncMock(side_effect=[
         _llm_response_with_mapping("TC-A"),
         _llm_response_with_mapping("TC-B"),
@@ -374,9 +370,9 @@ async def test_per_tc_llm_client_created_for_each_tc():
 
 
 @pytest.mark.asyncio
-async def test_per_tc_llm_accumulates_to_agent_llm_for_reporting():
+async def test_per_tc_llm_accumulates_to_agent_llm_for_reporting(mock_llm_client):
     """per-TC LLMClient 의 토큰/비용이 agent.llm 에 누적 합산 (agent_complete 보고용)."""
-    agent = _make_agent()
+    agent = _make_agent(mock_llm_client)
     agent.llm.chat = AsyncMock(return_value=_llm_response_with_mapping("TC-A"))
     # _create_tc_llm 이 반환한 mock 의 토큰/비용 시뮬레이션
     def _mock_create_tc_llm_with_usage():

@@ -1,9 +1,10 @@
 # QApilot 구현 플랜
 
-> **Version**: 1.11  
-> **최종 수정일**: 2026-05-20  
+> **Version**: 1.16  
+> **최종 수정일**: 2026-05-22  
 > **기반 문서**: 요구사항정의서 v0.4 / 개발표준정의서 v0.4  
 > **변경 이력**:  
+> - v1.16 (2026-05-22): **단위 테스트 정책 §단위 테스트 fixture 명문화 + tests/conftest.py 통합 fixture 신설** (이슈 #143). 본인 메모리 사례 #1 (PR #138 mock 함정 — `page.wait_for_response` 같이 실 Playwright Page 에 없는 메서드를 `AsyncMock()` 으로 주입해서 단위 테스트 통과 + e2e 통합 단계에서 6일 잠복 후 9 TC AttributeError 폭발) 의 진원 차단. **새 정책**: 본인 영역 (A+D) 의 모든 mock fixture 는 `MagicMock(spec=RealClass)` 강제 — 실 API 에 없는 attribute 주입 시 즉시 AttributeError. **tests/conftest.py 4종 fixture 통합**: `mock_page` (spec=Page) / `mock_page_with_distinct_locators` (chain entry 검증용) / `mock_llm_client` (spec=LLMClient) / `mock_base_tool` (spec=BaseTool). 9 파일 (UITestTool 3 + ActionMapper/CodeGenerator/CrossCheck 4 + pipeline 2) 의 helper 함수 (`_mock_page` / `_make_agent` / inline `fake_tool`) → fixture 인자 주입 패턴으로 변환. pytest 표준 패턴 도입 + DRY + 미래 본인 PR 의 단위 테스트 자동 안전 보장. Stage 0 (도구 정상) 마지막 견고성 layer 완성. 회귀 0 (변경 9 파일 195 테스트 전수 통과).
 > - v1.0 (2026-05-07): 최초 작성. Orchestrator 고정 DAG 전환, HITL 범위 축소, 리포트 단일 형식 반영
 > - v1.1 (2026-05-07): generate/test 파이프라인 분리 확정. generate=Layer1만, test=Layer2~3만
 > - v1.2 (2026-05-11): HITL 모듈 제거. generate를 generate_scenarios/generate_code 2단계로 추가 분리. 사용자는 두 명령 사이에서 시나리오를 자유롭게 수정·삭제 가능
@@ -627,6 +628,45 @@ v1.13 추가 4종 (이슈 #147, 2026-05-21): PR #124 / #134 본문에서 약속�
 - 출력: Pydantic 스키마로 형식 강제
 - 행동: Agent별 호출 가능 Tool을 config에 화이트리스트 정의
 - 데이터: .env, DB 접속정보, 개인정보, DB 원본 → LLM 전송 금지
+
+### 7.7 단위 테스트 정책 (v1.16, 이슈 #143)
+
+**원칙 — strict spec 강제**:
+- 모든 mock 은 `MagicMock(spec=RealClass)` 사용. `MagicMock()` (spec 없음) 금지.
+- 실 API 에 없는 attribute 를 mock 에 주입하려 하면 즉시 AttributeError. 단위 테스트 단계에서 함정 차단.
+- 본인 메모리 사례 #1 (PR #138, 2026-05-15) 의 진원: `page.wait_for_response = AsyncMock()` 같이 실 Playwright `Page` 에 없는 메서드를 mock 에 주입 → 6일 잠복 후 e2e 통합에서 9 TC AttributeError 폭발.
+
+**구조 — tests/conftest.py 통합 fixture**:
+- `mock_page` (spec=`playwright.async_api.Page`) — 공유 locator 패턴, UITestTool 일반 검증용
+- `mock_page_with_distinct_locators` (spec=Page) — get_by_* 별 distinct Locator (옵션 A chain entry 검증용)
+- `mock_llm_client` (spec=`qapilot.shared.llm_client.LLMClient`) — Agent 단위 테스트의 self.llm mock
+- `mock_base_tool` (spec=`qapilot.tools.base_tool.BaseTool`) — pipeline 노드의 tool.run mock
+
+**사용 패턴**:
+```python
+# ❌ 금지 (helper 함수 + spec 없는 MagicMock)
+def _mock_page() -> MagicMock:
+    page = MagicMock()  # spec 없음 — 함정 패턴
+    page.wait_for_response = AsyncMock()  # 실 API 에 없는데 주입됨
+    return page
+
+def test_foo(tool):
+    page = _mock_page()
+    ...
+
+# ✅ 권장 (conftest fixture 주입)
+def test_foo(tool, mock_page):  # mock_page = conftest fixture (spec=Page)
+    # page.wait_for_response = AsyncMock()  # ← AttributeError 즉시
+    ...
+```
+
+**적용 범위**:
+- A + D 의 모든 mock fixture 는 본 정책 준수
+- 인라인 mock (단발성, 한 테스트 안에서만) 은 `MagicMock(spec=RealClass)` 인라인 적용 가능 (fixture 통합은 가독성 trade-off)
+- 외부 라이브러리 (langchain / playwright) 의 deep object 는 spec 정합 어려운 경우 inline mock 정당
+
+**예외**:
+- `agent.prompts` 같은 자체 클래스 (PromptLoader) 는 본 정책 후속 확장 (현재 본 정책의 적용 범위 = Page/Locator/LLMClient/BaseTool)
 
 ---
 

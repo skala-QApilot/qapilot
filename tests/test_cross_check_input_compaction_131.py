@@ -32,11 +32,10 @@ from qapilot.agents.cross_check_agent import (
 )
 
 
-def _make_agent() -> CrossCheckAgent:
+def _make_agent(mock_llm_client: MagicMock) -> CrossCheckAgent:
     agent = CrossCheckAgent.__new__(CrossCheckAgent)
     agent.logger = MagicMock()
-    agent.llm = MagicMock()
-    agent.llm.chat = AsyncMock()
+    agent.llm = mock_llm_client
     agent.prompts = MagicMock()
     agent.prompts.system = MagicMock(return_value="SYSTEM")
     agent.prompts.render = MagicMock(side_effect=lambda **kw: f"USER<{kw['context'][:80]}>")
@@ -82,8 +81,8 @@ def test_stringify_str_passthrough():
 # ── _compact_ui_result ─────────────────────────────────────────────────────
 
 
-def test_compact_ui_removes_screenshot_path():
-    agent = _make_agent()
+def test_compact_ui_removes_screenshot_path(mock_llm_client):
+    agent = _make_agent(mock_llm_client)
     ui = {
         "tc_id": "TC-1", "status": "fail",
         "steps": [
@@ -98,9 +97,9 @@ def test_compact_ui_removes_screenshot_path():
     assert out["tc_id"] == "TC-1"
 
 
-def test_compact_ui_truncates_long_error():
+def test_compact_ui_truncates_long_error(mock_llm_client):
     """assertion 패턴 없는 long error 는 _MAX_ERROR_CHARS 로 cap."""
-    agent = _make_agent()
+    agent = _make_agent(mock_llm_client)
     long_error = "TOOL_UI_LOCATOR_NOT_FOUND: " + "x" * 5000
     ui = {"steps": [{"step_no": 1, "action": "fill", "error": long_error}]}
     out = agent._compact_ui_result(ui)
@@ -109,8 +108,8 @@ def test_compact_ui_truncates_long_error():
     assert "more chars" in err
 
 
-def test_compact_ui_keeps_last_5_console_logs():
-    agent = _make_agent()
+def test_compact_ui_keeps_last_5_console_logs(mock_llm_client):
+    agent = _make_agent(mock_llm_client)
     ui = {"steps": [{
         "step_no": 1, "action": "fill",
         "console_logs": [f"log {i}" for i in range(20)],
@@ -121,8 +120,8 @@ def test_compact_ui_keeps_last_5_console_logs():
     assert logs == ["log 15", "log 16", "log 17", "log 18", "log 19"]
 
 
-def test_compact_ui_handles_none_input():
-    agent = _make_agent()
+def test_compact_ui_handles_none_input(mock_llm_client):
+    agent = _make_agent(mock_llm_client)
     assert agent._compact_ui_result(None) == {}  # type: ignore[arg-type]
     assert agent._compact_ui_result({}) == {"steps": []}
 
@@ -130,8 +129,8 @@ def test_compact_ui_handles_none_input():
 # ── _compact_api_trace ──────────────────────────────────────────────────────
 
 
-def test_compact_api_removes_headers():
-    agent = _make_agent()
+def test_compact_api_removes_headers(mock_llm_client):
+    agent = _make_agent(mock_llm_client)
     api = {
         "tc_id": "TC-1", "total_calls": 1,
         "calls": [{
@@ -151,8 +150,8 @@ def test_compact_api_removes_headers():
     assert call["status_code"] == 200
 
 
-def test_compact_api_truncates_large_body():
-    agent = _make_agent()
+def test_compact_api_truncates_large_body(mock_llm_client):
+    agent = _make_agent(mock_llm_client)
     big_body = "x" * 5000
     api = {"calls": [{"request_body": big_body, "response_body": big_body, "status_code": 200}]}
     out = agent._compact_api_trace(api)
@@ -161,9 +160,9 @@ def test_compact_api_truncates_large_body():
     assert "more chars" in call["request_body"]
 
 
-def test_compact_api_converts_dict_body_to_json_string():
+def test_compact_api_converts_dict_body_to_json_string(mock_llm_client):
     """small dict body → JSON 문자열 (변환만, 핵심 필드 추출 트리거 안 함)."""
-    agent = _make_agent()
+    agent = _make_agent(mock_llm_client)
     api = {"calls": [{
         "request_body": {"email": "a@b.c", "password": "secret"},
         "status_code": 200,
@@ -173,9 +172,9 @@ def test_compact_api_converts_dict_body_to_json_string():
     assert out["calls"][0]["request_body"] == '{"email": "a@b.c", "password": "secret"}'
 
 
-def test_compact_api_slices_to_max_calls_with_failed_priority():
+def test_compact_api_slices_to_max_calls_with_failed_priority(mock_llm_client):
     """calls > _MAX_API_CALLS → 실패 호출 우선 + 나머지 first/last 분할."""
-    agent = _make_agent()
+    agent = _make_agent(mock_llm_client)
     # 100 calls — 5개 실패 (인덱스 50~54), 나머지 정상
     calls = []
     for i in range(100):
@@ -191,9 +190,9 @@ def test_compact_api_slices_to_max_calls_with_failed_priority():
     assert len(failed_in_out) == 5
 
 
-def test_compact_api_under_limit_keeps_all():
+def test_compact_api_under_limit_keeps_all(mock_llm_client):
     """calls <= _MAX_API_CALLS → 모두 보존, _truncated_calls 없음."""
-    agent = _make_agent()
+    agent = _make_agent(mock_llm_client)
     api = {"calls": [{"url": f"/api/{i}", "status_code": 200} for i in range(10)]}
     out = agent._compact_api_trace(api)
     assert len(out["calls"]) == 10
@@ -203,8 +202,8 @@ def test_compact_api_under_limit_keeps_all():
 # ── _compact_db_result ─────────────────────────────────────────────────────
 
 
-def test_compact_db_slices_to_max_snapshots():
-    agent = _make_agent()
+def test_compact_db_slices_to_max_snapshots(mock_llm_client):
+    agent = _make_agent(mock_llm_client)
     db = {
         "tc_id": "TC-1",
         "snapshots": [{"table": f"t{i}", "rows": []} for i in range(50)],
@@ -214,8 +213,8 @@ def test_compact_db_slices_to_max_snapshots():
     assert out["_truncated_snapshots"] == 50 - _MAX_DB_SNAPSHOTS
 
 
-def test_compact_db_truncates_large_rows():
-    agent = _make_agent()
+def test_compact_db_truncates_large_rows(mock_llm_client):
+    agent = _make_agent(mock_llm_client)
     db = {"snapshots": [{
         "table": "users",
         "rows": [{"id": i, "name": f"user{i}"} for i in range(50)],
@@ -226,8 +225,8 @@ def test_compact_db_truncates_large_rows():
     assert snap["_truncated_rows"] == 50 - _MAX_DB_ROWS_PER_SNAPSHOT
 
 
-def test_compact_db_handles_empty():
-    agent = _make_agent()
+def test_compact_db_handles_empty(mock_llm_client):
+    agent = _make_agent(mock_llm_client)
     assert agent._compact_db_result({}) == {"snapshots": []}
     assert agent._compact_db_result(None) == {}  # type: ignore[arg-type]
 
@@ -235,8 +234,8 @@ def test_compact_db_handles_empty():
 # ── _compact_for_llm 통합 ─────────────────────────────────────────────────
 
 
-def test_compact_for_llm_returns_three_compacted():
-    agent = _make_agent()
+def test_compact_for_llm_returns_three_compacted(mock_llm_client):
+    agent = _make_agent(mock_llm_client)
     ui, api, db = agent._compact_for_llm(
         {"steps": [{"step_no": 1, "screenshot_path": "/x.png"}]},
         {"calls": [{"url": "/a", "request_headers": {"X": "y"}}]},
@@ -250,9 +249,9 @@ def test_compact_for_llm_returns_three_compacted():
 
 
 @pytest.mark.asyncio
-async def test_analyze_with_llm_uses_compacted_input():
+async def test_analyze_with_llm_uses_compacted_input(mock_llm_client):
     """LLM 호출 시 user_prompt 의 context 가 압축본 (screenshot_path 등 제거됨)."""
-    agent = _make_agent()
+    agent = _make_agent(mock_llm_client)
     agent.llm.chat = AsyncMock(return_value=MagicMock(
         content=json.dumps({"error_code": "none", "summary": "", "mismatches": [], "match_score": 1.0})
     ))
@@ -279,9 +278,9 @@ async def test_analyze_with_llm_uses_compacted_input():
 
 
 @pytest.mark.asyncio
-async def test_analyze_with_llm_hard_cuts_when_over_max_input():
+async def test_analyze_with_llm_hard_cuts_when_over_max_input(mock_llm_client):
     """압축 후에도 _MAX_LLM_INPUT_CHARS 초과 시 hard cut + warning 로그."""
-    agent = _make_agent()
+    agent = _make_agent(mock_llm_client)
     agent.llm.chat = AsyncMock(return_value=MagicMock(
         content=json.dumps({"error_code": "none", "summary": "", "mismatches": [], "match_score": 1.0})
     ))
@@ -304,9 +303,9 @@ async def test_analyze_with_llm_hard_cuts_when_over_max_input():
 
 
 @pytest.mark.asyncio
-async def test_analyze_with_llm_preserves_core_semantics():
+async def test_analyze_with_llm_preserves_core_semantics(mock_llm_client):
     """압축이 정합성 분석 핵심 정보 (status_code, url, error_code prefix) 는 보존."""
-    agent = _make_agent()
+    agent = _make_agent(mock_llm_client)
     agent.llm.chat = AsyncMock(return_value=MagicMock(
         content=json.dumps({"error_code": "ui-api-mismatch", "summary": "x",
                             "mismatches": [{"field": "f", "ui_value": "a", "api_value": "b", "db_value": None}],
@@ -455,9 +454,9 @@ def test_compact_ui_error_no_pattern_char_cap():
     assert "TOOL_UI_LOCATOR_NOT_FOUND" in out
 
 
-def test_compact_api_trace_preserves_response_status_field_under_compaction():
+def test_compact_api_trace_preserves_response_status_field_under_compaction(mock_llm_client):
     """핵심 시나리오: BSS 응답의 status 가 큰 페이로드 뒤에 있어도 LLM input 에 보존."""
-    agent = _make_agent()
+    agent = _make_agent(mock_llm_client)
     huge_meta = "x" * 2000
     api = {"calls": [{
         "method": "POST", "url": "/api/order", "status_code": 200,
@@ -474,9 +473,9 @@ def test_compact_api_trace_preserves_response_status_field_under_compaction():
     assert huge_meta not in body  # noise 잘림
 
 
-def test_compact_ui_result_keeps_step_value_and_expected():
+def test_compact_ui_result_keeps_step_value_and_expected(mock_llm_client):
     """step 의 selector/value/expected 는 그대로 (LLM 이 ui_value 분석 시 필요)."""
-    agent = _make_agent()
+    agent = _make_agent(mock_llm_client)
     ui = {"steps": [{
         "step_no": 5, "action": "assert", "selector": "환영합니다",
         "selector_type": "text", "expected": "로그인 성공 메시지 노출",
@@ -493,9 +492,9 @@ def test_compact_ui_result_keeps_step_value_and_expected():
     assert "환영합니다" in step["error"]
 
 
-def test_compact_db_result_preserves_row_columns():
+def test_compact_db_result_preserves_row_columns(mock_llm_client):
     """DB row 의 컬럼 값은 그대로 (db_value 분석에 필수)."""
-    agent = _make_agent()
+    agent = _make_agent(mock_llm_client)
     db = {"snapshots": [{
         "table": "orders",
         "rows": [{"id": 1, "status": "CONFIRMED", "amount": 5000}],
