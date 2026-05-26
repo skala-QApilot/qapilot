@@ -43,6 +43,10 @@ class PipelineState(TypedDict):
     status: str
     current_layer: str
     error: str | None
+    # 산출물 저장 루트. 절대경로 권장. (예: /path/to/system-under-test/.qapilot)
+    # 파이프라인 전 노드가 이 값을 기준으로 scenarios / generated-code / results 등을 read/write 한다.
+    # CWD 의존을 제거하기 위해 도입됨 — 절대 Path(".qapilot")/... 식으로 직접 쓰지 말 것.
+    qapilot_dir: str
 
     # ── Layer 1A: 컨텍스트 + 시나리오 생성 ──
     scan_result: ScanResult | None

@@ -76,6 +76,7 @@ async def test_save_codes_persists_action_mappings_when_code_empty(tmp_path, mon
     monkeypatch.chdir(tmp_path)
     state = {
         "trace_id": "trace-105",
+        "qapilot_dir": str(tmp_path / ".qapilot"),
         "generated_codes": [],
         "action_mappings": [
             {"tc_id": "TS-001-TC-01", "actions": [{"type": "click"}]},

@@ -7,6 +7,8 @@ CLI와 API에서 호출하는 진입점. trace_id 는 호출부에서 주입할 
 Created: 2026-05-07
 """
 
+from pathlib import Path
+
 import structlog
 
 from qapilot.modules.trace_module import TraceModule
@@ -16,11 +18,18 @@ from qapilot.shared.logger import get_logger
 from qapilot.shared.schemas import RunOptions
 
 
-async def run_pipeline(options: RunOptions, trace_id: str | None = None) -> PipelineState:
+async def run_pipeline(
+    options: RunOptions,
+    qapilot_dir: str | Path,
+    trace_id: str | None = None,
+) -> PipelineState:
     """파이프라인을 실행하고 최종 상태를 반환한다.
 
     Args:
         options: 실행 옵션.
+        qapilot_dir: 산출물 루트 (절대경로 권장). 파이프라인 전 단계가 이 디렉토리
+            기준으로 scenarios / generated-code / results 등을 read/write 한다.
+            CLI: ``Path.cwd() / ".qapilot"``, API: 서비스별 등록 경로.
         trace_id: 외부에서 발급된 trace_id. None 이면 새로 발급한다.
 
     Returns:
@@ -46,6 +55,7 @@ async def run_pipeline(options: RunOptions, trace_id: str | None = None) -> Pipe
         "status": "running",
         "current_layer": "",
         "error": None,
+        "qapilot_dir": str(Path(qapilot_dir).resolve()),
         # Layer 1A
         "scan_result": None,
         "domain_rules": [],

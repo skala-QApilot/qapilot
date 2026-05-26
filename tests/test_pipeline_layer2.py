@@ -20,7 +20,11 @@ def _write_json(path: Path, data: Any) -> None:
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def _state(run_options: dict | None = None, trace_id: str = "") -> dict:
+def _state(
+    run_options: dict | None = None,
+    trace_id: str = "",
+    qapilot_dir: Path | None = None,
+) -> dict:
     return {
         "run_options": {
             "command": "test",
@@ -32,6 +36,8 @@ def _state(run_options: dict | None = None, trace_id: str = "") -> dict:
             **(run_options or {}),
         },
         "trace_id": trace_id,
+        # 테스트가 monkeypatch.chdir(tmp_path) 후 CWD/.qapilot 를 사용하던 패턴 보존.
+        "qapilot_dir": str(qapilot_dir if qapilot_dir is not None else Path.cwd() / ".qapilot"),
     }
 
 
@@ -168,6 +174,7 @@ async def test_load_scenarios_for_test_empty_dirs_graceful(tmp_path: Path, monke
 async def test_save_codes_persists_action_mappings(tmp_path: Path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     state = {
+        "qapilot_dir": str(tmp_path / ".qapilot"),
         "generated_codes": [{"tc_id": "TC-1", "code": "// stub"}],
         "action_mappings": [{"tc_id": "TC-1", "steps": [
             {"step_no": 1, "action": "navigate", "value": "/login"},
@@ -194,6 +201,7 @@ async def test_report_generates_markdown(tmp_path: Path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     state = {
         "trace_id": "trace-abc",
+        "qapilot_dir": str(tmp_path / ".qapilot"),
         "ui_results": [
             {"tc_id": "TC-1", "status": "pass", "steps": []},
             {"tc_id": "TC-2", "status": "fail", "steps": [

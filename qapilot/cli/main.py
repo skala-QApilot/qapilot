@@ -13,6 +13,7 @@ Created: 2026-05-07
 import asyncio
 import os
 import uuid
+from pathlib import Path
 from typing import Optional
 
 import typer
@@ -63,7 +64,7 @@ def generate_scenarios(
         "tags": None,
     }
     console.print(f"[bold {BRAND_PURPLE}]시나리오 생성을 시작합니다 (Layer 1)...[/bold {BRAND_PURPLE}]")
-    result = asyncio.run(run_pipeline(options))
+    result = asyncio.run(run_pipeline(options, Path.cwd() / ".qapilot"))
     console.print(f"[bold blue]시나리오 생성 완료! 대시보드(qapilot ui)에서 검토 후 'qapilot generate code'를 실행하세요. (상태: {result['status']})[/bold blue]")
     
     if sync:
@@ -88,7 +89,7 @@ def generate_code(
     }
     target = f"시나리오 {case}" if case else "저장된 전체 시나리오"
     console.print(f"[bold {BRAND_PURPLE}]{target} 기반 테스트 코드 생성을 시작합니다...[/bold {BRAND_PURPLE}]")
-    result = asyncio.run(run_pipeline(options))
+    result = asyncio.run(run_pipeline(options, Path.cwd() / ".qapilot"))
     console.print(f"[bold blue]테스트 코드 생성 완료! (상태: {result['status']})[/bold blue]")
     
     if sync:
@@ -121,7 +122,7 @@ def test(
         "tags": [tag] if tag else None,
     }
     console.print(f"[bold {BRAND_PURPLE}]로컬 테스트를 실행합니다 (필터: {filter_opt})...[/bold {BRAND_PURPLE}]")
-    result = asyncio.run(run_pipeline(options))
+    result = asyncio.run(run_pipeline(options, Path.cwd() / ".qapilot"))
     console.print(f"[bold blue]테스트 실행 완료! (상태: {result['status']})[/bold blue]")
 
 

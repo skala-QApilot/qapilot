@@ -170,7 +170,7 @@ class ScenarioGeneratorAgent(BaseAgent):
 
         confidence = round(confidence_sum / len(router_map), 3) if router_map else 0.5
         all_scenarios = self._renumber_and_set_depends_on(all_scenarios)
-        save_scenarios(all_scenarios)
+        # 디스크 영속화는 pipeline._save_scenarios 노드에서 수행 (위 메서드와 동일 사유).
 
         return ExecuteResult(
             result={"scenarios": all_scenarios, "prd_code_mismatches": mismatches},

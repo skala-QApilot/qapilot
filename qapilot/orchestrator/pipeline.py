@@ -29,6 +29,22 @@ from langgraph.graph import END, START, StateGraph
 from qapilot.orchestrator.state import PipelineState
 
 
+def _qapilot_path(state: PipelineState, *parts: str) -> Path:
+    """state["qapilot_dir"] 기준의 절대경로를 반환한다.
+
+    파이프라인 내부의 모든 파일 I/O 는 반드시 이 helper 를 거쳐야 한다.
+    ``Path(".qapilot")/...`` 같은 CWD 의존 경로는 금지 — 다른 서비스의
+    데이터를 덮어쓸 수 있다.
+    """
+    base = state.get("qapilot_dir")
+    if not base:
+        raise RuntimeError(
+            "PipelineState에 qapilot_dir 가 비어 있다. runner.run_pipeline(...) 호출부가 "
+            "qapilot_dir 인자를 누락한 것이다."
+        )
+    return Path(base).joinpath(*parts)
+
+
 def build_pipeline() -> StateGraph:
     """파이프라인 그래프를 구성하고 반환한다."""
     graph = StateGraph(PipelineState)
@@ -112,13 +128,13 @@ def _entry_point(command: str) -> str:
 
 
 # ── Layer 1A 헬퍼: spec §6.1 디스크 캐시 ──────────────────────────────────────
-def _save_codebase_index_to_disk(scan: dict) -> None:
+def _save_codebase_index_to_disk(scan: dict, state: PipelineState) -> None:
     """spec §6.1 의 .qapilot/codebase-index/ 4파일 저장 (L2 디스크 캐시).
 
     Tool 본체의 `.qapilot/manifest.json` (증분 분석 추적용) 과 독립.
     본 manifest 는 spec §6.1 정합용으로 codebase-index/ 안에 둔다.
     """
-    cache_dir = Path(".qapilot") / "codebase-index"
+    cache_dir = _qapilot_path(state, "codebase-index")
     cache_dir.mkdir(parents=True, exist_ok=True)
 
     endpoints: list[dict] = []
@@ -170,7 +186,6 @@ def _save_codebase_index_to_disk(scan: dict) -> None:
 # ── Layer 1A 노드 (generate_scenarios) ────────────────────────────────────────
 
 _SUPPORTED_DOC_SUFFIXES = frozenset({".md", ".pdf", ".docx", ".xlsx", ".xls"})
-_DOMAIN_INDEX_DIR = Path(".qapilot") / "domain"
 _VERSION_RE = re.compile(r'^(.+?)_v(\d+(?:\.\d+)*)$', re.IGNORECASE)
 
 
@@ -219,7 +234,7 @@ async def _doc_import(state: PipelineState) -> dict:
     logger = tool.logger
 
     for doc_path in sorted(doc_files):
-        index_path = _DOMAIN_INDEX_DIR / f"{doc_path.stem}.index.json"
+        index_path = _qapilot_path(state, "domain", f"{doc_path.stem}.index.json")
         if index_path.exists():
             try:
                 saved = json.loads(index_path.read_text(encoding="utf-8"))
@@ -288,7 +303,7 @@ async def _codebase_scan(state: PipelineState) -> dict:
     scan: dict[str, Any] = result.result["scan_result"]
 
     # L2: spec §6.1 정합 디스크 캐시 (Tool 본체 무수정)
-    _save_codebase_index_to_disk(scan)
+    _save_codebase_index_to_disk(scan, state)
 
     return {
         "trace_id": trace_id,
@@ -440,7 +455,7 @@ async def _scenario_generate(state: PipelineState) -> dict:
 async def _save_scenarios(state: PipelineState) -> dict:
     """생성된 시나리오를 .qapilot/scenarios/{ts_id}.json 에 저장 (spec §6.1, L2)."""
     scenarios = state.get("scenarios") or []
-    scenarios_dir = Path(".qapilot") / "scenarios"
+    scenarios_dir = _qapilot_path(state, "scenarios")
     scenarios_dir.mkdir(parents=True, exist_ok=True)
 
     saved_paths: list[str] = []
@@ -463,7 +478,7 @@ async def _load_scenarios_for_codegen(state: PipelineState) -> dict:
     import json
     from pathlib import Path
     
-    scenarios_dir = Path(".qapilot") / "scenarios"
+    scenarios_dir = _qapilot_path(state, "scenarios")
     if not scenarios_dir.exists():
         return {"scenarios": [], "error": "시나리오 디렉토리가 없습니다."}
 
@@ -488,7 +503,7 @@ async def _load_scenarios_for_codegen(state: PipelineState) -> dict:
     # scan_result 를 디스크 캐시에서 복원 (ActionMapperAgent 가 사용)
     scan_result = None
     try:
-        endpoints_path = Path(".qapilot") / "codebase-index" / "endpoints.json"
+        endpoints_path = _qapilot_path(state, "codebase-index", "endpoints.json")
         if endpoints_path.exists():
             endpoints = json.loads(endpoints_path.read_text(encoding="utf-8"))
             scan_result = {"files": [{"path": "mock", "endpoints": endpoints}]}
@@ -606,8 +621,8 @@ async def _save_codes(state: PipelineState) -> dict:
     generated_codes = state.get("generated_codes") or []
     action_mappings = state.get("action_mappings") or []
 
-    code_dir = Path(".qapilot") / "generated-code"
-    am_dir = Path(".qapilot") / "action-mappings"
+    code_dir = _qapilot_path(state, "generated-code")
+    am_dir = _qapilot_path(state, "action-mappings")
     code_dir.mkdir(parents=True, exist_ok=True)
     am_dir.mkdir(parents=True, exist_ok=True)
 
@@ -710,11 +725,11 @@ async def _load_scenarios_for_test(state: PipelineState) -> dict:
 
     trace_id = state.get("trace_id") or str(_uuid.uuid4())
 
-    scenarios = _load_json_files(Path(".qapilot") / "scenarios")
-    action_mappings = _load_json_files(Path(".qapilot") / "action-mappings")
+    scenarios = _load_json_files(_qapilot_path(state, "scenarios"))
+    action_mappings = _load_json_files(_qapilot_path(state, "action-mappings"))
 
     # generated_codes 는 .js 파일 — 검증·디버그용 (실행에 필수 X)
-    codes_dir = Path(".qapilot") / "generated-code"
+    codes_dir = _qapilot_path(state, "generated-code")
     generated_codes: list[dict] = []
     if codes_dir.exists():
         for path in sorted(codes_dir.glob("*.js")):
@@ -793,7 +808,7 @@ async def _test_execution(state: PipelineState) -> dict:
     headless = bool(getattr(cfg.test, "headless", True)) if hasattr(cfg, "test") else True
     target_url = getattr(cfg.project, "target_url", "") if hasattr(cfg, "project") else ""
 
-    results_root = Path(".qapilot") / "results" / trace_id
+    results_root = _qapilot_path(state, "results", trace_id)
 
     ui_results: list[dict] = []
     api_results: list[dict] = []
@@ -1259,7 +1274,7 @@ async def _report(state: PipelineState) -> dict:
                     f"{s.get('description', '')[:160]}"
                 )
 
-    reports_dir = Path(".qapilot") / "reports"
+    reports_dir = _qapilot_path(state, "reports")
     reports_dir.mkdir(parents=True, exist_ok=True)
     report_path = reports_dir / f"{trace_id}.md"
     report_path.write_text("\n".join(lines), encoding="utf-8")
