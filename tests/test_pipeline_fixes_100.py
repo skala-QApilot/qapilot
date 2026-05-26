@@ -13,6 +13,7 @@ import pytest
 
 from qapilot.cli import _ensure_browser as EB
 from qapilot.orchestrator import pipeline as P
+from qapilot.tools.base_tool import BaseTool
 
 
 # ── Fix #1: RuntimeWarning 0 ─────────────────────────────────────────────────
@@ -89,7 +90,7 @@ async def test_run_db_test_safe_calls_tool_when_env_set(monkeypatch):
     """QAPILOT_MODULE_URL 설정 시 Tool 호출."""
     monkeypatch.setenv("QAPILOT_MODULE_URL", "http://localhost:9999")
 
-    mock_tool = MagicMock()
+    mock_tool = MagicMock(spec=BaseTool)
     mock_tool.run = AsyncMock(return_value=MagicMock(
         result={"db_test": {"tc_id": "TC-1", "snapshots": [], "summary": "OK"}}
     ))

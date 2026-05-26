@@ -20,22 +20,6 @@ from qapilot.tools.ui_test_tool import (
 )
 
 
-def _mock_page_with_locators() -> MagicMock:
-    """page.get_by_*, page.locator 각각 별도 MagicMock 반환. 각 호출이 distinct mock 받아 chain 의 각 step 검증 가능."""
-    page = MagicMock()
-    # 각 get_by_* 가 호출될 때마다 새 mock 반환 (chain 의 각 entry 가 distinct locator 인지 보장)
-    for name in ("get_by_text", "get_by_label", "get_by_placeholder",
-                 "get_by_test_id", "get_by_role", "get_by_alt_text", "get_by_title", "locator"):
-        loc = MagicMock()
-        loc.fill = AsyncMock()
-        loc.click = AsyncMock()
-        loc.press = AsyncMock()
-        loc.clear = AsyncMock()
-        loc.select_option = AsyncMock()
-        loc.check = AsyncMock()
-        setattr(page, name, MagicMock(return_value=loc))
-    return page
-
 
 def _make_tool() -> UITestTool:
     tool = UITestTool.__new__(UITestTool)
@@ -46,10 +30,10 @@ def _make_tool() -> UITestTool:
 # ── _build_locator_chain — selector_type 별 chain 정의 정확성 ────────────────
 
 
-def test_chain_text_type_has_4_entries():
+def test_chain_text_type_has_4_entries(mock_page_with_distinct_locators):
     """text 타입: get_by_text → get_by_label → get_by_placeholder → get_by_test_id."""
     tool = _make_tool()
-    page = _mock_page_with_locators()
+    page = mock_page_with_distinct_locators
     chain = tool._build_locator_chain(page, {
         "selector": "이메일", "selector_type": "text", "action": "click",
     })
@@ -61,30 +45,30 @@ def test_chain_text_type_has_4_entries():
     page.get_by_test_id.assert_called_once_with("이메일")
 
 
-def test_chain_label_type_has_3_entries():
+def test_chain_label_type_has_3_entries(mock_page_with_distinct_locators):
     """label 타입: label → text → placeholder."""
     tool = _make_tool()
-    page = _mock_page_with_locators()
+    page = mock_page_with_distinct_locators
     chain = tool._build_locator_chain(page, {
         "selector": "이메일", "selector_type": "label", "action": "fill",
     })
     assert [c[0] for c in chain] == ["get_by_label", "get_by_text", "get_by_placeholder"]
 
 
-def test_chain_placeholder_type_has_3_entries():
+def test_chain_placeholder_type_has_3_entries(mock_page_with_distinct_locators):
     """placeholder 타입: placeholder → label → text."""
     tool = _make_tool()
-    page = _mock_page_with_locators()
+    page = mock_page_with_distinct_locators
     chain = tool._build_locator_chain(page, {
         "selector": "이메일", "selector_type": "placeholder", "action": "fill",
     })
     assert [c[0] for c in chain] == ["get_by_placeholder", "get_by_label", "get_by_text"]
 
 
-def test_chain_testid_type_has_3_entries():
+def test_chain_testid_type_has_3_entries(mock_page_with_distinct_locators):
     """testid 타입: get_by_test_id + data-testid/data-test-id css 직접 시도."""
     tool = _make_tool()
-    page = _mock_page_with_locators()
+    page = mock_page_with_distinct_locators
     chain = tool._build_locator_chain(page, {
         "selector": "email", "selector_type": "testid", "action": "fill",
     })
@@ -95,20 +79,20 @@ def test_chain_testid_type_has_3_entries():
     page.locator.assert_any_call('[data-test-id="email"]')
 
 
-def test_chain_role_type_falls_back_to_text():
+def test_chain_role_type_falls_back_to_text(mock_page_with_distinct_locators):
     """role 타입: role → text."""
     tool = _make_tool()
-    page = _mock_page_with_locators()
+    page = mock_page_with_distinct_locators
     chain = tool._build_locator_chain(page, {
         "selector": "button", "selector_type": "role", "action": "click",
     })
     assert [c[0] for c in chain] == ["get_by_role", "get_by_text"]
 
 
-def test_chain_css_single_attempt():
+def test_chain_css_single_attempt(mock_page_with_distinct_locators):
     """css 는 정확한 selector 가정 — 단일 시도, chain 적용 안 함."""
     tool = _make_tool()
-    page = _mock_page_with_locators()
+    page = mock_page_with_distinct_locators
     chain = tool._build_locator_chain(page, {
         "selector": "#login-btn", "selector_type": "css", "action": "click",
     })
@@ -117,10 +101,10 @@ def test_chain_css_single_attempt():
     page.locator.assert_called_once_with("#login-btn")
 
 
-def test_chain_xpath_single_attempt_with_prefix():
+def test_chain_xpath_single_attempt_with_prefix(mock_page_with_distinct_locators):
     """xpath 는 단일 시도. prefix 자동 부착."""
     tool = _make_tool()
-    page = _mock_page_with_locators()
+    page = mock_page_with_distinct_locators
     chain = tool._build_locator_chain(page, {
         "selector": "//button[@id='ok']", "selector_type": "xpath", "action": "click",
     })
@@ -128,10 +112,10 @@ def test_chain_xpath_single_attempt_with_prefix():
     page.locator.assert_called_once_with("xpath=//button[@id='ok']")
 
 
-def test_chain_selector_none_falls_back_with_3_entries():
+def test_chain_selector_none_falls_back_with_3_entries(mock_page_with_distinct_locators):
     """selector=None: expected/value/action 으로 text→placeholder→label fallback 3개."""
     tool = _make_tool()
-    page = _mock_page_with_locators()
+    page = mock_page_with_distinct_locators
     chain = tool._build_locator_chain(page, {
         "selector": None, "selector_type": None, "action": "click",
         "expected": "가입 완료",
@@ -147,10 +131,10 @@ def test_chain_selector_none_falls_back_with_3_entries():
 
 
 @pytest.mark.asyncio
-async def test_first_attempt_success_no_retry_no_warning():
+async def test_first_attempt_success_no_retry_no_warning(mock_page_with_distinct_locators):
     """1차 시도 성공 → 2~N차 미발화, retry log 없음."""
     tool = _make_tool()
-    page = _mock_page_with_locators()
+    page = mock_page_with_distinct_locators
     step = {"selector": "이메일", "selector_type": "text", "action": "click"}
 
     await tool._run_dom_action(page, "click", step)
@@ -173,10 +157,10 @@ async def test_first_attempt_success_no_retry_no_warning():
 
 
 @pytest.mark.asyncio
-async def test_first_fails_second_succeeds_emits_success_log():
+async def test_first_fails_second_succeeds_emits_success_log(mock_page_with_distinct_locators):
     """1차 PWTimeoutError → 2차 적중 → success log + retry warning 1건."""
     tool = _make_tool()
-    page = _mock_page_with_locators()
+    page = mock_page_with_distinct_locators
 
     # 1차 (get_by_text) click 은 timeout, 2차 (get_by_label) click 은 성공
     page.get_by_text.return_value.click = AsyncMock(side_effect=PWTimeoutError("Locator timeout"))
@@ -205,10 +189,10 @@ async def test_first_fails_second_succeeds_emits_success_log():
 
 
 @pytest.mark.asyncio
-async def test_all_chain_steps_fail_raises_last_error():
+async def test_all_chain_steps_fail_raises_last_error(mock_page_with_distinct_locators):
     """모든 chain step 실패 → 마지막 timeout 에러 그대로 raise."""
     tool = _make_tool()
-    page = _mock_page_with_locators()
+    page = mock_page_with_distinct_locators
     last_err = PWTimeoutError("마지막 timeout")
     page.get_by_text.return_value.click = AsyncMock(side_effect=PWTimeoutError("1"))
     page.get_by_label.return_value.click = AsyncMock(side_effect=PWTimeoutError("2"))
@@ -222,10 +206,10 @@ async def test_all_chain_steps_fail_raises_last_error():
 
 
 @pytest.mark.asyncio
-async def test_chain_short_timeout_for_fallback_steps():
+async def test_chain_short_timeout_for_fallback_steps(mock_page_with_distinct_locators):
     """2차+ 시도는 _CHAIN_FALLBACK_TIMEOUT_MS, 1차는 _CHAIN_PRIMARY_TIMEOUT_MS."""
     tool = _make_tool()
-    page = _mock_page_with_locators()
+    page = mock_page_with_distinct_locators
     page.get_by_label.return_value.click = AsyncMock(side_effect=PWTimeoutError("1차 fail"))
     page.get_by_text.return_value.click = AsyncMock(side_effect=PWTimeoutError("2차 fail"))
     page.get_by_placeholder.return_value.click = AsyncMock()  # 3차 success
@@ -241,10 +225,10 @@ async def test_chain_short_timeout_for_fallback_steps():
 
 
 @pytest.mark.asyncio
-async def test_chain_assertion_error_also_retries():
+async def test_chain_assertion_error_also_retries(mock_page_with_distinct_locators):
     """expect().to_have_text() 같은 assertion fail (AssertionError) 도 chain 진행."""
     tool = _make_tool()
-    page = _mock_page_with_locators()
+    page = mock_page_with_distinct_locators
 
     # mock expect — to_be_visible 가 AssertionError 시뮬레이션
     with patch("qapilot.tools.ui_test_tool.expect") as mexpect:
@@ -266,10 +250,10 @@ async def test_chain_assertion_error_also_retries():
 
 
 @pytest.mark.asyncio
-async def test_chain_does_not_apply_to_css_single_step():
+async def test_chain_does_not_apply_to_css_single_step(mock_page_with_distinct_locators):
     """css selector 는 chain 적용 안 함 — fail 시 그대로 raise (chain 의미 없음)."""
     tool = _make_tool()
-    page = _mock_page_with_locators()
+    page = mock_page_with_distinct_locators
     page.locator.return_value.click = AsyncMock(side_effect=PWTimeoutError("css fail"))
 
     step = {"selector": "#login-btn", "selector_type": "css", "action": "click"}
@@ -282,10 +266,10 @@ async def test_chain_does_not_apply_to_css_single_step():
 
 
 @pytest.mark.asyncio
-async def test_tool_execution_error_does_not_retry():
+async def test_tool_execution_error_does_not_retry(mock_page_with_distinct_locators):
     """ToolExecutionError (예: upload value 누락) 는 chain 의미 없음 — 즉시 raise."""
     tool = _make_tool()
-    page = _mock_page_with_locators()
+    page = mock_page_with_distinct_locators
     # _apply_action 에서 upload value 누락 시 raise
 
     step = {"selector": "input[type=file]", "selector_type": "css", "action": "upload"}
@@ -298,10 +282,10 @@ async def test_tool_execution_error_does_not_retry():
 # ── Option B: 런타임 DOM Scan + Fuzzy Match ─────────────────────────────────
 
 @pytest.mark.asyncio
-async def test_fallback_dom_scan_success():
+async def test_fallback_dom_scan_success(mock_page_with_distinct_locators):
     """모든 chain 실패 시 DOM scan 수행 후 fuzzy match로 성공."""
     tool = _make_tool()
-    page = _mock_page_with_locators()
+    page = mock_page_with_distinct_locators
     
     # 1차 chain(get_by_text 등)은 모두 실패
     for loc_mock in [page.get_by_text, page.get_by_label, page.get_by_placeholder, page.get_by_test_id]:
@@ -335,10 +319,10 @@ async def test_fallback_dom_scan_success():
 
 
 @pytest.mark.asyncio
-async def test_fallback_dom_scan_failed():
+async def test_fallback_dom_scan_failed(mock_page_with_distinct_locators):
     """DOM scan 결과에서도 match를 찾지 못하면 마지막 에러 발생."""
     tool = _make_tool()
-    page = _mock_page_with_locators()
+    page = mock_page_with_distinct_locators
     
     for loc_mock in [page.get_by_text, page.get_by_label, page.get_by_placeholder, page.get_by_test_id]:
         loc_mock.return_value.click = AsyncMock(side_effect=PWTimeoutError("chain fail"))
@@ -359,10 +343,10 @@ async def test_fallback_dom_scan_failed():
 
 
 @pytest.mark.asyncio
-async def test_fallback_dom_scan_returns_none_for_empty_selector():
+async def test_fallback_dom_scan_returns_none_for_empty_selector(mock_page_with_distinct_locators):
     """selector / expected / value / action 모두 비어있으면 DOM scan 자체 안 함 → None."""
     tool = _make_tool()
-    page = _mock_page_with_locators()
+    page = mock_page_with_distinct_locators
     page.evaluate = AsyncMock()
 
     step = {"selector": "", "selector_type": "text", "action": ""}
@@ -373,10 +357,10 @@ async def test_fallback_dom_scan_returns_none_for_empty_selector():
 
 
 @pytest.mark.asyncio
-async def test_fallback_dom_scan_returns_none_when_evaluate_raises():
+async def test_fallback_dom_scan_returns_none_when_evaluate_raises(mock_page_with_distinct_locators):
     """page.evaluate 가 raise → debug log + None 반환 (호출자에 전파 X)."""
     tool = _make_tool()
-    page = _mock_page_with_locators()
+    page = mock_page_with_distinct_locators
     page.evaluate = AsyncMock(side_effect=RuntimeError("page closed"))
 
     step = {"selector": "이메일", "selector_type": "text", "action": "fill"}
@@ -388,10 +372,10 @@ async def test_fallback_dom_scan_returns_none_when_evaluate_raises():
 
 
 @pytest.mark.asyncio
-async def test_fallback_dom_scan_returns_none_below_threshold():
+async def test_fallback_dom_scan_returns_none_below_threshold(mock_page_with_distinct_locators):
     """모든 후보의 score 가 임계값 0.6 미만 → None."""
     tool = _make_tool()
-    page = _mock_page_with_locators()
+    page = mock_page_with_distinct_locators
     # target='이메일' vs '주문하기' — SequenceMatcher ratio ~0 + 포함관계 없음
     page.evaluate = AsyncMock(return_value=[
         {"tag": "button", "text": "주문하기", "placeholder": "", "label": "",
@@ -404,10 +388,10 @@ async def test_fallback_dom_scan_returns_none_below_threshold():
 
 
 @pytest.mark.asyncio
-async def test_fallback_dom_scan_returns_none_when_dom_empty():
+async def test_fallback_dom_scan_returns_none_when_dom_empty(mock_page_with_distinct_locators):
     """DOM 스캔 결과 빈 list → None."""
     tool = _make_tool()
-    page = _mock_page_with_locators()
+    page = mock_page_with_distinct_locators
     page.evaluate = AsyncMock(return_value=[])
 
     step = {"selector": "이메일", "selector_type": "text", "action": "fill"}
@@ -416,10 +400,10 @@ async def test_fallback_dom_scan_returns_none_when_dom_empty():
 
 
 @pytest.mark.asyncio
-async def test_fallback_dom_scan_returns_testid_first():
+async def test_fallback_dom_scan_returns_testid_first(mock_page_with_distinct_locators):
     """반환 우선순위 — 매치 element 에 testid + placeholder + text 모두 있어도 testid 우선."""
     tool = _make_tool()
-    page = _mock_page_with_locators()
+    page = mock_page_with_distinct_locators
     page.evaluate = AsyncMock(return_value=[
         {"tag": "input",
          "text": "이메일 텍스트",
@@ -439,10 +423,10 @@ async def test_fallback_dom_scan_returns_testid_first():
 
 
 @pytest.mark.asyncio
-async def test_fallback_dom_scan_falls_back_to_name_when_other_attrs_empty():
+async def test_fallback_dom_scan_falls_back_to_name_when_other_attrs_empty(mock_page_with_distinct_locators):
     """testid/placeholder/text/label/id 모두 빈 문자열 → name 최후 fallback."""
     tool = _make_tool()
-    page = _mock_page_with_locators()
+    page = mock_page_with_distinct_locators
     page.evaluate = AsyncMock(return_value=[
         {"tag": "input",
          "text": "", "placeholder": "", "label": "", "testid": "", "id": "",
@@ -456,10 +440,10 @@ async def test_fallback_dom_scan_falls_back_to_name_when_other_attrs_empty():
 
 
 @pytest.mark.asyncio
-async def test_fallback_dom_scan_substring_match_bonus_breaks_threshold():
+async def test_fallback_dom_scan_substring_match_bonus_breaks_threshold(mock_page_with_distinct_locators):
     """포함관계 가산점 (+0.2) 로 임계값 통과 — target='이메일' vs cand='이메일을 입력하세요'."""
     tool = _make_tool()
-    page = _mock_page_with_locators()
+    page = mock_page_with_distinct_locators
     page.evaluate = AsyncMock(return_value=[
         {"tag": "input",
          "text": "", "placeholder": "이메일을 입력하세요",
@@ -473,10 +457,10 @@ async def test_fallback_dom_scan_substring_match_bonus_breaks_threshold():
 
 
 @pytest.mark.asyncio
-async def test_fallback_dom_scan_uses_expected_when_selector_none():
+async def test_fallback_dom_scan_uses_expected_when_selector_none(mock_page_with_distinct_locators):
     """selector=None 일 때 expected 를 target 으로 fuzzy match."""
     tool = _make_tool()
-    page = _mock_page_with_locators()
+    page = mock_page_with_distinct_locators
     page.evaluate = AsyncMock(return_value=[
         {"tag": "div", "text": "가입 완료", "placeholder": "",
          "label": "", "testid": "", "id": "", "name": ""}
@@ -490,13 +474,13 @@ async def test_fallback_dom_scan_uses_expected_when_selector_none():
 
 
 @pytest.mark.asyncio
-async def test_option_b_does_not_swallow_tool_execution_error():
+async def test_option_b_does_not_swallow_tool_execution_error(mock_page_with_distinct_locators):
     """이슈 #119 P2 — 옵션 B 분기에서 ToolExecutionError 는 즉시 raise (chain 의미 없음, 옵션 A 와 일관성)."""
     from qapilot.shared.errors import ErrorCode
     from qapilot.shared.errors import ToolExecutionError as TEE
 
     tool = _make_tool()
-    page = _mock_page_with_locators()
+    page = mock_page_with_distinct_locators
     # 옵션 A chain 모두 timeout — fallback 진입
     for loc_mock in [page.get_by_text, page.get_by_label, page.get_by_placeholder, page.get_by_test_id]:
         loc_mock.return_value.click = AsyncMock(side_effect=PWTimeoutError("chain fail"))

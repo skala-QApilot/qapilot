@@ -38,14 +38,13 @@ def _make_state(run_options: dict[str, Any]) -> dict[str, Any]:
 
 
 @pytest.mark.asyncio
-async def test_local_mode_uses_codebase_scanner_tool_when_no_repo_url():
+async def test_local_mode_uses_codebase_scanner_tool_when_no_repo_url(mock_base_tool):
     """로컬 모드 — run_options 에 repo_url / repos 없음 → CodebaseScannerTool 사용."""
     state = _make_state({"trigger": "init"})
 
-    fake_tool = MagicMock()
-    fake_tool.run = AsyncMock(return_value=MagicMock(result={"scan_result": _mock_scan_result()}))
+    mock_base_tool.run.return_value = MagicMock(result={"scan_result": _mock_scan_result()})
 
-    with patch("qapilot.tools.codebase_scanner_tool.CodebaseScannerTool", return_value=fake_tool) as local_cls, \
+    with patch("qapilot.tools.codebase_scanner_tool.CodebaseScannerTool", return_value=mock_base_tool) as local_cls, \
          patch("qapilot.tools.git_codebase_scanner_tool.GitCodebaseScannerTool") as git_cls, \
          patch("qapilot.orchestrator.pipeline._save_codebase_index_to_disk"):
         result = await _codebase_scan(state)  # type: ignore[arg-type]
@@ -57,7 +56,7 @@ async def test_local_mode_uses_codebase_scanner_tool_when_no_repo_url():
 
 
 @pytest.mark.asyncio
-async def test_git_mode_uses_git_codebase_scanner_when_repo_url_provided():
+async def test_git_mode_uses_git_codebase_scanner_when_repo_url_provided(mock_base_tool):
     """Git 모드 — run_options.repo_url 있음 → GitCodebaseScannerTool 사용."""
     state = _make_state({
         "trigger": "init",
@@ -66,11 +65,10 @@ async def test_git_mode_uses_git_codebase_scanner_when_repo_url_provided():
         "branch": "main",
     })
 
-    fake_tool = MagicMock()
-    fake_tool.run = AsyncMock(return_value=MagicMock(result={"scan_result": _mock_scan_result()}))
+    mock_base_tool.run.return_value = MagicMock(result={"scan_result": _mock_scan_result()})
 
     with patch("qapilot.tools.codebase_scanner_tool.CodebaseScannerTool") as local_cls, \
-         patch("qapilot.tools.git_codebase_scanner_tool.GitCodebaseScannerTool", return_value=fake_tool) as git_cls, \
+         patch("qapilot.tools.git_codebase_scanner_tool.GitCodebaseScannerTool", return_value=mock_base_tool) as git_cls, \
          patch("qapilot.orchestrator.pipeline._save_codebase_index_to_disk"):
         await _codebase_scan(state)  # type: ignore[arg-type]
 
@@ -79,18 +77,17 @@ async def test_git_mode_uses_git_codebase_scanner_when_repo_url_provided():
 
 
 @pytest.mark.asyncio
-async def test_git_mode_uses_git_scanner_when_repos_list_provided():
+async def test_git_mode_uses_git_scanner_when_repos_list_provided(mock_base_tool):
     """Git 모드 — repos (멀티 레포) 있음 → GitCodebaseScannerTool 사용."""
     state = _make_state({
         "trigger": "init",
         "repos": [{"repo_url": "https://github.com/a/b", "token": "t"}],
     })
 
-    fake_tool = MagicMock()
-    fake_tool.run = AsyncMock(return_value=MagicMock(result={"scan_result": _mock_scan_result()}))
+    mock_base_tool.run.return_value = MagicMock(result={"scan_result": _mock_scan_result()})
 
     with patch("qapilot.tools.codebase_scanner_tool.CodebaseScannerTool") as local_cls, \
-         patch("qapilot.tools.git_codebase_scanner_tool.GitCodebaseScannerTool", return_value=fake_tool) as git_cls, \
+         patch("qapilot.tools.git_codebase_scanner_tool.GitCodebaseScannerTool", return_value=mock_base_tool) as git_cls, \
          patch("qapilot.orchestrator.pipeline._save_codebase_index_to_disk"):
         await _codebase_scan(state)  # type: ignore[arg-type]
 
@@ -99,18 +96,17 @@ async def test_git_mode_uses_git_scanner_when_repos_list_provided():
 
 
 @pytest.mark.asyncio
-async def test_local_mode_passes_trigger_through():
+async def test_local_mode_passes_trigger_through(mock_base_tool):
     """로컬 모드도 trigger 등 params 전달."""
     state = _make_state({"trigger": "code_change"})
 
-    fake_tool = MagicMock()
-    fake_tool.run = AsyncMock(return_value=MagicMock(result={"scan_result": _mock_scan_result()}))
+    mock_base_tool.run.return_value = MagicMock(result={"scan_result": _mock_scan_result()})
 
-    with patch("qapilot.tools.codebase_scanner_tool.CodebaseScannerTool", return_value=fake_tool), \
+    with patch("qapilot.tools.codebase_scanner_tool.CodebaseScannerTool", return_value=mock_base_tool), \
          patch("qapilot.orchestrator.pipeline._save_codebase_index_to_disk"):
         await _codebase_scan(state)  # type: ignore[arg-type]
 
     # tool.run 의 호출 인자에서 trigger=code_change 확인
-    call_args = fake_tool.run.await_args
+    call_args = mock_base_tool.run.await_args
     tool_input = call_args.args[0]
     assert tool_input.params.get("trigger") == "code_change"
