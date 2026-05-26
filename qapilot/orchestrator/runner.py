@@ -22,6 +22,7 @@ async def run_pipeline(
     options: RunOptions,
     qapilot_dir: str | Path,
     trace_id: str | None = None,
+    staging_url: str | None = None,
 ) -> PipelineState:
     """파이프라인을 실행하고 최종 상태를 반환한다.
 
@@ -31,6 +32,8 @@ async def run_pipeline(
             기준으로 scenarios / generated-code / results 등을 read/write 한다.
             CLI: ``Path.cwd() / ".qapilot"``, API: 서비스별 등록 경로.
         trace_id: 외부에서 발급된 trace_id. None 이면 새로 발급한다.
+        staging_url: SUT base URL. SaaS 호출 경로에서 service.stagingUrl 을 그대로 흘려준다.
+            None/빈 문자열이면 Layer 2 의 _test_execution 이 cfg.project.target_url 로 fallback.
 
     Returns:
         파이프라인 최종 상태.
@@ -56,6 +59,7 @@ async def run_pipeline(
         "current_layer": "",
         "error": None,
         "qapilot_dir": str(Path(qapilot_dir).resolve()),
+        "staging_url": staging_url or "",
         # Layer 1A
         "scan_result": None,
         "domain_rules": [],

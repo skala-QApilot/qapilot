@@ -168,10 +168,11 @@ async def _run_pipeline_task(
     qapilot_dir: Path,
     trace_id: str,
     options: RunOptions,
+    staging_url: str | None = None,
 ) -> None:
     """백그라운드에서 파이프라인을 실행하고 trace를 갱신한다."""
     try:
-        state = await run_pipeline(options, qapilot_dir, trace_id=trace_id)
+        state = await run_pipeline(options, qapilot_dir, trace_id=trace_id, staging_url=staging_url)
         update_trace(qapilot_dir, trace_id, dict(state))
     except Exception as e:
         error = f"{type(e).__name__}: {e}"
@@ -186,6 +187,7 @@ def _start_pipeline(request: Request, body: dict[str, Any], options: RunOptions)
 
     trace_id = request.state.trace_id
     service_id = str(body.get("service_id") or "")
+    staging_url = str(body.get("staging_url") or "").strip() or None
     create_trace(
         qapilot_dir,
         trace_id,
@@ -193,7 +195,7 @@ def _start_pipeline(request: Request, body: dict[str, Any], options: RunOptions)
         options["trigger"],
         service_id=service_id,
     )
-    asyncio.create_task(_run_pipeline_task(qapilot_dir, trace_id, options))
+    asyncio.create_task(_run_pipeline_task(qapilot_dir, trace_id, options, staging_url))
     logger.info(
         "agent_pipeline_started",
         service_id=service_id,

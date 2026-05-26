@@ -444,6 +444,9 @@ async def _scenario_generate(state: PipelineState) -> dict:
                 "scan_result": state.get("scan_result"),
                 "domain_rules": state.get("domain_rules") or [],
                 "requirements": state.get("requirements") or [],
+                # codebase-index 디렉토리를 state.qapilot_dir 기준으로 read 하도록 전달.
+                # 미주입 시 agent 가 config.project.root → CWD fallback → qapilot 자체 dir 을 읽음 (회귀 원인).
+                "qapilot_dir": state.get("qapilot_dir"),
             },
             params={"trigger": trigger, "affected_only": affected_only},
         )
@@ -806,7 +809,11 @@ async def _test_execution(state: PipelineState) -> dict:
     action_mappings = state.get("action_mappings") or []
     cfg = load_config()
     headless = bool(getattr(cfg.test, "headless", True)) if hasattr(cfg, "test") else True
-    target_url = getattr(cfg.project, "target_url", "") if hasattr(cfg, "project") else ""
+    # SaaS 호출 경로(Spring) 에서는 state.staging_url 이 service.stagingUrl 로 채워져 있다.
+    # CLI 단독 실행에서는 비어있으므로 cfg.project.target_url 로 fallback.
+    target_url = state.get("staging_url") or (
+        getattr(cfg.project, "target_url", "") if hasattr(cfg, "project") else ""
+    )
 
     results_root = _qapilot_path(state, "results", trace_id)
 

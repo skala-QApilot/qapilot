@@ -48,6 +48,11 @@ class PipelineState(TypedDict):
     # CWD 의존을 제거하기 위해 도입됨 — 절대 Path(".qapilot")/... 식으로 직접 쓰지 말 것.
     qapilot_dir: str
 
+    # SUT base URL (예: https://staging.example.com). SaaS 멀티 테넌트 구조에서 service별
+    # stagingUrl 을 Layer 2 의 Playwright base URL 로 사용한다. CLI 단독 실행 시엔 빈 문자열
+    # → _test_execution 이 cfg.project.target_url 로 fallback 한다.
+    staging_url: str
+
     # ── Layer 1A: 컨텍스트 + 시나리오 생성 ──
     scan_result: ScanResult | None
     domain_rules: list[DomainRule]
