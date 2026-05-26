@@ -129,9 +129,31 @@
 | `repo_url` | 사용자 | ✅ 필수 입력 | `params["repo_url"]` 필수 | GitHub URL |
 | `branch` | 사용자 | ✅ 필수 입력 | `params.get("branch", "main")` ✅ | 기본값 `main` 자동 |
 | `target_url` | 사용자 | ✅ 필수 입력 | `cfg.project.target_url` (qapilot.config.yaml) | SUT staging URL |
-| `token` | **TBD** | ⚠️ **미정** | `params.get("token", "")` — **사용자별 입력 가정. default 빈 문자열 = public repo unauthenticated (GitHub rate limit 60/시간)**. "우리 측 공용" 정책 미구현 | (a) 우리 측 공용 (GitHub App / 서비스 계정) — secret store + `_normalize_repos` fallback layer 신설 필요 vs (b) 사용자별 PAT 입력 — projects/register 필드 + qapilot.config.yaml 저장 (보안 검토). **정책 결정 후 코드 정합**. PR #146/#162 본문에도 정책 명시 없음 |
+| `token` (GitHub) | **TBD** | ⚠️ **미정** | `params.get("token", "")` — **사용자별 입력 가정. default 빈 문자열 = public repo unauthenticated (GitHub rate limit 60/시간)**. "우리 측 공용" 정책 미구현 | (a) 우리 측 공용 (GitHub App / 서비스 계정) — secret store + `_normalize_repos` fallback layer 신설 필요 vs (b) 사용자별 PAT 입력 — projects/register 필드 + qapilot.config.yaml 저장 (보안 검토). **정책 결정 후 코드 정합**. PR #146/#162 본문에도 정책 명시 없음 |
 | `framework` | Central Hub | ❌ 입력 X | ✅ `_detect_language_framework()` 휴리스틱 완비 (pom.xml→spring / pyproject.toml→fastapi·django·flask / package.json→react·vue·next 등). **multi-repo 시 `","join(...)` 결합 형태** (`"fastapi,react"`) | GitCodebaseScannerTool 이 repo 종합 분석으로 자동 추론. ProjectRecord 의 framework 가 단일 string 이면 **multi-repo 표현 정책 결정 필요** |
 | `language` | Central Hub | ❌ 입력 X | ✅ 동일 (`_LANG_MAP` 카운트 top language) | 동일. multi-repo 콤마 결합 |
+
+#### 🔑 API Key / Token 정책 — 종류별 구분
+
+토큰은 두 종류 — **혼동 주의**:
+
+| 종류 | 정책 | 출처 | 현 develop 처리 |
+|---|---|---|---|
+| **OpenAI API key** (`OPENAI_API_KEY`) | ✅ **확정 — Central Hub 서비스 측 제공** (사용자 입력 X) | Central Hub 환경변수 (서버 측 `.env` 또는 secret) | `langchain_openai.ChatOpenAI` 가 환경변수 자동 로드 (`qapilot/shared/llm_client.py:121`) + `load_dotenv()` (`config.py:89`). **현 코드는 cwd `.env` 의존 — CLI 사용자별 가정**. Central Hub 채택 시 **서버 환경변수 설정 하나로 자동 작동** (코드 변경 거의 없음) |
+| **GitHub PAT** (`params["token"]`) | ⚠️ **미정 — 격차 6 (회의 결정 P0)** | (a) 우리 측 공용 GitHub App / 서비스 계정 vs (b) 사용자별 PAT 입력 | `git_codebase_scanner_tool.py:497` `params.get("token", "")`. **사용자별 입력 가정. default 빈 문자열** |
+
+**SaaS 표준 패턴 정합**:
+- ChatGPT / Claude.ai / Cursor 등 = 서비스 측 OpenAI key + 사용자 요금제로 비용 분배 → QApilot 동일 패턴
+- 외부 사용자 = 웹 UI 사용 → 자기 OpenAI key 입력은 SaaS 표준 위반 + UX 저하
+
+**비용 추적**:
+- `LLMClient.total_input_tokens / total_output_tokens / total_cost_usd` 이미 trace 단위 측정 ✅
+- 사용자별 회계 (요금제) = 향후 고도화 (Stage 4 의 운영 자동화 layer)
+- `LLMConfig.monthly_budget_usd = 500` 이미 정의됨 (현재는 단일 예산)
+
+**개발자 트랙 (CLI 로컬 e2e)**:
+- 현재처럼 자기 `.env` 사용 (mini-bss-lite/.env + qapilot/.env 실측 패턴)
+- **이슈 #135 의 `OPENAI_API_KEY` step 신설 = CLI 개발자 보조 진입점 한정** 으로 의미 재정의. 외부 사용자 UX 와 무관 (외부 = 서버 측 키 자동 사용)
 
 ### 3.4 실 e2e 검증 결과
 
@@ -160,7 +182,7 @@ GitCodebaseScannerTool 발동 경로 (현 develop):
 | **3** | `/api/agent/*` 엔드포인트가 qapilot.config.yaml 로드 → `RunOptions` 자동 채움 (또는 pipeline 노드가 cfg 에서 직접 읽기) | A+C 공유 (`api/agent_router.py` + `orchestrator/pipeline.py`) | 부분 | P0 |
 | **4** | 본인 `_codebase_scan` 분기 — `cfg.project.repo_url` fallback 추가 (이중 출처: RunOptions 우선 + cfg fallback) | A 본인 | ✅ | P1 (격차 1/3 후) |
 | **5** (인프라) | GitHub webhook 같은 자동 trigger | DevOps | ❌ | 고도화 |
-| **6** (정책 미정) | **token 정책 결정** — (a) Central Hub 공용 token (GitHub App / 서비스 계정, secret store + `_normalize_repos` fallback layer 신설) vs (b) 사용자별 PAT 입력 (projects/register 필드 + qapilot.config.yaml 저장 + 보안 검토). **현 코드 = (b) 사용자별 가정으로 작성**. 결정 후 격차 1/2 의 token 처리 방식 확정 | 회의 결정 | ❌ | P0 (격차 1/2 선행) |
+| **6** (정책 미정) | **GitHub token 정책 결정** — (a) Central Hub 공용 token (GitHub App / 서비스 계정, secret store + `_normalize_repos` fallback layer 신설) vs (b) 사용자별 PAT 입력 (projects/register 필드 + qapilot.config.yaml 저장 + 보안 검토). **현 코드 = (b) 사용자별 가정으로 작성**. 결정 후 격차 1/2 의 token 처리 방식 확정. **참고: OpenAI API key 는 별개 — 서비스 측 (Central Hub) 으로 확정** (§3.3 API Key/Token 정책 표 참조) | 회의 결정 | ❌ | P0 (격차 1/2 선행) |
 | **7** (정책 미정) | **multi-repo framework/language 표현 정책** — GitCodebaseScannerTool 이 multi-repo 시 `","join(...)` 결합 형태 출력 (`"fastapi,react"`). ProjectRecord 가 단일 string 필드면 (a) 콤마 그대로 저장 vs (b) repo 별 분리 필드 vs (c) primary framework 만 추출. **현 코드 = (a) 콤마 결합 그대로** | 회의 결정 | ❌ | P1 (격차 2 동반) |
 
 ### 4.2 결과 — e2e 가능 여부
