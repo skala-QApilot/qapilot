@@ -36,6 +36,10 @@ _SCENARIO_TRIGGERS = {"init", "natural_lang", "doc_update"}
 ScenarioTrigger = Literal["init", "natural_lang", "doc_update"]
 RunFilter = Literal["all", "failed", "affected"]
 
+# 실행 중인 파이프라인 task 레지스트리 — trace_id → asyncio.Task.
+# 정지 요청 시 task.cancel() 호출하여 즉시 중단할 수 있도록 추적한다.
+_running_tasks: dict[str, asyncio.Task] = {}
+
 
 @router.post("/scenario-generation")
 async def scenario_generation(request: Request) -> Any:
@@ -222,20 +226,53 @@ async def get_latest_screenshot(
     return FileResponse(latest, media_type="image/png")
 
 
+@router.post("/runs/{trace_id}/stop")
+async def stop_run(
+    trace_id: str,
+    qapilot_dir: str = Query(...),
+) -> Any:
+    """진행 중인 파이프라인을 즉시 중단한다. trace.status → "aborted".
+
+    이미 끝났거나 등록되지 않은 trace 면 idempotent 하게 ok 반환 (UI 가 race 안 만들도록).
+    """
+    qapilot_path = _valid_qapilot_dir(qapilot_dir)
+    if not qapilot_path:
+        return _invalid_qapilot_dir()
+
+    task = _running_tasks.get(trace_id)
+    if task and not task.done():
+        task.cancel()
+        logger.info("agent_pipeline_stop_requested", trace_id=trace_id)
+        return ok({"trace_id": trace_id, "status": "aborting"})
+
+    # 이미 끝났거나 등록되지 않은 trace — 디스크 status 가 ground truth.
+    return ok({"trace_id": trace_id, "status": "not_running"})
+
+
 async def _run_pipeline_task(
     qapilot_dir: Path,
     trace_id: str,
     options: RunOptions,
     staging_url: str | None = None,
 ) -> None:
-    """백그라운드에서 파이프라인을 실행하고 trace를 갱신한다."""
+    """백그라운드에서 파이프라인을 실행하고 trace를 갱신한다.
+
+    CancelledError (정지 요청) 와 일반 Exception (파이프라인 크래시) 모두
+    trace.status="aborted" 로 처리한다. "completed" 와 분리해 "이어서 실행" 가능.
+    """
     try:
         state = await run_pipeline(options, qapilot_dir, trace_id=trace_id, staging_url=staging_url)
         update_trace(qapilot_dir, trace_id, dict(state))
+    except asyncio.CancelledError:
+        update_trace_aborted(qapilot_dir, trace_id, "사용자 요청으로 중단됨")
+        logger.info("agent_pipeline_task_cancelled", trace_id=trace_id)
+        raise  # cancel 전파 (asyncio 가 task 상태를 cancelled 로 마크)
     except Exception as e:
         error = f"{type(e).__name__}: {e}"
         update_trace_aborted(qapilot_dir, trace_id, error)
         logger.error("agent_pipeline_task_failed", trace_id=trace_id, error=error)
+    finally:
+        _running_tasks.pop(trace_id, None)
 
 
 def _start_pipeline(request: Request, body: dict[str, Any], options: RunOptions) -> JSONResponse:
@@ -253,7 +290,8 @@ def _start_pipeline(request: Request, body: dict[str, Any], options: RunOptions)
         options["trigger"],
         service_id=service_id,
     )
-    asyncio.create_task(_run_pipeline_task(qapilot_dir, trace_id, options, staging_url))
+    task = asyncio.create_task(_run_pipeline_task(qapilot_dir, trace_id, options, staging_url))
+    _running_tasks[trace_id] = task
     logger.info(
         "agent_pipeline_started",
         service_id=service_id,
