@@ -863,10 +863,12 @@ class UITestTool(BaseTool):
 
         스텝 실패 직후 호출되는 경우, SPA hydrate 가 더 진행됐을 수 있어 짧게
         networkidle 대기 후 캡쳐. 실패해도 무방 (가능한 최선의 시점 캡쳐).
+        디버그용으로 같은 step 의 DOM html 도 page_NN.html 로 옆에 저장.
         """
         if screenshot_dir is None:
             return None
         path = screenshot_dir / f"step_{step_no:02d}.png"
+        html_path = screenshot_dir / f"step_{step_no:02d}.html"
         try:
             await page.wait_for_load_state("networkidle", timeout=2000)
         except Exception:
@@ -875,4 +877,9 @@ class UITestTool(BaseTool):
             await page.screenshot(path=str(path))
         except Exception:
             return None
+        try:
+            html = await page.content()
+            html_path.write_text(html, encoding="utf-8")
+        except Exception:
+            pass  # 디버그용이라 실패해도 무방
         return str(path)

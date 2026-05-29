@@ -112,6 +112,7 @@ async def test_run(request: Request) -> Any:
         "scenario_ids": _optional_list(body, "scenario_ids"),
         "filter": _optional_filter(body) or "all",
         "tags": _optional_list(body, "tags"),
+        "resume_from_trace": _optional_str(body, "resume_from_trace"),
     }
     _inject_git_options(body, options)
     return _start_pipeline(request, body, options)

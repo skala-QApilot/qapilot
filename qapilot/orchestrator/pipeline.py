@@ -755,6 +755,20 @@ async def _load_scenarios_for_test(state: PipelineState) -> dict:
         action_mappings = [a for a in action_mappings if a.get("tc_id") in valid_tc_ids]
         generated_codes = [c for c in generated_codes if c.get("tc_id") in valid_tc_ids]
 
+    # 필터 — run_options.resume_from_trace (이어서 실행)
+    # 이전 trace 의 results 디렉토리에 ui_result.json 이 있는 TC 는 이미 실행 완료된 것으로
+    # 간주하고 스킵. 끊긴 시점부터 이어가기 위함.
+    resume_from = state["run_options"].get("resume_from_trace")
+    if resume_from:
+        prev_results = _qapilot_path(state, "results", resume_from)
+        completed_tc_ids: set[str] = set()
+        if prev_results.exists():
+            for ui_path in prev_results.rglob("ui_result.json"):
+                completed_tc_ids.add(ui_path.parent.name)
+        if completed_tc_ids:
+            action_mappings = [a for a in action_mappings if a.get("tc_id") not in completed_tc_ids]
+            generated_codes = [c for c in generated_codes if c.get("tc_id") not in completed_tc_ids]
+
     # 필터 — run_options.tags (TC 단위)
     tags = state["run_options"].get("tags") or []
     if tags:
