@@ -5,11 +5,12 @@ Created: 2026-05-15
 """
 
 import asyncio
+import json
 from pathlib import Path
 from typing import Any, Literal, cast
 
 from fastapi import APIRouter, Depends, Query, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 
 from qapilot.api.internal_deps import verify_internal_token
 from qapilot.api.response import fail, ok
@@ -21,7 +22,7 @@ from qapilot.shared.trace_store import (
     create_trace,
     load_trace,
     update_trace,
-    update_trace_failed,
+    update_trace_aborted,
 )
 
 router = APIRouter(
@@ -164,6 +165,62 @@ async def get_trace(
     return ok({"trace": trace})
 
 
+@router.get("/runs/{trace_id}/progress")
+async def get_run_progress(
+    trace_id: str,
+    qapilot_dir: str = Query(...),
+) -> Any:
+    """test-run 진행 상황 — `.qapilot/results/{trace_id}/` 디스크 스캔 결과.
+
+    Layer 2 가 각 TC 마다 ui_result.json / api_result.json / db_result.json 을
+    실시간으로 디스크에 쓰므로, 폴링 호출자는 이 endpoint 로 부분 결과를 받을 수 있다.
+    """
+    qapilot_path = _valid_qapilot_dir(qapilot_dir)
+    if not qapilot_path:
+        return _invalid_qapilot_dir()
+
+    results_root = qapilot_path / "results" / trace_id
+    items: list[dict[str, Any]] = []
+    if results_root.exists():
+        for tc_dir in sorted(results_root.glob("*/*")):
+            if not tc_dir.is_dir():
+                continue
+            ts_id = tc_dir.parent.name
+            tc_id = tc_dir.name
+            item: dict[str, Any] = {"ts_id": ts_id, "tc_id": tc_id}
+            for kind in ("ui", "api", "db"):
+                f = tc_dir / f"{kind}_result.json"
+                if f.exists():
+                    try:
+                        item[kind] = json.loads(f.read_text(encoding="utf-8"))
+                    except (json.JSONDecodeError, OSError):
+                        item[kind] = None
+            items.append(item)
+    return ok({"trace_id": trace_id, "items": items, "count": len(items)})
+
+
+@router.get("/runs/{trace_id}/screenshot/latest")
+async def get_latest_screenshot(
+    trace_id: str,
+    qapilot_dir: str = Query(...),
+) -> Any:
+    """가장 최근에 캡쳐된 PNG 스크린샷을 반환. 없으면 204."""
+    qapilot_path = _valid_qapilot_dir(qapilot_dir)
+    if not qapilot_path:
+        return _invalid_qapilot_dir()
+
+    results_root = qapilot_path / "results" / trace_id
+    if not results_root.exists():
+        return Response(status_code=204)
+
+    pngs = list(results_root.rglob("*.png"))
+    if not pngs:
+        return Response(status_code=204)
+
+    latest = max(pngs, key=lambda p: p.stat().st_mtime)
+    return FileResponse(latest, media_type="image/png")
+
+
 async def _run_pipeline_task(
     qapilot_dir: Path,
     trace_id: str,
@@ -176,7 +233,7 @@ async def _run_pipeline_task(
         update_trace(qapilot_dir, trace_id, dict(state))
     except Exception as e:
         error = f"{type(e).__name__}: {e}"
-        update_trace_failed(qapilot_dir, trace_id, error)
+        update_trace_aborted(qapilot_dir, trace_id, error)
         logger.error("agent_pipeline_task_failed", trace_id=trace_id, error=error)
 
 

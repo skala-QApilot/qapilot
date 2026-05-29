@@ -71,12 +71,17 @@ def update_trace(qapilot_dir: str | Path, trace_id: str, state: dict) -> None:
     _save_trace(qapilot_dir, trace_id, trace)
 
 
-def update_trace_failed(qapilot_dir: str | Path, trace_id: str, error: str) -> None:
-    """파이프라인 실패 상태로 trace를 갱신한다."""
+def update_trace_aborted(qapilot_dir: str | Path, trace_id: str, error: str) -> None:
+    """파이프라인 비정상 종료(예외/Ctrl+C 등) 상태로 trace를 갱신한다.
+
+    "aborted" 는 trace lifecycle 의 한 종단 상태이며, TC-level 의 ``status="failed"``
+    (개별 테스트 케이스 실패) 와는 의미가 다르다. 두 축이 같은 단어를 쓰지 않도록
+    분리한다.
+    """
     trace = load_trace(qapilot_dir, trace_id) or {"trace_id": trace_id}
     trace.update(
         {
-            "status": "failed",
+            "status": "aborted",
             "completed_at": _utc_now(),
             "error": error,
         }

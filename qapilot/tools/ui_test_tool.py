@@ -283,7 +283,10 @@ class UITestTool(BaseTool):
             code=ErrorCode.TOOL_UI_AUTO_NAVIGATE,
         )
         try:
-            await page.goto(full_url)
+            # SPA (Vite/Next/CRA 등) 가 client-side hydrate 끝나야 selector 가 잡히므로
+            # default "load" 가 아닌 "networkidle" 까지 대기. 초기 XHR/fetch 끝날 때까지 기다린다.
+            # 일부 사이트가 long-poll/SSE 로 networkidle 못 만족할 수 있어 15s timeout 으로 cap.
+            await page.goto(full_url, wait_until="networkidle", timeout=15000)
         except Exception as e:
             self.logger.warning(
                 "ui_auto_navigate_failed",
@@ -856,10 +859,18 @@ class UITestTool(BaseTool):
     async def _capture_screenshot(
         page: Page, screenshot_dir: Path | None, step_no: int
     ) -> str | None:
-        """스크린샷 저장. screenshot_dir 미지정 시 None."""
+        """스크린샷 저장. screenshot_dir 미지정 시 None.
+
+        스텝 실패 직후 호출되는 경우, SPA hydrate 가 더 진행됐을 수 있어 짧게
+        networkidle 대기 후 캡쳐. 실패해도 무방 (가능한 최선의 시점 캡쳐).
+        """
         if screenshot_dir is None:
             return None
         path = screenshot_dir / f"step_{step_no:02d}.png"
+        try:
+            await page.wait_for_load_state("networkidle", timeout=2000)
+        except Exception:
+            pass  # 무시 — 캡쳐는 계속 진행
         try:
             await page.screenshot(path=str(path))
         except Exception:
