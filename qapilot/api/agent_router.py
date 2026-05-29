@@ -19,6 +19,7 @@ from qapilot.shared.errors import ErrorCode
 from qapilot.shared.logger import get_logger
 from qapilot.shared.schemas import RunOptions
 from qapilot.shared.trace_store import (
+    annotate_trace,
     create_trace,
     load_trace,
     update_trace,
@@ -226,6 +227,68 @@ async def get_latest_screenshot(
     return FileResponse(latest, media_type="image/png")
 
 
+@router.post("/runs/{trace_id}/resume")
+async def resume_run(
+    trace_id: str,
+    qapilot_dir: str = Query(...),
+) -> Any:
+    """중단된 trace 를 같은 trace_id 로 재개한다.
+
+    fresh start 와 달리 새 trace_id 를 만들지 않고 기존 trace 를 이어서 진행한다.
+    - 디스크의 results/{trace_id}/ 에 이미 있는 TC 는 자동 skip (resume_from_trace=self)
+    - 옵션 (scenario_ids, filter, tags, staging_url) 은 trace.json 에서 읽어 재사용
+    - 같은 trace_id 로 task 등록 → 새 stop 요청도 그대로 동작
+    """
+    qapilot_path = _valid_qapilot_dir(qapilot_dir)
+    if not qapilot_path:
+        return _invalid_qapilot_dir()
+
+    trace = load_trace(qapilot_path, trace_id)
+    if not trace:
+        return fail(ErrorCode.AGENT_API_002, "trace를 찾을 수 없습니다.")
+
+    status = str(trace.get("status") or "").lower()
+    if status != "aborted":
+        return fail(
+            ErrorCode.AGENT_API_003,
+            f"resume 는 aborted 상태에서만 가능합니다. 현재 status={status}",
+        )
+
+    if trace_id in _running_tasks and not _running_tasks[trace_id].done():
+        return fail(ErrorCode.AGENT_API_003, "이미 실행 중인 trace 입니다.")
+
+    options: RunOptions = {
+        "command": "test",
+        "trigger": None,
+        "user_input": None,
+        "scenario_ids": _optional_list_value(trace.get("scenario_ids")),
+        "filter": _optional_filter_value(trace.get("filter")) or "all",
+        "tags": _optional_list_value(trace.get("tags")),
+        "resume_from_trace": trace_id,  # 자기 자신 — 디스크 스캔으로 완료 TC skip
+    }
+    staging_url = str(trace.get("staging_url") or "").strip() or None
+
+    # 다시 running 으로 전환 — 이전 error 정보도 정리.
+    annotate_trace(qapilot_path, trace_id, status="running", error=None, completed_at=None)
+
+    task = asyncio.create_task(_run_pipeline_task(qapilot_path, trace_id, options, staging_url))
+    _running_tasks[trace_id] = task
+    logger.info("agent_pipeline_resumed", trace_id=trace_id)
+    return ok({"trace_id": trace_id, "status": "running"})
+
+
+def _optional_list_value(value: Any) -> list[str] | None:
+    if isinstance(value, list):
+        return [str(v) for v in value if v is not None]
+    return None
+
+
+def _optional_filter_value(value: Any) -> str | None:
+    if isinstance(value, str) and value in {"all", "failed", "affected"}:
+        return value
+    return None
+
+
 @router.post("/runs/{trace_id}/stop")
 async def stop_run(
     trace_id: str,
@@ -240,12 +303,21 @@ async def stop_run(
         return _invalid_qapilot_dir()
 
     task = _running_tasks.get(trace_id)
+    registered_count = len(_running_tasks)
     if task and not task.done():
         task.cancel()
-        logger.info("agent_pipeline_stop_requested", trace_id=trace_id)
+        logger.info("agent_pipeline_stop_requested", trace_id=trace_id, registered_count=registered_count)
         return ok({"trace_id": trace_id, "status": "aborting"})
 
     # 이미 끝났거나 등록되지 않은 trace — 디스크 status 가 ground truth.
+    logger.warning(
+        "agent_pipeline_stop_not_tracked",
+        trace_id=trace_id,
+        registered_count=registered_count,
+        registered_traces=list(_running_tasks.keys()),
+        task_present=bool(task),
+        task_done=task.done() if task else None,
+    )
     return ok({"trace_id": trace_id, "status": "not_running"})
 
 
@@ -289,6 +361,15 @@ def _start_pipeline(request: Request, body: dict[str, Any], options: RunOptions)
         options["command"],
         options["trigger"],
         service_id=service_id,
+    )
+    # 옵션을 trace.json 에 보존 — resume endpoint 가 같은 trace_id 로 재개할 때 읽어 쓴다.
+    annotate_trace(
+        qapilot_dir,
+        trace_id,
+        scenario_ids=options.get("scenario_ids"),
+        filter=options.get("filter"),
+        tags=options.get("tags"),
+        staging_url=staging_url,
     )
     task = asyncio.create_task(_run_pipeline_task(qapilot_dir, trace_id, options, staging_url))
     _running_tasks[trace_id] = task

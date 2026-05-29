@@ -755,6 +755,17 @@ async def _load_scenarios_for_test(state: PipelineState) -> dict:
         action_mappings = [a for a in action_mappings if a.get("tc_id") in valid_tc_ids]
         generated_codes = [c for c in generated_codes if c.get("tc_id") in valid_tc_ids]
 
+    # "선택한 시나리오들의 전체 TC 수" 기록 — P/F/N 의 분모. resume 시 새로 실행한 TC 만이
+    # 아니라, 사용자가 선택한 시나리오의 전체 TC 수가 total 이 되어야 함.
+    selected_total_tc_count = sum(
+        len(s.get("test_cases") or []) for s in scenarios
+    )
+    try:
+        from qapilot.shared.trace_store import annotate_trace as _annotate
+        _annotate(state["qapilot_dir"], trace_id, selected_total_tc_count=selected_total_tc_count)
+    except Exception:
+        pass  # 디스크 쓰기 실패는 무시 — 메인 흐름 보존
+
     # 필터 — run_options.resume_from_trace (이어서 실행)
     # 이전 trace 의 results 디렉토리에 ui_result.json 이 있는 TC 는 이미 실행 완료된 것으로
     # 간주하고 스킵. 끊긴 시점부터 이어가기 위함.
@@ -886,7 +897,10 @@ async def _test_execution(state: PipelineState) -> dict:
             await context.close()
             await browser.close()
 
-    tc_results = _aggregate_tc_results(ui_results, api_results, db_results)
+    # tc_results / scenario_results 집계는 디스크 기반 — 같은 trace_id 로 resume 한 경우
+    # 이전 run 의 결과도 results 디렉토리에 누적되어 있으므로 디스크 스캔이 진실의 source.
+    disk_ui, disk_api, disk_db = _load_all_tc_results_from_disk(results_root)
+    tc_results = _aggregate_tc_results(disk_ui, disk_api, disk_db)
     scenario_results = _aggregate_scenario_results(tc_results, scenarios)
 
     return {
@@ -896,6 +910,32 @@ async def _test_execution(state: PipelineState) -> dict:
         "tc_results": tc_results,
         "scenario_results": scenario_results,
     }
+
+
+def _load_all_tc_results_from_disk(
+    results_root: Path,
+) -> tuple[list[dict], list[dict], list[dict]]:
+    """results/{trace_id}/<ts>/<tc>/{ui,api,db}_result.json 전체를 로드한다.
+
+    같은 trace 가 여러 차례 resume 되어 결과가 누적된 경우 전부 합쳐 반환.
+    """
+    ui_all: list[dict] = []
+    api_all: list[dict] = []
+    db_all: list[dict] = []
+    if not results_root.exists():
+        return ui_all, api_all, db_all
+    for tc_dir in results_root.glob("*/*"):
+        if not tc_dir.is_dir():
+            continue
+        for kind, bucket in (("ui", ui_all), ("api", api_all), ("db", db_all)):
+            f = tc_dir / f"{kind}_result.json"
+            if not f.exists():
+                continue
+            try:
+                bucket.append(json.loads(f.read_text(encoding="utf-8")))
+            except (json.JSONDecodeError, OSError):
+                continue
+    return ui_all, api_all, db_all
 
 
 def _aggregate_tc_results(

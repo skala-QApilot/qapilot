@@ -71,6 +71,20 @@ def update_trace(qapilot_dir: str | Path, trace_id: str, state: dict) -> None:
     _save_trace(qapilot_dir, trace_id, trace)
 
 
+def annotate_trace(qapilot_dir: str | Path, trace_id: str, **fields: Any) -> None:
+    """trace.json 의 일부 필드를 갱신한다.
+
+    create_trace 와 update_trace 사이에서 부분 정보를 누적 기록할 때 사용.
+    예: 파이프라인 시작 직후 옵션 (scenario_ids, staging_url 등) 또는
+    _load_scenarios_for_test 단계의 selected_total_tc_count 보존.
+    """
+    if not fields:
+        return
+    trace = load_trace(qapilot_dir, trace_id) or {"trace_id": trace_id}
+    trace.update(fields)
+    _save_trace(qapilot_dir, trace_id, trace)
+
+
 def update_trace_aborted(qapilot_dir: str | Path, trace_id: str, error: str) -> None:
     """파이프라인 비정상 종료(예외/Ctrl+C 등) 상태로 trace를 갱신한다.
 
