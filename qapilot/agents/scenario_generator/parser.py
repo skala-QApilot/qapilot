@@ -95,6 +95,7 @@ def parse_response(
                     "values": values,
                     "tags": tc.get("tags", []),
                     "req_id": tc.get("req_id"),
+                    "api": tc.get("api"),
                 }
             )
 
@@ -109,6 +110,7 @@ def parse_response(
                 "trigger": trigger,
                 "affected_files": affected_files or s.get("affected_files", []),
                 "domain_rules_used": domain_rule_ids,
+                "requirements": s.get("requirements", []),
                 "test_cases": unique_tcs,
             }
         )
