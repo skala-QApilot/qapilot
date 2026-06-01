@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from qapilot.db.run_writer import upsert_run
 from qapilot.shared.logger import get_logger
 
 _logger = get_logger("trace_store")
@@ -40,6 +41,7 @@ def create_trace(
         "result_summary": {},
     }
     _save_trace(qapilot_dir, trace_id, trace)
+    upsert_run(trace)
     return trace
 
 
@@ -69,6 +71,7 @@ def update_trace(qapilot_dir: str | Path, trace_id: str, state: dict) -> None:
         payload["scenario_results"] = scenario_results
     trace.update(payload)
     _save_trace(qapilot_dir, trace_id, trace)
+    upsert_run(trace)
 
 
 def annotate_trace(qapilot_dir: str | Path, trace_id: str, **fields: Any) -> None:
@@ -83,6 +86,7 @@ def annotate_trace(qapilot_dir: str | Path, trace_id: str, **fields: Any) -> Non
     trace = load_trace(qapilot_dir, trace_id) or {"trace_id": trace_id}
     trace.update(fields)
     _save_trace(qapilot_dir, trace_id, trace)
+    upsert_run(trace)
 
 
 def update_trace_aborted(qapilot_dir: str | Path, trace_id: str, error: str) -> None:
@@ -101,6 +105,7 @@ def update_trace_aborted(qapilot_dir: str | Path, trace_id: str, error: str) -> 
         }
     )
     _save_trace(qapilot_dir, trace_id, trace)
+    upsert_run(trace)
 
 
 def load_trace(qapilot_dir: str | Path, trace_id: str) -> dict | None:
