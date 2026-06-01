@@ -26,8 +26,10 @@ from typing import Any
 
 from langgraph.graph import END, START, StateGraph
 
+from qapilot.db.tc_result_writer import insert_tc_artifact, upsert_tc_result
 from qapilot.orchestrator.state import PipelineState
 from qapilot.shared.logger import get_logger
+from qapilot.storage import s3_client
 
 
 def _qapilot_path(state: PipelineState, *parts: str) -> Path:
@@ -1134,6 +1136,17 @@ async def _test_execution(state: PipelineState) -> dict:
                 (tc_dir / "db_result.json").write_text(
                     json.dumps(db_res, ensure_ascii=False, indent=2), "utf-8"
                 )
+
+                # L3 DB / S3 mirror — 실패해도 디스크 진실은 보존됨
+                _mirror_tc_results_and_artifacts(
+                    trace_id=trace_id,
+                    ts_id=ts_id,
+                    tc_id=tc_id,
+                    ui_result=ui_res["ui_result"],
+                    api_result=ui_res["api_result"],
+                    db_result=db_res,
+                    screenshots_dir=screenshots_dir,
+                )
         finally:
             await context.close()
             await browser.close()
@@ -1151,6 +1164,60 @@ async def _test_execution(state: PipelineState) -> dict:
         "tc_results": tc_results,
         "scenario_results": scenario_results,
     }
+
+
+def _mirror_tc_results_and_artifacts(
+    *,
+    trace_id: str,
+    ts_id: str,
+    tc_id: str,
+    ui_result: dict,
+    api_result: dict,
+    db_result: dict,
+    screenshots_dir: Path,
+) -> None:
+    """ui/api/db 결과 → tc_results UPSERT, 스크린샷 PNG → S3 + tc_artifacts.
+
+    DB / S3 미설정/실패 시 모두 graceful — file 기록이 source of truth.
+    """
+    ui_result_id = upsert_tc_result(
+        run_id=trace_id, ts_id=ts_id, tc_id=tc_id, kind="ui", payload=ui_result,
+    )
+    upsert_tc_result(
+        run_id=trace_id, ts_id=ts_id, tc_id=tc_id, kind="api", payload=api_result,
+    )
+    upsert_tc_result(
+        run_id=trace_id, ts_id=ts_id, tc_id=tc_id, kind="db", payload=db_result,
+    )
+
+    # 스크린샷은 UI result 에 묶음. tc_result_id 없으면 (DB 비활성) S3 도 skip.
+    if not ui_result_id or not screenshots_dir.exists():
+        return
+
+    for png in sorted(screenshots_dir.glob("step_*.png")):
+        step_index = _parse_step_index(png.name)
+        if step_index is None:
+            continue
+        s3_key = f"runs/{trace_id}/tc/{ts_id}/{tc_id}/screenshots/{png.name}"
+        meta = s3_client.put_file(s3_key, str(png), content_type="image/png")
+        if meta is None:
+            continue
+        insert_tc_artifact(
+            tc_result_id=ui_result_id,
+            step_index=step_index,
+            kind="png",
+            s3_key=s3_key,
+            sha256=meta.get("sha256"),
+            size_bytes=meta.get("bytes"),
+        )
+
+
+_STEP_INDEX_RE = re.compile(r"step_(\d+)\.")
+
+
+def _parse_step_index(name: str) -> int | None:
+    m = _STEP_INDEX_RE.search(name)
+    return int(m.group(1)) if m else None
 
 
 def _load_all_tc_results_from_disk(
