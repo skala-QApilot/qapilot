@@ -166,6 +166,13 @@ class UITestTool(BaseTool):
         total_start = time.monotonic()
         tc_status = "pass"
 
+        # 이슈 #174 (격차 12 D 영역 본질 — 보강 #1): TC 시작 시 page = about:blank
+        # 초기 상태 보정. PR #122 auto-navigate 가 _DOM_ACTIONS 첫 step 만 발동
+        # 하므로 첫 step 이 wait 인 TC 는 about:blank 유지 → 후속 step 모두 fail.
+        # target_url 로 강제 navigate 후 SUT vue-router 의 redirect 결과 (/login 등)
+        # 를 _ensure_authenticated 가 처리한다.
+        await self._ensure_page_loaded(page, target_url)
+
         # 이슈 #121 (옵션 C): ActionMapping 에 navigate step 부재 시 auto-navigate.
         # 첫 step 이 DOM action 인 경우 SUT 가 잘못된 페이지 (예: vue-router redirect)
         # 일 가능성 — api_endpoint 힌트로 frontend route 추론 + page.goto 자동 호출.
@@ -236,6 +243,48 @@ class UITestTool(BaseTool):
 
         total_duration_ms = int((time.monotonic() - total_start) * 1000)
         return step_results, tc_status, total_duration_ms
+
+    async def _ensure_page_loaded(self, page: Page, target_url: str) -> None:
+        """이슈 #174 보강 #1: TC 시작 시 page = about:blank 보정.
+
+        Playwright `new_page()` 직후 page.url = about:blank. PR #122 auto-navigate
+        는 첫 step 이 DOM action (fill/click/assert 등) 일 때만 발동하므로,
+        ActionMapping 의 첫 step 이 wait 인 TC 는 about:blank 유지 → 후속 step
+        모두 fail.
+
+        본 fail-safe 는 _run_steps 진입 직후 page.url 이 비어있거나 about:blank /
+        data:, / file:// 등이면 target_url 로 강제 navigate. SUT 의 vue-router 가
+        / → /login 같은 redirect 를 적용하면 후속 _ensure_authenticated 가
+        인증 처리. target_url 미설정 (absolute URL 아님) 시 graceful skip.
+        """
+        if not target_url or not target_url.startswith(("http://", "https://")):
+            return
+
+        try:
+            current_url = page.url
+        except Exception:
+            return
+        # mock 또는 비정상 상태 (str 아님) → graceful skip
+        if not isinstance(current_url, str):
+            return
+        current_url = current_url.lower()
+
+        # about:blank / data:, / file:// / 빈 문자열 모두 SUT 페이지 미로드 상태
+        if current_url and not current_url.startswith(("about:", "data:", "file://")):
+            return  # 이미 SUT 페이지 로드됨
+
+        self.logger.info(
+            "ui_page_load_fallback",
+            from_url=current_url,
+            to_url=target_url,
+        )
+        try:
+            await page.goto(target_url, wait_until="domcontentloaded", timeout=10000)
+        except Exception as e:
+            self.logger.warning(
+                "ui_page_load_fallback_fail",
+                error=str(e).splitlines()[0] if str(e) else type(e).__name__,
+            )
 
     async def _ensure_authenticated(
         self,
