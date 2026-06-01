@@ -38,6 +38,13 @@ def create_app() -> FastAPI:
     # os.getenv 로 환경변수를 읽는 경로가 있어 반드시 부팅 시 채워줘야 한다.
     load_dotenv()
     setup_logger()
+
+    # DB / S3 pool lazy init 을 startup 에 강제 트리거 — 환경변수 누락이나
+    # 연결 실패를 즉시 로그로 가시화한다. 실패해도 graceful no-op 그대로 (file 기록은 동작).
+    from qapilot.db.connection import get_pool
+    from qapilot.storage.s3_client import get_client
+    get_pool()
+    get_client()
     app = FastAPI(title="QApilot", version="0.1.0")
 
     app.middleware("http")(_trace_id_middleware)

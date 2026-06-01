@@ -14,6 +14,7 @@ import uuid
 from typing import Any
 
 from qapilot.db.connection import get_pool
+from qapilot.messaging.redis_pubsub import publish_run_event
 from qapilot.shared.logger import get_logger
 
 _logger = get_logger("db.tc_result_writer")
@@ -60,7 +61,7 @@ def upsert_tc_result(
                 (new_id, run_id, ts_id, tc_id, kind, status, payload_json),
             )
             row = cur.fetchone()
-            return str(row[0]) if row else None
+            tc_result_id = str(row[0]) if row else None
     except Exception as e:
         _logger.warning(
             "tc_result_db_mirror_failed",
@@ -70,6 +71,15 @@ def upsert_tc_result(
             error=str(e),
         )
         return None
+
+    publish_run_event(run_id, "tc_result", {
+        "tc_result_id": tc_result_id,
+        "ts_id": ts_id,
+        "tc_id": tc_id,
+        "kind": kind,
+        "status": status,
+    })
+    return tc_result_id
 
 
 def insert_tc_artifact(
@@ -101,9 +111,18 @@ def insert_tc_artifact(
                 (new_id, tc_result_id, step_index, kind, s3_key, size_bytes, sha256),
             )
             cur.execute(
-                "UPDATE tc_results SET artifact_count = artifact_count + 1 WHERE id = %s",
+                "UPDATE tc_results SET artifact_count = artifact_count + 1 WHERE id = %s RETURNING run_id",
                 (tc_result_id,),
             )
+            row = cur.fetchone()
+            run_id = str(row[0]) if row else None
+        if run_id:
+            publish_run_event(run_id, "artifact", {
+                "tc_result_id": tc_result_id,
+                "step_index": step_index,
+                "kind": kind,
+                "s3_key": s3_key,
+            })
         return True
     except Exception as e:
         _logger.warning(

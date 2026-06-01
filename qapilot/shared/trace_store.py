@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from qapilot.db.run_writer import upsert_run
+from qapilot.messaging.redis_pubsub import publish_run_event
 from qapilot.shared.logger import get_logger
 
 _logger = get_logger("trace_store")
@@ -42,6 +43,7 @@ def create_trace(
     }
     _save_trace(qapilot_dir, trace_id, trace)
     upsert_run(trace)
+    publish_run_event(trace_id, "status", {"status": trace.get("status"), "started_at": trace.get("started_at")})
     return trace
 
 
@@ -72,6 +74,11 @@ def update_trace(qapilot_dir: str | Path, trace_id: str, state: dict) -> None:
     trace.update(payload)
     _save_trace(qapilot_dir, trace_id, trace)
     upsert_run(trace)
+    publish_run_event(trace_id, "status", {
+        "status": trace.get("status"),
+        "completed_at": trace.get("completed_at"),
+        "summary": trace.get("result_summary"),
+    })
 
 
 def annotate_trace(qapilot_dir: str | Path, trace_id: str, **fields: Any) -> None:
@@ -87,6 +94,10 @@ def annotate_trace(qapilot_dir: str | Path, trace_id: str, **fields: Any) -> Non
     trace.update(fields)
     _save_trace(qapilot_dir, trace_id, trace)
     upsert_run(trace)
+    # annotate 는 partial 갱신 — UI 가 관심 갖는 필드만 골라 push
+    publishable = {k: v for k, v in fields.items() if k in {"selected_total_tc_count", "scenario_ids", "staging_url"}}
+    if publishable:
+        publish_run_event(trace_id, "annotate", publishable)
 
 
 def update_trace_aborted(qapilot_dir: str | Path, trace_id: str, error: str) -> None:
@@ -106,6 +117,7 @@ def update_trace_aborted(qapilot_dir: str | Path, trace_id: str, error: str) -> 
     )
     _save_trace(qapilot_dir, trace_id, trace)
     upsert_run(trace)
+    publish_run_event(trace_id, "status", {"status": "aborted", "error": error})
 
 
 def load_trace(qapilot_dir: str | Path, trace_id: str) -> dict | None:

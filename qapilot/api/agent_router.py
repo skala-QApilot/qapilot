@@ -10,10 +10,11 @@ from pathlib import Path
 from typing import Any, Literal, cast
 
 from fastapi import APIRouter, Depends, Query, Request
-from fastapi.responses import FileResponse, JSONResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 
 from qapilot.api.internal_deps import verify_internal_token
 from qapilot.api.response import fail, ok
+from qapilot.messaging.redis_pubsub import subscribe_run_events
 from qapilot.orchestrator.runner import run_pipeline
 from qapilot.shared.errors import ErrorCode
 from qapilot.shared.logger import get_logger
@@ -203,6 +204,45 @@ async def get_run_progress(
                         item[kind] = None
             items.append(item)
     return ok({"trace_id": trace_id, "items": items, "count": len(items)})
+
+
+@router.get("/runs/{trace_id}/stream")
+async def stream_run_events(trace_id: str, request: Request) -> StreamingResponse:
+    """SSE — Redis pub/sub 채널 `run:<trace_id>` 의 이벤트를 클라이언트로 push.
+
+    이벤트 종류:
+      - status     : run 시작/완료/중단
+      - annotate   : selected_total_tc_count, scenario_ids 등 부분 갱신
+      - tc_result  : 한 TC 의 ui/api/db 결과 1건 (이전 1초 폴링 대체)
+      - artifact   : 스크린샷 등 binary 1건 (s3_key 포함)
+
+    클라이언트가 끊으면 (request.is_disconnected()) generator 종료.
+    REDIS_URL 미설정 시 즉시 close — UI 는 기존 1초 폴링 fallback 사용.
+    """
+
+    async def event_gen():
+        yield ": connected\n\n"  # SSE 초기 코멘트 — 일부 프록시가 첫 byte 받아야 stream 인식
+        try:
+            async for event in subscribe_run_events(trace_id):
+                if await request.is_disconnected():
+                    break
+                payload = json.dumps(event, ensure_ascii=False, default=str)
+                event_type = event.get("type") if isinstance(event, dict) else None
+                if event_type:
+                    yield f"event: {event_type}\ndata: {payload}\n\n"
+                else:
+                    yield f"data: {payload}\n\n"
+        except asyncio.CancelledError:
+            raise
+
+    return StreamingResponse(
+        event_gen(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",   # nginx buffering 끄기 (있을 경우)
+        },
+    )
 
 
 @router.get("/runs/{trace_id}/screenshot/latest")
