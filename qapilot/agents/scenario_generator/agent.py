@@ -223,6 +223,13 @@ class ScenarioGeneratorAgent(BaseAgent):
                 response.content, trigger, router_files, domain_rules
             )
 
+            # 각 TC 에 req_id 강제 주입 — LLM 이 출력에서 누락해도 RTM 매핑이 유실되지 않도록.
+            # _run_domain_based 는 req 단위 1회 호출이라 모든 결과 TC 가 이 req 를 검증.
+            for s in ts_scenarios:
+                for tc in s.get("test_cases") or []:
+                    if not tc.get("req_id"):
+                        tc["req_id"] = req.get("req_id")
+
             for s in ts_scenarios:
                 if len(s["test_cases"]) < 6:
                     self.logger.warning(

@@ -27,6 +27,7 @@ from typing import Any
 from langgraph.graph import END, START, StateGraph
 
 from qapilot.orchestrator.state import PipelineState
+from qapilot.shared.logger import get_logger
 
 
 def _qapilot_path(state: PipelineState, *parts: str) -> Path:
@@ -456,8 +457,20 @@ async def _scenario_generate(state: PipelineState) -> dict:
 
 
 async def _save_scenarios(state: PipelineState) -> dict:
-    """생성된 시나리오를 .qapilot/scenarios/{ts_id}.json 에 저장 (spec §6.1, L2)."""
+    """생성된 시나리오를 .qapilot/scenarios/{ts_id}.json 에 저장 (spec §6.1, L2).
+
+    동시에 RTM (Requirements Traceability Matrix) 버전 1개를 .qapilot/rtm-versions/ 에
+    자동 생성한다. 요구사항(state.requirements) ↔ TC(state.scenarios[].test_cases[].req_id)
+    매핑만 저장하고 status / passCount 는 Spring 이 응답 시점에 동적 계산한다.
+    """
     scenarios = state.get("scenarios") or []
+    requirements = state.get("requirements") or []
+    logger = get_logger(source="orchestrator", trace_id=state.get("trace_id"))
+    logger.info(
+        "save_scenarios_invoked",
+        scenarios_count=len(scenarios),
+        requirements_count=len(requirements),
+    )
     scenarios_dir = _qapilot_path(state, "scenarios")
     scenarios_dir.mkdir(parents=True, exist_ok=True)
 
@@ -470,10 +483,116 @@ async def _save_scenarios(state: PipelineState) -> dict:
         )
         saved_paths.append(str(path))
 
+    # RTM 버전 자동 생성 — 시나리오 생성마다 1개씩 누적.
+    try:
+        _write_initial_rtm_version(state)
+    except Exception as e:
+        # RTM 생성 실패는 본 시나리오 생성 흐름을 막지 않도록 silent.
+        logger = get_logger(source="orchestrator", trace_id=state.get("trace_id"))
+        logger.warning("rtm_version_write_failed", error=str(e))
+
     return {
         "saved_scenario_paths": saved_paths,
         "status": "completed",
     }
+
+
+def _write_initial_rtm_version(state: PipelineState) -> None:
+    """state.requirements 와 scenarios 의 TC 들을 매핑해 RTM 버전 JSON 을 디스크에 저장.
+
+    label 은 기존 RTM 버전 수 +1 기준 vN.0 (예: v1.0, v2.0). status/카운트는 빈 채로
+    두고 Spring 응답 시점 동적 계산.
+
+    state.requirements 가 비어있으면, scenarios 의 ts_id 별로 placeholder FR 을 만들어
+    최소한 RTM 구조는 항상 생성한다 (UI 에 빈 RTM 페이지 보이지 않도록).
+    """
+    import uuid as _uuid
+    from datetime import datetime, timezone
+
+    logger = get_logger(source="orchestrator", trace_id=state.get("trace_id"))
+    requirements = state.get("requirements") or []
+    scenarios = state.get("scenarios") or []
+    logger.info(
+        "rtm_write_invoked",
+        requirements_count=len(requirements),
+        scenarios_count=len(scenarios),
+    )
+    if not scenarios:
+        logger.info("rtm_write_skipped", reason="no scenarios")
+        return
+
+    # requirements 가 비어있는 경우 fallback — 각 TS 별로 placeholder FR 생성.
+    # 이렇게 하면 LLM 이 req_id 안 채워도 최소한 RTM 페이지가 보임.
+    if not requirements:
+        logger.warning("rtm_using_ts_fallback", reason="empty requirements list")
+        requirements = []
+        for ts in scenarios:
+            ts_id = ts.get("ts_id")
+            if not ts_id:
+                continue
+            requirements.append({
+                "req_id": f"FR-{ts_id}",
+                "content": ts.get("name") or ts.get("description") or ts_id,
+            })
+            # TC 들에도 req_id 강제 주입 (이 후 매핑 작업용)
+            for tc in ts.get("test_cases") or []:
+                if not tc.get("req_id"):
+                    tc["req_id"] = f"FR-{ts_id}"
+
+    # req_id → [tc_id] 매핑 구성
+    req_to_tcs: dict[str, list[str]] = {}
+    for ts in scenarios:
+        for tc in ts.get("test_cases") or []:
+            req_id = tc.get("req_id")
+            tc_id = tc.get("tc_id")
+            if not req_id or not tc_id:
+                continue
+            req_to_tcs.setdefault(req_id, []).append(tc_id)
+
+    rtm_requirements: list[dict] = []
+    for req in requirements:
+        req_id = req.get("req_id")
+        if not req_id:
+            continue
+        rtm_requirements.append({
+            "frId": req_id,
+            "content": req.get("content") or "",
+            "status": "미측정",
+            "passCount": 0,
+            "totalCount": len(req_to_tcs.get(req_id, [])),
+            "history": [],
+            "linkedTcIds": req_to_tcs.get(req_id, []),
+        })
+
+    rtm_dir = _qapilot_path(state, "rtm-versions")
+    rtm_dir.mkdir(parents=True, exist_ok=True)
+    existing_count = len(list(rtm_dir.glob("*.json")))
+    label = f"v{existing_count + 1}.0"
+
+    rtm_version_id = str(_uuid.uuid4())
+    rtm_version = {
+        "rtmVersionId": rtm_version_id,
+        "serviceId": "",  # FastAPI 는 service_id 모름 — Spring 이 listAll 시 디렉토리 위치 기반으로 알아냄
+        "label": label,
+        "traceId": state.get("trace_id"),
+        "requirements": rtm_requirements,
+        "summary": {
+            "total": len(rtm_requirements),
+            "satisfied": 0,
+            "unsatisfied": 0,
+            "unmeasured": len(rtm_requirements),
+        },
+        "createdAt": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+    }
+    (rtm_dir / f"{rtm_version_id}.json").write_text(
+        json.dumps(rtm_version, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    logger.info(
+        "rtm_version_written",
+        rtm_version_id=rtm_version_id,
+        label=label,
+        fr_count=len(rtm_requirements),
+    )
 
 
 async def _load_scenarios_for_codegen(state: PipelineState) -> dict:

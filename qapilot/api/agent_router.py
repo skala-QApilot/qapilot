@@ -336,15 +336,40 @@ async def _run_pipeline_task(
         state = await run_pipeline(options, qapilot_dir, trace_id=trace_id, staging_url=staging_url)
         update_trace(qapilot_dir, trace_id, dict(state))
     except asyncio.CancelledError:
+        # 중단 시점까지 디스크에 쌓인 부분 결과 (results/{trace_id}/*) 를 집계해서 trace.json 에 보존.
+        # ResultResponse 가 trace.json 의 tc_results 로 P/F 도출하므로, aborted 라도 진척 사항이
+        # UI 에 반영됨.
+        _persist_partial_tc_results_from_disk(qapilot_dir, trace_id)
         update_trace_aborted(qapilot_dir, trace_id, "사용자 요청으로 중단됨")
         logger.info("agent_pipeline_task_cancelled", trace_id=trace_id)
         raise  # cancel 전파 (asyncio 가 task 상태를 cancelled 로 마크)
     except Exception as e:
+        _persist_partial_tc_results_from_disk(qapilot_dir, trace_id)
         error = f"{type(e).__name__}: {e}"
         update_trace_aborted(qapilot_dir, trace_id, error)
         logger.error("agent_pipeline_task_failed", trace_id=trace_id, error=error)
     finally:
         _running_tasks.pop(trace_id, None)
+
+
+def _persist_partial_tc_results_from_disk(qapilot_dir: Path, trace_id: str) -> None:
+    """중단/실패 시점까지 results 디스크에 쌓인 ui/api/db 결과로 tc_results 집계해 trace 에 보존."""
+    try:
+        from qapilot.orchestrator.pipeline import (
+            _aggregate_tc_results,
+            _load_all_tc_results_from_disk,
+        )
+        results_root = qapilot_dir / "results" / trace_id
+        if not results_root.exists():
+            return
+        disk_ui, disk_api, disk_db = _load_all_tc_results_from_disk(results_root)
+        if not disk_ui:
+            return
+        tc_results = _aggregate_tc_results(disk_ui, disk_api, disk_db)
+        if tc_results:
+            annotate_trace(qapilot_dir, trace_id, tc_results=tc_results)
+    except Exception as e:
+        logger.warning("partial_tc_results_persist_failed", trace_id=trace_id, error=str(e))
 
 
 def _start_pipeline(request: Request, body: dict[str, Any], options: RunOptions) -> JSONResponse:
