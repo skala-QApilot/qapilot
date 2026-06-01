@@ -63,14 +63,14 @@ class NaturalLanguageAgent(BaseAgent):
         scan_summary = self._build_scan_summary(context.get("scan_result"))
         domain_rules_text = self._build_domain_rules_text(context.get("domain_rules") or [])
         history_text = self._build_history_text(context.get("conversation_history") or [])
-        scenarios_text = self._build_existing_scenarios_text(context.get("existing_scenarios") or [])
+        candidates_text = self._build_top_candidates_text(context.get("top_candidates") or [])
 
         user_prompt = self.prompts.render(
             user_input=user_input,
             scan_result_summary=scan_summary,
             domain_rules=domain_rules_text,
             conversation_history=history_text,
-            existing_scenarios=scenarios_text,
+            top_candidates=candidates_text,
         )
         user_prompt = self.with_correction_hint(user_prompt, last_error)
 
@@ -144,15 +144,20 @@ class NaturalLanguageAgent(BaseAgent):
         return "\n".join(lines)
 
     @staticmethod
-    def _build_existing_scenarios_text(scenarios: list[dict]) -> str:
-        """기존 시나리오 TS+TC 요약을 프롬프트용 텍스트로 변환한다."""
-        if not scenarios:
+    def _build_top_candidates_text(candidates: list[dict]) -> str:
+        """임베딩 pre-search로 추려진 top-N 후보 시나리오를 프롬프트용 텍스트로 변환한다.
+
+        전체 시나리오 목록 대신 이 후보만 LLM에 전달하여 프롬프트 크기를 제한한다.
+        """
+        if not candidates:
             return "없음"
         lines = []
-        for ts in scenarios:
+        for ts in candidates:
             ts_id = ts.get("ts_id", "")
             title = ts.get("title", "")
-            lines.append(f"- {ts_id}: {title}")
+            sim = ts.get("_similarity", "")
+            sim_str = f" (유사도: {sim})" if sim else ""
+            lines.append(f"- {ts_id}: {title}{sim_str}")
             for tc in ts.get("test_cases", []):
                 tc_id = tc.get("tc_id", "")
                 tc_title = tc.get("title", "")

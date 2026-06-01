@@ -16,7 +16,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from qapilot.agents.natural_language_agent import NaturalLanguageAgent
-from qapilot.orchestrator.pipeline import _resolve_scenario_targets
+from qapilot.orchestrator.pipeline import _resolve_scenario_targets, _rough_match_scenarios
 from qapilot.shared.config import load_config
 from qapilot.shared.schemas import AgentInput
 from qapilot.shared.session_store import (
@@ -120,6 +120,16 @@ async def _run_query(
     last_exchange = get_last_exchange(str(qapilot_dir), session_id)
     history = [last_exchange] if last_exchange else []
 
+    # 1단계: 임베딩 pre-search → top_candidates
+    try:
+        top_candidates = await _rough_match_scenarios(user_input, _MOCK_EXISTING_SCENARIOS)
+        if top_candidates:
+            print(_cyan(f"  [후보 {len(top_candidates)}개: {', '.join(c['ts_id'] for c in top_candidates)}]"))
+    except Exception as e:
+        print(_yellow(f"  [rough match 오류: {e}]"))
+        top_candidates = []
+
+    # 2단계: NaturalLanguageAgent — top_candidates 전달
     output = await agent.run(
         AgentInput(
             trace_id="manual-test",
@@ -127,7 +137,7 @@ async def _run_query(
                 "scan_result": _MOCK_SCAN_RESULT,
                 "domain_rules": [],
                 "conversation_history": history,
-                "existing_scenarios": _MOCK_EXISTING_SCENARIOS,
+                "top_candidates": top_candidates,
             },
             params={"trigger": "natural_lang", "user_input": user_input},
         )
@@ -136,13 +146,13 @@ async def _run_query(
     query_status = output.result.get("query_status", "sufficient")
     query_feedback = output.result.get("query_feedback")
 
-    # 임베딩 매칭 레이어: action_type: update인 항목에 target_ts_id / target_tc_id 주입
+    # 3단계: top_candidates 안에서 target_ts_id / target_tc_id 확정
     result = dict(output.result)
     if query_status == "sufficient":
         try:
             matched = await _resolve_scenario_targets(
                 result.get("requirements", []),
-                _MOCK_EXISTING_SCENARIOS,
+                top_candidates,
             )
             result["requirements"] = matched
         except Exception as e:

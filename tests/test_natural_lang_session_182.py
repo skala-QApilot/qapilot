@@ -135,25 +135,27 @@ def test_build_history_text_with_exchange(agent):
     assert "어떤 기능인지 알려주세요." in text
 
 
-def test_build_existing_scenarios_text_empty(agent):
-    assert agent._build_existing_scenarios_text([]) == "없음"
+def test_build_top_candidates_text_empty(agent):
+    assert agent._build_top_candidates_text([]) == "없음"
 
 
-def test_build_existing_scenarios_text_with_data(agent):
-    scenarios = [
+def test_build_top_candidates_text_with_data(agent):
+    candidates = [
         {
             "ts_id": "TS-001",
             "title": "로그인 시나리오",
+            "_similarity": 0.82,
             "test_cases": [
                 {"tc_id": "TC-001", "title": "정상 로그인"},
                 {"tc_id": "TC-002", "title": "비밀번호 오류"},
             ],
         }
     ]
-    text = agent._build_existing_scenarios_text(scenarios)
+    text = agent._build_top_candidates_text(candidates)
     assert "TS-001" in text
     assert "TC-001" in text
     assert "TC-002" in text
+    assert "0.82" in text
 
 
 def test_validate_requirement_sets_default_target_level(agent):

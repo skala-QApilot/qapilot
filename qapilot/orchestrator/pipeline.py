@@ -323,6 +323,45 @@ def _build_existing_scenarios_summary(state: PipelineState) -> list[dict]:
         return []
 
 
+async def _rough_match_scenarios(
+    user_input: str,
+    existing_scenarios: list[dict],
+    top_n: int = 5,
+    threshold: float = 0.40,
+) -> list[dict]:
+    """user_input을 직접 임베딩하여 기존 시나리오 중 top-N 후보를 반환한다.
+
+    NaturalLanguageAgent 호출 전에 실행되며, LLM에게 전체 목록 대신
+    유사도 높은 후보만 전달하여 프롬프트 크기를 제한한다.
+
+    threshold는 후보 탐색용으로 _resolve_scenario_targets보다 낮게 설정한다.
+    (후보가 없으면 LLM이 create로 판단하도록 유도)
+    """
+    import asyncio as _asyncio
+
+    import numpy as np
+
+    from qapilot.tools.domain_knowledge._embedder import get_embedder
+
+    if not existing_scenarios or not user_input.strip():
+        return []
+
+    embedder = get_embedder()
+    ts_texts = [ts.get("title") or ts.get("ts_id", "") for ts in existing_scenarios]
+    ts_vecs = await _asyncio.to_thread(embedder.encode, ts_texts, normalize_embeddings=True)
+    query_vecs = await _asyncio.to_thread(embedder.encode, [user_input], normalize_embeddings=True)
+    query_vec = query_vecs[0]
+
+    sims = [float(np.dot(query_vec, ts_vec)) for ts_vec in ts_vecs]
+    candidates = [
+        {**ts, "_similarity": round(sims[i], 4)}
+        for i, ts in enumerate(existing_scenarios)
+        if sims[i] >= threshold
+    ]
+    candidates.sort(key=lambda x: x["_similarity"], reverse=True)
+    return candidates[:top_n]
+
+
 async def _resolve_scenario_targets(
     requirements: list[dict],
     existing_scenarios: list[dict],
@@ -545,9 +584,18 @@ async def _requirement_extract(state: PipelineState) -> dict:
             if session_id and qapilot_dir else None
         )
 
-        # 기존 시나리오 TS+TC 요약 (이슈 #182)
+        # 전체 시나리오 목록 로드
         existing_scenarios_summary = _build_existing_scenarios_summary(state)
 
+        # 1단계: user_input 직접 임베딩 → top-N 후보 탐색 (이슈 #186)
+        # LLM에는 전체 목록 대신 후보만 전달 → 프롬프트 크기 제한, 확장성 확보
+        try:
+            top_candidates = await _rough_match_scenarios(user_input, existing_scenarios_summary)
+        except Exception as e:
+            get_logger("orchestrator").warning("rough_match_failed", error=str(e))
+            top_candidates = []
+
+        # 2단계: NaturalLanguageAgent — top_candidates 기반으로 create/update 판단
         agent = NaturalLanguageAgent(trace_id=state["trace_id"])
         output = await agent.run(
             AgentInput(
@@ -556,7 +604,7 @@ async def _requirement_extract(state: PipelineState) -> dict:
                     "scan_result": state.get("scan_result"),
                     "domain_rules": state.get("domain_rules") or [],
                     "conversation_history": [last_exchange] if last_exchange else [],
-                    "existing_scenarios": existing_scenarios_summary,
+                    "top_candidates": top_candidates,
                 },
                 params={"trigger": "natural_lang", "user_input": user_input},
             )
@@ -578,16 +626,11 @@ async def _requirement_extract(state: PipelineState) -> dict:
 
         requirements = output.result.get("requirements", []) or []
 
-        # 임베딩 매칭 레이어: action_type: update인 항목에 target_ts_id / target_tc_id 주입 (이슈 #182)
-        # LLM이 아닌 코드 레벨에서 기존 시나리오와 매칭하므로 존재하지 않는 ID 반환하지 않음
+        # 3단계: top_candidates 안에서 target_ts_id / target_tc_id 확정 주입 (이슈 #186)
         try:
-            requirements = await _resolve_scenario_targets(
-                requirements, existing_scenarios_summary
-            )
+            requirements = await _resolve_scenario_targets(requirements, top_candidates)
         except Exception as e:
-            get_logger("orchestrator").warning(
-                "scenario_target_resolve_failed", error=str(e)
-            )
+            get_logger("orchestrator").warning("scenario_target_resolve_failed", error=str(e))
 
         return {"requirements": requirements}
 
