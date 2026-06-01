@@ -6,6 +6,7 @@ Created: 2026-05-15
 
 import asyncio
 import json
+import os
 from pathlib import Path
 from typing import Any, Literal, cast
 
@@ -40,7 +41,56 @@ RunFilter = Literal["all", "failed", "affected"]
 
 # 실행 중인 파이프라인 task 레지스트리 — trace_id → asyncio.Task.
 # 정지 요청 시 task.cancel() 호출하여 즉시 중단할 수 있도록 추적한다.
+# CELERY_ENABLED=true 면 사용 안 함 — Celery broker 의 broadcast revoke 로 대체.
 _running_tasks: dict[str, asyncio.Task] = {}
+
+# Celery 워커 모드 — 멀티 인스턴스 SaaS 환경에서 유일하게 동작.
+# 기본 false (로컬 단일 프로세스 흐름 유지). 운영에선 환경변수로 true.
+_CELERY_ENABLED = os.environ.get("CELERY_ENABLED", "false").lower() == "true"
+
+
+def _submit_pipeline(
+    qapilot_dir: Path,
+    trace_id: str,
+    options: RunOptions,
+    staging_url: str | None,
+) -> None:
+    """파이프라인 실행 제출 — Celery 모드면 send_task, 아니면 asyncio.create_task.
+
+    Celery 모드: runs.task_id 에 Celery task id 기록 → stop 시 lookup 키로 사용.
+    """
+    if _CELERY_ENABLED:
+        from qapilot.db.run_writer import set_task_id
+        from qapilot.worker.tasks import run_pipeline_task
+
+        result = run_pipeline_task.delay(str(qapilot_dir), trace_id, dict(options), staging_url)
+        set_task_id(trace_id, result.id)
+        logger.info("agent_pipeline_submitted_celery", trace_id=trace_id, task_id=result.id)
+    else:
+        task = asyncio.create_task(_run_pipeline_task(qapilot_dir, trace_id, options, staging_url))
+        _running_tasks[trace_id] = task
+
+
+def _revoke_pipeline(trace_id: str) -> bool:
+    """진행 중 파이프라인 중단. 반환: 실제로 중단 시그널 보냈는지.
+
+    Celery 모드: runs.task_id 로 revoke 브로드캐스트 (어느 워커가 갖고 있든 도달).
+    asyncio 모드: 같은 프로세스의 _running_tasks 에서 cancel.
+    """
+    if _CELERY_ENABLED:
+        from qapilot.db.run_writer import get_task_id
+        from qapilot.worker.tasks import revoke_pipeline as celery_revoke
+
+        task_id = get_task_id(trace_id)
+        if not task_id:
+            return False
+        return celery_revoke(task_id)
+
+    task = _running_tasks.get(trace_id)
+    if task and not task.done():
+        task.cancel()
+        return True
+    return False
 
 
 @router.post("/scenario-generation")
@@ -311,9 +361,8 @@ async def resume_run(
     # 다시 running 으로 전환 — 이전 error 정보도 정리.
     annotate_trace(qapilot_path, trace_id, status="running", error=None, completed_at=None)
 
-    task = asyncio.create_task(_run_pipeline_task(qapilot_path, trace_id, options, staging_url))
-    _running_tasks[trace_id] = task
-    logger.info("agent_pipeline_resumed", trace_id=trace_id)
+    _submit_pipeline(qapilot_path, trace_id, options, staging_url)
+    logger.info("agent_pipeline_resumed", trace_id=trace_id, mode="celery" if _CELERY_ENABLED else "asyncio")
     return ok({"trace_id": trace_id, "status": "running"})
 
 
@@ -342,21 +391,15 @@ async def stop_run(
     if not qapilot_path:
         return _invalid_qapilot_dir()
 
-    task = _running_tasks.get(trace_id)
-    registered_count = len(_running_tasks)
-    if task and not task.done():
-        task.cancel()
-        logger.info("agent_pipeline_stop_requested", trace_id=trace_id, registered_count=registered_count)
+    if _revoke_pipeline(trace_id):
+        logger.info("agent_pipeline_stop_requested", trace_id=trace_id, mode="celery" if _CELERY_ENABLED else "asyncio")
         return ok({"trace_id": trace_id, "status": "aborting"})
 
-    # 이미 끝났거나 등록되지 않은 trace — 디스크 status 가 ground truth.
+    # 이미 끝났거나 등록되지 않은 trace — 디스크/DB status 가 ground truth.
     logger.warning(
         "agent_pipeline_stop_not_tracked",
         trace_id=trace_id,
-        registered_count=registered_count,
-        registered_traces=list(_running_tasks.keys()),
-        task_present=bool(task),
-        task_done=task.done() if task else None,
+        mode="celery" if _CELERY_ENABLED else "asyncio",
     )
     return ok({"trace_id": trace_id, "status": "not_running"})
 
@@ -436,12 +479,12 @@ def _start_pipeline(request: Request, body: dict[str, Any], options: RunOptions)
         tags=options.get("tags"),
         staging_url=staging_url,
     )
-    task = asyncio.create_task(_run_pipeline_task(qapilot_dir, trace_id, options, staging_url))
-    _running_tasks[trace_id] = task
+    _submit_pipeline(qapilot_dir, trace_id, options, staging_url)
     logger.info(
         "agent_pipeline_started",
         service_id=service_id,
         trace_id=trace_id,
+        mode="celery" if _CELERY_ENABLED else "asyncio",
         command=options["command"],
     )
     content = {"success": True, "data": {"trace_id": trace_id, "status": "running"}}

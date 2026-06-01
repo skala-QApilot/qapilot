@@ -77,6 +77,39 @@ ON CONFLICT (id) DO UPDATE SET
 """
 
 
+def set_task_id(trace_id: str, task_id: str | None) -> None:
+    """runs.task_id 만 갱신 — Celery 제출 직후 호출. revoke 시 lookup 키.
+
+    파일 trace 에는 저장 안 함 (task_id 는 DB-only 메타데이터).
+    """
+    pool = get_pool()
+    if pool is None or not trace_id:
+        return
+    try:
+        with pool.connection() as conn, conn.cursor() as cur:
+            cur.execute(
+                "UPDATE runs SET task_id = %s, updated_at = now() WHERE id = %s",
+                (task_id, trace_id),
+            )
+    except Exception as e:
+        _logger.warning("run_task_id_update_failed", trace_id=trace_id, error=str(e))
+
+
+def get_task_id(trace_id: str) -> str | None:
+    """runs.task_id 조회 — stop 시 revoke 대상 lookup."""
+    pool = get_pool()
+    if pool is None or not trace_id:
+        return None
+    try:
+        with pool.connection() as conn, conn.cursor() as cur:
+            cur.execute("SELECT task_id FROM runs WHERE id = %s", (trace_id,))
+            row = cur.fetchone()
+            return str(row[0]) if row and row[0] else None
+    except Exception as e:
+        _logger.warning("run_task_id_get_failed", trace_id=trace_id, error=str(e))
+        return None
+
+
 def _to_params(trace: dict) -> dict:
     options = {key: trace[key] for key in _OPTIONS_KEYS if key in trace}
     return {
