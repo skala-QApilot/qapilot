@@ -103,12 +103,13 @@ class DBTestTool(BaseTool):
 
         tables = await self._get_tables()
 
+        # seed 주입을 before 스냅샷 이전에 수행 → 시드 SQL이 테스트 SQL 로그에 섞이지 않도록
+        if seed_sql:
+            await self._inject_seed(seed_sql)
+
         before = {}
         for table in tables:
             before[table] = await self._get_snapshot(table)
-
-        if seed_sql:
-            await self._inject_seed(seed_sql)
 
         sql_logs = []
         try:
