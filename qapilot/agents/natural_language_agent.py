@@ -165,12 +165,17 @@ class NaturalLanguageAgent(BaseAgent):
             raise ValueError(f"허용되지 않는 req_type: {item['req_type']}")
         if item["priority"] not in ("high", "medium", "low"):
             raise ValueError(f"허용되지 않는 priority: {item['priority']}")
+        action_type = item.get("action_type", "create")
+        if action_type not in ("create", "update"):
+            action_type = "create"
         return {
             "req_id": str(item["req_id"]),
             "req_type": item["req_type"],
             "content": str(item["content"]),
             "priority": item["priority"],
             "domain_area": str(item["domain_area"]),
+            "action_type": action_type,
+            "target_ts_id": item.get("target_ts_id") or None,
         }
 
     def _calc_confidence(self, requirements: Sequence[RequirementItem]) -> float:

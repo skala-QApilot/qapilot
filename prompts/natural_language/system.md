@@ -19,7 +19,9 @@ JSON 배열. 각 항목은 아래 필드를 가진다.
     "req_type": "functional",
     "content": "사용자는 이메일과 비밀번호로 로그인할 수 있다.",
     "priority": "high",
-    "domain_area": "인증"
+    "domain_area": "인증",
+    "action_type": "create",
+    "target_ts_id": null
   }
 ]
 
@@ -29,6 +31,14 @@ JSON 배열. 각 항목은 아래 필드를 가진다.
 - content: 주어+동사 형식의 명확한 요구사항 문장 (30자 이상 권장)
 - priority: "high", "medium", "low" 중 하나만 허용
 - domain_area: 기능 영역 한 단어 (예: "인증", "결제", "주문", "마이페이지")
+- action_type: "create"(신규 시나리오 생성) 또는 "update"(기존 시나리오 수정) 중 하나
+- target_ts_id: action_type이 "update"일 때 수정 대상 시나리오 ID (예: "TS-003"), 신규면 null
+
+## action_type 판단 기준
+- 사용자 입력이 "추가", "만들어줘", "생성" 등 신규 기능을 요청하면 → "create", target_ts_id: null
+- 사용자 입력이 "수정", "바꿔줘", "변경" 등 기존 기능 변경을 암시하면 → "update"
+- "update"이고 기존 시나리오 목록에서 대상을 특정할 수 있으면 target_ts_id에 해당 ts_id 기입
+- 대상을 특정할 수 없으면 target_ts_id: null
 
 ## confidence 판단 기준
 - 모든 필드가 채워지고 3개 이상 항목 생성 시 높은 품질
