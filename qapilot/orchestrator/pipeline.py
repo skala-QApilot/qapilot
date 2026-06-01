@@ -258,6 +258,151 @@ async def _doc_import(state: PipelineState) -> dict:
     return {}
 
 
+def _load_scan_result_from_disk(state: PipelineState) -> dict:
+    """codebase-index/ 디스크 캐시에서 scan_result를 복원한다.
+
+    natural_lang 트리거처럼 코드베이스 재스캔이 불필요한 경우에 사용한다.
+    manifest.json → framework/language/endpoint_count,
+    endpoints.json → file별 endpoints 재구성.
+    캐시 미존재 시 scan_result=None으로 안전하게 반환한다.
+    """
+    try:
+        manifest_path = _qapilot_path(state, "codebase-index", "manifest.json")
+        endpoints_path = _qapilot_path(state, "codebase-index", "endpoints.json")
+        if not manifest_path.exists():
+            return {"scan_result": None, "current_layer": "L1A"}
+
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+
+        files: list[dict] = []
+        if endpoints_path.exists():
+            endpoints: list[dict] = json.loads(endpoints_path.read_text(encoding="utf-8"))
+            by_file: dict[str, list] = {}
+            for ep in endpoints:
+                by_file.setdefault(ep.get("file", ""), []).append(ep)
+            files = [
+                {"path": fpath, "endpoints": eps, "functions": [], "models": [], "dependencies": []}
+                for fpath, eps in by_file.items()
+            ]
+
+        scan_result = {
+            "files": files,
+            "git_diff": None,
+            "framework": manifest.get("framework") or "unknown",
+            "language": manifest.get("language") or "unknown",
+            "endpoint_count": int(manifest.get("endpoint_count") or 0),
+        }
+        return {"scan_result": scan_result, "current_layer": "L1A"}
+    except Exception:
+        return {"scan_result": None, "current_layer": "L1A"}
+
+
+def _build_existing_scenarios_summary(state: PipelineState) -> list[dict]:
+    """기존 시나리오를 TS+TC 요약으로 반환한다.
+
+    NaturalLanguageAgent가 target_ts_id / target_tc_id를 정확히 특정할 수 있도록
+    ts_id, title, test_cases(tc_id + title)만 추출해 전달한다.
+    전체 시나리오 JSON을 넘기면 프롬프트가 비대해지므로 요약본만 사용한다.
+    """
+    try:
+        scenarios = _load_json_files(_qapilot_path(state, "scenarios"))
+        summary = []
+        for ts in scenarios:
+            tc_summaries = [
+                {"tc_id": tc.get("tc_id"), "title": tc.get("title") or tc.get("name") or ""}
+                for tc in (ts.get("test_cases") or [])
+                if tc.get("tc_id")
+            ]
+            summary.append({
+                "ts_id": ts.get("ts_id"),
+                "title": ts.get("title") or ts.get("name") or "",
+                "test_cases": tc_summaries,
+            })
+        return summary
+    except Exception:
+        return []
+
+
+async def _resolve_scenario_targets(
+    requirements: list[dict],
+    existing_scenarios: list[dict],
+    threshold: float = 0.50,
+) -> list[dict]:
+    """action_type: update인 요구사항에 임베딩 매칭으로 target_ts_id / target_tc_id를 주입한다.
+
+    LLM이 아닌 코드 레벨에서 대상을 탐색하므로 존재하지 않는 ID를 반환하지 않는다.
+
+    흐름:
+    1. update 요구사항의 domain_area + content를 쿼리 텍스트로 임베딩
+    2. 기존 시나리오 TS 제목을 임베딩하여 코사인 유사도 계산
+    3. threshold 이상의 TS 매칭 → target_ts_id 주입
+    4. target_level이 tc/tv이면 해당 TS 내 TC 제목과 재매칭 → target_tc_id 주입
+    5. threshold 미달 시 null 유지 (ScenarioGeneratorAgent가 create처럼 처리)
+
+    Args:
+        threshold: 코사인 유사도 기준값. 0.68 미만이면 매칭 실패로 처리.
+    """
+    import asyncio as _asyncio
+
+    import numpy as np
+
+    from qapilot.tools.domain_knowledge._embedder import get_embedder
+
+    update_reqs = [r for r in requirements if r.get("action_type") == "update"]
+    if not update_reqs or not existing_scenarios:
+        return requirements
+
+    embedder = get_embedder()
+
+    # TS 텍스트 임베딩 — ts_id 접두사 제외, 제목만 사용 (ts_id가 임베딩 오염 방지)
+    ts_texts = [
+        ts.get("title") or ts.get("ts_id", "")
+        for ts in existing_scenarios
+    ]
+    query_texts = [
+        f"{r.get('domain_area', '')} {r.get('content', '')}"
+        for r in update_reqs
+    ]
+
+    ts_vecs = await _asyncio.to_thread(
+        embedder.encode, ts_texts, normalize_embeddings=True
+    )
+    query_vecs = await _asyncio.to_thread(
+        embedder.encode, query_texts, normalize_embeddings=True
+    )
+
+    for i, req in enumerate(update_reqs):
+        q_vec = query_vecs[i]
+        ts_sims = [float(np.dot(q_vec, ts_vec)) for ts_vec in ts_vecs]
+        best_ts_idx = int(np.argmax(ts_sims))
+
+        if ts_sims[best_ts_idx] < threshold:
+            continue  # 매칭 실패 — null 유지
+
+        matched_ts = existing_scenarios[best_ts_idx]
+        req["target_ts_id"] = matched_ts.get("ts_id")
+
+        # TC/TV 레벨 매칭
+        if req.get("target_level") in ("tc", "tv"):
+            tcs = matched_ts.get("test_cases") or []
+            if not tcs:
+                continue
+            tc_texts = [
+                tc.get("title") or tc.get("tc_id", "")
+                for tc in tcs
+            ]
+            tc_vecs = await _asyncio.to_thread(
+                embedder.encode, tc_texts, normalize_embeddings=True
+            )
+            tc_sims = [float(np.dot(q_vec, tc_vec)) for tc_vec in tc_vecs]
+            best_tc_idx = int(np.argmax(tc_sims))
+
+            if tc_sims[best_tc_idx] >= threshold:
+                req["target_tc_id"] = tcs[best_tc_idx].get("tc_id")
+
+    return requirements
+
+
 async def _codebase_scan(state: PipelineState) -> dict:
     """FR-000 코드베이스 스캔 + spec §6.1 디스크 캐시.
 
@@ -284,11 +429,33 @@ async def _codebase_scan(state: PipelineState) -> dict:
 
     is_git_mode = bool(run_options.get("repo_url") or run_options.get("repos"))
 
-    params: dict[str, Any] = {"trigger": run_options.get("trigger") or "init"}
+    trigger: str = run_options.get("trigger") or "init"
+
+    # natural_lang: 코드 변경 없음 → 디스크 캐시 복원, 스캔 skip (이슈 #180)
+    if trigger == "natural_lang":
+        return _load_scan_result_from_disk(state)
+
+    # doc_update: 코드 스캔 불필요 → 안전하게 None 반환 (이슈 #180, NoneType 크래시 수정)
+    if trigger == "doc_update":
+        return {"scan_result": None, "trace_id": trace_id, "current_layer": "L1A"}
+
+    params: dict[str, Any] = {"trigger": trigger}
     for key in ("repo_url", "token", "branch", "local_path", "repos"):
         val = run_options.get(key)
         if val is not None:
             params[key] = val
+
+    # code_change: 직전 스캔의 commit_hash를 읽어 증분 스캔 활성화 (이슈 #180)
+    if trigger == "code_change":
+        manifest_path = _qapilot_path(state, "codebase-index", "manifest.json")
+        if manifest_path.exists():
+            try:
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                last_hash = manifest.get("commit_hash", "")
+                if last_hash:
+                    params["last_commit_hash"] = last_hash
+            except Exception:
+                pass
 
     if is_git_mode:
         from qapilot.tools.git_codebase_scanner_tool import GitCodebaseScannerTool
@@ -349,11 +516,86 @@ async def _domain_knowledge(state: PipelineState) -> dict:
 
 
 async def _requirement_extract(state: PipelineState) -> dict:
-    """FR-024 RequirementExtractorAgent 호출.
+    """FR-024 trigger별 요구사항 추출.
 
-    user_input이 있으면 사용자가 직접 입력한 시나리오 요구사항을 파싱한다.
-    user_input이 없으면 Qdrant에 임포트된 PRD 문서에서 요구사항을 검색한다.
+    trigger에 따라 호출 Agent가 다르다 (이슈 #180):
+    - natural_lang : NaturalLanguageAgent — 챗봇 자연어 쿼리 해석
+    - init / doc_update : RequirementExtractorAgent — PRD 문서에서 요구사항 추출
+    - code_change : 재추출 불필요 → 빈 requirements 반환
     """
+    trigger = (state["run_options"].get("trigger") or "init")
+
+    # ── natural_lang: 챗봇 쿼리 → NaturalLanguageAgent ──────────────────────────
+    if trigger == "natural_lang":
+        from qapilot.agents.natural_language_agent import NaturalLanguageAgent
+        from qapilot.shared.schemas import AgentInput
+        from qapilot.shared.session_store import (
+            get_last_exchange,
+            save_exchange,
+        )
+
+        user_input = (state["run_options"].get("user_input") or "").strip()
+        session_id = state["run_options"].get("session_id") or ""
+        qapilot_dir = state.get("qapilot_dir") or ""
+
+        # 직전 교환을 context에 포함 (sufficient도 포함 — "도" 같은 연결 표현의 맥락 유지)
+        # rejected 교환은 get_last_exchange에서 None 반환하므로 맥락 오염 없음
+        last_exchange = (
+            get_last_exchange(qapilot_dir, session_id)
+            if session_id and qapilot_dir else None
+        )
+
+        # 기존 시나리오 TS+TC 요약 (이슈 #182)
+        existing_scenarios_summary = _build_existing_scenarios_summary(state)
+
+        agent = NaturalLanguageAgent(trace_id=state["trace_id"])
+        output = await agent.run(
+            AgentInput(
+                trace_id=state["trace_id"],
+                context={
+                    "scan_result": state.get("scan_result"),
+                    "domain_rules": state.get("domain_rules") or [],
+                    "conversation_history": [last_exchange] if last_exchange else [],
+                    "existing_scenarios": existing_scenarios_summary,
+                },
+                params={"trigger": "natural_lang", "user_input": user_input},
+            )
+        )
+
+        query_status = output.result.get("query_status", "sufficient")
+        query_feedback = output.result.get("query_feedback")
+
+        # 세션에 이번 교환 저장
+        if session_id and qapilot_dir:
+            save_exchange(qapilot_dir, session_id, user_input, query_status, query_feedback)
+
+        if query_status != "sufficient":
+            return {
+                "requirements": [],
+                "query_status": query_status,
+                "query_feedback": query_feedback,
+            }
+
+        requirements = output.result.get("requirements", []) or []
+
+        # 임베딩 매칭 레이어: action_type: update인 항목에 target_ts_id / target_tc_id 주입 (이슈 #182)
+        # LLM이 아닌 코드 레벨에서 기존 시나리오와 매칭하므로 존재하지 않는 ID 반환하지 않음
+        try:
+            requirements = await _resolve_scenario_targets(
+                requirements, existing_scenarios_summary
+            )
+        except Exception as e:
+            get_logger("orchestrator").warning(
+                "scenario_target_resolve_failed", error=str(e)
+            )
+
+        return {"requirements": requirements}
+
+    # ── code_change: 요구사항 재추출 불필요 ──────────────────────────────────────
+    if trigger == "code_change":
+        return {"requirements": []}
+
+    # ── init / doc_update: PRD 문서 → RequirementExtractorAgent ─────────────────
     user_input = (state["run_options"].get("user_input") or "").strip()
     if user_input:
         from qapilot.agents.requirement_extractor import RequirementExtractorAgent
@@ -367,15 +609,13 @@ async def _requirement_extract(state: PipelineState) -> dict:
                 params={"document_text": user_input, "existing_count": 0},
             )
         )
-        requirements = output.result.get("requirements", []) or []
-        return {"requirements": requirements}
+        return {"requirements": output.result.get("requirements", []) or []}
 
     # user_input 없음: Qdrant에 저장된 PRD 문서에서 요구사항 검색
     from qapilot.shared.schemas import ToolInput
     from qapilot.tools.domain_knowledge import DomainKnowledgeTool
-
-    # docs/ 에서 최신 PRD 파일명만 추출 (버전 필터 적용)
     from qapilot.shared.config import load_config
+
     config = load_config()
     proj = config.project
     repo_root = Path(proj.root or proj.repo_path or ".")
@@ -398,15 +638,12 @@ async def _requirement_extract(state: PipelineState) -> dict:
             )
         )
         rules = result.result.get("rules", []) or []
-
-        # 최신 PRD 문서 청크만 필터링 (이전 버전 제외)
         prd_rules = [
             r for r in rules
             if r.get("source", "") in latest_prd_sources
         ] if latest_prd_sources else [
             r for r in rules if "prd" in r.get("source", "").lower()
         ]
-
         _NON_FUNC_KEYWORDS = {"비기능", "성능", "보안", "가용성", "안정성", "확장성"}
         for i, rule in enumerate(prd_rules, start=1):
             section = rule.get("section", "")
@@ -437,18 +674,25 @@ async def _scenario_generate(state: PipelineState) -> dict:
     trigger = state["run_options"].get("trigger") or "code_change"
     affected_only = trigger == "code_change"
 
+    context: dict = {
+        "scan_result": state.get("scan_result"),
+        "domain_rules": state.get("domain_rules") or [],
+        "requirements": state.get("requirements") or [],
+        # codebase-index 디렉토리를 state.qapilot_dir 기준으로 read 하도록 전달.
+        # 미주입 시 agent 가 config.project.root → CWD fallback → qapilot 자체 dir 을 읽음 (회귀 원인).
+        "qapilot_dir": state.get("qapilot_dir"),
+    }
+
+    # natural_lang: 기존 시나리오를 context로 전달하여 추가/수정 여부 판단 가능하게 함 (이슈 #180)
+    if trigger == "natural_lang":
+        existing = _load_json_files(_qapilot_path(state, "scenarios"))
+        context["existing_scenarios"] = existing
+
     agent = ScenarioGeneratorAgent(trace_id=state["trace_id"])
     output = await agent.run(
         AgentInput(
             trace_id=state["trace_id"],
-            context={
-                "scan_result": state.get("scan_result"),
-                "domain_rules": state.get("domain_rules") or [],
-                "requirements": state.get("requirements") or [],
-                # codebase-index 디렉토리를 state.qapilot_dir 기준으로 read 하도록 전달.
-                # 미주입 시 agent 가 config.project.root → CWD fallback → qapilot 자체 dir 을 읽음 (회귀 원인).
-                "qapilot_dir": state.get("qapilot_dir"),
-            },
+            context=context,
             params={"trigger": trigger, "affected_only": affected_only},
         )
     )
@@ -466,6 +710,18 @@ async def _save_scenarios(state: PipelineState) -> dict:
     scenarios = state.get("scenarios") or []
     requirements = state.get("requirements") or []
     logger = get_logger(source="orchestrator", trace_id=state.get("trace_id"))
+
+    # natural_lang에서 insufficient/rejected 반환 시 시나리오 저장 없이 통과 (이슈 #182)
+    query_status = state.get("query_status")
+    if query_status and query_status != "sufficient":
+        logger.info("save_scenarios_skipped", query_status=query_status)
+        return {
+            "saved_scenario_paths": [],
+            "status": "skipped",
+            "query_status": query_status,
+            "query_feedback": state.get("query_feedback"),
+        }
+
     logger.info(
         "save_scenarios_invoked",
         scenarios_count=len(scenarios),
@@ -474,22 +730,41 @@ async def _save_scenarios(state: PipelineState) -> dict:
     scenarios_dir = _qapilot_path(state, "scenarios")
     scenarios_dir.mkdir(parents=True, exist_ok=True)
 
+    trigger = state["run_options"].get("trigger") or "init"
     saved_paths: list[str] = []
-    for idx, ts in enumerate(scenarios, start=1):
-        ts_id = ts.get("ts_id") or f"TS-{idx:03d}"
-        path = scenarios_dir / f"{ts_id}.json"
-        path.write_text(
-            json.dumps(ts, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
-        saved_paths.append(str(path))
 
-    # RTM 버전 자동 생성 — 시나리오 생성마다 1개씩 누적.
-    try:
-        _write_initial_rtm_version(state)
-    except Exception as e:
-        # RTM 생성 실패는 본 시나리오 생성 흐름을 막지 않도록 silent.
-        logger = get_logger(source="orchestrator", trace_id=state.get("trace_id"))
-        logger.warning("rtm_version_write_failed", error=str(e))
+    if trigger == "natural_lang":
+        # natural_lang: delta(신규/수정 시나리오)만 저장, 기존 시나리오 파일 유지 (이슈 #180)
+        # ScenarioGeneratorAgent가 반환한 시나리오만 쓰고, 나머지는 건드리지 않음.
+        for idx, ts in enumerate(scenarios, start=1):
+            ts_id = ts.get("ts_id") or f"TS-{idx:03d}"
+            path = scenarios_dir / f"{ts_id}.json"
+            path.write_text(
+                json.dumps(ts, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+            saved_paths.append(str(path))
+            logger.info(
+                "scenario_merged",
+                ts_id=ts_id,
+                action_type=ts.get("action_type", "create"),
+            )
+    else:
+        for idx, ts in enumerate(scenarios, start=1):
+            ts_id = ts.get("ts_id") or f"TS-{idx:03d}"
+            path = scenarios_dir / f"{ts_id}.json"
+            path.write_text(
+                json.dumps(ts, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+            saved_paths.append(str(path))
+
+    # RTM 버전 자동 생성 — natural_lang delta 저장 시에는 skip (전체 시나리오 기준이 아니므로)
+    if trigger != "natural_lang":
+        try:
+            _write_initial_rtm_version(state)
+        except Exception as e:
+            # RTM 생성 실패는 본 시나리오 생성 흐름을 막지 않도록 silent.
+            logger = get_logger(source="orchestrator", trace_id=state.get("trace_id"))
+            logger.warning("rtm_version_write_failed", error=str(e))
 
     return {
         "saved_scenario_paths": saved_paths,
