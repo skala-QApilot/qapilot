@@ -18,6 +18,7 @@ from qapilot.orchestrator.runner import run_pipeline
 from qapilot.shared.errors import ErrorCode
 from qapilot.shared.logger import get_logger
 from qapilot.shared.schemas import RunOptions
+from qapilot.shared.session_store import new_session_id
 from qapilot.shared.trace_store import (
     annotate_trace,
     create_trace,
@@ -50,13 +51,20 @@ async def scenario_generation(request: Request) -> Any:
     if error:
         return error
 
+    # natural_lang: session_id 없으면 신규 발급 (이슈 #182)
+    trigger = _scenario_trigger(body)
+    session_id = _optional_str(body, "session_id")
+    if trigger == "natural_lang" and not session_id:
+        session_id = new_session_id()
+
     options: RunOptions = {
         "command": "generate_scenarios",
-        "trigger": _scenario_trigger(body),
+        "trigger": trigger,
         "user_input": _optional_str(body, "user_input"),
         "scenario_ids": _optional_list(body, "scenario_ids"),
         "filter": _optional_filter(body),
         "tags": _optional_list(body, "tags"),
+        "session_id": session_id,
     }
     _inject_git_options(body, options)
     return _start_pipeline(request, body, options)
@@ -406,6 +414,8 @@ def _start_pipeline(request: Request, body: dict[str, Any], options: RunOptions)
     )
     content = {"success": True, "data": {"trace_id": trace_id, "status": "running"}}
     content["trace_id"] = trace_id
+    if options.get("session_id"):
+        content["session_id"] = options["session_id"]
     return JSONResponse(status_code=202, content=content)
 
 

@@ -1,3 +1,7 @@
+# 이전 대화 이력
+
+{{conversation_history}}
+
 # 코드베이스 컨텍스트
 
 {{scan_result_summary}}
@@ -6,12 +10,22 @@
 
 {{domain_rules}}
 
+# 기존 시나리오 목록
+
+{{existing_scenarios}}
+
 # 사용자 입력
 
 {{user_input}}
 
 # 지시사항
 
-위 코드베이스 컨텍스트와 도메인 규칙을 참조하여
-사용자 입력을 RequirementItem JSON 배열로 변환하라.
-JSON 배열 외에 아무것도 출력하지 않는다.
+위 정보를 참조하여 사용자 입력을 분석하고 아래 중 하나로 응답하라.
+
+1. 시나리오 생성/수정이 가능하면 sufficient + requirements 배열 반환
+2. 정보가 부족하면 insufficient + query_feedback(보충 질문) 반환
+3. QA와 무관한 질의면 rejected + query_feedback(안내 메시지) 반환
+
+이전 대화 이력이 있으면 현재 입력과 합쳐서 의미를 파악하라.
+기존 시나리오 목록을 참조하여 수정 대상(target_ts_id, target_tc_id)을 정확히 특정하라.
+JSON 외에 아무것도 출력하지 않는다.
