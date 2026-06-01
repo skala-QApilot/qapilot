@@ -32,7 +32,7 @@ async def test_route_a_api_error_code_detected(agent):
         params={"tc_id": "TC-001"}
     )
 
-    with patch.object(agent, "_analyze_with_llm", new=AsyncMock(return_value=([], 1.0, "none", "모든 계층 데이터가 일치함."))):
+    with patch.object(agent, "_analyze_with_llm", new=AsyncMock(return_value=([], 1.0, 0, "none", "모든 계층 데이터가 일치함."))):
         output = await agent.run(input)
 
     assert output.result["route"] == "A"
@@ -60,7 +60,7 @@ async def test_route_a_ui_error_code_detected(agent):
         params={"tc_id": "TC-001"}
     )
 
-    with patch.object(agent, "_analyze_with_llm", new=AsyncMock(return_value=([], 1.0, "none", "모든 계층 데이터가 일치함."))):
+    with patch.object(agent, "_analyze_with_llm", new=AsyncMock(return_value=([], 1.0, 0, "none", "모든 계층 데이터가 일치함."))):
         output = await agent.run(input)
 
     assert output.result["route"] == "A"
@@ -85,7 +85,7 @@ async def test_route_a_db_error_code_detected(agent):
         params={"tc_id": "TC-001"}
     )
 
-    with patch.object(agent, "_analyze_with_llm", new=AsyncMock(return_value=([], 1.0, "none", "모든 계층 데이터가 일치함."))):
+    with patch.object(agent, "_analyze_with_llm", new=AsyncMock(return_value=([], 1.0, 0, "none", "모든 계층 데이터가 일치함."))):
         output = await agent.run(input)
 
     assert output.result["route"] == "A"
@@ -96,7 +96,7 @@ async def test_route_a_db_error_code_detected(agent):
 @pytest.mark.asyncio
 async def test_route_b_no_error_code(agent):
     """경로 B: 에러 코드 없을 때 LLM으로 불일치 분석."""
-    with patch.object(agent, "_analyze_with_llm", new=AsyncMock(return_value=([], 0.5, "ui-api-mismatch", "api /api/login의 응답은 hong이(가) 왔기 때문에, 로그인 화면의 username 부분에서 홍길동이 떠야 하는데 hong이 떴음."))):
+    with patch.object(agent, "_analyze_with_llm", new=AsyncMock(return_value=([], 0.5, 0, "ui-api-mismatch", "api /api/login의 응답은 hong이(가) 왔기 때문에, 로그인 화면의 username 부분에서 홍길동이 떠야 하는데 hong이 떴음."))):
         input = AgentInput(
             trace_id="test-trace-001",
             context={
@@ -115,3 +115,26 @@ async def test_route_b_no_error_code(agent):
     assert output.result["route"] == "B"
     assert output.result["error_code"] == "ui-api-mismatch"
     assert "summary" in output.result
+
+
+@pytest.mark.asyncio
+async def test_route_b_matched_fields_returned(agent):
+    """경로 B: matched_fields가 LLM 응답 값으로 반환되는지 확인."""
+    with patch.object(agent, "_analyze_with_llm", new=AsyncMock(return_value=([], 1.0, 3, "none", "모든 계층 데이터가 일치함."))):
+        input = AgentInput(
+            trace_id="test-trace-001",
+            context={
+                "ui_result": {"status": "pass", "steps": []},
+                "api_trace": {
+                    "calls": [{"url": "/api/login", "status_code": 200, "response_body": {"token": "abc"}}],
+                    "total_calls": 1,
+                    "error_calls": 0,
+                },
+                "db_result": {"snapshots": []},
+            },
+            params={"tc_id": "TC-001"}
+        )
+        output = await agent.run(input)
+
+    assert output.result["route"] == "B"
+    assert output.result["cross_check"]["matched_fields"] == 3
