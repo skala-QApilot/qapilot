@@ -959,6 +959,17 @@ async def _test_execution(state: PipelineState) -> dict:
         getattr(cfg.project, "target_url", "") if hasattr(cfg, "project") else ""
     )
 
+    # 이슈 #174 (격차 12 D 영역): UITestTool 의 _ensure_authenticated fail-safe 용
+    # cfg.project.test_account → dict 변환. cfg 미설정 시 None (Tool 측 graceful skip).
+    test_account_cfg = getattr(cfg.project, "test_account", None) if hasattr(cfg, "project") else None
+    test_account_dict: dict | None = None
+    if test_account_cfg and getattr(test_account_cfg, "email", None) and getattr(test_account_cfg, "password", None):
+        test_account_dict = {
+            "email": test_account_cfg.email,
+            "password": test_account_cfg.password,
+            "login_path": getattr(test_account_cfg, "login_path", None),
+        }
+
     results_root = _qapilot_path(state, "results", trace_id)
 
     ui_results: list[dict] = []
@@ -990,6 +1001,7 @@ async def _test_execution(state: PipelineState) -> dict:
                     UITestTool=UITestTool,
                     APITraceTool=APITraceTool,
                     ToolInput=ToolInput,
+                    test_account=test_account_dict,
                 )
                 ui_results.append(ui_res["ui_result"])
                 api_results.append(ui_res["api_result"])
@@ -1118,6 +1130,7 @@ async def _run_ui_with_trace(
     UITestTool,
     APITraceTool,
     ToolInput,
+    test_account: dict | None = None,
 ) -> dict:
     """APITraceTool 의 listener 등록 (즉시 반환) + UITestTool 실행 후 api calls 재계산."""
     apt = APITraceTool(trace_id=trace_id)
@@ -1125,16 +1138,19 @@ async def _run_ui_with_trace(
     api_trace = apt_out.result["api_trace"]
 
     ui_tool = UITestTool(trace_id=trace_id)
+    ui_params = {
+        "page": page,
+        "action_mapping": action_mapping,
+        "tc_id": tc_id,
+        "target_url": target_url,
+        "screenshot_dir": str(screenshots_dir),
+    }
+    if test_account:
+        ui_params["test_account"] = test_account
     ui_out = await ui_tool.run(
         ToolInput(
             trace_id=trace_id,
-            params={
-                "page": page,
-                "action_mapping": action_mapping,
-                "tc_id": tc_id,
-                "target_url": target_url,
-                "screenshot_dir": str(screenshots_dir),
-            },
+            params=ui_params,
         )
     )
 

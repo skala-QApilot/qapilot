@@ -67,11 +67,30 @@ class AuthConfig(BaseModel):
     refresh_token_expire_days: int = 7
 
 
+class TestAccountConfig(BaseModel):
+    """SUT 테스트 사용자 인증 정보 — UITestTool 의 precondition fail-safe 가 활용.
+
+    이슈 #174 (격차 12 D 영역 본질): 인증 필요 시나리오의 TC 시작 시 페이지가
+    `/login` 으로 redirect 되면 본 계정으로 자동 로그인 시도. 시나리오 책임
+    경계 정합 — 시나리오 본문엔 로그인 step 없음 (Cucumber Background /
+    pytest fixture / Playwright test.beforeEach 패턴).
+
+    **Phase 1 (현재)**: qapilot.config.yaml 의 `project.test_account` 로 수동 입력.
+    **Phase 2 (후속)**: GitCodebaseScannerTool 확장 — seed.py / fixtures / .env 자동 추출.
+    """
+
+    email: str | None = None
+    password: str | None = None
+    # 로그인 페이지 URL 패턴 (e.g. "/login", "/sign-in"). None 이면 기본 패턴 사용.
+    login_path: str | None = None
+
+
 class ProjectConfig(BaseModel):
     name: str | None = None
     target_url: str | None = None
     root: str | None = None
     repo_path: str | None = None
+    test_account: TestAccountConfig = TestAccountConfig()
 
 
 class QApilotConfig(BaseModel):
