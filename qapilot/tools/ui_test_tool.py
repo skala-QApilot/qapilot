@@ -114,6 +114,9 @@ class UITestTool(BaseTool):
         action_mapping = params.get("action_mapping") or {}
         tc_id: str = params.get("tc_id") or action_mapping.get("tc_id") or "unknown"
         target_url: str = params.get("target_url", "")
+        # 이슈 #174 (격차 12 D 영역): TC 시작 시 인증 fail-safe 용 test_account.
+        # pipeline 의 _test_execution 이 cfg.project.test_account 를 dict 로 넘김.
+        test_account: dict[str, Any] | None = params.get("test_account")
 
         screenshot_dir: Path | None = None
         if params.get("screenshot_dir") is not None:
@@ -131,7 +134,7 @@ class UITestTool(BaseTool):
         page.on("console", lambda msg: console_logs.append(f"[{msg.type}] {msg.text}"))
 
         step_results, tc_status, total_duration_ms = await self._run_steps(
-            page, steps, target_url, screenshot_dir, console_logs
+            page, steps, target_url, screenshot_dir, console_logs, test_account
         )
 
         ui_result: UITestResult = {
@@ -156,6 +159,7 @@ class UITestTool(BaseTool):
         target_url: str,
         screenshot_dir: Path | None,
         console_logs: list[str],
+        test_account: dict[str, Any] | None = None,
     ) -> tuple[list[UIStepResult], str, int]:
         """ActionStep 시퀀스를 순차 실행. 실패 시 후속 스텝 skip."""
         step_results: list[UIStepResult] = []
@@ -169,6 +173,13 @@ class UITestTool(BaseTool):
         # 배경: docs/e2e-navigate-gap-analysis.md
         if steps and steps[0].get("action") in _DOM_ACTIONS:
             await self._try_auto_navigate(page, steps, target_url)
+
+        # 이슈 #174 (격차 12 D 영역 본질): TC 시작 시 인증 fail-safe.
+        # 시나리오는 self-contained 가 아니라 pytest fixture / Playwright
+        # test.beforeEach / Cucumber Background 패턴 — precondition (로그인) 은
+        # 별도 layer 처리. PR #122 auto-navigate 후에도 SUT 가 /login redirect
+        # 한 경우 cfg.project.test_account 로 자동 로그인 시도.
+        await self._ensure_authenticated(page, steps, target_url, test_account)
 
         for idx, step in enumerate(steps):
             step_no = int(step.get("step_no") or idx + 1)
@@ -225,6 +236,149 @@ class UITestTool(BaseTool):
 
         total_duration_ms = int((time.monotonic() - total_start) * 1000)
         return step_results, tc_status, total_duration_ms
+
+    async def _ensure_authenticated(
+        self,
+        page: Page,
+        steps: list[ActionStep],
+        target_url: str,
+        test_account: dict[str, Any] | None,
+    ) -> None:
+        """이슈 #174 (격차 12 D 영역 본질): TC 시작 시 인증 fail-safe.
+
+        시나리오 책임 경계 정합 — 시나리오 본문은 self-contained 가 아니라
+        pytest fixture / Playwright test.beforeEach / Cucumber Background
+        패턴으로 precondition (로그인) 은 별도 layer 처리. UITestTool 이 본 layer.
+
+        동작:
+        - test_account 미설정 (cfg 부재) → graceful skip
+        - 현재 page URL 이 로그인 패턴 매칭 안 함 (이미 인증됨 / 다른 페이지)
+          → skip
+        - 로그인 form 휴리스틱 fallback chain — email/password fill + 로그인 button click
+        - 로그인 후 PR #122 auto-navigate 와 동일 로직으로 원 의도 URL 재네비
+
+        실패 graceful:
+        - test_account 미설정 → debug log + skip (현재 동작 보존)
+        - form selector 못 찾음 → warning + 후속 step 들이 그대로 fail (현재 동작)
+
+        Phase 1 (현재): qapilot.config.yaml 의 project.test_account 수동 입력.
+        Phase 2 (후속): GitCodebaseScannerTool 확장으로 seed.py / fixtures / .env
+        자동 추출 → ProjectRecord 에 자동 채움.
+        """
+        if not test_account:
+            return
+        email = test_account.get("email")
+        password = test_account.get("password")
+        if not email or not password:
+            return
+
+        try:
+            current_url = (page.url or "").lower()
+        except Exception:
+            return
+
+        # 휴리스틱 — 사용자 지정 path 또는 일반 로그인 URL 패턴
+        login_path = (test_account.get("login_path") or "").lower()
+        default_patterns = ("/login", "/signin", "/sign-in", "/auth/login")
+        login_patterns = (login_path,) + default_patterns if login_path else default_patterns
+
+        if not any(p and p in current_url for p in login_patterns):
+            return  # 이미 인증된 상태 또는 다른 페이지
+
+        self.logger.info(
+            "ui_auth_fallback_start",
+            url=current_url,
+            email_masked=email[:3] + "***",
+        )
+
+        # 로그인 form 휴리스틱 fallback chain — email/password/submit
+        email_locators = [
+            page.get_by_placeholder("이메일"),
+            page.get_by_label("이메일"),
+            page.get_by_placeholder("Email"),
+            page.get_by_label("Email"),
+            page.locator("input[type=email]"),
+            page.locator("input[name=email]"),
+            page.locator("input[name=username]"),
+            page.get_by_test_id("email"),
+        ]
+        password_locators = [
+            page.get_by_placeholder("비밀번호"),
+            page.get_by_label("비밀번호"),
+            page.get_by_placeholder("Password"),
+            page.get_by_label("Password"),
+            page.locator("input[type=password]"),
+            page.locator("input[name=password]"),
+            page.get_by_test_id("password"),
+        ]
+        submit_locators = [
+            page.get_by_role("button", name="로그인"),
+            page.get_by_role("button", name="Sign in"),
+            page.get_by_role("button", name="Login"),
+            page.get_by_text("로그인", exact=True),
+            page.locator("button[type=submit]"),
+            page.get_by_test_id("login-submit"),
+        ]
+
+        async def _try_first_fill(locators, value: str, label: str) -> bool:
+            for loc in locators:
+                try:
+                    await loc.fill(value, timeout=2000)
+                    return True
+                except Exception:
+                    continue
+            self.logger.warning("ui_auth_fallback_locator_miss", field=label)
+            return False
+
+        async def _try_first_click(locators, label: str) -> bool:
+            for loc in locators:
+                try:
+                    await loc.click(timeout=2000)
+                    return True
+                except Exception:
+                    continue
+            self.logger.warning("ui_auth_fallback_locator_miss", field=label)
+            return False
+
+        try:
+            if not await _try_first_fill(email_locators, email, "email"):
+                return
+            if not await _try_first_fill(password_locators, password, "password"):
+                return
+            if not await _try_first_click(submit_locators, "submit"):
+                return
+            # SPA 정합 — vue-router/react-router 는 router.push 후 URL 만 변경되고
+            # networkidle 안 도달할 수 있음 (background polling). URL change 우선 대기 +
+            # networkidle 보조 대기.
+            try:
+                await page.wait_for_url(
+                    lambda url: not any(p and p in url.lower() for p in login_patterns),
+                    timeout=5000,
+                )
+            except Exception:
+                # URL 변경 timeout — fallback 으로 networkidle 짧게 시도
+                try:
+                    await page.wait_for_load_state("networkidle", timeout=2000)
+                except Exception:
+                    pass
+        except Exception as e:
+            self.logger.warning(
+                "ui_auth_fallback_fail",
+                error=str(e).splitlines()[0] if str(e) else type(e).__name__,
+            )
+            return
+
+        new_url = page.url or ""
+        if any(p in new_url.lower() for p in login_patterns):
+            # 로그인 후에도 /login 머무름 = 실패 (계정 잘못/네트워크 에러 등)
+            self.logger.warning("ui_auth_fallback_still_login", final_url=new_url)
+            return
+
+        self.logger.info("ui_auth_fallback_success", final_url=new_url)
+
+        # 로그인 성공 후 원 의도 URL 재네비 (PR #122 와 동일)
+        if steps and steps[0].get("action") in _DOM_ACTIONS:
+            await self._try_auto_navigate(page, steps, target_url)
 
     async def _try_auto_navigate(
         self, page: Page, steps: list[ActionStep], target_url: str
