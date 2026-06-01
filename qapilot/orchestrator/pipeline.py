@@ -26,6 +26,7 @@ from typing import Any
 
 from langgraph.graph import END, START, StateGraph
 
+from qapilot.db.rtm_writer import write_rtm_version
 from qapilot.db.scenario_writer import upsert_scenario_version
 from qapilot.db.tc_result_writer import insert_tc_artifact, upsert_tc_result
 from qapilot.orchestrator.state import PipelineState
@@ -714,6 +715,18 @@ def _write_initial_rtm_version(state: PipelineState) -> None:
         label=label,
         fr_count=len(rtm_requirements),
     )
+
+    # DB mirror — service_id 가 trace.json 에 있어야 함. 없으면 graceful skip.
+    trace_loaded = load_trace(state["qapilot_dir"], state["trace_id"]) or {}
+    service_id_for_db = trace_loaded.get("service_id")
+    if service_id_for_db:
+        write_rtm_version(
+            service_id=service_id_for_db,
+            trace_id=state.get("trace_id"),
+            label=label,
+            requirements=rtm_requirements,
+            summary=rtm_version["summary"],
+        )
 
 
 async def _load_scenarios_for_codegen(state: PipelineState) -> dict:
