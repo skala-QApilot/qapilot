@@ -17,7 +17,15 @@ from qapilot.shared.errors import ErrorCode, ToolExecutionError
 from qapilot.shared.schemas import DBSnapshot, DBTestResult
 from qapilot.tools.base_tool import BaseTool
 
-MODULE_URL = os.getenv("QAPILOT_MODULE_URL", "")
+MODULE_URL = os.getenv("QAPILOT_SUT_DB_URL", "")
+API_TOKEN = os.getenv("QAPILOT_SUT_DB_TOKEN", "")
+
+
+def _auth_headers() -> dict:
+    """인증 헤더 반환."""
+    if not API_TOKEN:
+        return {}
+    return {"Authorization": f"Bearer {API_TOKEN}"}
 
 
 class DBTestTool(BaseTool):
@@ -36,7 +44,7 @@ class DBTestTool(BaseTool):
         """DB 테이블 목록 조회."""
         try:
             async with httpx.AsyncClient() as client:
-                response = await client.get(f"{MODULE_URL}/db/tables")
+                response = await client.get(f"{MODULE_URL}/db/tables", headers=_auth_headers())
                 response.raise_for_status()
                 return response.json()["data"]["tables"]
         except httpx.ConnectError as e:
@@ -49,7 +57,7 @@ class DBTestTool(BaseTool):
         try:
             async with httpx.AsyncClient() as client:
                 response = await client.get(
-                    f"{MODULE_URL}/db/snapshot", params={"table": table}
+                    f"{MODULE_URL}/db/snapshot", params={"table": table}, headers=_auth_headers()
                 )
                 response.raise_for_status()
                 return response.json()["data"]
@@ -63,7 +71,7 @@ class DBTestTool(BaseTool):
         try:
             async with httpx.AsyncClient() as client:
                 response = await client.post(
-                    f"{MODULE_URL}/db/seed", json={"sql": seed_sql}
+                    f"{MODULE_URL}/db/seed", json={"sql": seed_sql}, headers=_auth_headers()
                 )
                 response.raise_for_status()
         except httpx.ConnectError as e:
@@ -75,7 +83,7 @@ class DBTestTool(BaseTool):
         """SQL 쿼리 로그 조회."""
         try:
             async with httpx.AsyncClient() as client:
-                response = await client.get(f"{MODULE_URL}/db/sql-logs")
+                response = await client.get(f"{MODULE_URL}/db/sql-logs", headers=_auth_headers())
                 response.raise_for_status()
                 return response.json()["data"]["logs"]
         except httpx.ConnectError as e:
@@ -87,7 +95,7 @@ class DBTestTool(BaseTool):
         """롤백 수행."""
         try:
             async with httpx.AsyncClient() as client:
-                response = await client.post(f"{MODULE_URL}/db/rollback")
+                response = await client.post(f"{MODULE_URL}/db/rollback", headers=_auth_headers())
                 response.raise_for_status()
         except httpx.ConnectError as e:
             raise ToolExecutionError(ErrorCode.TOOL_004, f"DB 스캔 모듈 연결 실패: {e}")
@@ -100,7 +108,7 @@ class DBTestTool(BaseTool):
         seed_sql = params.get("seed_sql")
 
         if not MODULE_URL:
-            raise ValueError("QAPILOT_MODULE_URL 환경변수가 설정되지 않았습니다.")
+            raise ValueError("QAPILOT_SUT_DB_URL 환경변수가 설정되지 않았습니다.")
 
         tables = await self._get_tables()
 
