@@ -7,6 +7,7 @@ trace_id 기준으로 SQL 호출을 추적한다.
 Created: 2026-05-07
 """
 
+import json
 import os
 from typing import Any
 
@@ -123,16 +124,31 @@ class DBTestTool(BaseTool):
 
         snapshots: list[DBSnapshot] = []
         for table in tables:
-            before_count = before[table].get("row_count", 0)
-            after_count = after[table].get("row_count", 0)
+            before_data = before[table]
+            after_data = after[table]
+            before_count = before_data.get("row_count", 0)
+            after_count = after_data.get("row_count", 0)
             diff = after_count - before_count
+
+            # before/after rows 데이터가 있으면 실제 행 변경 감지
+            modified = 0
+            before_rows = before_data.get("rows")
+            after_rows = after_data.get("rows")
+            if before_rows is not None and after_rows is not None:
+                # primary key 기준으로 동일한 행 수 내 데이터 변경 감지
+                before_set = {json.dumps(row, sort_keys=True) for row in before_rows}
+                after_set = {json.dumps(row, sort_keys=True) for row in after_rows}
+                # 행 수는 같지만 내용이 다른 경우 modified 계산
+                if before_count == after_count:
+                    modified = len(before_set - after_set)
+
             snapshots.append(DBSnapshot(
                 table=table,
                 row_count_before=before_count,
                 row_count_after=after_count,
                 added=max(diff, 0),
                 deleted=max(-diff, 0),
-                modified=0,
+                modified=modified,
             ))
 
         await self._rollback()
