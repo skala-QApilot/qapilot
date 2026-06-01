@@ -26,9 +26,11 @@ from typing import Any
 
 from langgraph.graph import END, START, StateGraph
 
+from qapilot.db.scenario_writer import upsert_scenario_version
 from qapilot.db.tc_result_writer import insert_tc_artifact, upsert_tc_result
 from qapilot.orchestrator.state import PipelineState
 from qapilot.shared.logger import get_logger
+from qapilot.shared.trace_store import load_trace
 from qapilot.storage import s3_client
 
 
@@ -569,6 +571,9 @@ async def _save_scenarios(state: PipelineState) -> dict:
 
     trigger = state["run_options"].get("trigger") or "init"
     saved_paths: list[str] = []
+    # service_id 는 trace.json 에서 — Spring 이 create_trace 시점에 넣어둔 값.
+    trace = load_trace(state["qapilot_dir"], state["trace_id"]) or {}
+    service_id = trace.get("service_id")
 
     if trigger == "natural_lang":
         # natural_lang: delta(신규/수정 시나리오)만 저장, 기존 시나리오 파일 유지 (이슈 #180)
@@ -580,6 +585,8 @@ async def _save_scenarios(state: PipelineState) -> dict:
                 json.dumps(ts, ensure_ascii=False, indent=2), encoding="utf-8"
             )
             saved_paths.append(str(path))
+            if service_id:
+                upsert_scenario_version(service_id, ts_id, ts)
             logger.info(
                 "scenario_merged",
                 ts_id=ts_id,
@@ -593,6 +600,8 @@ async def _save_scenarios(state: PipelineState) -> dict:
                 json.dumps(ts, ensure_ascii=False, indent=2), encoding="utf-8"
             )
             saved_paths.append(str(path))
+            if service_id:
+                upsert_scenario_version(service_id, ts_id, ts)
 
     # RTM 버전 자동 생성 — natural_lang delta 저장 시에는 skip (전체 시나리오 기준이 아니므로)
     if trigger != "natural_lang":
