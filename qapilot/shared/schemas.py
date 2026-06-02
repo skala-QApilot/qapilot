@@ -7,7 +7,7 @@ Created: 2026-05-07
 """
 
 from dataclasses import dataclass
-from typing import Any, Literal, TypedDict
+from typing import Any, Literal, NotRequired, TypedDict
 
 from pydantic import BaseModel, Field
 
@@ -171,6 +171,10 @@ class RequirementItem(TypedDict):
     content: str
     priority: Literal["high", "medium", "low"]
     domain_area: str
+    action_type: NotRequired[Literal["create", "update"]]  # 기본값 "create"
+    target_level: NotRequired[Literal["ts", "tc", "tv"]]   # update 시 수정 단위
+    target_ts_id: NotRequired[str | None]                  # 대상 TS ID (임베딩 레이어에서 주입)
+    target_tc_id: NotRequired[str | None]                  # 대상 TC ID (target_level=tc/tv 시 주입)
 
 
 # ── TS / TC / TV ──

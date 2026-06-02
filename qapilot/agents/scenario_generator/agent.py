@@ -250,10 +250,13 @@ class ScenarioGeneratorAgent(BaseAgent):
         mismatches: list,
         last_error: str | None,
     ) -> ExecuteResult:
-        """요구사항 기반 도메인별 시나리오 생성 — 1 domain_area = 1 TS."""
-        from qapilot.tools.domain_knowledge import DomainKnowledgeTool
+        """요구사항 기반 도메인별 시나리오 생성 — 1 domain_area = 1 TS.
 
+        action_type == "create" (또는 target_ts_id null 폴백) → 새 TS 생성.
+        action_type == "update" + target_ts_id 있음 → target_level에 따라 부분 수정.
+        """
         all_scenarios: list = []
+        all_updated: list = []   # update 결과 (ts_id 고정, 재번호 부여 없이 바로 저장)
         confidence_sum = 0.0
         all_endpoints: list[dict] = self._read_index_json("endpoints.json")  # type: ignore[assignment]
         target_requirements, skipped_requirements = self._split_scenario_requirements(requirements)
@@ -308,15 +311,9 @@ class ScenarioGeneratorAgent(BaseAgent):
             self._pin_req_id(ts_scenarios, req_id)
             self._fill_api_for_domain(ts_scenarios, req, router_files, req_endpoints)
 
-            # 각 TC 에 req_id 강제 주입 — LLM 이 출력에서 누락해도 RTM 매핑이 유실되지 않도록.
-            # _run_domain_based 는 req 단위 1회 호출이라 모든 결과 TC 가 이 req 를 검증.
-            for s in ts_scenarios:
-                for tc in s.get("test_cases") or []:
-                    if not tc.get("req_id"):
-                        tc["req_id"] = req.get("req_id")
-
-            for s in ts_scenarios:
-                if len(s["test_cases"]) < 6:
+            if action_type == "update" and target_ts_id:
+                existing_ts = self._load_scenario_file(target_ts_id)
+                if existing_ts is None:
                     self.logger.warning(
                         "tc_count_below_minimum",
                         req_id=req_id,
@@ -324,9 +321,25 @@ class ScenarioGeneratorAgent(BaseAgent):
                         tc_count=len(s["test_cases"]),
                         minimum=6,
                     )
+                    continue
 
-            all_scenarios.extend(ts_scenarios)
+            else:
+                ts_scenarios, ts_confidence = await self._generate_ts_for_req(
+                    req, scan_result, domain_rules, trigger, mismatch_text, last_error,
+                )
+                all_scenarios.extend(ts_scenarios)
+
             confidence_sum += ts_confidence
+
+        # update 결과는 ts_id 고정 — 재번호 부여 없이 바로 덮어쓴다.
+        from qapilot.agents.scenario_generator.repository import save_scenario
+        for ts in all_updated:
+            save_scenario(ts)
+
+        confidence = round(confidence_sum / max(len(requirements), 1), 3)
+
+        if not all_scenarios:
+            # create 대상이 없고 update만 있는 경우
             self.logger.info(
                 "requirement_scenario_generated",
                 req_id=req_id,
@@ -1273,10 +1286,26 @@ class ScenarioGeneratorAgent(BaseAgent):
     def _format_requirements(self, requirements: list) -> str:
         if not requirements:
             return "없음"
-        return "\n".join(
-            f"[{r['req_id']}] ({r['req_type']}/{r['priority']}) {r['content']} [도메인: {r['domain_area']}]"
-            for r in requirements
-        )
+        lines: list[str] = []
+        for r in requirements:
+            base = (
+                f"[{r['req_id']}] ({r.get('req_type', '')}/{r.get('priority', '')}) "
+                f"{r['content']} [도메인: {r.get('domain_area', '')}]"
+            )
+            action_type = r.get("action_type", "create")
+            target_level = r.get("target_level", "ts")
+            target_ts_id = r.get("target_ts_id")
+            target_tc_id = r.get("target_tc_id")
+            if action_type == "update":
+                meta = f" [action=update level={target_level}"
+                if target_ts_id:
+                    meta += f" target_ts={target_ts_id}"
+                if target_tc_id:
+                    meta += f" target_tc={target_tc_id}"
+                meta += "]"
+                base += meta
+            lines.append(base)
+        return "\n".join(lines)
 
     def _build_router_map(self, affected_files: list[str]) -> dict[str, list[dict]]:
         """endpoints.json에서 라우터 파일 → 엔드포인트 목록 맵을 구성한다.

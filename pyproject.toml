@@ -28,7 +28,14 @@ dependencies = [
     "qdrant-client>=1.9",
     # RDB
     "asyncpg>=0.29",
+    "psycopg[binary,pool]>=3.1",
     "sqlalchemy>=2.0",
+    # 객체 저장소 (S3 / MinIO)
+    "boto3>=1.34",
+    # 메시지 브로커 (SSE pub/sub + Celery broker)
+    "redis>=5.0",
+    # 분산 워커 (SaaS 멀티 인스턴스용)
+    "celery>=5.4",
     # 테스트 실행
     "playwright>=1.44",
     # AST 파싱

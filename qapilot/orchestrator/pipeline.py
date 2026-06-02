@@ -26,8 +26,14 @@ from typing import Any
 
 from langgraph.graph import END, START, StateGraph
 
+from qapilot.db.code_writer import upsert_action_mapping, upsert_codebase_index, upsert_generated_code
+from qapilot.db.rtm_writer import write_rtm_version
+from qapilot.db.scenario_writer import upsert_scenario_version
+from qapilot.db.tc_result_writer import insert_tc_artifact, upsert_tc_result
 from qapilot.orchestrator.state import PipelineState
 from qapilot.shared.logger import get_logger
+from qapilot.shared.trace_store import load_trace
+from qapilot.storage import s3_client
 
 
 def _qapilot_path(state: PipelineState, *parts: str) -> Path:
@@ -172,16 +178,28 @@ def _save_codebase_index_to_disk(scan: dict, state: PipelineState) -> None:
         "endpoint_count": int(scan.get("endpoint_count", 0) or 0),
     }
 
-    for filename, payload in (
+    indices: tuple[tuple[str, Any], ...] = (
         ("endpoints.json", endpoints),
         ("models.json", models),
         ("functions.json", functions),
         ("callgraph.json", callgraph),
         ("manifest.json", manifest),
-    ):
+    )
+    for filename, payload in indices:
         (cache_dir / filename).write_text(
             json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
         )
+
+    # PR-17 — DB+S3 mirror. service_id 는 trace.json 에서.
+    trace = load_trace(state["qapilot_dir"], state["trace_id"]) or {}
+    service_id = trace.get("service_id")
+    if service_id:
+        commit_hash = manifest.get("commit_hash") or None
+        file_count = manifest.get("file_count")
+        for filename, payload in indices:
+            kind = filename.replace(".json", "")
+            upsert_codebase_index(service_id, commit_hash, kind, payload,
+                                  file_count=file_count if kind == "manifest" else None)
 
 
 # ── Layer 1A 노드 (generate_scenarios) ────────────────────────────────────────
@@ -785,6 +803,9 @@ async def _save_scenarios(state: PipelineState) -> dict:
 
     trigger = state["run_options"].get("trigger") or "init"
     saved_paths: list[str] = []
+    # service_id 는 trace.json 에서 — Spring 이 create_trace 시점에 넣어둔 값.
+    trace = load_trace(state["qapilot_dir"], state["trace_id"]) or {}
+    service_id = trace.get("service_id")
 
     if trigger == "natural_lang":
         # natural_lang: delta(신규/수정 시나리오)만 저장, 기존 시나리오 파일 유지 (이슈 #180)
@@ -796,6 +817,8 @@ async def _save_scenarios(state: PipelineState) -> dict:
                 json.dumps(ts, ensure_ascii=False, indent=2), encoding="utf-8"
             )
             saved_paths.append(str(path))
+            if service_id:
+                upsert_scenario_version(service_id, ts_id, ts)
             logger.info(
                 "scenario_merged",
                 ts_id=ts_id,
@@ -809,6 +832,8 @@ async def _save_scenarios(state: PipelineState) -> dict:
                 json.dumps(ts, ensure_ascii=False, indent=2), encoding="utf-8"
             )
             saved_paths.append(str(path))
+            if service_id:
+                upsert_scenario_version(service_id, ts_id, ts)
 
     # RTM 버전 자동 생성 — natural_lang delta 저장 시에는 skip (전체 시나리오 기준이 아니므로)
     if trigger != "natural_lang":
@@ -921,6 +946,18 @@ def _write_initial_rtm_version(state: PipelineState) -> None:
         label=label,
         fr_count=len(rtm_requirements),
     )
+
+    # DB mirror — service_id 가 trace.json 에 있어야 함. 없으면 graceful skip.
+    trace_loaded = load_trace(state["qapilot_dir"], state["trace_id"]) or {}
+    service_id_for_db = trace_loaded.get("service_id")
+    if service_id_for_db:
+        write_rtm_version(
+            service_id=service_id_for_db,
+            trace_id=state.get("trace_id"),
+            label=label,
+            requirements=rtm_requirements,
+            summary=rtm_version["summary"],
+        )
 
 
 async def _load_scenarios_for_codegen(state: PipelineState) -> dict:
@@ -1077,21 +1114,30 @@ async def _save_codes(state: PipelineState) -> dict:
     am_dir.mkdir(parents=True, exist_ok=True)
 
     saved_code_paths: list[str] = []
+    # PR-17 — DB+S3 dual-write. trace.json 에서 service_id lookup. 없으면 graceful skip.
+    trace = load_trace(state["qapilot_dir"], state["trace_id"]) or {}
+    service_id = trace.get("service_id")
+
     for code_obj in generated_codes:
         tc_id = code_obj.get("tc_id")
         if not tc_id:
             continue
+        code_text = code_obj.get("code", "")
         path = code_dir / f"{tc_id}.js"
-        path.write_text(code_obj.get("code", ""), encoding="utf-8")
+        path.write_text(code_text, encoding="utf-8")
         saved_code_paths.append(str(path))
+        if service_id:
+            upsert_generated_code(service_id, tc_id, code_text)
 
-    # 신규 — ActionMapping 디스크 영속화 (Layer 2 의 _load_scenarios_for_test 가 읽음)
+    # ActionMapping 디스크 영속화 (Layer 2 의 _load_scenarios_for_test 가 읽음)
     for am in action_mappings:
         tc_id = am.get("tc_id")
         if not tc_id:
             continue
         path = am_dir / f"{tc_id}.json"
         path.write_text(json.dumps(am, ensure_ascii=False, indent=2), encoding="utf-8")
+        if service_id:
+            upsert_action_mapping(service_id, tc_id, am)
 
     return {
         "saved_code_paths": saved_code_paths,
@@ -1352,6 +1398,17 @@ async def _test_execution(state: PipelineState) -> dict:
                 (tc_dir / "db_result.json").write_text(
                     json.dumps(db_res, ensure_ascii=False, indent=2), "utf-8"
                 )
+
+                # L3 DB / S3 mirror — 실패해도 디스크 진실은 보존됨
+                _mirror_tc_results_and_artifacts(
+                    trace_id=trace_id,
+                    ts_id=ts_id,
+                    tc_id=tc_id,
+                    ui_result=ui_res["ui_result"],
+                    api_result=ui_res["api_result"],
+                    db_result=db_res,
+                    screenshots_dir=screenshots_dir,
+                )
         finally:
             await context.close()
             await browser.close()
@@ -1369,6 +1426,60 @@ async def _test_execution(state: PipelineState) -> dict:
         "tc_results": tc_results,
         "scenario_results": scenario_results,
     }
+
+
+def _mirror_tc_results_and_artifacts(
+    *,
+    trace_id: str,
+    ts_id: str,
+    tc_id: str,
+    ui_result: dict,
+    api_result: dict,
+    db_result: dict,
+    screenshots_dir: Path,
+) -> None:
+    """ui/api/db 결과 → tc_results UPSERT, 스크린샷 PNG → S3 + tc_artifacts.
+
+    DB / S3 미설정/실패 시 모두 graceful — file 기록이 source of truth.
+    """
+    ui_result_id = upsert_tc_result(
+        run_id=trace_id, ts_id=ts_id, tc_id=tc_id, kind="ui", payload=ui_result,
+    )
+    upsert_tc_result(
+        run_id=trace_id, ts_id=ts_id, tc_id=tc_id, kind="api", payload=api_result,
+    )
+    upsert_tc_result(
+        run_id=trace_id, ts_id=ts_id, tc_id=tc_id, kind="db", payload=db_result,
+    )
+
+    # 스크린샷은 UI result 에 묶음. tc_result_id 없으면 (DB 비활성) S3 도 skip.
+    if not ui_result_id or not screenshots_dir.exists():
+        return
+
+    for png in sorted(screenshots_dir.glob("step_*.png")):
+        step_index = _parse_step_index(png.name)
+        if step_index is None:
+            continue
+        s3_key = f"runs/{trace_id}/tc/{ts_id}/{tc_id}/screenshots/{png.name}"
+        meta = s3_client.put_file(s3_key, str(png), content_type="image/png")
+        if meta is None:
+            continue
+        insert_tc_artifact(
+            tc_result_id=ui_result_id,
+            step_index=step_index,
+            kind="png",
+            s3_key=s3_key,
+            sha256=meta.get("sha256"),
+            size_bytes=meta.get("bytes"),
+        )
+
+
+_STEP_INDEX_RE = re.compile(r"step_(\d+)\.")
+
+
+def _parse_step_index(name: str) -> int | None:
+    m = _STEP_INDEX_RE.search(name)
+    return int(m.group(1)) if m else None
 
 
 def _load_all_tc_results_from_disk(
