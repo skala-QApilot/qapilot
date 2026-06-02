@@ -11,6 +11,54 @@ import re
 from qapilot.shared.errors import AgentExecutionError, ErrorCode
 from qapilot.shared.schemas import TestCase, TestScenario, TestValue
 
+
+def _resolve_tc_depends_on(raw_depends: list, ts_id: str) -> list[str]:
+    """TC depends_on의 "TC-XX" 상대 참조를 완전한 ID로 변환한다.
+
+    LLM이 "TC-01" 형식으로 출력한 참조를 "TS-034-TC-01" 형태로 확장한다.
+    이미 완전한 ID(TS-XXX-TC-YY)이면 그대로 유지한다.
+    """
+    resolved: list[str] = []
+    for ref in raw_depends:
+        if re.match(r'^TC-\d+$', str(ref)):
+            n = int(str(ref).split('-')[1])
+            resolved.append(f"{ts_id}-TC-{n:02d}")
+        else:
+            resolved.append(str(ref))
+    return resolved
+
+def _fix_unescaped_newlines(json_str: str) -> str:
+    """JSON 문자열 값 내의 이스케이프되지 않은 줄바꿈·탭을 수정한다.
+
+    LLM이 given/when/then 값에 literal newline을 넣을 때 발생하는
+    JSONDecodeError를 방지하기 위해 문자 단위로 파싱해 수정한다.
+    """
+    result: list[str] = []
+    in_string = False
+    escape_next = False
+
+    for ch in json_str:
+        if escape_next:
+            result.append(ch)
+            escape_next = False
+        elif ch == "\\" and in_string:
+            result.append(ch)
+            escape_next = True
+        elif ch == '"':
+            result.append(ch)
+            in_string = not in_string
+        elif in_string and ch == "\n":
+            result.append("\\n")
+        elif in_string and ch == "\r":
+            result.append("\\r")
+        elif in_string and ch == "\t":
+            result.append("\\t")
+        else:
+            result.append(ch)
+
+    return "".join(result)
+
+
 _DOMAIN_KEYWORDS: dict[str, list[str]] = {
     "결제": ["payment", "pay", "결제", "checkout"],
     "회원": ["user", "member", "account", "profile", "회원"],
@@ -47,7 +95,10 @@ def parse_response(
     """
     try:
         cleaned = re.sub(r"```(?:json)?\s*|\s*```", "", content).strip()
-        data = json.loads(cleaned)
+        try:
+            data = json.loads(cleaned)
+        except json.JSONDecodeError:
+            data = json.loads(_fix_unescaped_newlines(cleaned))
     except json.JSONDecodeError as e:
         raise AgentExecutionError(
             ErrorCode.AGENT_004,
@@ -95,6 +146,8 @@ def parse_response(
                     "values": values,
                     "tags": tc.get("tags", []),
                     "req_id": tc.get("req_id"),
+                    "api": tc.get("api"),
+                    "depends_on": _resolve_tc_depends_on(tc.get("depends_on", []), ts_id),
                 }
             )
 
@@ -107,8 +160,9 @@ def parse_response(
                 "name": s.get("name", ""),
                 "description": s.get("description", ""),
                 "trigger": trigger,
-                "affected_files": affected_files or s.get("affected_files", []),
+                "affected_files": affected_files if affected_files is not None else s.get("affected_files", []),
                 "domain_rules_used": domain_rule_ids,
+                "requirements": s.get("requirements", []),
                 "test_cases": unique_tcs,
             }
         )

@@ -91,8 +91,23 @@ class VectorStore:
 
         return stored, failed
 
+    async def collection_exists(self) -> bool:
+        """Qdrant 컬렉션 존재 여부를 반환한다."""
+        from qdrant_client import AsyncQdrantClient
+
+        client = AsyncQdrantClient(url=self._qdrant_url())
+        try:
+            resp = await client.get_collections()
+            return _QDRANT_COLLECTION in {c.name for c in resp.collections}
+        except Exception:
+            return False
+        finally:
+            await client.close()
+
     async def search(self, query: str, top_k: int = _TOP_K_DEFAULT) -> list[DomainRule]:
         """쿼리를 임베딩하여 Qdrant에서 유사 도메인 규칙을 검색한다.
+
+        컬렉션이 없으면 빈 목록을 반환한다 (Qdrant 재시작 등으로 컬렉션이 소실된 경우).
 
         Args:
             query: 검색 쿼리 문자열.
@@ -106,6 +121,11 @@ class VectorStore:
         client = AsyncQdrantClient(url=self._qdrant_url())
 
         try:
+            resp = await client.get_collections()
+            if _QDRANT_COLLECTION not in {c.name for c in resp.collections}:
+                self._logger.warning("qdrant_collection_missing", name=_QDRANT_COLLECTION)
+                return []
+
             embedder = get_embedder()
             vecs = await asyncio.to_thread(embedder.encode, [query], normalize_embeddings=True)
             vector = vecs[0].tolist()

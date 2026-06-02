@@ -252,6 +252,12 @@ async def _doc_import(state: PipelineState) -> dict:
     tool = DomainKnowledgeTool(trace_id=trace_id)
     logger = tool.logger
 
+    # Qdrant 컬렉션이 없으면 index.json skip 조건을 무시하고 전체 재적재
+    from qapilot.tools.domain_knowledge._store import VectorStore
+    collection_alive = await VectorStore(logger).collection_exists()
+    if not collection_alive:
+        logger.warning("qdrant_collection_missing_reimport", name="domain_knowledge")
+
     for doc_path in sorted(doc_files):
         index_path = _qapilot_path(state, "domain", f"{doc_path.stem}.index.json")
         if index_path.exists():
@@ -658,17 +664,17 @@ async def _requirement_extract(state: PipelineState) -> dict:
 
     # ── init / doc_update: PRD 문서 → RequirementExtractorAgent ─────────────────
     user_input = (state["run_options"].get("user_input") or "").strip()
-    if user_input:
-        from qapilot.agents.requirement_extractor import RequirementExtractorAgent
-        from qapilot.shared.schemas import AgentInput
+    document_text = user_input or _read_latest_prd_text()
 
-        agent = RequirementExtractorAgent(trace_id=state["trace_id"])
-        output = await agent.run(
-            AgentInput(
-                trace_id=state["trace_id"],
-                context={"domain_rules": state.get("domain_rules") or []},
-                params={"document_text": user_input, "existing_count": 0},
-            )
+    if not document_text:
+        return {"requirements": []}
+
+    agent = RequirementExtractorAgent(trace_id=state["trace_id"])
+    output = await agent.run(
+        AgentInput(
+            trace_id=state["trace_id"],
+            context={"domain_rules": state.get("domain_rules") or []},
+            params={"document_text": document_text, "existing_count": 0},
         )
         return {"requirements": output.result.get("requirements", []) or []}
 
@@ -724,7 +730,13 @@ async def _requirement_extract(state: PipelineState) -> dict:
     except Exception:
         pass
 
-    return {"requirements": requirements}
+    texts: list[str] = []
+    for p in prd_docs:
+        try:
+            texts.append(p.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+    return "\n\n".join(texts)
 
 
 async def _scenario_generate(state: PipelineState) -> dict:

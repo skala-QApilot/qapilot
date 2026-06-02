@@ -18,7 +18,7 @@ class LLMConfig(BaseModel):
     default_model: str = "gpt-4o-mini"
     deep_model: str = "gpt-4o"
     monthly_budget_usd: float = 500
-    max_tokens_per_task: int = 200000
+    max_tokens_per_task: int = 300000
 
 
 class AgentOverride(BaseModel):

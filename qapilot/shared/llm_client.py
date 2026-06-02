@@ -47,8 +47,14 @@ class LLMClient:
     total_input_tokens / total_output_tokens / total_cost_usd.
     """
 
-    def __init__(self, config: LLMConfig, trace_id: str | None = None):
+    def __init__(
+        self,
+        config: LLMConfig,
+        trace_id: str | None = None,
+        default_model: str | None = None,
+    ):
         self._config = config
+        self._default_model = default_model or config.default_model
         self._logger = get_logger(source="llm_client", trace_id=trace_id)
         self._cache: dict[str, LLMResponse] = {}
         self.total_input_tokens: int = 0
@@ -95,7 +101,7 @@ class LLMClient:
                 {"used": self.total_tokens, "limit": self._config.max_tokens_per_task},
             )
 
-        model = model or self._config.default_model
+        model = model or self._default_model
         cache_key = self._cache_key(system_prompt, user_prompt, model)
 
         if cache_key in self._cache:

@@ -200,6 +200,8 @@ class TestCase(TypedDict):
     values: list[TestValue]
     tags: list[str]
     req_id: str | None
+    api: str | None  # 검증 대상 API (예: "POST /api/orders")
+    depends_on: list[str]  # 선행 TC ID 목록 (예: ["TS-034-TC-01"])
 
 
 class TestScenario(TypedDict):
@@ -211,6 +213,7 @@ class TestScenario(TypedDict):
     trigger: str
     affected_files: list[str]
     domain_rules_used: list[str]
+    requirements: list[str]  # 참조한 PRD 요구사항 번호 (예: ["FR-ORDER-01", "FR-BIL-01"])
     depends_on: list[str]  # 선행 실행이 필요한 TS ID 목록 (예: ["TS-001"])
     test_cases: list[TestCase]
 

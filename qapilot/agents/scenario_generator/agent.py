@@ -11,9 +11,14 @@ from __future__ import annotations
 
 import json
 import re
+from collections import Counter
 from pathlib import Path
 from typing import Any
 
+from qapilot.agents.scenario_generator.coverage_checker import (
+    compute_coverage,
+    format_coverage_report,
+)
 from qapilot.agents.scenario_generator.parser import (
     detect_prd_code_mismatch,
     format_mismatches,
@@ -49,6 +54,20 @@ _ROUTER_PRIORITY: list[str] = [
     "usage",
 ]
 
+# 라우터 basename → API prefix 매핑 (main.py include_router prefix 기준)
+# contracts 서비스는 파일명이 routers.py이므로 경로 내 "contracts" 포함 여부로 판단한다.
+_ROUTER_PREFIX: dict[str, str] = {
+    "auth":      "/api/auth",
+    "plans":     "/api/plans",
+    "orders":    "/api/orders",
+    "billing":   "/api/billing",
+    "notices":   "/api/notices",
+    "tier":      "/api/tier",
+    "usage":     "/api/usage",
+    "family":    "/api/family",
+    "contracts": "/api/contracts",
+}
+
 # 라우터별 선행 의존 관계 (라우터 basename 기준)
 _ROUTER_DEPENDENCIES: dict[str, list[str]] = {
     "auth":      [],
@@ -62,6 +81,43 @@ _ROUTER_DEPENDENCIES: dict[str, list[str]] = {
     "usage":     ["auth", "orders"],
 }
 
+# TC 텍스트 기반 HTTP method 추론 우선순위 테이블.
+# 순서대로 평가하며 매칭되면 해당 method 목록을 반환한다.
+_ACTION_METHOD_MAP: list[tuple[list[str], list[str]]] = [
+    (["해지", "취소", "삭제", "탈퇴", "제거"], ["DELETE", "PATCH"]),
+    (["변경", "수정", "업데이트", "갱신"], ["PATCH", "PUT"]),
+    (["생성", "등록", "가입", "신청", "추가", "발급", "발행", "로그인", "login", "signup", "toggle"], ["POST"]),
+]
+
+# GET이 할당됐을 때 명백히 쓰기 액션임을 나타내는 키워드 — 재추론 대상
+# "주문"은 명사로도 쓰여 "주문 상세 조회" 같은 읽기 TC에서 오탐이 발생하므로 제외
+_WRITE_ACTION_KEYWORDS: frozenset[str] = frozenset([
+    "가입", "등록", "생성", "신청", "로그인", "login", "signup",
+    "발급", "발행", "추가", "해지", "취소", "삭제", "탈퇴", "toggle",
+])
+
+# 읽기 전용 액션 키워드 — 비GET API가 할당된 경우 재추론 대상
+_READ_ACTION_KEYWORDS: frozenset[str] = frozenset(["조회", "열람"])
+_NON_INTEGRATION_REQUIREMENT_KEYWORDS: frozenset[str] = frozenset([
+    "p95", "p99", "응답 시간", "응답시간", "처리량", "부하", "성능",
+    "가용성", "99.5", "모니터링", "CPU", "디스크",
+])
+_API_TESTABLE_OPERATIONAL_KEYWORDS: frozenset[str] = frozenset([
+    "X-Trace-Id", "trace", "추적성", "표준 응답", "모든 응답",
+])
+
+# TC 텍스트 키워드 → 핸들러 이름 힌트 매핑.
+# 같은 HTTP method를 공유하는 엔드포인트가 여러 개일 때 더 정확한 엔드포인트를 선택하는 데 사용한다.
+_HANDLER_HINTS: list[tuple[list[str], list[str]]] = [
+    (["로그인", "login", "인증"],        ["login", "signin", "sign_in", "authenticate"]),
+    (["가입", "signup", "등록"],         ["signup", "register", "sign_up", "create_user"]),
+    (["해지", "terminate", "탈퇴"],      ["terminate", "withdraw", "leave", "deactivate"]),
+    (["취소", "cancel"],                 ["cancel", "abort"]),
+    (["삭제", "delete"],                 ["delete", "remove", "destroy"]),
+    (["초대", "invite", "join"],         ["invite", "join", "add_member"]),
+    (["갱신", "refresh", "renew"],       ["refresh", "renew", "reissue"]),
+]
+
 
 class ScenarioGeneratorAgent(BaseAgent):
     """시나리오 생성 Agent.
@@ -74,6 +130,7 @@ class ScenarioGeneratorAgent(BaseAgent):
     """
 
     allowed_tools = ["codebase_scanner", "domain_knowledge"]
+    use_deep_model = True
 
     async def _execute(
         self,
@@ -115,7 +172,7 @@ class ScenarioGeneratorAgent(BaseAgent):
         if requirements:
             return await self._run_domain_based(
                 scan_result, domain_rules, requirements, trigger,
-                mismatch_text, mismatches, last_error,
+                affected_files, mismatch_text, mismatches, last_error,
             )
 
         return await self._run_router_based(
@@ -167,10 +224,13 @@ class ScenarioGeneratorAgent(BaseAgent):
             ts_scenarios, ts_confidence = parse_response(
                 response.content, trigger, [router_file], domain_rules
             )
+            self._sanitize_api_fields(ts_scenarios)
+            self._correct_api_method_mismatches(ts_scenarios)
             all_scenarios.extend(ts_scenarios)
             confidence_sum += ts_confidence
 
         confidence = round(confidence_sum / len(router_map), 3) if router_map else 0.5
+        all_scenarios = self._deduplicate_scenarios(all_scenarios)
         all_scenarios = self._renumber_and_set_depends_on(all_scenarios)
         # 디스크 영속화는 pipeline._save_scenarios 노드에서 수행 (위 메서드와 동일 사유).
 
@@ -185,6 +245,7 @@ class ScenarioGeneratorAgent(BaseAgent):
         domain_rules: list,
         requirements: list,
         trigger: str,
+        affected_files: list[str],
         mismatch_text: str,
         mismatches: list,
         last_error: str | None,
@@ -197,44 +258,68 @@ class ScenarioGeneratorAgent(BaseAgent):
         all_scenarios: list = []
         all_updated: list = []   # update 결과 (ts_id 고정, 재번호 부여 없이 바로 저장)
         confidence_sum = 0.0
+        all_endpoints: list[dict] = self._read_index_json("endpoints.json")  # type: ignore[assignment]
+        target_requirements, skipped_requirements = self._split_scenario_requirements(requirements)
+        if skipped_requirements:
+            self.logger.info(
+                "requirements_skipped_for_scenario_generation",
+                count=len(skipped_requirements),
+                req_ids=[req.get("req_id") for req in skipped_requirements],
+            )
 
-        for req in requirements:
-            action_type = req.get("action_type", "create")
-            target_ts_id = req.get("target_ts_id")
+        req_endpoint_map = await self._map_requirements_to_endpoints(target_requirements, all_endpoints)
+
+        for req in target_requirements:
+            domain_area = req.get("domain_area") or "기타"
+            req_id = req.get("req_id", "")
+            req_endpoints = req_endpoint_map.get(req_id) or self._select_endpoints_for_requirement(req, all_endpoints)
+            req_endpoint_map[req_id] = req_endpoints
+            router_files = list(dict.fromkeys(
+                ep.get("file", "")
+                for ep in req_endpoints
+                if ep.get("file")
+            ))
+            if not router_files:
+                router_files = self._find_router_files_for_domain(domain_area, [req])
+            prompt_files = router_files or affected_files
+            area_domain_rules = domain_rules or await self._fetch_domain_rules(domain_area, top_k=5)
+            area_domain_rules_text = DomainKnowledgeTool.format_rules_for_prompt(area_domain_rules) or "없음"
+
+            user_prompt = self.with_correction_hint(
+                self.prompts.render(
+                    domain_rules=area_domain_rules_text,
+                    requirements=self._format_requirements([req]),
+                    scan_summary=self._format_scan_summary_for_requirement(req_id, req, req_endpoints),
+                    code_index=self._format_code_index_for_requirement(router_files, req_endpoints, scan_result),
+                    affected_files=", ".join(prompt_files) if prompt_files else domain_area,
+                    trigger=trigger,
+                    mismatch_note=mismatch_text,
+                ),
+                last_error,
+            )
+
+            response = await self.llm.chat(
+                system_prompt=self.prompts.system(),
+                user_prompt=user_prompt,
+            )
+
+            ts_scenarios, ts_confidence = parse_response(
+                response.content, trigger, prompt_files, domain_rules
+            )
+            self._sanitize_api_fields(ts_scenarios, self._endpoint_paths(req_endpoints))
+            self._correct_api_method_mismatches(ts_scenarios)
+            self._pin_req_id(ts_scenarios, req_id)
+            self._fill_api_for_domain(ts_scenarios, req, router_files, req_endpoints)
 
             if action_type == "update" and target_ts_id:
                 existing_ts = self._load_scenario_file(target_ts_id)
                 if existing_ts is None:
                     self.logger.warning(
-                        "update_target_not_found_fallback_create",
-                        target_ts_id=target_ts_id,
-                        req_id=req.get("req_id"),
-                    )
-                    ts_scenarios, ts_confidence = await self._generate_ts_for_req(
-                        req, scan_result, domain_rules, trigger, mismatch_text, last_error,
-                    )
-                    all_scenarios.extend(ts_scenarios)
-                else:
-                    target_level = req.get("target_level", "ts")
-                    if target_level == "tc":
-                        updated_ts, ts_confidence = await self._run_update_tc(
-                            req, existing_ts, scan_result, domain_rules, trigger, mismatch_text,
-                        )
-                    elif target_level == "tv":
-                        updated_ts, ts_confidence = await self._run_add_tv(
-                            req, existing_ts, scan_result, domain_rules, trigger, mismatch_text,
-                        )
-                    else:  # "ts" (default)
-                        updated_ts, ts_confidence = await self._run_update_ts(
-                            req, existing_ts, scan_result, domain_rules, trigger, mismatch_text,
-                        )
-                    all_updated.append(updated_ts)
-                    confidence_sum += ts_confidence
-                    self.logger.info(
-                        "scenario_updated",
-                        ts_id=target_ts_id,
-                        target_level=target_level,
-                        req_id=req.get("req_id"),
+                        "tc_count_below_minimum",
+                        req_id=req_id,
+                        domain=domain_area,
+                        tc_count=len(s["test_cases"]),
+                        minimum=6,
                     )
                     continue
 
@@ -256,16 +341,97 @@ class ScenarioGeneratorAgent(BaseAgent):
         if not all_scenarios:
             # create 대상이 없고 update만 있는 경우
             self.logger.info(
-                "scenarios_updated_only",
-                updated_count=len(all_updated),
-                mismatch_count=len(mismatches),
-                confidence=confidence,
-            )
-            return ExecuteResult(
-                result={"scenarios": all_updated, "prd_code_mismatches": mismatches},
-                confidence=confidence,
+                "requirement_scenario_generated",
+                req_id=req_id,
+                domain=domain_area,
+                mapped_api_count=len(req_endpoints),
+                ts_count=len(ts_scenarios),
+                tc_count=sum(len(s["test_cases"]) for s in ts_scenarios),
             )
 
+        # ── 커버리지 gap-fill ─────────────────────────────────────────────────
+        # 생성 후 미커버 요구사항이 있으면 해당 req만 재생성한다 (최대 1회).
+        _MAX_FILL_RETRIES = 2
+        call_count = len(target_requirements)
+
+        for _attempt in range(_MAX_FILL_RETRIES):
+            coverage = compute_coverage(all_scenarios, target_requirements)
+            self.logger.info(
+                "coverage_check",
+                attempt=_attempt,
+                rate=coverage["rate"],
+                uncovered_count=len(coverage["uncovered"]),
+            )
+            if not coverage["uncovered"]:
+                break
+
+            self.logger.warning(
+                "coverage_gap_detected",
+                uncovered_req_ids=[r["req_id"] for r in coverage["uncovered"]],
+                attempt=_attempt + 1,
+            )
+
+            for req in coverage["uncovered"]:
+                domain_area = req.get("domain_area") or "기타"
+                req_id = req.get("req_id", "")
+                req_endpoints = req_endpoint_map.get(req_id) or self._select_endpoints_for_requirement(req, all_endpoints)
+                req_endpoint_map[req_id] = req_endpoints
+                router_files = list(dict.fromkeys(
+                    ep.get("file", "")
+                    for ep in req_endpoints
+                    if ep.get("file")
+                ))
+                if not router_files:
+                    router_files = self._find_router_files_for_domain(domain_area, [req])
+                prompt_files = router_files or affected_files
+                fill_rules = domain_rules or await self._fetch_domain_rules(domain_area, top_k=5)
+                fill_rules_text = DomainKnowledgeTool.format_rules_for_prompt(fill_rules) or "없음"
+
+                fill_prompt = self.prompts.render(
+                    domain_rules=fill_rules_text,
+                    requirements=self._format_requirements([req]),
+                    scan_summary=self._format_scan_summary_for_requirement(req_id, req, req_endpoints),
+                    code_index=self._format_code_index_for_requirement(router_files, req_endpoints, scan_result),
+                    affected_files=", ".join(prompt_files) if prompt_files else domain_area,
+                    trigger=trigger,
+                    mismatch_note=mismatch_text,
+                )
+                fill_response = await self.llm.chat(
+                    system_prompt=self.prompts.system(),
+                    user_prompt=fill_prompt,
+                )
+                fill_scenarios, fill_confidence = parse_response(
+                    fill_response.content, trigger, prompt_files, domain_rules
+                )
+                self._sanitize_api_fields(fill_scenarios, self._endpoint_paths(req_endpoints))
+                self._correct_api_method_mismatches(fill_scenarios)
+                self._pin_req_id(fill_scenarios, req_id)
+                self._fill_api_for_domain(fill_scenarios, req, router_files, req_endpoints)
+                all_scenarios.extend(fill_scenarios)
+                confidence_sum += fill_confidence
+                call_count += 1
+                self.logger.info(
+                    "gap_filled",
+                    req_id=req["req_id"],
+                    ts_added=len(fill_scenarios),
+                )
+
+        # 최종 커버리지 로그
+        final_coverage = compute_coverage(all_scenarios, target_requirements)
+        self.logger.info(
+            "final_coverage",
+            rate=final_coverage["rate"],
+            report=format_coverage_report(final_coverage),
+        )
+
+        # 요구사항 기반 모드에서는 전체 API 커버리지를 목표로 추가 TS를 만들지 않는다.
+        # 없는 요구사항에 엔드포인트를 억지로 붙이는 문제를 막기 위해,
+        # 마지막 api 보정도 각 TS의 요구사항에 매핑된 API 후보 안에서만 수행한다.
+        self._fill_api_nulls_global(all_scenarios, req_endpoint_map)
+        self._sanitize_scenarios_against_requirements(all_scenarios, target_requirements, req_endpoint_map)
+
+        confidence = round(confidence_sum / call_count, 3) if call_count else 0.5
+        all_scenarios = self._deduplicate_scenarios(all_scenarios)
         all_scenarios = self._renumber_and_set_depends_on(all_scenarios)
         save_scenarios(all_scenarios)
 
@@ -275,303 +441,450 @@ class ScenarioGeneratorAgent(BaseAgent):
             tc_count=sum(len(s["test_cases"]) for s in all_scenarios),
             mismatch_count=len(mismatches),
             confidence=confidence,
+            coverage_rate=final_coverage["rate"],
         )
 
         return ExecuteResult(
-            result={"scenarios": all_scenarios, "prd_code_mismatches": mismatches},
+            result={
+                "scenarios": all_scenarios,
+                "prd_code_mismatches": mismatches,
+                "coverage": {
+                    "rate": final_coverage["rate"],
+                    "uncovered": [r["req_id"] for r in final_coverage["uncovered"]],
+                    "skipped": [r["req_id"] for r in skipped_requirements],
+                },
+                "skipped_requirements": skipped_requirements,
+            },
             confidence=confidence,
         )
 
-    # ── create / update 헬퍼 ─────────────────────────────────────────────────
+    def _sanitize_api_fields(self, scenarios: list, allowed_apis: set[str] | None = None) -> None:
+        """LLM이 생성한 api 필드 중 실제 존재하지 않는 경로를 null로 초기화한다.
 
-    async def _generate_ts_for_req(
-        self,
-        req: dict,
-        scan_result: dict,
-        domain_rules: list,
-        trigger: str,
-        mismatch_text: str,
-        last_error: str | None = None,
-    ) -> tuple[list, float]:
-        """단일 RequirementItem으로 새 TS를 생성하고 (scenarios, confidence)를 반환한다."""
-        from qapilot.tools.domain_knowledge import DomainKnowledgeTool
+        allowed_apis가 주어지면 존재 여부뿐 아니라 요구사항에 매핑된 후보 API인지도
+        검증한다. 요구사항 기반 생성에서는 이 후보 밖 API를 연결하지 않는다.
 
-        domain_area = req.get("domain_area") or "기타"
-        router_files = self._find_router_files_for_domain(domain_area, [req])
-        area_domain_rules = domain_rules if domain_rules else await self._fetch_domain_rules(domain_area, top_k=5)
-        area_domain_rules_text = DomainKnowledgeTool.format_rules_for_prompt(area_domain_rules) or "없음"
-
-        user_prompt = self.with_correction_hint(
-            self.prompts.render(
-                domain_rules=area_domain_rules_text,
-                requirements=self._format_requirements([req]),
-                scan_summary=self._format_scan_summary_for_domain(domain_area, router_files),
-                code_index=self._format_code_index_for_domain(router_files, scan_result),
-                affected_files=", ".join(router_files) if router_files else domain_area,
-                trigger=trigger,
-                mismatch_note=mismatch_text,
-                update_context="",
-            ),
-            last_error,
-        )
-
-        response = await self.llm.chat(
-            system_prompt=self.prompts.system(),
-            user_prompt=user_prompt,
-        )
-        ts_scenarios, ts_confidence = parse_response(
-            response.content, trigger, router_files, domain_rules
-        )
-
-        for s in ts_scenarios:
-            for tc in s.get("test_cases") or []:
-                if not tc.get("req_id"):
-                    tc["req_id"] = req.get("req_id")
-
-        for s in ts_scenarios:
-            if len(s["test_cases"]) < 6:
-                self.logger.warning(
-                    "tc_count_below_minimum",
-                    req_id=req.get("req_id"),
-                    domain=domain_area,
-                    tc_count=len(s["test_cases"]),
-                    minimum=6,
-                )
-
-        self.logger.info(
-            "requirement_scenario_generated",
-            req_id=req.get("req_id"),
-            domain=domain_area,
-            ts_count=len(ts_scenarios),
-            tc_count=sum(len(s["test_cases"]) for s in ts_scenarios),
-        )
-        return ts_scenarios, ts_confidence
-
-    async def _run_update_ts(
-        self,
-        req: dict,
-        existing_ts: dict,
-        scan_result: dict,
-        domain_rules: list,
-        trigger: str,
-        mismatch_text: str,
-    ) -> tuple[dict, float]:
-        """기존 TS 전체를 재생성한다. ts_id는 기존 값을 유지한다."""
-        from qapilot.tools.domain_knowledge import DomainKnowledgeTool
-
-        domain_area = req.get("domain_area") or "기타"
-        router_files = existing_ts.get("affected_files") or self._find_router_files_for_domain(domain_area, [req])
-        area_domain_rules = domain_rules if domain_rules else await self._fetch_domain_rules(domain_area, top_k=5)
-        area_domain_rules_text = DomainKnowledgeTool.format_rules_for_prompt(area_domain_rules) or "없음"
-
-        existing_tc_summary = "\n".join(
-            f"  - [{tc['tc_id']}] {tc.get('name', '')}"
-            for tc in existing_ts.get("test_cases", [])
-        )
-        update_context = (
-            f"## 수정 대상 시나리오 (ts_id: {existing_ts['ts_id']} 유지)\n"
-            f"현재 TS 이름: {existing_ts.get('name', '')}\n"
-            f"현재 TC 목록:\n{existing_tc_summary}\n\n"
-            f"위 TS를 아래 요구사항 변경에 맞게 전체 재생성하라. "
-            f"ts_id는 반드시 {existing_ts['ts_id']}로 고정하라."
-        )
-
-        user_prompt = self.prompts.render(
-            domain_rules=area_domain_rules_text,
-            requirements=self._format_requirements([req]),
-            scan_summary=self._format_scan_summary_for_domain(domain_area, router_files),
-            code_index=self._format_code_index_for_domain(router_files, scan_result),
-            affected_files=", ".join(router_files) if router_files else domain_area,
-            trigger=trigger,
-            mismatch_note=mismatch_text,
-            update_context=update_context,
-        )
-
-        response = await self.llm.chat(
-            system_prompt=self.prompts.system(),
-            user_prompt=user_prompt,
-        )
-        ts_scenarios, ts_confidence = parse_response(
-            response.content, trigger, router_files, domain_rules
-        )
-
-        if not ts_scenarios:
-            return existing_ts, 0.3
-
-        updated = ts_scenarios[0]
-        updated["ts_id"] = existing_ts["ts_id"]
-        # TC ID도 기존 ts_id 기준으로 재부여
-        for j, tc in enumerate(updated.get("test_cases", [])):
-            tc["tc_id"] = f"{existing_ts['ts_id']}-TC-{j + 1:02d}"
-            if not tc.get("req_id"):
-                tc["req_id"] = req.get("req_id")
-
-        return updated, ts_confidence
-
-    async def _run_update_tc(
-        self,
-        req: dict,
-        existing_ts: dict,
-        scan_result: dict,
-        domain_rules: list,
-        trigger: str,
-        mismatch_text: str,
-    ) -> tuple[dict, float]:
-        """기존 TS에서 target_tc_id에 해당하는 TC만 수정한다. 나머지 TC는 보존한다."""
-        from qapilot.tools.domain_knowledge import DomainKnowledgeTool
-
-        target_tc_id = req.get("target_tc_id")
-        domain_area = req.get("domain_area") or "기타"
-        router_files = existing_ts.get("affected_files") or self._find_router_files_for_domain(domain_area, [req])
-        area_domain_rules = domain_rules if domain_rules else await self._fetch_domain_rules(domain_area, top_k=5)
-        area_domain_rules_text = DomainKnowledgeTool.format_rules_for_prompt(area_domain_rules) or "없음"
-
-        target_tc = next(
-            (tc for tc in existing_ts.get("test_cases", []) if tc.get("tc_id") == target_tc_id),
-            None,
-        )
-        if target_tc is None and target_tc_id:
-            self.logger.warning("target_tc_not_found", target_tc_id=target_tc_id, ts_id=existing_ts["ts_id"])
-
-        existing_tc_text = json.dumps(target_tc, ensure_ascii=False, indent=2) if target_tc else "없음"
-        update_context = (
-            f"## TC 수정 모드 (ts_id: {existing_ts['ts_id']} 유지)\n"
-            f"수정 대상 TC ID: {target_tc_id or '없음'}\n"
-            f"현재 TC 내용:\n```json\n{existing_tc_text}\n```\n\n"
-            f"위 TC를 아래 요구사항 변경에 맞게 수정하라. "
-            f"scenarios 배열에 원소 1개, test_cases에 수정된 TC 1개만 출력하라. "
-            f"tc_id는 {target_tc_id or '기존 ID'}로 유지하라."
-        )
-
-        user_prompt = self.prompts.render(
-            domain_rules=area_domain_rules_text,
-            requirements=self._format_requirements([req]),
-            scan_summary=self._format_scan_summary_for_domain(domain_area, router_files),
-            code_index=self._format_code_index_for_domain(router_files, scan_result),
-            affected_files=", ".join(router_files) if router_files else domain_area,
-            trigger=trigger,
-            mismatch_note=mismatch_text,
-            update_context=update_context,
-        )
-
-        response = await self.llm.chat(
-            system_prompt=self.prompts.system(),
-            user_prompt=user_prompt,
-        )
-        ts_scenarios, ts_confidence = parse_response(
-            response.content, trigger, router_files, domain_rules
-        )
-
-        if not ts_scenarios or not ts_scenarios[0].get("test_cases"):
-            return existing_ts, 0.3
-
-        new_tc = ts_scenarios[0]["test_cases"][0]
-        new_tc["tc_id"] = target_tc_id or new_tc.get("tc_id", "")
-        if not new_tc.get("req_id"):
-            new_tc["req_id"] = req.get("req_id")
-
-        updated_tcs = [
-            new_tc if tc.get("tc_id") == target_tc_id else tc
-            for tc in existing_ts.get("test_cases", [])
-        ]
-        if target_tc is None:
-            updated_tcs.append(new_tc)
-
-        updated_ts = {**existing_ts, "test_cases": updated_tcs}
-        return updated_ts, ts_confidence
-
-    async def _run_add_tv(
-        self,
-        req: dict,
-        existing_ts: dict,
-        scan_result: dict,
-        domain_rules: list,
-        trigger: str,
-        mismatch_text: str,
-    ) -> tuple[dict, float]:
-        """기존 TC에 새로운 TV(입력값 변형)를 추가한다.
-
-        target_tc_id가 있으면 해당 TC에만, 없으면 TS 내 전체 TC에 추가한다.
+        phantom path(예: DELETE /api/contracts/{order_id})를 방지하며,
+        null로 초기화된 TCs는 이후 _fill_api_for_domain 또는 stub 주입이 처리한다.
         """
-        from qapilot.tools.domain_knowledge import DomainKnowledgeTool
+        valid_apis: set[str] = {
+            self._get_full_ep_path(ep)
+            for ep in self._read_index_json("endpoints.json")  # type: ignore[arg-type]
+        }
+        api_scope = allowed_apis if allowed_apis is not None else valid_apis
+        for s in scenarios:
+            for tc in s.get("test_cases", []):
+                api = tc.get("api")
+                if api and api not in (None, "null") and (api not in valid_apis or api not in api_scope):
+                    tc["api"] = None
 
-        target_tc_id = req.get("target_tc_id")
-        domain_area = req.get("domain_area") or "기타"
-        router_files = existing_ts.get("affected_files") or self._find_router_files_for_domain(domain_area, [req])
-        area_domain_rules = domain_rules if domain_rules else await self._fetch_domain_rules(domain_area, top_k=5)
-        area_domain_rules_text = DomainKnowledgeTool.format_rules_for_prompt(area_domain_rules) or "없음"
+    def _fill_api_nulls_global(
+        self,
+        all_scenarios: list,
+        req_endpoint_map: dict[str, list[dict]] | None = None,
+    ) -> None:
+        """저장 직전 전체 시나리오를 순회해 api=null TC를 TC 단위로 채운다.
 
-        target_tcs = [
-            tc for tc in existing_ts.get("test_cases", [])
-            if (not target_tc_id) or tc.get("tc_id") == target_tc_id
-        ]
-        tc_summary = "\n".join(
-            f"  [{tc['tc_id']}] {tc.get('name', '')}: "
-            f"values={json.dumps([v.get('field') for v in tc.get('values', [])], ensure_ascii=False)}"
-            for tc in target_tcs
-        )
-        update_context = (
-            f"## TV 추가 모드 (ts_id: {existing_ts['ts_id']} 유지)\n"
-            f"대상 TC: {target_tc_id or '전체'}\n"
-            f"현재 TC 및 values:\n{tc_summary}\n\n"
-            f"위 TC에 추가할 새로운 입력값 변형(values)을 포함한 TC를 출력하라. "
-            f"기존 values를 유지하면서 새 values를 추가하라. "
-            f"tc_id는 기존 값을 유지하라. "
-            f"scenarios에 원소 1개, test_cases에 대상 TC만 출력하라."
-        )
+        req_endpoint_map이 있으면 TS의 requirements에 연결된 후보 API 안에서만
+        채운다. 후보가 없는 요구사항 기반 TS는 api=null을 유지한다.
+        """
+        all_endpoints: list[dict] = self._read_index_json("endpoints.json")  # type: ignore[assignment]
+        valid_apis: set[str] = {self._get_full_ep_path(ep) for ep in all_endpoints}
+        _HEALTH_HANDLERS = {"health", "healthcheck", "ping"}
 
-        user_prompt = self.prompts.render(
-            domain_rules=area_domain_rules_text,
-            requirements=self._format_requirements([req]),
-            scan_summary=self._format_scan_summary_for_domain(domain_area, router_files),
-            code_index=self._format_code_index_for_domain(router_files, scan_result),
-            affected_files=", ".join(router_files) if router_files else domain_area,
-            trigger=trigger,
-            mismatch_note=mismatch_text,
-            update_context=update_context,
-        )
+        for s in all_scenarios:
+            null_tcs = [
+                tc for tc in s.get("test_cases", [])
+                if not tc.get("api") or tc.get("api") in (None, "null")
+            ]
+            if not null_tcs:
+                continue
 
-        response = await self.llm.chat(
-            system_prompt=self.prompts.system(),
-            user_prompt=user_prompt,
-        )
-        ts_scenarios, ts_confidence = parse_response(
-            response.content, trigger, router_files, domain_rules
-        )
-
-        if not ts_scenarios:
-            return existing_ts, 0.3
-
-        # LLM이 반환한 TC별로 values를 기존 TC에 병합한다.
-        new_tc_map = {tc["tc_id"]: tc for tc in ts_scenarios[0].get("test_cases", [])}
-        updated_tcs: list = []
-        for tc in existing_ts.get("test_cases", []):
-            new_tc = new_tc_map.get(tc["tc_id"])
-            if new_tc:
-                existing_fields = {v.get("field") for v in tc.get("values", [])}
-                extra_values = [
-                    v for v in new_tc.get("values", [])
-                    if v.get("field") not in existing_fields
+            sibling_apis = [
+                tc.get("api") for tc in s.get("test_cases", [])
+                if tc.get("api") and tc.get("api") not in (None, "null")
+            ]
+            if req_endpoint_map is not None:
+                req_ids = [
+                    r for r in s.get("requirements", [])
+                    if r and r in req_endpoint_map
                 ]
-                merged = {**tc, "values": tc.get("values", []) + extra_values}
-                updated_tcs.append(merged)
+                domain_eps = [
+                    ep for req_id in req_ids
+                    for ep in req_endpoint_map.get(req_id, [])
+                    if ep.get("handler", "") not in _HEALTH_HANDLERS
+                    and not ep.get("path", "").endswith("/health")
+                ]
+                valid_apis_for_ts = self._endpoint_paths(domain_eps)
+                sibling_apis = [api for api in sibling_apis if api in valid_apis_for_ts]
+                if not domain_eps:
+                    continue
             else:
-                updated_tcs.append(tc)
+                router_files: list[str] = s.get("affected_files") or []
+                domain_eps = [
+                    ep for ep in all_endpoints
+                    if ep.get("file", "") in router_files
+                    and ep.get("handler", "") not in _HEALTH_HANDLERS
+                    and not ep.get("path", "").endswith("/health")
+                ]
+                if not domain_eps:
+                    ts_text = s.get("name", "") + " " + " ".join(tc.get("name", "") for tc in null_tcs)
+                    for basename, kws in _ROUTER_KEYWORDS.items():
+                        if any(k in ts_text for k in kws):
+                            domain_eps = [
+                                ep for ep in all_endpoints
+                                if ep.get("handler", "") not in _HEALTH_HANDLERS
+                                and not ep.get("path", "").endswith("/health")
+                                and (
+                                    ep.get("file", "").split("/")[-1].replace(".py", "").replace(".ts", "").replace(".js", "") == basename
+                                    or ("contracts" in ep.get("file", "") and basename == "contracts")
+                                )
+                            ]
+                            if domain_eps:
+                                break
 
-        updated_ts = {**existing_ts, "test_cases": updated_tcs}
-        return updated_ts, ts_confidence
+            for tc in null_tcs:
+                valid_scope = self._endpoint_paths(domain_eps) if req_endpoint_map is not None else valid_apis
+                api = self._infer_api_for_tc(tc, valid_scope, sibling_apis, domain_eps)
+                if api:
+                    tc["api"] = api
 
-    def _load_scenario_file(self, ts_id: str) -> dict | None:
-        """qapilot_dir 기준으로 기존 시나리오 파일을 로드한다."""
-        from qapilot.agents.scenario_generator.repository import load_scenario
+        null_remaining = sum(
+            1 for s in all_scenarios
+            for tc in s.get("test_cases", [])
+            if not tc.get("api") or tc.get("api") in (None, "null")
+        )
+        self.logger.info("api_null_fill_global_done", null_remaining=null_remaining)
 
-        qapilot_dir = getattr(self, "_qapilot_dir_override", None)
-        if qapilot_dir:
-            path = Path(qapilot_dir) / "scenarios" / f"{ts_id}.json"
-            if path.exists():
-                return json.loads(path.read_text(encoding="utf-8"))
+    def _infer_api_for_tc(
+        self,
+        tc: dict,
+        valid_apis: set[str],
+        sibling_apis: list[str],
+        domain_eps: list[dict],
+    ) -> str | None:
+        """TC 하나에 대해 api 값을 추론한다.
+
+        우선순위:
+        1. when/name 텍스트에서 METHOD + 경로 직접 추출
+        2. sibling TC 중 같은 HTTP method에서 최빈 api
+        3. domain_eps에서 TC 텍스트 기반 method 추론 후 선택
+        """
+        # Strategy 1: when → name 순으로 텍스트에서 직접 추출
+        for field in ("when", "name"):
+            extracted = self._extract_api_from_text(tc.get(field, ""), valid_apis)
+            if extracted:
+                return extracted
+
+        # Strategy 2: sibling 중 TC method 힌트와 일치하는 최빈 api
+        if sibling_apis:
+            tc_text = (tc.get("when", "") + " " + tc.get("name", "")).upper()
+            for method in ("DELETE", "PATCH", "PUT", "POST", "GET"):
+                if method in tc_text:
+                    matched = [a for a in sibling_apis if a.startswith(method + " ")]
+                    if matched:
+                        return Counter(matched).most_common(1)[0][0]
+            return Counter(sibling_apis).most_common(1)[0][0]
+
+        # Strategy 3: domain_eps에서 _ACTION_METHOD_MAP 기반 method 추론 후 선택.
+        # 같은 method를 공유하는 엔드포인트가 여러 개이면 _HANDLER_HINTS로 핸들러 이름 매칭.
+        if domain_eps:
+            tc_text = tc.get("when", "") + " " + tc.get("name", "")
+            tc_text_lower = tc_text.lower()
+            preferred = ["GET"]
+            for keywords, methods in _ACTION_METHOD_MAP:
+                if any(k in tc_text for k in keywords):
+                    preferred = methods
+                    break
+            candidate_eps = [ep for ep in domain_eps if ep.get("method") in preferred]
+            if len(candidate_eps) > 1:
+                for hint_kws, handler_kws in _HANDLER_HINTS:
+                    if any(k in tc_text_lower for k in hint_kws):
+                        matched = [
+                            ep for ep in candidate_eps
+                            if any(h in ep.get("handler", "").lower() for h in handler_kws)
+                        ]
+                        if matched:
+                            return self._get_full_ep_path(matched[0])
+            ep = next(iter(candidate_eps), domain_eps[0])
+            return self._get_full_ep_path(ep)
+
+        return None
+
+    def _extract_api_from_text(self, text: str, valid_apis: set[str]) -> str | None:
+        """텍스트에서 'METHOD /api/path' 패턴을 추출해 valid_apis와 대조한다.
+
+        경로 파라미터 템플릿({param})도 매칭한다.
+        """
+        m = re.search(r'\b(GET|POST|PUT|PATCH|DELETE)\s+(/api/[^\s,\)\]]+)', text)
+        if not m:
             return None
-        return load_scenario(ts_id)
+        candidate = f"{m.group(1)} {m.group(2).rstrip('/.,])')}"
+        if candidate in valid_apis:
+            return candidate
+        # 경로 파라미터 템플릿 매칭: /api/orders/{order_id} 형태
+        cand_method, cand_path = candidate.split(" ", 1)
+        for valid_api in valid_apis:
+            v_method, v_path = valid_api.split(" ", 1)
+            if v_method != cand_method:
+                continue
+            pattern = re.sub(r'\{[^}]+\}', r'[^/]+', v_path)
+            if re.fullmatch(pattern, cand_path):
+                return valid_api
+        return None
+
+    def _pin_req_id(self, scenarios: list, req_id: str) -> None:
+        """TS 내 모든 TC의 req_id를 해당 요구사항 ID로 고정한다.
+
+        REQ 기반으로 LLM을 호출하므로 해당 TS의 모든 TC는 그 REQ와 연관된다.
+        LLM이 존재하지 않는 req_id를 만들어도 저장되지 않도록 여기서 강제한다.
+        """
+        for s in scenarios:
+            for tc in s.get("test_cases", []):
+                tc["req_id"] = req_id or None
+            s["requirements"] = [req_id] if req_id else []
+
+    def _fill_api_for_domain(
+        self,
+        scenarios: list,
+        req: dict,
+        router_files: list[str],
+        allowed_endpoints: list[dict] | None = None,
+    ) -> None:
+        """api=null TC에 TC 내용 기반 per-TC 추론으로 엔드포인트를 채운다.
+
+        단일 primary API를 일괄 할당하지 않고 _infer_api_for_tc()로 TC별로 적합한
+        엔드포인트를 선택한다. 이렇게 하면 로그인 TC → POST /login,
+        조회 TC → GET /me처럼 TC 의도에 맞는 method가 선택된다.
+        """
+        all_endpoints: list[dict] = self._read_index_json("endpoints.json")  # type: ignore[assignment]
+        domain_eps = (
+            allowed_endpoints
+            if allowed_endpoints is not None
+            else [ep for ep in all_endpoints if ep.get("file", "") in router_files]
+        )
+        valid_apis: set[str] = self._endpoint_paths(domain_eps)
+        if not domain_eps:
+            return
+
+        for s in scenarios:
+            sibling_apis: list[str] = [
+                tc.get("api") for tc in s.get("test_cases", [])
+                if tc.get("api") and tc.get("api") not in (None, "null") and tc.get("api") in valid_apis
+            ]
+            for tc in s.get("test_cases", []):
+                if not tc.get("api") or tc.get("api") in (None, "null"):
+                    api = self._infer_api_for_tc(tc, valid_apis, sibling_apis, domain_eps)
+                    if api:
+                        tc["api"] = api
+                        sibling_apis.append(api)
+
+    @staticmethod
+    def _kw_in(keyword: str, text_lower: str) -> bool:
+        """키워드가 텍스트에서 독립 단어(앞에 공백 또는 시작)로 나타나는지 확인.
+
+        '비로그인'에 '로그인'이 포함되는 오탐을 방지하기 위해 공백 경계를 사용한다.
+        """
+        return f" {keyword}" in f" {text_lower}"
+
+    def _correct_api_method_mismatches(self, scenarios: list) -> None:
+        """TC 내용과 할당된 api의 HTTP method가 불일치하면 api를 null로 초기화한다.
+
+        세 가지 케이스를 처리한다:
+        1. 쓰기/삭제 액션 TC에 GET이 할당된 경우
+        2. 읽기 전용 액션(조회) TC에 비GET이 할당된 경우
+        3. _ACTION_METHOD_MAP 기반으로 추론한 예상 method와 할당 method가 다른 경우
+
+        null로 초기화된 TC는 이후 _fill_api_for_domain 또는 _fill_api_nulls_global에서
+        TC 내용 기반으로 재추론한다.
+        """
+        for s in scenarios:
+            for tc in s.get("test_cases", []):
+                api = tc.get("api")
+                if not api or api in (None, "null"):
+                    continue
+                method = api.split()[0]
+                tc_lower = (tc.get("name", "") + " " + tc.get("when", "")).lower()
+
+                has_write = any(self._kw_in(k, tc_lower) for k in _WRITE_ACTION_KEYWORDS)
+                has_read = any(k in tc_lower for k in _READ_ACTION_KEYWORDS)
+
+                # 1. 쓰기/삭제 액션 TC에 GET 할당
+                if method == "GET" and has_write:
+                    tc["api"] = None
+                    continue
+
+                # 2. 읽기 전용 액션(조회) TC에 비GET 할당 — 쓰기 키워드가 없어야 함
+                if method != "GET" and has_read and not has_write:
+                    tc["api"] = None
+                    continue
+
+                # 3. _ACTION_METHOD_MAP 기반 예상 method 불일치
+                for keywords, expected_methods in _ACTION_METHOD_MAP:
+                    if any(self._kw_in(k, tc_lower) for k in keywords):
+                        if method not in expected_methods:
+                            tc["api"] = None
+                        break
+
+    def _get_full_ep_path(self, ep: dict) -> str:
+        """엔드포인트 dict에서 'METHOD /api/prefix/path' 형태의 전체 경로를 반환한다."""
+        file_path = ep.get("file", "")
+        rel_path = ep.get("path", "")
+        method = ep.get("method", "?")
+
+        if "contracts" in file_path:
+            prefix = _ROUTER_PREFIX.get("contracts", "")
+        else:
+            basename = file_path.split("/")[-1].replace(".py", "").replace(".ts", "").replace(".js", "")
+            prefix = _ROUTER_PREFIX.get(basename, "")
+
+        full = prefix + rel_path if rel_path else prefix
+        return f"{method} {full}"
+
+    def _endpoint_paths(self, endpoints: list[dict]) -> set[str]:
+        """엔드포인트 dict 목록을 'METHOD /api/path' 집합으로 변환한다."""
+        return {self._get_full_ep_path(ep) for ep in endpoints}
+
+    def _format_ep_for_prompt(self, ep: dict) -> str:
+        """프롬프트용 엔드포인트 표기: 'METHOD /path [인증필요|공개]'."""
+        auth_label = "인증필요" if ep.get("requires_auth") else "공개"
+        return f"{self._get_full_ep_path(ep)} [{auth_label}]"
+
+    def _split_scenario_requirements(
+        self, requirements: list[dict]
+    ) -> tuple[list[dict], list[dict]]:
+        """API 통합 시나리오로 검증 가능한 요구사항과 제외 대상을 분리한다."""
+        target: list[dict] = []
+        skipped: list[dict] = []
+        for req in requirements:
+            if self._is_api_scenario_requirement(req):
+                target.append(req)
+            else:
+                skipped.append({
+                    **req,
+                    "skip_reason": "통합 API 시나리오로 직접 검증하기 어려운 비기능 요구사항",
+                })
+        return target, skipped
+
+    def _is_api_scenario_requirement(self, req: dict) -> bool:
+        """기능 FR 또는 API로 샘플링 가능한 운영성 요구사항만 시나리오화한다."""
+        req_id = req.get("req_id", "")
+        req_type = req.get("req_type", "functional")
+        text = f"{req_id} {req.get('domain_area', '')} {req.get('content', '')}"
+
+        if req_id.startswith("FR-") or req_type == "functional":
+            return True
+
+        if any(keyword in text for keyword in _API_TESTABLE_OPERATIONAL_KEYWORDS):
+            return True
+
+        if any(keyword in text for keyword in _NON_INTEGRATION_REQUIREMENT_KEYWORDS):
+            return False
+
+        return False
+
+    def _select_endpoints_for_requirement(self, req: dict, all_endpoints: list[dict]) -> list[dict]:
+        """요구사항 텍스트를 기준으로 실제 존재하는 API 후보를 좁힌다.
+
+        LLM 매핑이 실패했을 때 쓰는 결정적 fallback이다. 요구사항 도메인으로 라우터를
+        먼저 좁힌 뒤, 동작 키워드(조회/변경/해지 등)로 HTTP method를 제한한다.
+        """
+        req_text = f"{req.get('domain_area', '')} {req.get('content', '')}"
+        explicit_eps = self._match_explicit_endpoints(req_text, all_endpoints)
+        if explicit_eps:
+            return explicit_eps
+
+        operational_eps = self._select_operational_endpoints(req_text, all_endpoints)
+        if operational_eps:
+            return operational_eps
+
+        matched_basenames: set[str] = set()
+        for basename, keywords in _ROUTER_KEYWORDS.items():
+            if any(keyword in req_text for keyword in keywords):
+                matched_basenames.add(basename)
+
+        def endpoint_domain(ep: dict) -> str:
+            file_path = ep.get("file", "")
+            basename = file_path.split("/")[-1].replace(".py", "").replace(".ts", "").replace(".js", "")
+            if "contracts" in file_path:
+                return "contracts"
+            return basename
+
+        domain_eps = [
+            ep for ep in all_endpoints
+            if endpoint_domain(ep) in matched_basenames
+        ]
+        if not domain_eps:
+            return []
+
+        preferred_methods: list[str] = []
+        text_lower = req_text.lower()
+        if any(keyword in req_text for keyword in ("조회", "목록", "상세", "확인", "열람")):
+            preferred_methods.append("GET")
+        for keywords, methods in _ACTION_METHOD_MAP:
+            if any(self._kw_in(keyword, text_lower) for keyword in keywords):
+                preferred_methods.extend(methods)
+
+        if preferred_methods:
+            method_set = set(preferred_methods)
+            filtered = [ep for ep in domain_eps if ep.get("method") in method_set]
+            if filtered:
+                return filtered
+
+        return domain_eps
+
+    def _match_explicit_endpoints(self, text: str, all_endpoints: list[dict]) -> list[dict]:
+        """요구사항 본문에 명시된 METHOD /api/path를 실제 endpoint dict로 매칭한다."""
+        wanted = {
+            f"{m.group(1)} {m.group(2).rstrip('`.,)')}"
+            for m in re.finditer(r'\b(GET|POST|PUT|PATCH|DELETE)\s+`?(/api/[^\s`|,)]+)', text)
+        }
+        if not wanted:
+            return []
+
+        return [
+            ep for ep in all_endpoints
+            if self._get_full_ep_path(ep) in wanted
+        ]
+
+    def _select_operational_endpoints(self, text: str, all_endpoints: list[dict]) -> list[dict]:
+        """X-Trace-Id 같은 운영성 요구사항을 대표 API에 매핑한다."""
+        if not any(keyword in text for keyword in _API_TESTABLE_OPERATIONAL_KEYWORDS):
+            return []
+
+        preferred = [
+            "GET /api/plans",
+            "GET /api/plans/{plan_id}",
+            "POST /api/auth/login",
+        ]
+        by_path = {self._get_full_ep_path(ep): ep for ep in all_endpoints}
+        return [by_path[path] for path in preferred if path in by_path]
+
+    def _sanitize_scenarios_against_requirements(
+        self,
+        scenarios: list,
+        requirements: list[dict],
+        req_endpoint_map: dict[str, list[dict]],
+    ) -> None:
+        """최종 저장 전 존재하는 요구사항과 매핑된 API만 남긴다."""
+        valid_req_ids = {req.get("req_id", "") for req in requirements}
+        for s in scenarios:
+            req_ids = [
+                req_id for req_id in s.get("requirements", [])
+                if req_id in valid_req_ids
+            ]
+            s["requirements"] = list(dict.fromkeys(req_ids))
+            allowed_apis = self._endpoint_paths([
+                ep for req_id in s["requirements"]
+                for ep in req_endpoint_map.get(req_id, [])
+            ])
+
+            for tc in s.get("test_cases", []):
+                if tc.get("req_id") not in valid_req_ids:
+                    tc["req_id"] = s["requirements"][0] if s["requirements"] else None
+                api = tc.get("api")
+                if api and api not in (None, "null") and api not in allowed_apis:
+                    tc["api"] = None
 
     def _find_router_files_for_domain(self, domain_area: str, reqs: list[dict]) -> list[str]:
         """도메인 영역명과 요구사항 내용 키워드로 관련 라우터 파일 목록을 반환한다."""
@@ -581,30 +894,52 @@ class ScenarioGeneratorAgent(BaseAgent):
         for basename, keywords in _ROUTER_KEYWORDS.items():
             if any(k in search_text for k in keywords):
                 matched_basenames.add(basename)
+
+        def _file_matches(file_path: str) -> bool:
+            if not file_path:
+                return False
+            basename = file_path.split("/")[-1].replace(".py", "").replace(".ts", "").replace(".js", "")
+            if basename == "main":  # 진입점 파일(health-only)은 제외
+                return False
+            if basename in matched_basenames:
+                return True
+            # 파일명이 도메인과 다른 경우(예: contracts/routers.py) 디렉터리 경로 컴포넌트로 매칭
+            return any(part in matched_basenames for part in file_path.split("/")[:-1])
+
         return list(dict.fromkeys(
             ep.get("file", "")
             for ep in all_endpoints
-            if ep.get("file", "").split("/")[-1]
-                .replace(".py", "").replace(".ts", "").replace(".js", "")
-            in matched_basenames
-            and ep.get("file", "")
+            if _file_matches(ep.get("file", ""))
         ))
 
     def _format_scan_summary_for_domain(self, domain_area: str, router_files: list[str]) -> str:
-        """도메인 영역 기준 scan summary를 반환한다."""
+        """도메인 영역 기준 scan summary를 반환한다.
+
+        도메인 라우터 엔드포인트를 전체 경로(/api/prefix/path)로 보여준다.
+        매칭된 라우터가 없으면 전체 엔드포인트 목록을 참조용으로 포함한다.
+        """
         manifest: dict = self._read_index_json("manifest.json")  # type: ignore[assignment]
         all_endpoints: list[dict] = self._read_index_json("endpoints.json")  # type: ignore[assignment]
         domain_eps = [ep for ep in all_endpoints if ep.get("file", "") in router_files]
-        ep_strs = [f"{ep.get('method', '?')} {ep.get('path', '?')}" for ep in domain_eps]
         short_files = [
             f.split("/")[-1].replace(".py", "").replace(".ts", "").replace(".js", "")
             for f in router_files
         ]
+
+        if domain_eps:
+            ep_strs = [self._format_ep_for_prompt(ep) for ep in domain_eps]
+            ep_label = f"엔드포인트 ({len(domain_eps)}개): {', '.join(ep_strs)}"
+        else:
+            # 라우터 매칭 실패 시 전체 목록을 참조용으로 제공
+            all_ep_strs = [self._format_ep_for_prompt(ep) for ep in all_endpoints
+                           if ep.get("path") is not None and not ep.get("path", "").endswith("/health")]
+            ep_label = f"엔드포인트 (0개 — 전체 목록 참조): {', '.join(all_ep_strs)}"
+
         lines = [
             f"프레임워크: {manifest.get('framework', 'unknown')} ({manifest.get('language', 'unknown')})",
             f"도메인 영역: {domain_area}",
             f"관련 라우터: {', '.join(short_files) or '없음'}",
-            f"엔드포인트 ({len(domain_eps)}개): {', '.join(ep_strs) or '없음'}",
+            ep_label,
         ]
         return "\n".join(lines)
 
@@ -675,7 +1010,7 @@ class ScenarioGeneratorAgent(BaseAgent):
             for r in requirements
         )
         ep_text = "\n".join(
-            f"{ep.get('method', '?')} {ep.get('path', '?')} "
+            f"{self._get_full_ep_path(ep)} "
             f"[{ep.get('file', '').split('/')[-1]}] handler={ep.get('handler', '')}"
             for ep in all_endpoints
         )
@@ -691,15 +1026,15 @@ class ScenarioGeneratorAgent(BaseAgent):
 {ep_text}
 
 # 지시사항
-각 요구사항(REQ-XXX)에 대해 그 요구사항을 구현하는 엔드포인트를 매핑하라.
+각 요구사항(req_id)에 대해 그 요구사항을 구현하는 엔드포인트를 매핑하라.
 하나의 요구사항이 여러 엔드포인트에 매핑될 수 있다. 구현 엔드포인트가 없으면 빈 배열로 표시하라.
 반드시 아래 JSON 형식으로만 출력하라:
 {{
   "mappings": [
     {{
-      "req_id": "REQ-001",
+      "req_id": "FR-AUTH-01",
       "endpoints": [
-        {{"method": "POST", "path": "/auth/login"}}
+        {{"method": "POST", "path": "/api/auth/login"}}
       ]
     }}
   ]
@@ -713,6 +1048,10 @@ class ScenarioGeneratorAgent(BaseAgent):
             ep_lookup: dict[tuple[str, str], dict] = {
                 (ep.get("method", ""), ep.get("path", "")): ep for ep in all_endpoints
             }
+            ep_lookup.update({
+                (ep.get("method", ""), self._get_full_ep_path(ep).split(" ", 1)[1]): ep
+                for ep in all_endpoints
+            })
 
             result: dict[str, list[dict]] = {}
             for mapping in parsed.get("mappings", []):
@@ -736,14 +1075,76 @@ class ScenarioGeneratorAgent(BaseAgent):
             self.logger.warning("req_endpoint_mapping_failed", error=str(e))
             return {}
 
+    def _deduplicate_scenarios(self, scenarios: list) -> list:
+        """동일 API 집합을 커버하는 중복 시나리오를 병합한다.
+
+        두 TS가 완전히 같은 엔드포인트 집합만 다루면 중복으로 판단하고,
+        두 번째 TS의 고유 TC를 첫 번째 TS에 병합한 뒤 제거한다.
+
+        단, API 집합이 1개뿐인 경우 이름도 같아야 병합한다.
+        LLM이 다른 목적의 TC에 동일한 단일 API를 잘못 태깅했을 때 시나리오들이
+        과도하게 합쳐지는 것을 방지하기 위함이다.
+        """
+        result: list = []
+        # key: (api_set, name_if_single_api) → index in result
+        seen_api_sets: dict[tuple, int] = {}
+
+        for s in scenarios:
+            api_set = frozenset(
+                tc.get("api", "")
+                for tc in s.get("test_cases", [])
+                if tc.get("api") and tc.get("api") not in (None, "null")
+            )
+            if not api_set:
+                result.append(s)
+                continue
+
+            # 단일 엔드포인트 시나리오는 이름도 일치해야 중복 판정
+            name_key = s.get("name", "") if len(api_set) == 1 else ""
+            dedup_key = (api_set, name_key)
+
+            if dedup_key in seen_api_sets:
+                existing = result[seen_api_sets[dedup_key]]
+                existing_gwt: set[str] = {
+                    f"{tc.get('given','')}|{tc.get('when','')}|{tc.get('then','')}"
+                    for tc in existing["test_cases"]
+                }
+                for tc in s["test_cases"]:
+                    key = f"{tc.get('given','')}|{tc.get('when','')}|{tc.get('then','')}"
+                    if key not in existing_gwt:
+                        existing["test_cases"].append(tc)
+                        existing_gwt.add(key)
+                self.logger.info(
+                    "duplicate_scenario_merged",
+                    merged_name=s.get("name", ""),
+                    into_name=existing.get("name", ""),
+                )
+            else:
+                seen_api_sets[dedup_key] = len(result)
+                result.append(s)
+
+        return result
+
     def _renumber_and_set_depends_on(self, all_scenarios: list) -> list:
         """TS ID를 순서대로 재부여하고 depends_on을 설정한다."""
         for i, s in enumerate(all_scenarios):
             old_ts_id = s["ts_id"]
             new_ts_id = f"TS-{i + 1:03d}"
             s["ts_id"] = new_ts_id
+
+            # 병합으로 중복된 TC ID를 포함해 전체 TC를 순서대로 재번호 부여.
+            # old_id → new_id 맵을 먼저 빌드하고 depends_on 참조도 교체한다.
+            old_to_new_tc: dict[str, str] = {}
+            for j, tc in enumerate(s["test_cases"]):
+                old_id = tc["tc_id"]
+                new_id = f"{new_ts_id}-TC-{j + 1:02d}"
+                if old_id not in old_to_new_tc:
+                    old_to_new_tc[old_id] = new_id
+                tc["tc_id"] = new_id
+
             for tc in s["test_cases"]:
-                tc["tc_id"] = tc["tc_id"].replace(old_ts_id, new_ts_id)
+                if tc.get("depends_on"):
+                    tc["depends_on"] = [old_to_new_tc.get(d, d) for d in tc["depends_on"]]
 
         basename_to_tsid: dict[str, str] = {}
         for s in all_scenarios:
@@ -781,7 +1182,7 @@ class ScenarioGeneratorAgent(BaseAgent):
             ep.get("file", "").split("/")[-1].replace(".py", "").replace(".ts", "").replace(".js", "")
             for ep in endpoints if ep.get("file")
         ))
-        ep_strs = [f"{ep.get('method', '?')} {ep.get('path', '?')}" for ep in endpoints]
+        ep_strs = [self._format_ep_for_prompt(ep) for ep in endpoints]
         lines = [
             f"프레임워크: {manifest.get('framework', 'unknown')} ({manifest.get('language', 'unknown')})",
             f"검증 요구사항: [{req_id}] {req.get('content', '')}",
@@ -946,7 +1347,7 @@ class ScenarioGeneratorAgent(BaseAgent):
         """단일 라우터 파일 기준의 scan summary를 반환한다."""
         manifest: dict = self._read_index_json("manifest.json")  # type: ignore[assignment]
         short = router_file.split("/")[-1].replace(".py", "").replace(".ts", "").replace(".js", "")
-        ep_strs = [f"{ep.get('method','?')} {ep.get('path','?')}" for ep in endpoints]
+        ep_strs = [self._format_ep_for_prompt(ep) for ep in endpoints]
         lines = [
             f"프레임워크: {manifest.get('framework', 'unknown')} ({manifest.get('language', 'unknown')})",
             f"대상 라우터: [{short}] {router_file}",
@@ -1122,7 +1523,7 @@ class ScenarioGeneratorAgent(BaseAgent):
             lines.append(f"API 라우터 ({len(router_map)}개 파일):")
             for file_path, eps in router_map.items():
                 short_path = file_path.split("/")[-1].replace(".py", "").replace(".ts", "").replace(".js", "")
-                ep_strs = [f"{ep.get('method','?')} {ep.get('path','?')}" for ep in eps]
+                ep_strs = [self._get_full_ep_path(ep) for ep in eps]
                 lines.append(f"  [{short_path}] {', '.join(ep_strs)}")
 
         return "\n".join(lines)
