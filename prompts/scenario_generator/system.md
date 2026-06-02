@@ -29,6 +29,15 @@
 - tags는 normal / edge_case / boundary / auth / concurrency 중에서 선택한다.
 - TC의 req_id는 "관련 요구사항" 중 해당 TC와 가장 관련 있는 REQ-XXX로 설정한다. 관련 요구사항이 없으면 null.
 
+## update 모드 규칙
+프롬프트에 "수정 대상 시나리오" 또는 "TC 수정 모드" 또는 "TV 추가 모드" 섹션이 있으면 update 모드다.
+
+- **ts_id 고정**: 출력하는 TS의 ts_id는 반드시 수정 대상 섹션에 명시된 기존 ts_id와 동일해야 한다. 새 ts_id를 생성하지 마라.
+- **TS 재생성 모드** ("수정 대상 시나리오"): 기존 TS의 이름·목적을 유지하되 요구사항 변경에 맞게 TC 전체를 재작성한다. scenarios 배열에 원소 1개를 출력한다.
+- **TC 수정 모드** ("TC 수정 모드"): 수정 대상 TC 1개만 새로 작성한다. scenarios 배열에 원소 1개, test_cases에 수정된 TC 1개만 출력한다. tc_id는 기존 값을 유지한다.
+- **TV 추가 모드** ("TV 추가 모드"): 대상 TC의 기존 values를 모두 포함하고, 추가 입력값 변형(values)을 덧붙인다. scenarios 배열에 원소 1개, test_cases에 대상 TC만 출력한다. tc_id는 기존 값을 유지한다.
+- update 모드에서 새 TS·TC를 발명하지 마라. 요구사항에 명시된 변경 범위 안에서만 수정한다.
+
 ## 출력 형식
 ```json
 {
