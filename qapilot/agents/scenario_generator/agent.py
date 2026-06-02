@@ -255,6 +255,8 @@ class ScenarioGeneratorAgent(BaseAgent):
         action_type == "create" (또는 target_ts_id null 폴백) → 새 TS 생성.
         action_type == "update" + target_ts_id 있음 → target_level에 따라 부분 수정.
         """
+        from qapilot.tools.domain_knowledge import DomainKnowledgeTool
+
         all_scenarios: list = []
         all_updated: list = []   # update 결과 (ts_id 고정, 재번호 부여 없이 바로 저장)
         confidence_sum = 0.0
@@ -310,25 +312,7 @@ class ScenarioGeneratorAgent(BaseAgent):
             self._correct_api_method_mismatches(ts_scenarios)
             self._pin_req_id(ts_scenarios, req_id)
             self._fill_api_for_domain(ts_scenarios, req, router_files, req_endpoints)
-
-            if action_type == "update" and target_ts_id:
-                existing_ts = self._load_scenario_file(target_ts_id)
-                if existing_ts is None:
-                    self.logger.warning(
-                        "tc_count_below_minimum",
-                        req_id=req_id,
-                        domain=domain_area,
-                        tc_count=len(s["test_cases"]),
-                        minimum=6,
-                    )
-                    continue
-
-            else:
-                ts_scenarios, ts_confidence = await self._generate_ts_for_req(
-                    req, scan_result, domain_rules, trigger, mismatch_text, last_error,
-                )
-                all_scenarios.extend(ts_scenarios)
-
+            all_scenarios.extend(ts_scenarios)
             confidence_sum += ts_confidence
 
         # update 결과는 ts_id 고정 — 재번호 부여 없이 바로 덮어쓴다.

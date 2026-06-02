@@ -578,6 +578,33 @@ async def _domain_knowledge(state: PipelineState) -> dict:
     return {"domain_rules": rules}
 
 
+def _read_latest_prd_text() -> str:
+    """docs/ 디렉토리의 최신 PRD 파일을 읽어 텍스트로 반환한다."""
+    from qapilot.shared.config import load_config
+
+    config = load_config()
+    proj = config.project
+    repo_root = Path(proj.root or proj.repo_path or ".")
+    docs_dir = repo_root / "docs"
+    if not docs_dir.exists():
+        return ""
+    all_docs = [
+        p for p in docs_dir.rglob("*")
+        if p.is_file() and p.suffix.lower() in _SUPPORTED_DOC_SUFFIXES
+    ]
+    prd_docs = [
+        p for p in _filter_latest_doc_versions(all_docs)
+        if "prd" in p.name.lower()
+    ]
+    texts: list[str] = []
+    for p in prd_docs:
+        try:
+            texts.append(p.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+    return "\n\n".join(texts)
+
+
 async def _requirement_extract(state: PipelineState) -> dict:
     """FR-024 trigger별 요구사항 추출.
 
@@ -663,6 +690,9 @@ async def _requirement_extract(state: PipelineState) -> dict:
         return {"requirements": []}
 
     # ── init / doc_update: PRD 문서 → RequirementExtractorAgent ─────────────────
+    from qapilot.agents.requirement_extractor import RequirementExtractorAgent
+    from qapilot.shared.schemas import AgentInput
+
     user_input = (state["run_options"].get("user_input") or "").strip()
     document_text = user_input or _read_latest_prd_text()
 
@@ -676,67 +706,8 @@ async def _requirement_extract(state: PipelineState) -> dict:
             context={"domain_rules": state.get("domain_rules") or []},
             params={"document_text": document_text, "existing_count": 0},
         )
-        return {"requirements": output.result.get("requirements", []) or []}
-
-    # user_input 없음: Qdrant에 저장된 PRD 문서에서 요구사항 검색
-    from qapilot.shared.schemas import ToolInput
-    from qapilot.tools.domain_knowledge import DomainKnowledgeTool
-    from qapilot.shared.config import load_config
-
-    config = load_config()
-    proj = config.project
-    repo_root = Path(proj.root or proj.repo_path or ".")
-    docs_dir = repo_root / "docs"
-    latest_prd_sources: set[str] = set()
-    if docs_dir.exists():
-        all_docs = [p for p in docs_dir.rglob("*") if p.is_file() and p.suffix.lower() in _SUPPORTED_DOC_SUFFIXES]
-        latest_prd_sources = {
-            p.name for p in _filter_latest_doc_versions(all_docs)
-            if "prd" in p.name.lower()
-        }
-
-    tool = DomainKnowledgeTool(trace_id=state["trace_id"])
-    requirements = []
-    try:
-        result = await tool.run(
-            ToolInput(
-                trace_id=state["trace_id"],
-                params={"action": "search", "query": "기능 요구사항 시스템", "top_k": 30},
-            )
-        )
-        rules = result.result.get("rules", []) or []
-        prd_rules = [
-            r for r in rules
-            if r.get("source", "") in latest_prd_sources
-        ] if latest_prd_sources else [
-            r for r in rules if "prd" in r.get("source", "").lower()
-        ]
-        _NON_FUNC_KEYWORDS = {"비기능", "성능", "보안", "가용성", "안정성", "확장성"}
-        for i, rule in enumerate(prd_rules, start=1):
-            section = rule.get("section", "")
-            req_type = (
-                "non_functional"
-                if any(k in section for k in _NON_FUNC_KEYWORDS)
-                else "functional"
-            )
-            domain_area = section or rule.get("source", "").replace(".md", "")
-            requirements.append({
-                "req_id": f"REQ-{i:03d}",
-                "req_type": req_type,
-                "content": rule["content"],
-                "priority": "medium",
-                "domain_area": domain_area,
-            })
-    except Exception:
-        pass
-
-    texts: list[str] = []
-    for p in prd_docs:
-        try:
-            texts.append(p.read_text(encoding="utf-8"))
-        except Exception:
-            continue
-    return "\n\n".join(texts)
+    )
+    return {"requirements": output.result.get("requirements", []) or []}
 
 
 async def _scenario_generate(state: PipelineState) -> dict:
