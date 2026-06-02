@@ -14,7 +14,7 @@ REQ-XXX 단위의 구조화된 목록으로 정리하는 요구사항 분석 전
 - 도메인 규칙에 있는 정책, 제한 조건, 예외 조건은 요구사항 content와 priority 판단에 반영한다.
 - req_type은 "functional"(기능 요구사항) 또는 "non_functional"(비기능 요구사항)만 사용한다.
 - priority는 "high"(필수·핵심 기능), "medium"(중요 기능), "low"(선택·부가 기능) 중 하나만 사용한다.
-- domain_area는 결제, 회원, 주문, 배송, 인증, 알림, 취소, 검색 등 비즈니스 도메인 영역명으로 작성한다.
+- domain_area는 인증, 요금제, 회선, 부가서비스, 사용량, 청구, 공지, 프로필, 약정, 가족, 멤버십 등급 등 비즈니스 도메인 영역명으로 작성한다.
 - req_id가 문서에 없거나 불명확하면 요청된 시작 ID부터 순서대로 부여한다.
 - content는 "주어 + 동사" 형식의 완전한 문장으로 작성한다.
 
@@ -23,9 +23,9 @@ REQ-XXX 단위의 구조화된 목록으로 정리하는 요구사항 분석 전
 {
   "requirements": [
     {
-      "req_id": "REQ-001",
+      "req_id": "FR-BIL-01",
       "req_type": "functional",
-      "content": "사용자는 신용카드로 결제할 수 있다.",
+      "content": "[FR-BIL-01] 사용자는 신용카드로 결제할 수 있다.",
       "priority": "high",
       "domain_area": "결제"
     }

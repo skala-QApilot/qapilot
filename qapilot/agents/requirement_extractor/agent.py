@@ -13,6 +13,23 @@ import json
 import re
 from typing import Any
 
+_FR_ID_RE = re.compile(r'^FR-[A-Z]+-\d+$')
+_FR_HEADING_RE = re.compile(r'(?m)^#{2,6}\s+(FR-[A-Z]+-\d+)\s+(.+?)\s*$')
+
+_DOMAIN_BY_FR_PREFIX: dict[str, str] = {
+    "AUTH": "인증",
+    "PLAN": "요금제",
+    "ORDER": "회선",
+    "BNF": "부가서비스",
+    "USG": "사용량",
+    "BIL": "청구",
+    "NTC": "공지",
+    "PRF": "프로필",
+    "CONTRACT": "약정",
+    "FAM": "가족",
+    "TIER": "멤버십 등급",
+}
+
 from qapilot.agents.base_agent import BaseAgent
 from qapilot.agents.requirement_extractor.repository import save_requirements
 from qapilot.shared.database import create_tables
@@ -83,7 +100,9 @@ class RequirementExtractorAgent(BaseAgent):
             user_prompt=user_prompt,
         )
 
-        requirements, confidence = self._parse_response(response.content, existing_count)
+        requirements, confidence = self._parse_response(
+            response.content, existing_count, document_text
+        )
 
         await create_tables()
         await save_requirements(requirements, self.trace_id or "")
@@ -117,7 +136,7 @@ class RequirementExtractorAgent(BaseAgent):
             return []
 
     def _parse_response(
-        self, content: str, existing_count: int
+        self, content: str, existing_count: int, document_text: str = ""
     ) -> tuple[list[RequirementItem], float]:
         """LLM 응답 JSON을 파싱하고 RequirementItem 목록을 반환한다.
 
@@ -160,16 +179,84 @@ class RequirementExtractorAgent(BaseAgent):
                 seen.add(key)
                 unique.append(item)
 
-        # ID 순번 재부여 (LLM 생성 ID 무시)
-        requirements: list[RequirementItem] = [
-            {
-                "req_id": f"REQ-{existing_count + i + 1:03d}",
+        # FR-XXX-NN 형식 req_id는 원본 유지; 그 외에는 순번 부여
+        requirements: list[RequirementItem] = []
+        seq = existing_count + 1
+        for item in unique:
+            llm_id = (item.get("req_id") or "").strip()
+            if _FR_ID_RE.match(llm_id):
+                req_id = llm_id
+            else:
+                req_id = f"REQ-{seq:03d}"
+                seq += 1
+            requirements.append({
+                "req_id": req_id,
                 "req_type": item.get("req_type", "functional"),
                 "content": item.get("content", ""),
                 "priority": item.get("priority", "medium"),
                 "domain_area": item.get("domain_area", ""),
-            }
-            for i, item in enumerate(unique)
-        ]
+            })
+
+        requirements = self._ensure_all_document_frs(requirements, document_text)
 
         return requirements, min(max(confidence, 0.0), 1.0)
+
+    def _ensure_all_document_frs(
+        self, requirements: list[RequirementItem], document_text: str
+    ) -> list[RequirementItem]:
+        """LLM이 누락한 FR 섹션을 문서 heading 기준으로 보강한다.
+
+        PRD의 `#### FR-TIER-01 ...` 같은 명시적 기능 요구사항은 테스트 RTM의
+        기준 행이므로, LLM 응답에서 빠져도 결정적으로 추가한다.
+        """
+        if not document_text:
+            return requirements
+
+        seen_ids = {req["req_id"] for req in requirements}
+        additions: list[RequirementItem] = []
+        matches = list(_FR_HEADING_RE.finditer(document_text))
+
+        for idx, match in enumerate(matches):
+            req_id = match.group(1).strip()
+            if req_id in seen_ids:
+                continue
+
+            title = match.group(2).strip()
+            section_end = matches[idx + 1].start() if idx + 1 < len(matches) else len(document_text)
+            section = document_text[match.end():section_end]
+            process = self._extract_section_table_value(section, "처리")
+            endpoint = self._extract_section_table_value(section, "엔드포인트")
+
+            prefix = req_id.split("-")[1]
+            domain_area = _DOMAIN_BY_FR_PREFIX.get(prefix, prefix)
+            content_parts = [f"[{req_id}] {title}"]
+            if process:
+                content_parts.append(process)
+            if endpoint:
+                content_parts.append(f"엔드포인트: {endpoint}")
+
+            additions.append({
+                "req_id": req_id,
+                "req_type": "functional",
+                "content": " — ".join(content_parts),
+                "priority": "high",
+                "domain_area": domain_area,
+            })
+            seen_ids.add(req_id)
+
+        if additions:
+            self.logger.info(
+                "document_fr_requirements_backfilled",
+                count=len(additions),
+                req_ids=[item["req_id"] for item in additions],
+            )
+
+        return requirements + additions
+
+    @staticmethod
+    def _extract_section_table_value(section: str, key: str) -> str:
+        pattern = re.compile(rf'^\|\s*{re.escape(key)}\s*\|\s*(.+?)\s*\|', re.MULTILINE)
+        match = pattern.search(section)
+        if not match:
+            return ""
+        return re.sub(r'`', '', match.group(1).strip())
