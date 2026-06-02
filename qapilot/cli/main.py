@@ -19,9 +19,10 @@ from typing import Optional
 import typer
 
 from qapilot.cli._branding import BRAND_PURPLE, console
-from qapilot.cli.api_client import ApiClient
-from qapilot.cli.commands.init import init
-from qapilot.cli.sync import sync_local_to_server
+# NOTE: 다음 모듈은 PR-15b 에서 qapilot/legacy/ 로 이동했다.
+#   - qapilot.cli.api_client    (server 의 /api/cli/** 호출 — 라우트 자체 제거됨)
+#   - qapilot.cli.commands.init (qapilot init — local 프로젝트 등록은 SaaS 에서 UI 로 대체)
+#   - qapilot.cli.sync          (로컬→서버 동기화 — 모든 데이터가 이미 서버에 있음)
 from qapilot.orchestrator.runner import run_pipeline
 from qapilot.shared.logger import setup_logger
 from qapilot.shared.schemas import RunOptions
@@ -42,17 +43,12 @@ def _init_cli(ctx: typer.Context) -> None:
         raise typer.Exit()
 
 
-# `qapilot init` — 핸들러는 cli/commands/init.py 에 정의됨.
-app.command()(init)
-
-
 generate_app = typer.Typer(help="시나리오 및 테스트 코드 자동 생성 (Layer 1)")
 app.add_typer(generate_app, name="generate")
 
 @generate_app.command("scenarios")
 def generate_scenarios(
     affected: bool = typer.Option(False, "--affected", help="Git 변경분만 생성"),
-    sync: bool = typer.Option(True, "--sync/--no-sync", help="완료 후 서버와 동기화"),
 ) -> None:
     """시나리오 자동 생성. 생성 후 사용자가 대시보드에서 검토·수정한다."""
     options: RunOptions = {
@@ -66,17 +62,11 @@ def generate_scenarios(
     console.print(f"[bold {BRAND_PURPLE}]시나리오 생성을 시작합니다 (Layer 1)...[/bold {BRAND_PURPLE}]")
     result = asyncio.run(run_pipeline(options, Path.cwd() / ".qapilot"))
     console.print(f"[bold blue]시나리오 생성 완료! 대시보드(qapilot ui)에서 검토 후 'qapilot generate code'를 실행하세요. (상태: {result['status']})[/bold blue]")
-    
-    if sync:
-        asyncio.run(sync_local_to_server())
-    else:
-        console.print("생성된 시나리오가 서버로 동기화될 준비가 되었습니다.")
 
 
 @generate_app.command("code")
 def generate_code(
     case: Optional[str] = typer.Option(None, "--case", help="특정 시나리오 ID"),
-    sync: bool = typer.Option(True, "--sync/--no-sync", help="완료 후 서버와 동기화"),
 ) -> None:
     """저장된 시나리오를 기반으로 테스트 코드 자동 생성."""
     options: RunOptions = {
@@ -91,11 +81,6 @@ def generate_code(
     console.print(f"[bold {BRAND_PURPLE}]{target} 기반 테스트 코드 생성을 시작합니다...[/bold {BRAND_PURPLE}]")
     result = asyncio.run(run_pipeline(options, Path.cwd() / ".qapilot"))
     console.print(f"[bold blue]테스트 코드 생성 완료! (상태: {result['status']})[/bold blue]")
-    
-    if sync:
-        asyncio.run(sync_local_to_server())
-    else:
-        console.print("생성된 코드가 서버로 동기화될 준비가 되었습니다.")
 
 
 @app.command()
@@ -182,13 +167,6 @@ def rescan() -> None:
         console.print(f"[bold blue]재생성 완료! (파일: {files_cnt}개, 엔드포인트: {endpoint_cnt}개, 프레임워크: {framework})[/bold blue]")
     except Exception as e:
         console.print(f"[red]재생성 중 오류 발생: {e}[/red]")
-
-
-@app.command()
-def sync() -> None:
-    """로컬 산출물을 서버와 동기화."""
-    console.print(f"[bold {BRAND_PURPLE}]서버 동기화를 시작합니다...[/bold {BRAND_PURPLE}]")
-    asyncio.run(sync_local_to_server())
 
 
 @app.command()
