@@ -129,12 +129,16 @@ async def test_email_password_fill_invoked(mock_page):
 
 @pytest.mark.asyncio
 async def test_page_load_fallback_about_blank_navigates(mock_page):
-    """page.url = about:blank → target_url 로 강제 navigate."""
+    """page.url = about:blank → target_url 로 강제 navigate.
+
+    2026-06-02 보강: wait_until="networkidle" 로 SPA hydrate 까지 대기 (domcontentloaded
+    는 HTML 파싱만 끝나 빈 <div id="app"> 상태 — 후속 selector timeout).
+    """
     tool = _make_tool()
     mock_page.url = "about:blank"
     await tool._ensure_page_loaded(mock_page, "http://localhost:3000")
     mock_page.goto.assert_awaited_once_with(
-        "http://localhost:3000", wait_until="domcontentloaded", timeout=10000
+        "http://localhost:3000", wait_until="networkidle", timeout=10000
     )
 
 
