@@ -134,6 +134,7 @@ async def test_report_includes_layer3_sections(tmp_path: Path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     state = {
         "trace_id": "trace-r3",
+        "qapilot_dir": str(tmp_path / ".qapilot"),
         "ui_results": [{"tc_id": "TC-1", "status": "fail", "steps": []}],
         "cross_check_results": [
             {"tc_id": "TC-1", "match_score": 0.0, "mismatched_fields": 2, "has_mismatch": True},
@@ -172,6 +173,7 @@ async def test_report_omits_layer3_sections_when_empty(tmp_path: Path, monkeypat
     monkeypatch.chdir(tmp_path)
     state = {
         "trace_id": "trace-empty",
+        "qapilot_dir": str(tmp_path / ".qapilot"),
         "ui_results": [{"tc_id": "TC-1", "status": "pass", "steps": []}],
         "cross_check_results": [
             {"tc_id": "TC-1", "match_score": 1.0, "mismatched_fields": 0, "has_mismatch": False},

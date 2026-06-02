@@ -27,6 +27,23 @@ from typing import Any
 from langgraph.graph import END, START, StateGraph
 
 from qapilot.orchestrator.state import PipelineState
+from qapilot.shared.logger import get_logger
+
+
+def _qapilot_path(state: PipelineState, *parts: str) -> Path:
+    """state["qapilot_dir"] 기준의 절대경로를 반환한다.
+
+    파이프라인 내부의 모든 파일 I/O 는 반드시 이 helper 를 거쳐야 한다.
+    ``Path(".qapilot")/...`` 같은 CWD 의존 경로는 금지 — 다른 서비스의
+    데이터를 덮어쓸 수 있다.
+    """
+    base = state.get("qapilot_dir")
+    if not base:
+        raise RuntimeError(
+            "PipelineState에 qapilot_dir 가 비어 있다. runner.run_pipeline(...) 호출부가 "
+            "qapilot_dir 인자를 누락한 것이다."
+        )
+    return Path(base).joinpath(*parts)
 
 
 def build_pipeline() -> StateGraph:
@@ -112,13 +129,13 @@ def _entry_point(command: str) -> str:
 
 
 # ── Layer 1A 헬퍼: spec §6.1 디스크 캐시 ──────────────────────────────────────
-def _save_codebase_index_to_disk(scan: dict) -> None:
+def _save_codebase_index_to_disk(scan: dict, state: PipelineState) -> None:
     """spec §6.1 의 .qapilot/codebase-index/ 4파일 저장 (L2 디스크 캐시).
 
     Tool 본체의 `.qapilot/manifest.json` (증분 분석 추적용) 과 독립.
     본 manifest 는 spec §6.1 정합용으로 codebase-index/ 안에 둔다.
     """
-    cache_dir = Path(".qapilot") / "codebase-index"
+    cache_dir = _qapilot_path(state, "codebase-index")
     cache_dir.mkdir(parents=True, exist_ok=True)
 
     endpoints: list[dict] = []
@@ -170,7 +187,6 @@ def _save_codebase_index_to_disk(scan: dict) -> None:
 # ── Layer 1A 노드 (generate_scenarios) ────────────────────────────────────────
 
 _SUPPORTED_DOC_SUFFIXES = frozenset({".md", ".pdf", ".docx", ".xlsx", ".xls"})
-_DOMAIN_INDEX_DIR = Path(".qapilot") / "domain"
 _VERSION_RE = re.compile(r'^(.+?)_v(\d+(?:\.\d+)*)$', re.IGNORECASE)
 
 
@@ -225,8 +241,8 @@ async def _doc_import(state: PipelineState) -> dict:
         logger.warning("qdrant_collection_missing_reimport", name="domain_knowledge")
 
     for doc_path in sorted(doc_files):
-        index_path = _DOMAIN_INDEX_DIR / f"{doc_path.stem}.index.json"
-        if collection_alive and index_path.exists():
+        index_path = _qapilot_path(state, "domain", f"{doc_path.stem}.index.json")
+        if index_path.exists():
             try:
                 saved = json.loads(index_path.read_text(encoding="utf-8"))
                 if saved.get("file") == str(doc_path):
@@ -246,6 +262,190 @@ async def _doc_import(state: PipelineState) -> dict:
             logger.warning("doc_import_failed", file=str(doc_path), error=str(e))
 
     return {}
+
+
+def _load_scan_result_from_disk(state: PipelineState) -> dict:
+    """codebase-index/ 디스크 캐시에서 scan_result를 복원한다.
+
+    natural_lang 트리거처럼 코드베이스 재스캔이 불필요한 경우에 사용한다.
+    manifest.json → framework/language/endpoint_count,
+    endpoints.json → file별 endpoints 재구성.
+    캐시 미존재 시 scan_result=None으로 안전하게 반환한다.
+    """
+    try:
+        manifest_path = _qapilot_path(state, "codebase-index", "manifest.json")
+        endpoints_path = _qapilot_path(state, "codebase-index", "endpoints.json")
+        if not manifest_path.exists():
+            return {"scan_result": None, "current_layer": "L1A"}
+
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+
+        files: list[dict] = []
+        if endpoints_path.exists():
+            endpoints: list[dict] = json.loads(endpoints_path.read_text(encoding="utf-8"))
+            by_file: dict[str, list] = {}
+            for ep in endpoints:
+                by_file.setdefault(ep.get("file", ""), []).append(ep)
+            files = [
+                {"path": fpath, "endpoints": eps, "functions": [], "models": [], "dependencies": []}
+                for fpath, eps in by_file.items()
+            ]
+
+        scan_result = {
+            "files": files,
+            "git_diff": None,
+            "framework": manifest.get("framework") or "unknown",
+            "language": manifest.get("language") or "unknown",
+            "endpoint_count": int(manifest.get("endpoint_count") or 0),
+        }
+        return {"scan_result": scan_result, "current_layer": "L1A"}
+    except Exception:
+        return {"scan_result": None, "current_layer": "L1A"}
+
+
+def _build_existing_scenarios_summary(state: PipelineState) -> list[dict]:
+    """기존 시나리오를 TS+TC 요약으로 반환한다.
+
+    NaturalLanguageAgent가 target_ts_id / target_tc_id를 정확히 특정할 수 있도록
+    ts_id, title, test_cases(tc_id + title)만 추출해 전달한다.
+    전체 시나리오 JSON을 넘기면 프롬프트가 비대해지므로 요약본만 사용한다.
+    """
+    try:
+        scenarios = _load_json_files(_qapilot_path(state, "scenarios"))
+        summary = []
+        for ts in scenarios:
+            tc_summaries = [
+                {"tc_id": tc.get("tc_id"), "title": tc.get("title") or tc.get("name") or ""}
+                for tc in (ts.get("test_cases") or [])
+                if tc.get("tc_id")
+            ]
+            summary.append({
+                "ts_id": ts.get("ts_id"),
+                "title": ts.get("title") or ts.get("name") or "",
+                "test_cases": tc_summaries,
+            })
+        return summary
+    except Exception:
+        return []
+
+
+async def _rough_match_scenarios(
+    user_input: str,
+    existing_scenarios: list[dict],
+    top_n: int = 5,
+    threshold: float = 0.40,
+) -> list[dict]:
+    """user_input을 직접 임베딩하여 기존 시나리오 중 top-N 후보를 반환한다.
+
+    NaturalLanguageAgent 호출 전에 실행되며, LLM에게 전체 목록 대신
+    유사도 높은 후보만 전달하여 프롬프트 크기를 제한한다.
+
+    threshold는 후보 탐색용으로 _resolve_scenario_targets보다 낮게 설정한다.
+    (후보가 없으면 LLM이 create로 판단하도록 유도)
+    """
+    import asyncio as _asyncio
+
+    import numpy as np
+
+    from qapilot.tools.domain_knowledge._embedder import get_embedder
+
+    if not existing_scenarios or not user_input.strip():
+        return []
+
+    embedder = get_embedder()
+    ts_texts = [ts.get("title") or ts.get("ts_id", "") for ts in existing_scenarios]
+    ts_vecs = await _asyncio.to_thread(embedder.encode, ts_texts, normalize_embeddings=True)
+    query_vecs = await _asyncio.to_thread(embedder.encode, [user_input], normalize_embeddings=True)
+    query_vec = query_vecs[0]
+
+    sims = [float(np.dot(query_vec, ts_vec)) for ts_vec in ts_vecs]
+    candidates = [
+        {**ts, "_similarity": round(sims[i], 4)}
+        for i, ts in enumerate(existing_scenarios)
+        if sims[i] >= threshold
+    ]
+    candidates.sort(key=lambda x: x["_similarity"], reverse=True)
+    return candidates[:top_n]
+
+
+async def _resolve_scenario_targets(
+    requirements: list[dict],
+    existing_scenarios: list[dict],
+    threshold: float = 0.50,
+) -> list[dict]:
+    """action_type: update인 요구사항에 임베딩 매칭으로 target_ts_id / target_tc_id를 주입한다.
+
+    LLM이 아닌 코드 레벨에서 대상을 탐색하므로 존재하지 않는 ID를 반환하지 않는다.
+
+    흐름:
+    1. update 요구사항의 domain_area + content를 쿼리 텍스트로 임베딩
+    2. 기존 시나리오 TS 제목을 임베딩하여 코사인 유사도 계산
+    3. threshold 이상의 TS 매칭 → target_ts_id 주입
+    4. target_level이 tc/tv이면 해당 TS 내 TC 제목과 재매칭 → target_tc_id 주입
+    5. threshold 미달 시 null 유지 (ScenarioGeneratorAgent가 create처럼 처리)
+
+    Args:
+        threshold: 코사인 유사도 기준값. 0.68 미만이면 매칭 실패로 처리.
+    """
+    import asyncio as _asyncio
+
+    import numpy as np
+
+    from qapilot.tools.domain_knowledge._embedder import get_embedder
+
+    update_reqs = [r for r in requirements if r.get("action_type") == "update"]
+    if not update_reqs or not existing_scenarios:
+        return requirements
+
+    embedder = get_embedder()
+
+    # TS 텍스트 임베딩 — ts_id 접두사 제외, 제목만 사용 (ts_id가 임베딩 오염 방지)
+    ts_texts = [
+        ts.get("title") or ts.get("ts_id", "")
+        for ts in existing_scenarios
+    ]
+    query_texts = [
+        f"{r.get('domain_area', '')} {r.get('content', '')}"
+        for r in update_reqs
+    ]
+
+    ts_vecs = await _asyncio.to_thread(
+        embedder.encode, ts_texts, normalize_embeddings=True
+    )
+    query_vecs = await _asyncio.to_thread(
+        embedder.encode, query_texts, normalize_embeddings=True
+    )
+
+    for i, req in enumerate(update_reqs):
+        q_vec = query_vecs[i]
+        ts_sims = [float(np.dot(q_vec, ts_vec)) for ts_vec in ts_vecs]
+        best_ts_idx = int(np.argmax(ts_sims))
+
+        if ts_sims[best_ts_idx] < threshold:
+            continue  # 매칭 실패 — null 유지
+
+        matched_ts = existing_scenarios[best_ts_idx]
+        req["target_ts_id"] = matched_ts.get("ts_id")
+
+        # TC/TV 레벨 매칭
+        if req.get("target_level") in ("tc", "tv"):
+            tcs = matched_ts.get("test_cases") or []
+            if not tcs:
+                continue
+            tc_texts = [
+                tc.get("title") or tc.get("tc_id", "")
+                for tc in tcs
+            ]
+            tc_vecs = await _asyncio.to_thread(
+                embedder.encode, tc_texts, normalize_embeddings=True
+            )
+            tc_sims = [float(np.dot(q_vec, tc_vec)) for tc_vec in tc_vecs]
+            best_tc_idx = int(np.argmax(tc_sims))
+
+            if tc_sims[best_tc_idx] >= threshold:
+                req["target_tc_id"] = tcs[best_tc_idx].get("tc_id")
+
+    return requirements
 
 
 async def _codebase_scan(state: PipelineState) -> dict:
@@ -274,11 +474,33 @@ async def _codebase_scan(state: PipelineState) -> dict:
 
     is_git_mode = bool(run_options.get("repo_url") or run_options.get("repos"))
 
-    params: dict[str, Any] = {"trigger": run_options.get("trigger") or "init"}
+    trigger: str = run_options.get("trigger") or "init"
+
+    # natural_lang: 코드 변경 없음 → 디스크 캐시 복원, 스캔 skip (이슈 #180)
+    if trigger == "natural_lang":
+        return _load_scan_result_from_disk(state)
+
+    # doc_update: 코드 스캔 불필요 → 안전하게 None 반환 (이슈 #180, NoneType 크래시 수정)
+    if trigger == "doc_update":
+        return {"scan_result": None, "trace_id": trace_id, "current_layer": "L1A"}
+
+    params: dict[str, Any] = {"trigger": trigger}
     for key in ("repo_url", "token", "branch", "local_path", "repos"):
         val = run_options.get(key)
         if val is not None:
             params[key] = val
+
+    # code_change: 직전 스캔의 commit_hash를 읽어 증분 스캔 활성화 (이슈 #180)
+    if trigger == "code_change":
+        manifest_path = _qapilot_path(state, "codebase-index", "manifest.json")
+        if manifest_path.exists():
+            try:
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                last_hash = manifest.get("commit_hash", "")
+                if last_hash:
+                    params["last_commit_hash"] = last_hash
+            except Exception:
+                pass
 
     if is_git_mode:
         from qapilot.tools.git_codebase_scanner_tool import GitCodebaseScannerTool
@@ -294,7 +516,7 @@ async def _codebase_scan(state: PipelineState) -> dict:
     scan: dict[str, Any] = result.result["scan_result"]
 
     # L2: spec §6.1 정합 디스크 캐시 (Tool 본체 무수정)
-    _save_codebase_index_to_disk(scan)
+    _save_codebase_index_to_disk(scan, state)
 
     return {
         "trace_id": trace_id,
@@ -339,14 +561,90 @@ async def _domain_knowledge(state: PipelineState) -> dict:
 
 
 async def _requirement_extract(state: PipelineState) -> dict:
-    """FR-024 RequirementExtractorAgent 호출.
+    """FR-024 trigger별 요구사항 추출.
 
-    user_input이 있으면 사용자 입력 텍스트를, 없으면 docs/ 의 최신 PRD 파일을
-    그대로 RequirementExtractorAgent에 넘겨 LLM 기반으로 모든 FR-XXX를 추출한다.
+    trigger에 따라 호출 Agent가 다르다 (이슈 #180):
+    - natural_lang : NaturalLanguageAgent — 챗봇 자연어 쿼리 해석
+    - init / doc_update : RequirementExtractorAgent — PRD 문서에서 요구사항 추출
+    - code_change : 재추출 불필요 → 빈 requirements 반환
     """
-    from qapilot.agents.requirement_extractor import RequirementExtractorAgent
-    from qapilot.shared.schemas import AgentInput
+    trigger = (state["run_options"].get("trigger") or "init")
 
+    # ── natural_lang: 챗봇 쿼리 → NaturalLanguageAgent ──────────────────────────
+    if trigger == "natural_lang":
+        from qapilot.agents.natural_language_agent import NaturalLanguageAgent
+        from qapilot.shared.schemas import AgentInput
+        from qapilot.shared.session_store import (
+            get_last_exchange,
+            save_exchange,
+        )
+
+        user_input = (state["run_options"].get("user_input") or "").strip()
+        session_id = state["run_options"].get("session_id") or ""
+        qapilot_dir = state.get("qapilot_dir") or ""
+
+        # 직전 교환을 context에 포함 (sufficient도 포함 — "도" 같은 연결 표현의 맥락 유지)
+        # rejected 교환은 get_last_exchange에서 None 반환하므로 맥락 오염 없음
+        last_exchange = (
+            get_last_exchange(qapilot_dir, session_id)
+            if session_id and qapilot_dir else None
+        )
+
+        # 전체 시나리오 목록 로드
+        existing_scenarios_summary = _build_existing_scenarios_summary(state)
+
+        # 1단계: user_input 직접 임베딩 → top-N 후보 탐색 (이슈 #186)
+        # LLM에는 전체 목록 대신 후보만 전달 → 프롬프트 크기 제한, 확장성 확보
+        try:
+            top_candidates = await _rough_match_scenarios(user_input, existing_scenarios_summary)
+        except Exception as e:
+            get_logger("orchestrator").warning("rough_match_failed", error=str(e))
+            top_candidates = []
+
+        # 2단계: NaturalLanguageAgent — top_candidates 기반으로 create/update 판단
+        agent = NaturalLanguageAgent(trace_id=state["trace_id"])
+        output = await agent.run(
+            AgentInput(
+                trace_id=state["trace_id"],
+                context={
+                    "scan_result": state.get("scan_result"),
+                    "domain_rules": state.get("domain_rules") or [],
+                    "conversation_history": [last_exchange] if last_exchange else [],
+                    "top_candidates": top_candidates,
+                },
+                params={"trigger": "natural_lang", "user_input": user_input},
+            )
+        )
+
+        query_status = output.result.get("query_status", "sufficient")
+        query_feedback = output.result.get("query_feedback")
+
+        # 세션에 이번 교환 저장
+        if session_id and qapilot_dir:
+            save_exchange(qapilot_dir, session_id, user_input, query_status, query_feedback)
+
+        if query_status != "sufficient":
+            return {
+                "requirements": [],
+                "query_status": query_status,
+                "query_feedback": query_feedback,
+            }
+
+        requirements = output.result.get("requirements", []) or []
+
+        # 3단계: top_candidates 안에서 target_ts_id / target_tc_id 확정 주입 (이슈 #186)
+        try:
+            requirements = await _resolve_scenario_targets(requirements, top_candidates)
+        except Exception as e:
+            get_logger("orchestrator").warning("scenario_target_resolve_failed", error=str(e))
+
+        return {"requirements": requirements}
+
+    # ── code_change: 요구사항 재추출 불필요 ──────────────────────────────────────
+    if trigger == "code_change":
+        return {"requirements": []}
+
+    # ── init / doc_update: PRD 문서 → RequirementExtractorAgent ─────────────────
     user_input = (state["run_options"].get("user_input") or "").strip()
     document_text = user_input or _read_latest_prd_text()
 
@@ -360,34 +658,59 @@ async def _requirement_extract(state: PipelineState) -> dict:
             context={"domain_rules": state.get("domain_rules") or []},
             params={"document_text": document_text, "existing_count": 0},
         )
-    )
-    requirements = output.result.get("requirements", []) or []
-    return {"requirements": requirements}
+        return {"requirements": output.result.get("requirements", []) or []}
 
-
-def _read_latest_prd_text() -> str:
-    """docs/ 에서 최신 PRD 파일(.md)을 읽어 하나의 텍스트로 합쳐 반환한다.
-
-    .pdf/.docx 같은 비-텍스트 형식은 본 함수에서 다루지 않는다(임포터가 텍스트화 책임).
-    PRD가 여러 개라면 모두 합쳐 LLM에 전달한다.
-    """
+    # user_input 없음: Qdrant에 저장된 PRD 문서에서 요구사항 검색
+    from qapilot.shared.schemas import ToolInput
+    from qapilot.tools.domain_knowledge import DomainKnowledgeTool
     from qapilot.shared.config import load_config
 
     config = load_config()
     proj = config.project
     repo_root = Path(proj.root or proj.repo_path or ".")
     docs_dir = repo_root / "docs"
-    if not docs_dir.exists():
-        return ""
+    latest_prd_sources: set[str] = set()
+    if docs_dir.exists():
+        all_docs = [p for p in docs_dir.rglob("*") if p.is_file() and p.suffix.lower() in _SUPPORTED_DOC_SUFFIXES]
+        latest_prd_sources = {
+            p.name for p in _filter_latest_doc_versions(all_docs)
+            if "prd" in p.name.lower()
+        }
 
-    all_docs = [
-        p for p in docs_dir.rglob("*")
-        if p.is_file() and p.suffix.lower() in _SUPPORTED_DOC_SUFFIXES
-    ]
-    prd_docs = [
-        p for p in _filter_latest_doc_versions(all_docs)
-        if "prd" in p.name.lower() and p.suffix.lower() == ".md"
-    ]
+    tool = DomainKnowledgeTool(trace_id=state["trace_id"])
+    requirements = []
+    try:
+        result = await tool.run(
+            ToolInput(
+                trace_id=state["trace_id"],
+                params={"action": "search", "query": "기능 요구사항 시스템", "top_k": 30},
+            )
+        )
+        rules = result.result.get("rules", []) or []
+        prd_rules = [
+            r for r in rules
+            if r.get("source", "") in latest_prd_sources
+        ] if latest_prd_sources else [
+            r for r in rules if "prd" in r.get("source", "").lower()
+        ]
+        _NON_FUNC_KEYWORDS = {"비기능", "성능", "보안", "가용성", "안정성", "확장성"}
+        for i, rule in enumerate(prd_rules, start=1):
+            section = rule.get("section", "")
+            req_type = (
+                "non_functional"
+                if any(k in section for k in _NON_FUNC_KEYWORDS)
+                else "functional"
+            )
+            domain_area = section or rule.get("source", "").replace(".md", "")
+            requirements.append({
+                "req_id": f"REQ-{i:03d}",
+                "req_type": req_type,
+                "content": rule["content"],
+                "priority": "medium",
+                "domain_area": domain_area,
+            })
+    except Exception:
+        pass
 
     texts: list[str] = []
     for p in prd_docs:
@@ -406,15 +729,23 @@ async def _scenario_generate(state: PipelineState) -> dict:
     trigger = state["run_options"].get("trigger") or "code_change"
     affected_only = trigger == "code_change"
 
+    context: dict = {
+        "scan_result": state.get("scan_result"),
+        "domain_rules": state.get("domain_rules") or [],
+        "requirements": state.get("requirements") or [],
+        # codebase-index 디렉토리를 state.qapilot_dir 기준으로 read 하도록 전달.
+        # 미주입 시 agent 가 config.project.root → CWD fallback → qapilot 자체 dir 을 읽음 (회귀 원인).
+        "qapilot_dir": state.get("qapilot_dir"),
+    }
+
+    # natural_lang: existing_scenarios 불필요 — requirements의 target_ts_id/target_tc_id로
+    # ScenarioGeneratorAgent가 qapilot_dir/scenarios/{ts_id}.json을 직접 로드하면 됨
+
     agent = ScenarioGeneratorAgent(trace_id=state["trace_id"])
     output = await agent.run(
         AgentInput(
             trace_id=state["trace_id"],
-            context={
-                "scan_result": state.get("scan_result"),
-                "domain_rules": state.get("domain_rules") or [],
-                "requirements": state.get("requirements") or [],
-            },
+            context=context,
             params={"trigger": trigger, "affected_only": affected_only},
         )
     )
@@ -423,19 +754,70 @@ async def _scenario_generate(state: PipelineState) -> dict:
 
 
 async def _save_scenarios(state: PipelineState) -> dict:
-    """생성된 시나리오를 .qapilot/scenarios/{ts_id}.json 에 저장 (spec §6.1, L2)."""
+    """생성된 시나리오를 .qapilot/scenarios/{ts_id}.json 에 저장 (spec §6.1, L2).
+
+    동시에 RTM (Requirements Traceability Matrix) 버전 1개를 .qapilot/rtm-versions/ 에
+    자동 생성한다. 요구사항(state.requirements) ↔ TC(state.scenarios[].test_cases[].req_id)
+    매핑만 저장하고 status / passCount 는 Spring 이 응답 시점에 동적 계산한다.
+    """
     scenarios = state.get("scenarios") or []
-    scenarios_dir = Path(".qapilot") / "scenarios"
+    requirements = state.get("requirements") or []
+    logger = get_logger(source="orchestrator", trace_id=state.get("trace_id"))
+
+    # natural_lang에서 insufficient/rejected 반환 시 시나리오 저장 없이 통과 (이슈 #182)
+    query_status = state.get("query_status")
+    if query_status and query_status != "sufficient":
+        logger.info("save_scenarios_skipped", query_status=query_status)
+        return {
+            "saved_scenario_paths": [],
+            "status": "skipped",
+            "query_status": query_status,
+            "query_feedback": state.get("query_feedback"),
+        }
+
+    logger.info(
+        "save_scenarios_invoked",
+        scenarios_count=len(scenarios),
+        requirements_count=len(requirements),
+    )
+    scenarios_dir = _qapilot_path(state, "scenarios")
     scenarios_dir.mkdir(parents=True, exist_ok=True)
 
+    trigger = state["run_options"].get("trigger") or "init"
     saved_paths: list[str] = []
-    for idx, ts in enumerate(scenarios, start=1):
-        ts_id = ts.get("ts_id") or f"TS-{idx:03d}"
-        path = scenarios_dir / f"{ts_id}.json"
-        path.write_text(
-            json.dumps(ts, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
-        saved_paths.append(str(path))
+
+    if trigger == "natural_lang":
+        # natural_lang: delta(신규/수정 시나리오)만 저장, 기존 시나리오 파일 유지 (이슈 #180)
+        # ScenarioGeneratorAgent가 반환한 시나리오만 쓰고, 나머지는 건드리지 않음.
+        for idx, ts in enumerate(scenarios, start=1):
+            ts_id = ts.get("ts_id") or f"TS-{idx:03d}"
+            path = scenarios_dir / f"{ts_id}.json"
+            path.write_text(
+                json.dumps(ts, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+            saved_paths.append(str(path))
+            logger.info(
+                "scenario_merged",
+                ts_id=ts_id,
+                action_type=ts.get("action_type", "create"),
+            )
+    else:
+        for idx, ts in enumerate(scenarios, start=1):
+            ts_id = ts.get("ts_id") or f"TS-{idx:03d}"
+            path = scenarios_dir / f"{ts_id}.json"
+            path.write_text(
+                json.dumps(ts, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+            saved_paths.append(str(path))
+
+    # RTM 버전 자동 생성 — natural_lang delta 저장 시에는 skip (전체 시나리오 기준이 아니므로)
+    if trigger != "natural_lang":
+        try:
+            _write_initial_rtm_version(state)
+        except Exception as e:
+            # RTM 생성 실패는 본 시나리오 생성 흐름을 막지 않도록 silent.
+            logger = get_logger(source="orchestrator", trace_id=state.get("trace_id"))
+            logger.warning("rtm_version_write_failed", error=str(e))
 
     return {
         "saved_scenario_paths": saved_paths,
@@ -443,12 +825,110 @@ async def _save_scenarios(state: PipelineState) -> dict:
     }
 
 
+def _write_initial_rtm_version(state: PipelineState) -> None:
+    """state.requirements 와 scenarios 의 TC 들을 매핑해 RTM 버전 JSON 을 디스크에 저장.
+
+    label 은 기존 RTM 버전 수 +1 기준 vN.0 (예: v1.0, v2.0). status/카운트는 빈 채로
+    두고 Spring 응답 시점 동적 계산.
+
+    state.requirements 가 비어있으면, scenarios 의 ts_id 별로 placeholder FR 을 만들어
+    최소한 RTM 구조는 항상 생성한다 (UI 에 빈 RTM 페이지 보이지 않도록).
+    """
+    import uuid as _uuid
+    from datetime import datetime, timezone
+
+    logger = get_logger(source="orchestrator", trace_id=state.get("trace_id"))
+    requirements = state.get("requirements") or []
+    scenarios = state.get("scenarios") or []
+    logger.info(
+        "rtm_write_invoked",
+        requirements_count=len(requirements),
+        scenarios_count=len(scenarios),
+    )
+    if not scenarios:
+        logger.info("rtm_write_skipped", reason="no scenarios")
+        return
+
+    # requirements 가 비어있는 경우 fallback — 각 TS 별로 placeholder FR 생성.
+    # 이렇게 하면 LLM 이 req_id 안 채워도 최소한 RTM 페이지가 보임.
+    if not requirements:
+        logger.warning("rtm_using_ts_fallback", reason="empty requirements list")
+        requirements = []
+        for ts in scenarios:
+            ts_id = ts.get("ts_id")
+            if not ts_id:
+                continue
+            requirements.append({
+                "req_id": f"FR-{ts_id}",
+                "content": ts.get("name") or ts.get("description") or ts_id,
+            })
+            # TC 들에도 req_id 강제 주입 (이 후 매핑 작업용)
+            for tc in ts.get("test_cases") or []:
+                if not tc.get("req_id"):
+                    tc["req_id"] = f"FR-{ts_id}"
+
+    # req_id → [tc_id] 매핑 구성
+    req_to_tcs: dict[str, list[str]] = {}
+    for ts in scenarios:
+        for tc in ts.get("test_cases") or []:
+            req_id = tc.get("req_id")
+            tc_id = tc.get("tc_id")
+            if not req_id or not tc_id:
+                continue
+            req_to_tcs.setdefault(req_id, []).append(tc_id)
+
+    rtm_requirements: list[dict] = []
+    for req in requirements:
+        req_id = req.get("req_id")
+        if not req_id:
+            continue
+        rtm_requirements.append({
+            "frId": req_id,
+            "content": req.get("content") or "",
+            "status": "미측정",
+            "passCount": 0,
+            "totalCount": len(req_to_tcs.get(req_id, [])),
+            "history": [],
+            "linkedTcIds": req_to_tcs.get(req_id, []),
+        })
+
+    rtm_dir = _qapilot_path(state, "rtm-versions")
+    rtm_dir.mkdir(parents=True, exist_ok=True)
+    existing_count = len(list(rtm_dir.glob("*.json")))
+    label = f"v{existing_count + 1}.0"
+
+    rtm_version_id = str(_uuid.uuid4())
+    rtm_version = {
+        "rtmVersionId": rtm_version_id,
+        "serviceId": "",  # FastAPI 는 service_id 모름 — Spring 이 listAll 시 디렉토리 위치 기반으로 알아냄
+        "label": label,
+        "traceId": state.get("trace_id"),
+        "requirements": rtm_requirements,
+        "summary": {
+            "total": len(rtm_requirements),
+            "satisfied": 0,
+            "unsatisfied": 0,
+            "unmeasured": len(rtm_requirements),
+        },
+        "createdAt": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+    }
+    (rtm_dir / f"{rtm_version_id}.json").write_text(
+        json.dumps(rtm_version, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    logger.info(
+        "rtm_version_written",
+        rtm_version_id=rtm_version_id,
+        label=label,
+        fr_count=len(rtm_requirements),
+    )
+
+
 async def _load_scenarios_for_codegen(state: PipelineState) -> dict:
     """.qapilot/scenarios/ 에서 시나리오를 로드한다 (코드 생성용)."""
     import json
     from pathlib import Path
     
-    scenarios_dir = Path(".qapilot") / "scenarios"
+    scenarios_dir = _qapilot_path(state, "scenarios")
     if not scenarios_dir.exists():
         return {"scenarios": [], "error": "시나리오 디렉토리가 없습니다."}
 
@@ -473,7 +953,7 @@ async def _load_scenarios_for_codegen(state: PipelineState) -> dict:
     # scan_result 를 디스크 캐시에서 복원 (ActionMapperAgent 가 사용)
     scan_result = None
     try:
-        endpoints_path = Path(".qapilot") / "codebase-index" / "endpoints.json"
+        endpoints_path = _qapilot_path(state, "codebase-index", "endpoints.json")
         if endpoints_path.exists():
             endpoints = json.loads(endpoints_path.read_text(encoding="utf-8"))
             scan_result = {"files": [{"path": "mock", "endpoints": endpoints}]}
@@ -591,8 +1071,8 @@ async def _save_codes(state: PipelineState) -> dict:
     generated_codes = state.get("generated_codes") or []
     action_mappings = state.get("action_mappings") or []
 
-    code_dir = Path(".qapilot") / "generated-code"
-    am_dir = Path(".qapilot") / "action-mappings"
+    code_dir = _qapilot_path(state, "generated-code")
+    am_dir = _qapilot_path(state, "action-mappings")
     code_dir.mkdir(parents=True, exist_ok=True)
     am_dir.mkdir(parents=True, exist_ok=True)
 
@@ -635,7 +1115,7 @@ def _load_json_files(directory: Path) -> list[dict]:
     return items
 
 
-def _topo_sort_scenarios(scenarios: list[dict]) -> list[dict]:
+def _topo_sort_scenarios(scenarios: list[Any]) -> list[dict]:
     """`depends_on` (PR #82 신규) 기반 토폴로지 정렬.
 
     순환 의존 또는 unknown 의존은 graceful — 정렬 불가 항목은 마지막에 둠.
@@ -665,7 +1145,7 @@ def _topo_sort_scenarios(scenarios: list[dict]) -> list[dict]:
     return sorted_list
 
 
-def _collect_tc_tags(scenarios: list[dict]) -> dict[str, list[str]]:
+def _collect_tc_tags(scenarios: list[Any]) -> dict[str, list[str]]:
     """TC id → tag 목록 dict."""
     result: dict[str, list[str]] = {}
     for ts in scenarios:
@@ -676,12 +1156,12 @@ def _collect_tc_tags(scenarios: list[dict]) -> dict[str, list[str]]:
     return result
 
 
-def _ts_id_of_tc(tc_id: str, scenarios: list[dict]) -> str:
+def _ts_id_of_tc(tc_id: str, scenarios: list[Any]) -> str:
     """TC id → 소속 TS id. 매칭 실패 시 'unknown'."""
     for ts in scenarios:
         for tc in ts.get("test_cases") or []:
             if tc.get("tc_id") == tc_id:
-                return ts.get("ts_id") or "unknown"
+                return str(ts.get("ts_id") or "unknown")
     return "unknown"
 
 
@@ -695,11 +1175,11 @@ async def _load_scenarios_for_test(state: PipelineState) -> dict:
 
     trace_id = state.get("trace_id") or str(_uuid.uuid4())
 
-    scenarios = _load_json_files(Path(".qapilot") / "scenarios")
-    action_mappings = _load_json_files(Path(".qapilot") / "action-mappings")
+    scenarios = _load_json_files(_qapilot_path(state, "scenarios"))
+    action_mappings = _load_json_files(_qapilot_path(state, "action-mappings"))
 
     # generated_codes 는 .js 파일 — 검증·디버그용 (실행에 필수 X)
-    codes_dir = Path(".qapilot") / "generated-code"
+    codes_dir = _qapilot_path(state, "generated-code")
     generated_codes: list[dict] = []
     if codes_dir.exists():
         for path in sorted(codes_dir.glob("*.js")):
@@ -721,6 +1201,31 @@ async def _load_scenarios_for_test(state: PipelineState) -> dict:
         }
         action_mappings = [a for a in action_mappings if a.get("tc_id") in valid_tc_ids]
         generated_codes = [c for c in generated_codes if c.get("tc_id") in valid_tc_ids]
+
+    # "선택한 시나리오들의 전체 TC 수" 기록 — P/F/N 의 분모. resume 시 새로 실행한 TC 만이
+    # 아니라, 사용자가 선택한 시나리오의 전체 TC 수가 total 이 되어야 함.
+    selected_total_tc_count = sum(
+        len(s.get("test_cases") or []) for s in scenarios
+    )
+    try:
+        from qapilot.shared.trace_store import annotate_trace as _annotate
+        _annotate(state["qapilot_dir"], trace_id, selected_total_tc_count=selected_total_tc_count)
+    except Exception:
+        pass  # 디스크 쓰기 실패는 무시 — 메인 흐름 보존
+
+    # 필터 — run_options.resume_from_trace (이어서 실행)
+    # 이전 trace 의 results 디렉토리에 ui_result.json 이 있는 TC 는 이미 실행 완료된 것으로
+    # 간주하고 스킵. 끊긴 시점부터 이어가기 위함.
+    resume_from = state["run_options"].get("resume_from_trace")
+    if resume_from:
+        prev_results = _qapilot_path(state, "results", resume_from)
+        completed_tc_ids: set[str] = set()
+        if prev_results.exists():
+            for ui_path in prev_results.rglob("ui_result.json"):
+                completed_tc_ids.add(ui_path.parent.name)
+        if completed_tc_ids:
+            action_mappings = [a for a in action_mappings if a.get("tc_id") not in completed_tc_ids]
+            generated_codes = [c for c in generated_codes if c.get("tc_id") not in completed_tc_ids]
 
     # 필터 — run_options.tags (TC 단위)
     tags = state["run_options"].get("tags") or []
@@ -776,9 +1281,24 @@ async def _test_execution(state: PipelineState) -> dict:
     action_mappings = state.get("action_mappings") or []
     cfg = load_config()
     headless = bool(getattr(cfg.test, "headless", True)) if hasattr(cfg, "test") else True
-    target_url = getattr(cfg.project, "target_url", "") if hasattr(cfg, "project") else ""
+    # SaaS 호출 경로(Spring) 에서는 state.staging_url 이 service.stagingUrl 로 채워져 있다.
+    # CLI 단독 실행에서는 비어있으므로 cfg.project.target_url 로 fallback.
+    target_url = state.get("staging_url") or (
+        getattr(cfg.project, "target_url", "") if hasattr(cfg, "project") else ""
+    )
 
-    results_root = Path(".qapilot") / "results" / trace_id
+    # 이슈 #174 (격차 12 D 영역): UITestTool 의 _ensure_authenticated fail-safe 용
+    # cfg.project.test_account → dict 변환. cfg 미설정 시 None (Tool 측 graceful skip).
+    test_account_cfg = getattr(cfg.project, "test_account", None) if hasattr(cfg, "project") else None
+    test_account_dict: dict | None = None
+    if test_account_cfg and getattr(test_account_cfg, "email", None) and getattr(test_account_cfg, "password", None):
+        test_account_dict = {
+            "email": test_account_cfg.email,
+            "password": test_account_cfg.password,
+            "login_path": getattr(test_account_cfg, "login_path", None),
+        }
+
+    results_root = _qapilot_path(state, "results", trace_id)
 
     ui_results: list[dict] = []
     api_results: list[dict] = []
@@ -809,6 +1329,7 @@ async def _test_execution(state: PipelineState) -> dict:
                     UITestTool=UITestTool,
                     APITraceTool=APITraceTool,
                     ToolInput=ToolInput,
+                    test_account=test_account_dict,
                 )
                 ui_results.append(ui_res["ui_result"])
                 api_results.append(ui_res["api_result"])
@@ -835,7 +1356,10 @@ async def _test_execution(state: PipelineState) -> dict:
             await context.close()
             await browser.close()
 
-    tc_results = _aggregate_tc_results(ui_results, api_results, db_results)
+    # tc_results / scenario_results 집계는 디스크 기반 — 같은 trace_id 로 resume 한 경우
+    # 이전 run 의 결과도 results 디렉토리에 누적되어 있으므로 디스크 스캔이 진실의 source.
+    disk_ui, disk_api, disk_db = _load_all_tc_results_from_disk(results_root)
+    tc_results = _aggregate_tc_results(disk_ui, disk_api, disk_db)
     scenario_results = _aggregate_scenario_results(tc_results, scenarios)
 
     return {
@@ -847,6 +1371,32 @@ async def _test_execution(state: PipelineState) -> dict:
     }
 
 
+def _load_all_tc_results_from_disk(
+    results_root: Path,
+) -> tuple[list[dict], list[dict], list[dict]]:
+    """results/{trace_id}/<ts>/<tc>/{ui,api,db}_result.json 전체를 로드한다.
+
+    같은 trace 가 여러 차례 resume 되어 결과가 누적된 경우 전부 합쳐 반환.
+    """
+    ui_all: list[dict] = []
+    api_all: list[dict] = []
+    db_all: list[dict] = []
+    if not results_root.exists():
+        return ui_all, api_all, db_all
+    for tc_dir in results_root.glob("*/*"):
+        if not tc_dir.is_dir():
+            continue
+        for kind, bucket in (("ui", ui_all), ("api", api_all), ("db", db_all)):
+            f = tc_dir / f"{kind}_result.json"
+            if not f.exists():
+                continue
+            try:
+                bucket.append(json.loads(f.read_text(encoding="utf-8")))
+            except (json.JSONDecodeError, OSError):
+                continue
+    return ui_all, api_all, db_all
+
+
 def _aggregate_tc_results(
     ui_results: list[dict], api_results: list[dict], db_results: list[dict]
 ) -> dict[str, str]:
@@ -855,9 +1405,9 @@ def _aggregate_tc_results(
     판정 기준: UI 가 pass/skip/fallback_used 이고, API error_calls 0, DB error 없음 → passed.
     하나라도 위반 → failed. spec §6 의 results/{trace}/{ts}/{tc}/*.json 과 정합.
     """
-    ui_map = {r.get("tc_id"): r for r in ui_results if r.get("tc_id")}
-    api_map = {r.get("tc_id"): r for r in api_results if r.get("tc_id")}
-    db_map = {r.get("tc_id"): r for r in db_results if r.get("tc_id")}
+    ui_map: dict[str, Any] = {str(r["tc_id"]): r for r in ui_results if r.get("tc_id") is not None}
+    api_map: dict[str, Any] = {str(r["tc_id"]): r for r in api_results if r.get("tc_id") is not None}
+    db_map: dict[str, Any] = {str(r["tc_id"]): r for r in db_results if r.get("tc_id") is not None}
 
     tc_results: dict[str, str] = {}
     for tc_id in ui_map.keys():
@@ -875,7 +1425,7 @@ def _aggregate_tc_results(
 
 
 def _aggregate_scenario_results(
-    tc_results: dict[str, str], scenarios: list[dict]
+    tc_results: dict[str, str], scenarios: list[Any]
 ) -> dict[str, str]:
     """TS 별 status 도출 — 모든 TC passed → passed, 하나라도 failed → failed, TC 없으면 미수록.
 
@@ -901,13 +1451,14 @@ async def _run_ui_with_trace(
     *,
     page,
     tc_id: str,
-    action_mapping: dict,
+    action_mapping: Any,
     target_url: str,
     screenshots_dir: Path,
     trace_id: str,
     UITestTool,
     APITraceTool,
     ToolInput,
+    test_account: dict | None = None,
 ) -> dict:
     """APITraceTool 의 listener 등록 (즉시 반환) + UITestTool 실행 후 api calls 재계산."""
     apt = APITraceTool(trace_id=trace_id)
@@ -915,16 +1466,19 @@ async def _run_ui_with_trace(
     api_trace = apt_out.result["api_trace"]
 
     ui_tool = UITestTool(trace_id=trace_id)
+    ui_params = {
+        "page": page,
+        "action_mapping": action_mapping,
+        "tc_id": tc_id,
+        "target_url": target_url,
+        "screenshot_dir": str(screenshots_dir),
+    }
+    if test_account:
+        ui_params["test_account"] = test_account
     ui_out = await ui_tool.run(
         ToolInput(
             trace_id=trace_id,
-            params={
-                "page": page,
-                "action_mapping": action_mapping,
-                "tc_id": tc_id,
-                "target_url": target_url,
-                "screenshot_dir": str(screenshots_dir),
-            },
+            params=ui_params,
         )
     )
 
@@ -994,9 +1548,9 @@ async def _cross_check(state: PipelineState) -> dict:
     db_results = state.get("db_results") or []
 
     # tc_id 별 인덱싱
-    ui_map = {r.get("tc_id"): r for r in ui_results if r.get("tc_id")}
-    api_map = {r.get("tc_id"): r for r in api_results if r.get("tc_id")}
-    db_map = {r.get("tc_id"): r for r in db_results if r.get("tc_id")}
+    ui_map: dict[str, Any] = {str(r["tc_id"]): r for r in ui_results if r.get("tc_id") is not None}
+    api_map: dict[str, Any] = {str(r["tc_id"]): r for r in api_results if r.get("tc_id") is not None}
+    db_map: dict[str, Any] = {str(r["tc_id"]): r for r in db_results if r.get("tc_id") is not None}
 
     cross_check_results: list[dict] = []
     any_mismatch = False
@@ -1244,7 +1798,7 @@ async def _report(state: PipelineState) -> dict:
                     f"{s.get('description', '')[:160]}"
                 )
 
-    reports_dir = Path(".qapilot") / "reports"
+    reports_dir = _qapilot_path(state, "reports")
     reports_dir.mkdir(parents=True, exist_ok=True)
     report_path = reports_dir / f"{trace_id}.md"
     report_path.write_text("\n".join(lines), encoding="utf-8")

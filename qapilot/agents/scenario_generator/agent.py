@@ -156,6 +156,8 @@ class ScenarioGeneratorAgent(BaseAgent):
         requirements: list = context.get("requirements", [])
         trigger: str = params.get("trigger", "code_change")
         affected_only: bool = bool(params.get("affected_only", False))
+        # codebase-index read 경로 — pipeline 이 state.qapilot_dir 을 주입함. 없으면 CWD fallback.
+        self._qapilot_dir_override: str | None = context.get("qapilot_dir")
 
         if not scan_result:
             scan_result = await self._fetch_scan_result()
@@ -230,7 +232,7 @@ class ScenarioGeneratorAgent(BaseAgent):
         confidence = round(confidence_sum / len(router_map), 3) if router_map else 0.5
         all_scenarios = self._deduplicate_scenarios(all_scenarios)
         all_scenarios = self._renumber_and_set_depends_on(all_scenarios)
-        save_scenarios(all_scenarios)
+        # 디스크 영속화는 pipeline._save_scenarios 노드에서 수행 (위 메서드와 동일 사유).
 
         return ExecuteResult(
             result={"scenarios": all_scenarios, "prd_code_mismatches": mismatches},
@@ -305,6 +307,13 @@ class ScenarioGeneratorAgent(BaseAgent):
             self._correct_api_method_mismatches(ts_scenarios)
             self._pin_req_id(ts_scenarios, req_id)
             self._fill_api_for_domain(ts_scenarios, req, router_files, req_endpoints)
+
+            # 각 TC 에 req_id 강제 주입 — LLM 이 출력에서 누락해도 RTM 매핑이 유실되지 않도록.
+            # _run_domain_based 는 req 단위 1회 호출이라 모든 결과 TC 가 이 req 를 검증.
+            for s in ts_scenarios:
+                for tc in s.get("test_cases") or []:
+                    if not tc.get("req_id"):
+                        tc["req_id"] = req.get("req_id")
 
             for s in ts_scenarios:
                 if len(s["test_cases"]) < 6:
@@ -1374,6 +1383,11 @@ class ScenarioGeneratorAgent(BaseAgent):
         return "\n".join(lines) if lines else "코드 인덱스 없음"
 
     def _get_index_dir(self) -> Path:
+        # pipeline 이 state.qapilot_dir 을 _execute context 로 주입한 경우 그것이 진실원천.
+        # 미주입(CLI 단독 호출 등) 시 기존 fallback (config.project.root 또는 CWD).
+        override = getattr(self, "_qapilot_dir_override", None)
+        if override:
+            return Path(override) / "codebase-index"
         proj = self._config.project
         base = Path(proj.root or proj.repo_path or ".")
         return base / ".qapilot" / "codebase-index"

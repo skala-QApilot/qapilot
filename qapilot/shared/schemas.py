@@ -95,6 +95,11 @@ class RunOptions(TypedDict):
     scenario_ids: list[str] | None
     filter: Literal["all", "failed", "affected"] | None
     tags: list[str] | None
+    # test 전용 — 이어서 실행: 지정된 이전 trace 의 results 디렉토리에 이미 ui_result.json
+    # 이 있는 TC 는 새 실행에서 자동 skip 한다. 끊긴 시점부터 이어가기 위함.
+    resume_from_trace: str | None
+    # natural_lang 전용 — 챗봇 대화 세션 ID (이슈 #182)
+    session_id: str | None
     # git_codebase_scanner 전용 — Git 접속 정보
     repo_url: str
     token: str

@@ -5,6 +5,7 @@ Created: 2026-05-07
 """
 
 import structlog
+from dotenv import load_dotenv
 from fastapi import FastAPI, Request
 
 from qapilot.api.agent_router import router as agent_router
@@ -33,6 +34,9 @@ async def _trace_id_middleware(request: Request, call_next):
 
 def create_app() -> FastAPI:
     """FastAPI 앱을 생성한다."""
+    # .env 파일을 시작 시 1회 로드 — verify_internal_token 등 요청 처리 시점에
+    # os.getenv 로 환경변수를 읽는 경로가 있어 반드시 부팅 시 채워줘야 한다.
+    load_dotenv()
     setup_logger()
     app = FastAPI(title="QApilot", version="0.1.0")
 
