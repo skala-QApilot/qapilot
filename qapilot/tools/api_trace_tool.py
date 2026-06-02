@@ -8,7 +8,7 @@ Created: 2026-05-07
 """
 
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Any
 
 from playwright.async_api import Page, Request, Response
@@ -75,10 +75,45 @@ class APITraceTool(BaseTool):
         )
         self._calls.append(call)
 
+    def _match_steps(self, steps: list[dict], test_start_time: datetime) -> None:
+        """UI 스텝 실행 시간 범위로 API 호출에 matched_step_no 매칭.
+
+        각 스텝의 시작 시간 = test_start_time + 이전 스텝들의 duration_ms 누적
+        각 스텝의 종료 시간 = 시작 시간 + 해당 스텝 duration_ms
+        API 호출 timestamp가 스텝 시간 범위 안에 있으면 매칭
+        """
+        if not steps:
+            return
+
+        # 각 스텝의 시작/종료 시간 계산
+        step_ranges: list[tuple[int, datetime, datetime]] = []
+        elapsed_ms = 0
+        for step in steps:
+            step_no = step.get("step_no")
+            duration_ms = step.get("duration_ms", 0)
+            step_start = test_start_time + timedelta(milliseconds=elapsed_ms)
+            step_end = step_start + timedelta(milliseconds=duration_ms)
+            step_ranges.append((step_no, step_start, step_end))
+            elapsed_ms += duration_ms
+
+        # 각 API 호출에 matched_step_no 매칭
+        for call in self._calls:
+            try:
+                call_time = datetime.fromisoformat(call["timestamp"])
+            except Exception:
+                continue
+
+            for step_no, step_start, step_end in step_ranges:
+                if step_start <= call_time <= step_end:
+                    call["matched_step_no"] = step_no
+                    break
+
     async def _execute(self, params: dict[str, Any]) -> dict[str, Any]:
         """Playwright page에 네트워크 리스너 등록하고 API 호출 캡처."""
         page: Page = params.get("page")
         tc_id: str = params.get("tc_id", "unknown")
+        steps: list[dict] = params.get("steps", [])
+        test_start_time: datetime = params.get("test_start_time") or datetime.now(timezone.utc)
 
         if page is None:
             raise ValueError("params에 'page' (Playwright Page 인스턴스) 필요")
@@ -88,6 +123,10 @@ class APITraceTool(BaseTool):
 
         page.on("request", self._on_request)
         page.on("response", self._on_response)
+
+        # UI 스텝 정보가 있으면 matched_step_no 매칭
+        if steps:
+            self._match_steps(steps, test_start_time)
 
         error_calls = sum(1 for c in self._calls if c["status_code"] >= 400)
 
