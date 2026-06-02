@@ -434,7 +434,11 @@ class CodebaseScannerTool(BaseTool):
                 path = _node_text(args.named_children[0]).strip("\"'")
             defn = node.child_by_field_name("definition")
             handler = _node_text(defn.child_by_field_name("name")) if defn else ""
-            return {"method": method.upper(), "path": path, "handler": handler}
+            requires_auth = False
+            if defn:
+                params_text = _node_text(defn.child_by_field_name("parameters"))
+                requires_auth = "get_current_customer" in params_text or "get_current_user" in params_text
+            return {"method": method.upper(), "path": path, "handler": handler, "requires_auth": requires_auth}
         return None
 
     @staticmethod

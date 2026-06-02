@@ -1089,12 +1089,15 @@ class GitCodebaseScannerTool(BaseTool):
             defn = node.child_by_field_name("definition")
             handler = _node_text(defn.child_by_field_name("name")) if defn else ""
             params = _params_to_list(defn.child_by_field_name("parameters") if defn else None)
+            params_text = _node_text(defn.child_by_field_name("parameters")) if defn else ""
+            requires_auth = "get_current_customer" in params_text or "get_current_user" in params_text
             return {
                 "method": method.upper(),
                 "path": path,
                 "handler": handler,
                 "params": params,
                 "response_model": response_model,
+                "requires_auth": requires_auth,
             }
         return None
 
