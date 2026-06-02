@@ -1103,7 +1103,7 @@ def _load_json_files(directory: Path) -> list[dict]:
     return items
 
 
-def _topo_sort_scenarios(scenarios: list[dict]) -> list[dict]:
+def _topo_sort_scenarios(scenarios: list[Any]) -> list[dict]:
     """`depends_on` (PR #82 신규) 기반 토폴로지 정렬.
 
     순환 의존 또는 unknown 의존은 graceful — 정렬 불가 항목은 마지막에 둠.
@@ -1133,7 +1133,7 @@ def _topo_sort_scenarios(scenarios: list[dict]) -> list[dict]:
     return sorted_list
 
 
-def _collect_tc_tags(scenarios: list[dict]) -> dict[str, list[str]]:
+def _collect_tc_tags(scenarios: list[Any]) -> dict[str, list[str]]:
     """TC id → tag 목록 dict."""
     result: dict[str, list[str]] = {}
     for ts in scenarios:
@@ -1144,12 +1144,12 @@ def _collect_tc_tags(scenarios: list[dict]) -> dict[str, list[str]]:
     return result
 
 
-def _ts_id_of_tc(tc_id: str, scenarios: list[dict]) -> str:
+def _ts_id_of_tc(tc_id: str, scenarios: list[Any]) -> str:
     """TC id → 소속 TS id. 매칭 실패 시 'unknown'."""
     for ts in scenarios:
         for tc in ts.get("test_cases") or []:
             if tc.get("tc_id") == tc_id:
-                return ts.get("ts_id") or "unknown"
+                return str(ts.get("ts_id") or "unknown")
     return "unknown"
 
 
@@ -1393,9 +1393,9 @@ def _aggregate_tc_results(
     판정 기준: UI 가 pass/skip/fallback_used 이고, API error_calls 0, DB error 없음 → passed.
     하나라도 위반 → failed. spec §6 의 results/{trace}/{ts}/{tc}/*.json 과 정합.
     """
-    ui_map = {r.get("tc_id"): r for r in ui_results if r.get("tc_id")}
-    api_map = {r.get("tc_id"): r for r in api_results if r.get("tc_id")}
-    db_map = {r.get("tc_id"): r for r in db_results if r.get("tc_id")}
+    ui_map: dict[str, Any] = {str(r["tc_id"]): r for r in ui_results if r.get("tc_id") is not None}
+    api_map: dict[str, Any] = {str(r["tc_id"]): r for r in api_results if r.get("tc_id") is not None}
+    db_map: dict[str, Any] = {str(r["tc_id"]): r for r in db_results if r.get("tc_id") is not None}
 
     tc_results: dict[str, str] = {}
     for tc_id in ui_map.keys():
@@ -1413,7 +1413,7 @@ def _aggregate_tc_results(
 
 
 def _aggregate_scenario_results(
-    tc_results: dict[str, str], scenarios: list[dict]
+    tc_results: dict[str, str], scenarios: list[Any]
 ) -> dict[str, str]:
     """TS 별 status 도출 — 모든 TC passed → passed, 하나라도 failed → failed, TC 없으면 미수록.
 
@@ -1439,7 +1439,7 @@ async def _run_ui_with_trace(
     *,
     page,
     tc_id: str,
-    action_mapping: dict,
+    action_mapping: Any,
     target_url: str,
     screenshots_dir: Path,
     trace_id: str,
@@ -1536,9 +1536,9 @@ async def _cross_check(state: PipelineState) -> dict:
     db_results = state.get("db_results") or []
 
     # tc_id 별 인덱싱
-    ui_map = {r.get("tc_id"): r for r in ui_results if r.get("tc_id")}
-    api_map = {r.get("tc_id"): r for r in api_results if r.get("tc_id")}
-    db_map = {r.get("tc_id"): r for r in db_results if r.get("tc_id")}
+    ui_map: dict[str, Any] = {str(r["tc_id"]): r for r in ui_results if r.get("tc_id") is not None}
+    api_map: dict[str, Any] = {str(r["tc_id"]): r for r in api_results if r.get("tc_id") is not None}
+    db_map: dict[str, Any] = {str(r["tc_id"]): r for r in db_results if r.get("tc_id") is not None}
 
     cross_check_results: list[dict] = []
     any_mismatch = False
