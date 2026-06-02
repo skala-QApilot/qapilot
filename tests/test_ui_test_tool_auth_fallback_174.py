@@ -122,3 +122,46 @@ async def test_email_password_fill_invoked(mock_page):
     fill_values = [c.args[0] if c.args else c.kwargs.get("value") for c in fill_calls]
     assert any("demo@test.com" in str(v) for v in fill_values)
     assert any("Passw0rd!" in str(v) for v in fill_values)
+
+
+# ── _ensure_page_loaded (보강 #1) ────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_page_load_fallback_about_blank_navigates(mock_page):
+    """page.url = about:blank → target_url 로 강제 navigate."""
+    tool = _make_tool()
+    mock_page.url = "about:blank"
+    await tool._ensure_page_loaded(mock_page, "http://localhost:3000")
+    mock_page.goto.assert_awaited_once_with(
+        "http://localhost:3000", wait_until="domcontentloaded", timeout=10000
+    )
+
+
+@pytest.mark.asyncio
+async def test_page_load_fallback_already_loaded_skip(mock_page):
+    """이미 SUT 페이지 로드됨 → skip."""
+    tool = _make_tool()
+    mock_page.url = "http://localhost:3000/dashboard"
+    await tool._ensure_page_loaded(mock_page, "http://localhost:3000")
+    mock_page.goto.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_page_load_fallback_invalid_target_url_skip(mock_page):
+    """target_url 미설정 또는 scheme 부재 → graceful skip."""
+    tool = _make_tool()
+    mock_page.url = "about:blank"
+    await tool._ensure_page_loaded(mock_page, "")
+    mock_page.goto.assert_not_awaited()
+    await tool._ensure_page_loaded(mock_page, "/relative")
+    mock_page.goto.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_page_load_fallback_data_scheme_navigates(mock_page):
+    """data:, scheme 도 SUT 미로드 → target_url 로 navigate."""
+    tool = _make_tool()
+    mock_page.url = "data:,"
+    await tool._ensure_page_loaded(mock_page, "http://localhost:3000")
+    mock_page.goto.assert_awaited_once()

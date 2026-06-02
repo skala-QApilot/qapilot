@@ -96,9 +96,15 @@ async def test_git_mode_uses_git_scanner_when_repos_list_provided(mock_base_tool
 
 
 @pytest.mark.asyncio
-async def test_local_mode_passes_trigger_through(mock_base_tool):
-    """로컬 모드도 trigger 등 params 전달."""
+async def test_local_mode_passes_trigger_through(mock_base_tool, tmp_path):
+    """로컬 모드도 trigger 등 params 전달.
+
+    이슈 #180: code_change 트리거는 _qapilot_path(manifest.json) 접근이 추가되어
+    qapilot_dir 가 state 에 있어야 한다. manifest.json 미존재 시 last_commit_hash 미전달로
+    안전하게 폴백하므로 파일 생성 없이 tmp_path 만 전달한다.
+    """
     state = _make_state({"trigger": "code_change"})
+    state["qapilot_dir"] = str(tmp_path)
 
     mock_base_tool.run.return_value = MagicMock(result={"scan_result": _mock_scan_result()})
 
