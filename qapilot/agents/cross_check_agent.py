@@ -104,7 +104,7 @@ class CrossCheckAgent(BaseAgent):
         api_trace: dict,
         db_result: dict,
         last_error: str | None,
-    ) -> tuple[list[CrossCheckMismatch], float, str, str]:
+    ) -> tuple[list[CrossCheckMismatch], float, int, str, str]:
         """LLM으로 UI/API/DB 불일치 분석.
 
         이슈 #131: LLM 호출 직전 input 압축 — context_length_exceeded 차단.
@@ -152,15 +152,17 @@ class CrossCheckAgent(BaseAgent):
             parsed = json.loads(response.content)
             mismatches = [CrossCheckMismatch(**m) for m in parsed.get("mismatches", [])]
             match_score = float(parsed.get("match_score", 1.0))
+            matched_fields = int(parsed.get("matched_fields", 0))
             error_code = parsed.get("error_code", "none")
             summary = parsed.get("summary", "")
         except Exception:
             mismatches = []
             match_score = 1.0
+            matched_fields = 0
             error_code = "none"
             summary = ""
 
-        return mismatches, match_score, error_code, summary
+        return mismatches, match_score, matched_fields, error_code, summary
 
     async def _execute(
         self,
@@ -186,7 +188,7 @@ class CrossCheckAgent(BaseAgent):
                 has_mismatch=True,
             )
             # 경로 A summary는 LLM으로 생성
-            _, _, _, summary = await self._analyze_with_llm(
+            _, _, _, _, summary = await self._analyze_with_llm(
                 ui_result, api_trace, db_result, last_error
             )
             return ExecuteResult(
@@ -200,14 +202,14 @@ class CrossCheckAgent(BaseAgent):
             )
 
         # 경로 B: 에러 코드 없는 경우 → LLM으로 불일치 분석
-        mismatches, match_score, mismatch_code, summary = await self._analyze_with_llm(
+        mismatches, match_score, matched_fields, mismatch_code, summary = await self._analyze_with_llm(
             ui_result, api_trace, db_result, last_error
         )
 
         result = CrossCheckResult(
             tc_id=tc_id,
             match_score=match_score,
-            matched_fields=0,
+            matched_fields=matched_fields,
             mismatched_fields=len(mismatches),
             mismatches=mismatches,
             has_mismatch=len(mismatches) > 0,

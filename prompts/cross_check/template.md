@@ -24,8 +24,10 @@
       "db_value": "DB 값 또는 null"
     }
   ],
+  "matched_fields": 0,
   "match_score": 0.0
 }
 ```
 
-불일치가 없으면 error_code는 "none", mismatches는 빈 배열, match_score는 1.0으로 반환한다.
+- matched_fields: 비교한 전체 필드 중 UI/API/DB 값이 일치한 필드 수
+- 불일치가 없으면 error_code는 "none", mismatches는 빈 배열, match_score는 1.0으로 반환한다.
