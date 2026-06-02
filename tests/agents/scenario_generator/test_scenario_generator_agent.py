@@ -97,7 +97,14 @@ VALID_LLM_JSON = {
 
 
 def _make_llm_response(data: dict) -> LLMResponse:
-    return LLMResponse(content=json.dumps(data, ensure_ascii=False), model="gpt-4o-mini", tokens_used=100, cached=False)
+    return LLMResponse(
+        content=json.dumps(data, ensure_ascii=False),
+        model="gpt-4o-mini",
+        input_tokens=50,
+        output_tokens=50,
+        cost_usd=0.0,
+        cached=False,
+    )
 
 
 def _make_input(**context_kwargs) -> AgentInput:
@@ -113,6 +120,17 @@ def _make_input(**context_kwargs) -> AgentInput:
     )
 
 
+def _patch_index(agent: ScenarioGeneratorAgent, endpoints: list[dict]) -> None:
+    def read_index(filename: str):
+        if filename == "endpoints.json":
+            return endpoints
+        if filename == "manifest.json":
+            return {"framework": "FastAPI", "language": "Python"}
+        return []
+
+    agent._read_index_json = read_index  # type: ignore[method-assign]
+
+
 # ── 테스트 ──────────────────────────────────────────────────────────────────────
 
 
@@ -125,7 +143,7 @@ async def test_시나리오_정상_생성(mock_save):
     output = await agent.run(_make_input())
 
     scenarios = output.result["scenarios"]
-    assert len(scenarios) == 1
+    assert len(scenarios) == len(SAMPLE_REQUIREMENTS)
     assert scenarios[0]["ts_id"] == "TS-001"
     assert scenarios[0]["name"] == "회원 가입 시나리오"
     assert len(scenarios[0]["test_cases"]) == 2
@@ -228,3 +246,153 @@ async def test_TS_TC_ID_자동_부여(mock_save):
     tcs = scenarios[0]["test_cases"]
     assert tcs[0]["tc_id"] == "TS-001-TC-01"
     assert tcs[1]["tc_id"] == "TS-001-TC-02"
+
+
+def test_요구사항_API_후보_밖_api는_null로_정리된다():
+    """요구사항에 매핑된 API 후보 밖의 실제 API도 해당 TS에는 연결하지 않는다."""
+    agent = ScenarioGeneratorAgent(trace_id="test-trace")
+    endpoints = [
+        {"method": "POST", "path": "", "file": "src/auth.py", "handler": "signup"},
+        {"method": "GET", "path": "/me", "file": "src/auth.py", "handler": "me"},
+    ]
+    _patch_index(agent, endpoints)
+
+    scenarios = [
+        {
+            "test_cases": [
+                {"api": "POST /api/auth"},
+                {"api": "GET /api/auth/me"},
+            ]
+        }
+    ]
+
+    agent._sanitize_api_fields(scenarios, {"POST /api/auth"})
+
+    assert scenarios[0]["test_cases"][0]["api"] == "POST /api/auth"
+    assert scenarios[0]["test_cases"][1]["api"] is None
+
+
+def test_요구사항_ID는_현재_요구사항으로_고정된다():
+    """LLM이 없는 요구사항 ID를 만들면 현재 요구사항 ID로 덮어쓴다."""
+    agent = ScenarioGeneratorAgent(trace_id="test-trace")
+    scenarios = [
+        {
+            "requirements": ["FR-FAKE-99"],
+            "test_cases": [
+                {"req_id": "FR-FAKE-99"},
+                {"req_id": None},
+            ],
+        }
+    ]
+
+    agent._pin_req_id(scenarios, "FR-ORDER-01")
+
+    assert scenarios[0]["requirements"] == ["FR-ORDER-01"]
+    assert [tc["req_id"] for tc in scenarios[0]["test_cases"]] == [
+        "FR-ORDER-01",
+        "FR-ORDER-01",
+    ]
+
+
+def test_전역_api_null_채움은_요구사항_매핑_api만_사용한다():
+    """저장 직전 null api 보정도 요구사항에 매핑된 API 후보 안에서만 수행한다."""
+    agent = ScenarioGeneratorAgent(trace_id="test-trace")
+    endpoints = [
+        {
+            "method": "PATCH",
+            "path": "/{order_id}/change-plan",
+            "file": "backend/app/routers/orders.py",
+            "handler": "change_plan",
+        },
+        {
+            "method": "GET",
+            "path": "",
+            "file": "backend/app/routers/orders.py",
+            "handler": "list_orders",
+        },
+    ]
+    _patch_index(agent, endpoints)
+    scenarios = [
+        {
+            "name": "요금제 변경",
+            "requirements": ["FR-ORDER-02"],
+            "affected_files": ["backend/app/routers/orders.py"],
+            "test_cases": [
+                {
+                    "name": "요금제 즉시 변경",
+                    "when": "요금제 변경을 요청하면",
+                    "api": None,
+                }
+            ],
+        }
+    ]
+
+    agent._fill_api_nulls_global(
+        scenarios,
+        {"FR-ORDER-02": [endpoints[0]]},
+    )
+
+    assert scenarios[0]["test_cases"][0]["api"] == "PATCH /api/orders/{order_id}/change-plan"
+
+
+def test_요구사항_분리에서_API검증_불가_NFR은_제외된다():
+    """성능/가용성 NFR은 제외하고 X-Trace-Id는 API 검증 대상으로 남긴다."""
+    agent = ScenarioGeneratorAgent(trace_id="test-trace")
+    requirements = [
+        {
+            "req_id": "FR-TIER-01",
+            "req_type": "functional",
+            "content": "[FR-TIER-01] 내 등급 조회 — 엔드포인트: GET /api/tier",
+            "priority": "high",
+            "domain_area": "멤버십 등급",
+        },
+        {
+            "req_id": "REQ-002",
+            "req_type": "non_functional",
+            "content": "API 응답 시간 p99는 500ms 이하이어야 한다",
+            "priority": "medium",
+            "domain_area": "성능",
+        },
+        {
+            "req_id": "REQ-005",
+            "req_type": "non_functional",
+            "content": "모든 응답에 X-Trace-Id 헤더를 부여한다",
+            "priority": "medium",
+            "domain_area": "추적성",
+        },
+    ]
+
+    target, skipped = agent._split_scenario_requirements(requirements)
+
+    assert [req["req_id"] for req in target] == ["FR-TIER-01", "REQ-005"]
+    assert [req["req_id"] for req in skipped] == ["REQ-002"]
+
+
+def test_요구사항_본문의_명시적_API를_우선_매핑한다():
+    """FR 본문에 적힌 METHOD /api/path가 있으면 그 엔드포인트만 후보로 사용한다."""
+    agent = ScenarioGeneratorAgent(trace_id="test-trace")
+    endpoints = [
+        {
+            "method": "GET",
+            "path": "",
+            "file": "backend/app/routers/tier.py",
+            "handler": "get_my_tier",
+        },
+        {
+            "method": "POST",
+            "path": "/brands/{brand_code}/issue",
+            "file": "backend/app/routers/tier.py",
+            "handler": "issue_tier_brand_coupon",
+        },
+    ]
+
+    selected = agent._select_endpoints_for_requirement(
+        {
+            "req_id": "FR-TIER-01",
+            "content": "[FR-TIER-01] 내 등급 조회 — 엔드포인트: GET /api/tier",
+            "domain_area": "멤버십 등급",
+        },
+        endpoints,
+    )
+
+    assert [agent._get_full_ep_path(ep) for ep in selected] == ["GET /api/tier"]

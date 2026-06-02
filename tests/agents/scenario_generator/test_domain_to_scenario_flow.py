@@ -93,7 +93,14 @@ LLM_RESPONSE_JSON = {
 
 
 def _llm_resp(data: dict) -> LLMResponse:
-    return LLMResponse(content=json.dumps(data, ensure_ascii=False), model="gpt-4o-mini", tokens_used=120, cached=False)
+    return LLMResponse(
+        content=json.dumps(data, ensure_ascii=False),
+        model="gpt-4o-mini",
+        input_tokens=60,
+        output_tokens=60,
+        cost_usd=0.0,
+        cached=False,
+    )
 
 
 @patch("qapilot.agents.scenario_generator.agent.save_scenarios")
