@@ -726,10 +726,8 @@ async def _scenario_generate(state: PipelineState) -> dict:
         "qapilot_dir": state.get("qapilot_dir"),
     }
 
-    # natural_lang: 기존 시나리오를 context로 전달하여 추가/수정 여부 판단 가능하게 함 (이슈 #180)
-    if trigger == "natural_lang":
-        existing = _load_json_files(_qapilot_path(state, "scenarios"))
-        context["existing_scenarios"] = existing
+    # natural_lang: existing_scenarios 불필요 — requirements의 target_ts_id/target_tc_id로
+    # ScenarioGeneratorAgent가 qapilot_dir/scenarios/{ts_id}.json을 직접 로드하면 됨
 
     agent = ScenarioGeneratorAgent(trace_id=state["trace_id"])
     output = await agent.run(
