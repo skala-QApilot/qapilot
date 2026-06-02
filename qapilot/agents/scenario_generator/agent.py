@@ -298,7 +298,7 @@ class ScenarioGeneratorAgent(BaseAgent):
 
         domain_area = req.get("domain_area") or "기타"
         router_files = self._find_router_files_for_domain(domain_area, [req])
-        area_domain_rules = await self._fetch_domain_rules(domain_area, top_k=5)
+        area_domain_rules = domain_rules if domain_rules else await self._fetch_domain_rules(domain_area, top_k=5)
         area_domain_rules_text = DomainKnowledgeTool.format_rules_for_prompt(area_domain_rules) or "없음"
 
         user_prompt = self.with_correction_hint(
@@ -361,7 +361,7 @@ class ScenarioGeneratorAgent(BaseAgent):
 
         domain_area = req.get("domain_area") or "기타"
         router_files = existing_ts.get("affected_files") or self._find_router_files_for_domain(domain_area, [req])
-        area_domain_rules = await self._fetch_domain_rules(domain_area, top_k=5)
+        area_domain_rules = domain_rules if domain_rules else await self._fetch_domain_rules(domain_area, top_k=5)
         area_domain_rules_text = DomainKnowledgeTool.format_rules_for_prompt(area_domain_rules) or "없음"
 
         existing_tc_summary = "\n".join(
@@ -423,7 +423,7 @@ class ScenarioGeneratorAgent(BaseAgent):
         target_tc_id = req.get("target_tc_id")
         domain_area = req.get("domain_area") or "기타"
         router_files = existing_ts.get("affected_files") or self._find_router_files_for_domain(domain_area, [req])
-        area_domain_rules = await self._fetch_domain_rules(domain_area, top_k=5)
+        area_domain_rules = domain_rules if domain_rules else await self._fetch_domain_rules(domain_area, top_k=5)
         area_domain_rules_text = DomainKnowledgeTool.format_rules_for_prompt(area_domain_rules) or "없음"
 
         target_tc = next(
@@ -498,7 +498,7 @@ class ScenarioGeneratorAgent(BaseAgent):
         target_tc_id = req.get("target_tc_id")
         domain_area = req.get("domain_area") or "기타"
         router_files = existing_ts.get("affected_files") or self._find_router_files_for_domain(domain_area, [req])
-        area_domain_rules = await self._fetch_domain_rules(domain_area, top_k=5)
+        area_domain_rules = domain_rules if domain_rules else await self._fetch_domain_rules(domain_area, top_k=5)
         area_domain_rules_text = DomainKnowledgeTool.format_rules_for_prompt(area_domain_rules) or "없음"
 
         target_tcs = [

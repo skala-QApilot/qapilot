@@ -97,7 +97,7 @@ VALID_LLM_JSON = {
 
 
 def _make_llm_response(data: dict) -> LLMResponse:
-    return LLMResponse(content=json.dumps(data, ensure_ascii=False), model="gpt-4o-mini", tokens_used=100, cached=False)
+    return LLMResponse(content=json.dumps(data, ensure_ascii=False), model="gpt-4o-mini", input_tokens=50, output_tokens=50, cost_usd=0.0, cached=False)
 
 
 def _make_input(**context_kwargs) -> AgentInput:
@@ -125,7 +125,8 @@ async def test_시나리오_정상_생성(mock_save):
     output = await agent.run(_make_input())
 
     scenarios = output.result["scenarios"]
-    assert len(scenarios) == 1
+    # 요구사항 수(2)만큼 TS 생성 — 요구사항별 1:1 생성 방식
+    assert len(scenarios) == len(SAMPLE_REQUIREMENTS)
     assert scenarios[0]["ts_id"] == "TS-001"
     assert scenarios[0]["name"] == "회원 가입 시나리오"
     assert len(scenarios[0]["test_cases"]) == 2
