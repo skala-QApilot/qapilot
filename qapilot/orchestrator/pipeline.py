@@ -1304,16 +1304,21 @@ async def _test_execution(state: PipelineState) -> dict:
         getattr(cfg.project, "target_url", "") if hasattr(cfg, "project") else ""
     )
 
-    # 이슈 #174 (격차 12 D 영역): UITestTool 의 _ensure_authenticated fail-safe 용
-    # cfg.project.test_account → dict 변환. cfg 미설정 시 None (Tool 측 graceful skip).
-    test_account_cfg = getattr(cfg.project, "test_account", None) if hasattr(cfg, "project") else None
-    test_account_dict: dict | None = None
-    if test_account_cfg and getattr(test_account_cfg, "email", None) and getattr(test_account_cfg, "password", None):
-        test_account_dict = {
-            "email": test_account_cfg.email,
-            "password": test_account_cfg.password,
-            "login_path": getattr(test_account_cfg, "login_path", None),
-        }
+    # 이슈 #174 (격차 12 D 영역): UITestTool 의 _ensure_authenticated fail-safe 용 test_account.
+    # 격차 12 SaaS 후속 (2026-06-02): state.test_account 우선 (Spring 이 body 로 채움) →
+    # 없으면 cfg.project.test_account fallback (CLI 흐름 / dev 임시). staging_url 동형.
+    test_account_state = state.get("test_account")
+    test_account_dict: dict | None = (
+        test_account_state if isinstance(test_account_state, dict) and test_account_state.get("email") and test_account_state.get("password") else None
+    )
+    if test_account_dict is None:
+        test_account_cfg = getattr(cfg.project, "test_account", None) if hasattr(cfg, "project") else None
+        if test_account_cfg and getattr(test_account_cfg, "email", None) and getattr(test_account_cfg, "password", None):
+            test_account_dict = {
+                "email": test_account_cfg.email,
+                "password": test_account_cfg.password,
+                "login_path": getattr(test_account_cfg, "login_path", None),
+            }
 
     results_root = _qapilot_path(state, "results", trace_id)
 
