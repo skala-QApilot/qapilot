@@ -26,6 +26,7 @@ from typing import Any
 
 from langgraph.graph import END, START, StateGraph
 
+from qapilot.db.code_writer import upsert_action_mapping, upsert_codebase_index, upsert_generated_code
 from qapilot.db.rtm_writer import write_rtm_version
 from qapilot.db.scenario_writer import upsert_scenario_version
 from qapilot.db.tc_result_writer import insert_tc_artifact, upsert_tc_result
@@ -177,16 +178,28 @@ def _save_codebase_index_to_disk(scan: dict, state: PipelineState) -> None:
         "endpoint_count": int(scan.get("endpoint_count", 0) or 0),
     }
 
-    for filename, payload in (
+    indices: tuple[tuple[str, Any], ...] = (
         ("endpoints.json", endpoints),
         ("models.json", models),
         ("functions.json", functions),
         ("callgraph.json", callgraph),
         ("manifest.json", manifest),
-    ):
+    )
+    for filename, payload in indices:
         (cache_dir / filename).write_text(
             json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
         )
+
+    # PR-17 — DB+S3 mirror. service_id 는 trace.json 에서.
+    trace = load_trace(state["qapilot_dir"], state["trace_id"]) or {}
+    service_id = trace.get("service_id")
+    if service_id:
+        commit_hash = manifest.get("commit_hash") or None
+        file_count = manifest.get("file_count")
+        for filename, payload in indices:
+            kind = filename.replace(".json", "")
+            upsert_codebase_index(service_id, commit_hash, kind, payload,
+                                  file_count=file_count if kind == "manifest" else None)
 
 
 # ── Layer 1A 노드 (generate_scenarios) ────────────────────────────────────────
@@ -1089,21 +1102,30 @@ async def _save_codes(state: PipelineState) -> dict:
     am_dir.mkdir(parents=True, exist_ok=True)
 
     saved_code_paths: list[str] = []
+    # PR-17 — DB+S3 dual-write. trace.json 에서 service_id lookup. 없으면 graceful skip.
+    trace = load_trace(state["qapilot_dir"], state["trace_id"]) or {}
+    service_id = trace.get("service_id")
+
     for code_obj in generated_codes:
         tc_id = code_obj.get("tc_id")
         if not tc_id:
             continue
+        code_text = code_obj.get("code", "")
         path = code_dir / f"{tc_id}.js"
-        path.write_text(code_obj.get("code", ""), encoding="utf-8")
+        path.write_text(code_text, encoding="utf-8")
         saved_code_paths.append(str(path))
+        if service_id:
+            upsert_generated_code(service_id, tc_id, code_text)
 
-    # 신규 — ActionMapping 디스크 영속화 (Layer 2 의 _load_scenarios_for_test 가 읽음)
+    # ActionMapping 디스크 영속화 (Layer 2 의 _load_scenarios_for_test 가 읽음)
     for am in action_mappings:
         tc_id = am.get("tc_id")
         if not tc_id:
             continue
         path = am_dir / f"{tc_id}.json"
         path.write_text(json.dumps(am, ensure_ascii=False, indent=2), encoding="utf-8")
+        if service_id:
+            upsert_action_mapping(service_id, tc_id, am)
 
     return {
         "saved_code_paths": saved_code_paths,
