@@ -192,6 +192,7 @@ class TestCase(TypedDict):
     tags: list[str]
     req_id: str | None
     api: str | None  # 검증 대상 API (예: "POST /api/orders")
+    depends_on: list[str]  # 선행 TC ID 목록 (예: ["TS-034-TC-01"])
 
 
 class TestScenario(TypedDict):
