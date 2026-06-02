@@ -53,6 +53,13 @@ class PipelineState(TypedDict):
     # → _test_execution 이 cfg.project.target_url 로 fallback 한다.
     staging_url: str
 
+    # SUT 인증 정보 (격차 12 SaaS 후속). SaaS 호출 경로에서 Spring 이 body 에 `test_account`
+    # dict ({email, password, login_path?}) 를 채워 보내면 agent_router 가 state 에 주입.
+    # _test_execution 이 cfg.project.test_account 보다 우선 사용 (staging_url 동형).
+    # CLI 단독 실행 / Spring 미주입 시 None — UITestTool 의 _ensure_authenticated 가 cfg 로
+    # fallback 또는 graceful skip.
+    test_account: dict | None
+
     # ── Layer 1A: 컨텍스트 + 시나리오 생성 ──
     scan_result: ScanResult | None
     domain_rules: list[DomainRule]

@@ -25,15 +25,27 @@ def run_pipeline_task(
     trace_id: str,
     options: dict[str, Any],
     staging_url: str | None = None,
+    test_account: dict | None = None,
 ) -> dict[str, Any]:
     """파이프라인 1회 실행. self.request.id 가 Celery task id (runs.task_id 에 저장).
 
     내부 run_pipeline 은 async — 워커 컨텍스트에서 새 event loop 로 돌린다.
     각 워커 프로세스는 자체 loop 를 가지므로 asyncio.run 안전.
+
+    test_account: 격차 12 SaaS 후속 — Spring 이 body 로 보낸 인증 정보 dict.
+    None 이면 pipeline._test_execution 이 cfg.project.test_account 로 fallback.
     """
     _logger.info("celery_task_started", trace_id=trace_id, task_id=self.request.id)
     try:
-        return asyncio.run(run_pipeline(qapilot_dir=qapilot_dir, trace_id=trace_id, options=options, staging_url=staging_url))
+        return asyncio.run(
+            run_pipeline(
+                qapilot_dir=qapilot_dir,
+                trace_id=trace_id,
+                options=options,
+                staging_url=staging_url,
+                test_account=test_account,
+            )
+        )
     except Exception as e:
         _logger.error("celery_task_failed", trace_id=trace_id, error=str(e))
         raise

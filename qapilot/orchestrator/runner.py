@@ -23,6 +23,7 @@ async def run_pipeline(
     qapilot_dir: str | Path,
     trace_id: str | None = None,
     staging_url: str | None = None,
+    test_account: dict | None = None,
 ) -> PipelineState:
     """파이프라인을 실행하고 최종 상태를 반환한다.
 
@@ -34,6 +35,9 @@ async def run_pipeline(
         trace_id: 외부에서 발급된 trace_id. None 이면 새로 발급한다.
         staging_url: SUT base URL. SaaS 호출 경로에서 service.stagingUrl 을 그대로 흘려준다.
             None/빈 문자열이면 Layer 2 의 _test_execution 이 cfg.project.target_url 로 fallback.
+        test_account: SUT 인증 정보 ({email, password, login_path?}). 격차 12 SaaS 후속 —
+            Spring 이 body 에 채워 보내면 _test_execution 이 cfg.project.test_account 보다
+            우선 사용. None 이면 cfg fallback 또는 _ensure_authenticated graceful skip.
 
     Returns:
         파이프라인 최종 상태.
@@ -60,6 +64,7 @@ async def run_pipeline(
         "error": None,
         "qapilot_dir": str(Path(qapilot_dir).resolve()),
         "staging_url": staging_url or "",
+        "test_account": test_account if isinstance(test_account, dict) else None,
         # Layer 1A
         "scan_result": None,
         "domain_rules": [],

@@ -55,6 +55,7 @@ def _submit_pipeline(
     trace_id: str,
     options: RunOptions,
     staging_url: str | None,
+    test_account: dict | None = None,
 ) -> None:
     """파이프라인 실행 제출 — Celery 모드면 send_task, 아니면 asyncio.create_task.
 
@@ -64,11 +65,13 @@ def _submit_pipeline(
         from qapilot.db.run_writer import set_task_id
         from qapilot.worker.tasks import run_pipeline_task
 
-        result = run_pipeline_task.delay(str(qapilot_dir), trace_id, dict(options), staging_url)
+        result = run_pipeline_task.delay(str(qapilot_dir), trace_id, dict(options), staging_url, test_account)
         set_task_id(trace_id, result.id)
         logger.info("agent_pipeline_submitted_celery", trace_id=trace_id, task_id=result.id)
     else:
-        task = asyncio.create_task(_run_pipeline_task(qapilot_dir, trace_id, options, staging_url))
+        task = asyncio.create_task(
+            _run_pipeline_task(qapilot_dir, trace_id, options, staging_url, test_account)
+        )
         _running_tasks[trace_id] = task
 
 
@@ -365,11 +368,14 @@ async def resume_run(
         "resume_from_trace": trace_id,  # 자기 자신 — 디스크 스캔으로 완료 TC skip
     }
     staging_url = str(trace.get("staging_url") or "").strip() or None
+    # 격차 12 SaaS 후속: resume 시 원 trace 의 test_account 복원.
+    test_account_saved = trace.get("test_account")
+    test_account = test_account_saved if isinstance(test_account_saved, dict) else None
 
     # 다시 running 으로 전환 — 이전 error 정보도 정리.
     annotate_trace(qapilot_path, trace_id, status="running", error=None, completed_at=None)
 
-    _submit_pipeline(qapilot_path, trace_id, options, staging_url)
+    _submit_pipeline(qapilot_path, trace_id, options, staging_url, test_account)
     logger.info("agent_pipeline_resumed", trace_id=trace_id, mode="celery" if _CELERY_ENABLED else "asyncio")
     return ok({"trace_id": trace_id, "status": "running"})
 
@@ -417,6 +423,7 @@ async def _run_pipeline_task(
     trace_id: str,
     options: RunOptions,
     staging_url: str | None = None,
+    test_account: dict | None = None,
 ) -> None:
     """백그라운드에서 파이프라인을 실행하고 trace를 갱신한다.
 
@@ -424,7 +431,13 @@ async def _run_pipeline_task(
     trace.status="aborted" 로 처리한다. "completed" 와 분리해 "이어서 실행" 가능.
     """
     try:
-        state = await run_pipeline(options, qapilot_dir, trace_id=trace_id, staging_url=staging_url)
+        state = await run_pipeline(
+            options,
+            qapilot_dir,
+            trace_id=trace_id,
+            staging_url=staging_url,
+            test_account=test_account,
+        )
         update_trace(qapilot_dir, trace_id, dict(state))
     except asyncio.CancelledError:
         # 중단 시점까지 디스크에 쌓인 부분 결과 (results/{trace_id}/*) 를 집계해서 trace.json 에 보존.
@@ -471,6 +484,10 @@ def _start_pipeline(request: Request, body: dict[str, Any], options: RunOptions)
     trace_id = request.state.trace_id
     service_id = str(body.get("service_id") or "")
     staging_url = str(body.get("staging_url") or "").strip() or None
+    # 격차 12 SaaS 후속: body 의 test_account dict ({email, password, login_path?}) 추출.
+    # Spring 미주입 시 None — pipeline._test_execution 이 cfg.project.test_account 로 fallback.
+    test_account_body = body.get("test_account")
+    test_account = test_account_body if isinstance(test_account_body, dict) else None
     create_trace(
         qapilot_dir,
         trace_id,
@@ -486,8 +503,9 @@ def _start_pipeline(request: Request, body: dict[str, Any], options: RunOptions)
         filter=options.get("filter"),
         tags=options.get("tags"),
         staging_url=staging_url,
+        test_account=test_account,
     )
-    _submit_pipeline(qapilot_dir, trace_id, options, staging_url)
+    _submit_pipeline(qapilot_dir, trace_id, options, staging_url, test_account)
     logger.info(
         "agent_pipeline_started",
         service_id=service_id,

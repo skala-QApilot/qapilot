@@ -279,7 +279,11 @@ class UITestTool(BaseTool):
             to_url=target_url,
         )
         try:
-            await page.goto(target_url, wait_until="domcontentloaded", timeout=10000)
+            # SPA (Vue/React 등) 가 mount 끝나야 후속 fill/click selector 가 잡힌다.
+            # `domcontentloaded` 는 HTML 파싱만 끝남 — `<div id="app"></div>` 빈 상태 → 후속 step
+            # 의 selector 가 모두 timeout. `networkidle` 로 JS 다운로드/실행/초기 XHR 까지 대기.
+            # 일부 SUT 가 SSE/long-poll 로 networkidle 못 만족할 수 있어 10s timeout cap (기존).
+            await page.goto(target_url, wait_until="networkidle", timeout=10000)
         except Exception as e:
             self.logger.warning(
                 "ui_page_load_fallback_fail",
@@ -513,12 +517,20 @@ class UITestTool(BaseTool):
           `/plans`, `/orders`). 깊은 path (`/api/contracts/1/cancel`) 를 모두 사용
           하면 부정확.
 
+        2026-06-02 진단 — 휴리스틱 v3 보강 ([[project_qapilot_06_02_white_screen_root_cause]]):
+        - well-known 인증 prefix (`/auth/`) 는 마지막 segment 사용. backend 가 보통
+          `/api/auth/signup` 같은 그룹 묶음이지만 frontend route 는 평탄한 `/signup`,
+          `/login`. 1차 segment `/auth` 를 그대로 쓰면 라우트 부재 → 흰화면.
+
         예시 변환:
         - `"POST /login"` → `/login`
         - `"GET /api/plans"` → `/plans`
         - `"DELETE /api/contracts/1/cancel"` → `/contracts`
         - `"GET /api/family-group/join"` → `/family-group`
         - `"POST /signup"` → `/signup`
+        - `"POST /api/auth/signup"` → `/signup` (v3 보강 — 이전 v2 는 `/auth` 잘못 반환)
+        - `"POST /api/auth/login"` → `/login` (v3 보강)
+        - `"POST /api/auth/reset-password"` → `/reset-password` (v3 보강)
 
         정교화는 후속 — ActionMapper 가 직접 navigate step prepend (C 영역) 또는
         frontend codebase 인덱싱 (C 영역) 권장.
@@ -541,10 +553,15 @@ class UITestTool(BaseTool):
                 cleaned = cleaned[4:]  # "/api/contracts" → "/contracts"
             elif cleaned == "/api":
                 continue  # 의미 없는 /api 단독은 skip, 다음 step 시도
-            # 이슈 #123 P3: 1차 segment 만 사용 (frontend route 단순화 휴리스틱)
             segments = [seg for seg in cleaned.split("/") if seg]
-            if segments:
-                return "/" + segments[0]
+            if not segments:
+                continue
+            # 휴리스틱 v3 (2026-06-02): well-known 인증 prefix 는 마지막 segment 사용.
+            # backend `/api/auth/{action}` 그룹 ↔ frontend `/login`, `/signup` 평탄 라우트.
+            if segments[0] == "auth" and len(segments) >= 2:
+                return "/" + segments[-1]
+            # 이슈 #123 P3: 그 외엔 1차 segment 만 사용 (frontend route 단순화)
+            return "/" + segments[0]
         return None
 
     async def _run_step(self, page: Page, step: ActionStep, target_url: str) -> None:
