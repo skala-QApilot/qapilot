@@ -40,14 +40,24 @@ class BaseAgent(ABC):
 
     agent_name: str = ""
     allowed_tools: list[str] = []
+    use_deep_model: bool = False  # True면 config.llm.deep_model을 기본 모델로 사용
 
     def __init__(self, trace_id: str | None = None, config: QApilotConfig | None = None):
         self.trace_id = trace_id
         self._config = config or load_config()
         self._agent_name = self.agent_name or class_name_to_snake(self.__class__.__name__)
         self._resolved = resolve_agent_config(self._agent_name, self._config)
+        override = self._config.agent.overrides.get(self._agent_name)
+        if self.use_deep_model and not (override and override.model):
+            self._resolved = self._resolved.model_copy(
+                update={"model": self._config.llm.deep_model}
+            )
         self.logger = get_logger(source=self._agent_name, trace_id=trace_id)
-        self.llm = LLMClient(self._config.llm, trace_id=trace_id)
+        self.llm = LLMClient(
+            self._config.llm,
+            trace_id=trace_id,
+            default_model=self._resolved.model,
+        )
         self.prompts = PromptLoader(self._agent_name)
 
     async def run(self, input: AgentInput) -> AgentOutput:

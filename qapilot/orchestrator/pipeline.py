@@ -218,9 +218,15 @@ async def _doc_import(state: PipelineState) -> dict:
     tool = DomainKnowledgeTool(trace_id=trace_id)
     logger = tool.logger
 
+    # Qdrant 컬렉션이 없으면 index.json skip 조건을 무시하고 전체 재적재
+    from qapilot.tools.domain_knowledge._store import VectorStore
+    collection_alive = await VectorStore(logger).collection_exists()
+    if not collection_alive:
+        logger.warning("qdrant_collection_missing_reimport", name="domain_knowledge")
+
     for doc_path in sorted(doc_files):
         index_path = _DOMAIN_INDEX_DIR / f"{doc_path.stem}.index.json"
-        if index_path.exists():
+        if collection_alive and index_path.exists():
             try:
                 saved = json.loads(index_path.read_text(encoding="utf-8"))
                 if saved.get("file") == str(doc_path):
@@ -335,82 +341,61 @@ async def _domain_knowledge(state: PipelineState) -> dict:
 async def _requirement_extract(state: PipelineState) -> dict:
     """FR-024 RequirementExtractorAgent 호출.
 
-    user_input이 있으면 사용자가 직접 입력한 시나리오 요구사항을 파싱한다.
-    user_input이 없으면 Qdrant에 임포트된 PRD 문서에서 요구사항을 검색한다.
+    user_input이 있으면 사용자 입력 텍스트를, 없으면 docs/ 의 최신 PRD 파일을
+    그대로 RequirementExtractorAgent에 넘겨 LLM 기반으로 모든 FR-XXX를 추출한다.
     """
+    from qapilot.agents.requirement_extractor import RequirementExtractorAgent
+    from qapilot.shared.schemas import AgentInput
+
     user_input = (state["run_options"].get("user_input") or "").strip()
-    if user_input:
-        from qapilot.agents.requirement_extractor import RequirementExtractorAgent
-        from qapilot.shared.schemas import AgentInput
+    document_text = user_input or _read_latest_prd_text()
 
-        agent = RequirementExtractorAgent(trace_id=state["trace_id"])
-        output = await agent.run(
-            AgentInput(
-                trace_id=state["trace_id"],
-                context={"domain_rules": state.get("domain_rules") or []},
-                params={"document_text": user_input, "existing_count": 0},
-            )
+    if not document_text:
+        return {"requirements": []}
+
+    agent = RequirementExtractorAgent(trace_id=state["trace_id"])
+    output = await agent.run(
+        AgentInput(
+            trace_id=state["trace_id"],
+            context={"domain_rules": state.get("domain_rules") or []},
+            params={"document_text": document_text, "existing_count": 0},
         )
-        requirements = output.result.get("requirements", []) or []
-        return {"requirements": requirements}
+    )
+    requirements = output.result.get("requirements", []) or []
+    return {"requirements": requirements}
 
-    # user_input 없음: Qdrant에 저장된 PRD 문서에서 요구사항 검색
-    from qapilot.shared.schemas import ToolInput
-    from qapilot.tools.domain_knowledge import DomainKnowledgeTool
 
-    # docs/ 에서 최신 PRD 파일명만 추출 (버전 필터 적용)
+def _read_latest_prd_text() -> str:
+    """docs/ 에서 최신 PRD 파일(.md)을 읽어 하나의 텍스트로 합쳐 반환한다.
+
+    .pdf/.docx 같은 비-텍스트 형식은 본 함수에서 다루지 않는다(임포터가 텍스트화 책임).
+    PRD가 여러 개라면 모두 합쳐 LLM에 전달한다.
+    """
     from qapilot.shared.config import load_config
+
     config = load_config()
     proj = config.project
     repo_root = Path(proj.root or proj.repo_path or ".")
     docs_dir = repo_root / "docs"
-    latest_prd_sources: set[str] = set()
-    if docs_dir.exists():
-        all_docs = [p for p in docs_dir.rglob("*") if p.is_file() and p.suffix.lower() in _SUPPORTED_DOC_SUFFIXES]
-        latest_prd_sources = {
-            p.name for p in _filter_latest_doc_versions(all_docs)
-            if "prd" in p.name.lower()
-        }
+    if not docs_dir.exists():
+        return ""
 
-    tool = DomainKnowledgeTool(trace_id=state["trace_id"])
-    requirements = []
-    try:
-        result = await tool.run(
-            ToolInput(
-                trace_id=state["trace_id"],
-                params={"action": "search", "query": "기능 요구사항 시스템", "top_k": 30},
-            )
-        )
-        rules = result.result.get("rules", []) or []
+    all_docs = [
+        p for p in docs_dir.rglob("*")
+        if p.is_file() and p.suffix.lower() in _SUPPORTED_DOC_SUFFIXES
+    ]
+    prd_docs = [
+        p for p in _filter_latest_doc_versions(all_docs)
+        if "prd" in p.name.lower() and p.suffix.lower() == ".md"
+    ]
 
-        # 최신 PRD 문서 청크만 필터링 (이전 버전 제외)
-        prd_rules = [
-            r for r in rules
-            if r.get("source", "") in latest_prd_sources
-        ] if latest_prd_sources else [
-            r for r in rules if "prd" in r.get("source", "").lower()
-        ]
-
-        _NON_FUNC_KEYWORDS = {"비기능", "성능", "보안", "가용성", "안정성", "확장성"}
-        for i, rule in enumerate(prd_rules, start=1):
-            section = rule.get("section", "")
-            req_type = (
-                "non_functional"
-                if any(k in section for k in _NON_FUNC_KEYWORDS)
-                else "functional"
-            )
-            domain_area = section or rule.get("source", "").replace(".md", "")
-            requirements.append({
-                "req_id": f"REQ-{i:03d}",
-                "req_type": req_type,
-                "content": rule["content"],
-                "priority": "medium",
-                "domain_area": domain_area,
-            })
-    except Exception:
-        pass
-
-    return {"requirements": requirements}
+    texts: list[str] = []
+    for p in prd_docs:
+        try:
+            texts.append(p.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+    return "\n\n".join(texts)
 
 
 async def _scenario_generate(state: PipelineState) -> dict:
