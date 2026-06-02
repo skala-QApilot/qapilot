@@ -189,68 +189,83 @@ class ScenarioGeneratorAgent(BaseAgent):
         mismatches: list,
         last_error: str | None,
     ) -> ExecuteResult:
-        """요구사항 기반 도메인별 시나리오 생성 — 1 domain_area = 1 TS."""
-        from qapilot.tools.domain_knowledge import DomainKnowledgeTool
+        """요구사항 기반 도메인별 시나리오 생성 — 1 domain_area = 1 TS.
 
+        action_type == "create" (또는 target_ts_id null 폴백) → 새 TS 생성.
+        action_type == "update" + target_ts_id 있음 → target_level에 따라 부분 수정.
+        """
         all_scenarios: list = []
+        all_updated: list = []   # update 결과 (ts_id 고정, 재번호 부여 없이 바로 저장)
         confidence_sum = 0.0
 
         for req in requirements:
-            domain_area = req.get("domain_area") or "기타"
-            router_files = self._find_router_files_for_domain(domain_area, [req])
-            area_domain_rules = await self._fetch_domain_rules(domain_area, top_k=5)
-            area_domain_rules_text = DomainKnowledgeTool.format_rules_for_prompt(area_domain_rules) or "없음"
+            action_type = req.get("action_type", "create")
+            target_ts_id = req.get("target_ts_id")
 
-            user_prompt = self.with_correction_hint(
-                self.prompts.render(
-                    domain_rules=area_domain_rules_text,
-                    requirements=self._format_requirements([req]),
-                    scan_summary=self._format_scan_summary_for_domain(domain_area, router_files),
-                    code_index=self._format_code_index_for_domain(router_files, scan_result),
-                    affected_files=", ".join(router_files) if router_files else domain_area,
-                    trigger=trigger,
-                    mismatch_note=mismatch_text,
-                ),
-                last_error,
-            )
-
-            response = await self.llm.chat(
-                system_prompt=self.prompts.system(),
-                user_prompt=user_prompt,
-            )
-
-            ts_scenarios, ts_confidence = parse_response(
-                response.content, trigger, router_files, domain_rules
-            )
-
-            # 각 TC 에 req_id 강제 주입 — LLM 이 출력에서 누락해도 RTM 매핑이 유실되지 않도록.
-            # _run_domain_based 는 req 단위 1회 호출이라 모든 결과 TC 가 이 req 를 검증.
-            for s in ts_scenarios:
-                for tc in s.get("test_cases") or []:
-                    if not tc.get("req_id"):
-                        tc["req_id"] = req.get("req_id")
-
-            for s in ts_scenarios:
-                if len(s["test_cases"]) < 6:
+            if action_type == "update" and target_ts_id:
+                existing_ts = self._load_scenario_file(target_ts_id)
+                if existing_ts is None:
                     self.logger.warning(
-                        "tc_count_below_minimum",
+                        "update_target_not_found_fallback_create",
+                        target_ts_id=target_ts_id,
                         req_id=req.get("req_id"),
-                        domain=domain_area,
-                        tc_count=len(s["test_cases"]),
-                        minimum=6,
                     )
+                    ts_scenarios, ts_confidence = await self._generate_ts_for_req(
+                        req, scan_result, domain_rules, trigger, mismatch_text, last_error,
+                    )
+                    all_scenarios.extend(ts_scenarios)
+                else:
+                    target_level = req.get("target_level", "ts")
+                    if target_level == "tc":
+                        updated_ts, ts_confidence = await self._run_update_tc(
+                            req, existing_ts, scan_result, domain_rules, trigger, mismatch_text,
+                        )
+                    elif target_level == "tv":
+                        updated_ts, ts_confidence = await self._run_add_tv(
+                            req, existing_ts, scan_result, domain_rules, trigger, mismatch_text,
+                        )
+                    else:  # "ts" (default)
+                        updated_ts, ts_confidence = await self._run_update_ts(
+                            req, existing_ts, scan_result, domain_rules, trigger, mismatch_text,
+                        )
+                    all_updated.append(updated_ts)
+                    confidence_sum += ts_confidence
+                    self.logger.info(
+                        "scenario_updated",
+                        ts_id=target_ts_id,
+                        target_level=target_level,
+                        req_id=req.get("req_id"),
+                    )
+                    continue
 
-            all_scenarios.extend(ts_scenarios)
+            else:
+                ts_scenarios, ts_confidence = await self._generate_ts_for_req(
+                    req, scan_result, domain_rules, trigger, mismatch_text, last_error,
+                )
+                all_scenarios.extend(ts_scenarios)
+
             confidence_sum += ts_confidence
+
+        # update 결과는 ts_id 고정 — 재번호 부여 없이 바로 덮어쓴다.
+        from qapilot.agents.scenario_generator.repository import save_scenario
+        for ts in all_updated:
+            save_scenario(ts)
+
+        confidence = round(confidence_sum / max(len(requirements), 1), 3)
+
+        if not all_scenarios:
+            # create 대상이 없고 update만 있는 경우
             self.logger.info(
-                "requirement_scenario_generated",
-                req_id=req.get("req_id"),
-                domain=domain_area,
-                ts_count=len(ts_scenarios),
-                tc_count=sum(len(s["test_cases"]) for s in ts_scenarios),
+                "scenarios_updated_only",
+                updated_count=len(all_updated),
+                mismatch_count=len(mismatches),
+                confidence=confidence,
+            )
+            return ExecuteResult(
+                result={"scenarios": all_updated, "prd_code_mismatches": mismatches},
+                confidence=confidence,
             )
 
-        confidence = round(confidence_sum / len(requirements), 3) if requirements else 0.5
         all_scenarios = self._renumber_and_set_depends_on(all_scenarios)
         save_scenarios(all_scenarios)
 
@@ -266,6 +281,297 @@ class ScenarioGeneratorAgent(BaseAgent):
             result={"scenarios": all_scenarios, "prd_code_mismatches": mismatches},
             confidence=confidence,
         )
+
+    # ── create / update 헬퍼 ─────────────────────────────────────────────────
+
+    async def _generate_ts_for_req(
+        self,
+        req: dict,
+        scan_result: dict,
+        domain_rules: list,
+        trigger: str,
+        mismatch_text: str,
+        last_error: str | None = None,
+    ) -> tuple[list, float]:
+        """단일 RequirementItem으로 새 TS를 생성하고 (scenarios, confidence)를 반환한다."""
+        from qapilot.tools.domain_knowledge import DomainKnowledgeTool
+
+        domain_area = req.get("domain_area") or "기타"
+        router_files = self._find_router_files_for_domain(domain_area, [req])
+        area_domain_rules = await self._fetch_domain_rules(domain_area, top_k=5)
+        area_domain_rules_text = DomainKnowledgeTool.format_rules_for_prompt(area_domain_rules) or "없음"
+
+        user_prompt = self.with_correction_hint(
+            self.prompts.render(
+                domain_rules=area_domain_rules_text,
+                requirements=self._format_requirements([req]),
+                scan_summary=self._format_scan_summary_for_domain(domain_area, router_files),
+                code_index=self._format_code_index_for_domain(router_files, scan_result),
+                affected_files=", ".join(router_files) if router_files else domain_area,
+                trigger=trigger,
+                mismatch_note=mismatch_text,
+                update_context="",
+            ),
+            last_error,
+        )
+
+        response = await self.llm.chat(
+            system_prompt=self.prompts.system(),
+            user_prompt=user_prompt,
+        )
+        ts_scenarios, ts_confidence = parse_response(
+            response.content, trigger, router_files, domain_rules
+        )
+
+        for s in ts_scenarios:
+            for tc in s.get("test_cases") or []:
+                if not tc.get("req_id"):
+                    tc["req_id"] = req.get("req_id")
+
+        for s in ts_scenarios:
+            if len(s["test_cases"]) < 6:
+                self.logger.warning(
+                    "tc_count_below_minimum",
+                    req_id=req.get("req_id"),
+                    domain=domain_area,
+                    tc_count=len(s["test_cases"]),
+                    minimum=6,
+                )
+
+        self.logger.info(
+            "requirement_scenario_generated",
+            req_id=req.get("req_id"),
+            domain=domain_area,
+            ts_count=len(ts_scenarios),
+            tc_count=sum(len(s["test_cases"]) for s in ts_scenarios),
+        )
+        return ts_scenarios, ts_confidence
+
+    async def _run_update_ts(
+        self,
+        req: dict,
+        existing_ts: dict,
+        scan_result: dict,
+        domain_rules: list,
+        trigger: str,
+        mismatch_text: str,
+    ) -> tuple[dict, float]:
+        """기존 TS 전체를 재생성한다. ts_id는 기존 값을 유지한다."""
+        from qapilot.tools.domain_knowledge import DomainKnowledgeTool
+
+        domain_area = req.get("domain_area") or "기타"
+        router_files = existing_ts.get("affected_files") or self._find_router_files_for_domain(domain_area, [req])
+        area_domain_rules = await self._fetch_domain_rules(domain_area, top_k=5)
+        area_domain_rules_text = DomainKnowledgeTool.format_rules_for_prompt(area_domain_rules) or "없음"
+
+        existing_tc_summary = "\n".join(
+            f"  - [{tc['tc_id']}] {tc.get('name', '')}"
+            for tc in existing_ts.get("test_cases", [])
+        )
+        update_context = (
+            f"## 수정 대상 시나리오 (ts_id: {existing_ts['ts_id']} 유지)\n"
+            f"현재 TS 이름: {existing_ts.get('name', '')}\n"
+            f"현재 TC 목록:\n{existing_tc_summary}\n\n"
+            f"위 TS를 아래 요구사항 변경에 맞게 전체 재생성하라. "
+            f"ts_id는 반드시 {existing_ts['ts_id']}로 고정하라."
+        )
+
+        user_prompt = self.prompts.render(
+            domain_rules=area_domain_rules_text,
+            requirements=self._format_requirements([req]),
+            scan_summary=self._format_scan_summary_for_domain(domain_area, router_files),
+            code_index=self._format_code_index_for_domain(router_files, scan_result),
+            affected_files=", ".join(router_files) if router_files else domain_area,
+            trigger=trigger,
+            mismatch_note=mismatch_text,
+            update_context=update_context,
+        )
+
+        response = await self.llm.chat(
+            system_prompt=self.prompts.system(),
+            user_prompt=user_prompt,
+        )
+        ts_scenarios, ts_confidence = parse_response(
+            response.content, trigger, router_files, domain_rules
+        )
+
+        if not ts_scenarios:
+            return existing_ts, 0.3
+
+        updated = ts_scenarios[0]
+        updated["ts_id"] = existing_ts["ts_id"]
+        # TC ID도 기존 ts_id 기준으로 재부여
+        for j, tc in enumerate(updated.get("test_cases", [])):
+            tc["tc_id"] = f"{existing_ts['ts_id']}-TC-{j + 1:02d}"
+            if not tc.get("req_id"):
+                tc["req_id"] = req.get("req_id")
+
+        return updated, ts_confidence
+
+    async def _run_update_tc(
+        self,
+        req: dict,
+        existing_ts: dict,
+        scan_result: dict,
+        domain_rules: list,
+        trigger: str,
+        mismatch_text: str,
+    ) -> tuple[dict, float]:
+        """기존 TS에서 target_tc_id에 해당하는 TC만 수정한다. 나머지 TC는 보존한다."""
+        from qapilot.tools.domain_knowledge import DomainKnowledgeTool
+
+        target_tc_id = req.get("target_tc_id")
+        domain_area = req.get("domain_area") or "기타"
+        router_files = existing_ts.get("affected_files") or self._find_router_files_for_domain(domain_area, [req])
+        area_domain_rules = await self._fetch_domain_rules(domain_area, top_k=5)
+        area_domain_rules_text = DomainKnowledgeTool.format_rules_for_prompt(area_domain_rules) or "없음"
+
+        target_tc = next(
+            (tc for tc in existing_ts.get("test_cases", []) if tc.get("tc_id") == target_tc_id),
+            None,
+        )
+        if target_tc is None and target_tc_id:
+            self.logger.warning("target_tc_not_found", target_tc_id=target_tc_id, ts_id=existing_ts["ts_id"])
+
+        existing_tc_text = json.dumps(target_tc, ensure_ascii=False, indent=2) if target_tc else "없음"
+        update_context = (
+            f"## TC 수정 모드 (ts_id: {existing_ts['ts_id']} 유지)\n"
+            f"수정 대상 TC ID: {target_tc_id or '없음'}\n"
+            f"현재 TC 내용:\n```json\n{existing_tc_text}\n```\n\n"
+            f"위 TC를 아래 요구사항 변경에 맞게 수정하라. "
+            f"scenarios 배열에 원소 1개, test_cases에 수정된 TC 1개만 출력하라. "
+            f"tc_id는 {target_tc_id or '기존 ID'}로 유지하라."
+        )
+
+        user_prompt = self.prompts.render(
+            domain_rules=area_domain_rules_text,
+            requirements=self._format_requirements([req]),
+            scan_summary=self._format_scan_summary_for_domain(domain_area, router_files),
+            code_index=self._format_code_index_for_domain(router_files, scan_result),
+            affected_files=", ".join(router_files) if router_files else domain_area,
+            trigger=trigger,
+            mismatch_note=mismatch_text,
+            update_context=update_context,
+        )
+
+        response = await self.llm.chat(
+            system_prompt=self.prompts.system(),
+            user_prompt=user_prompt,
+        )
+        ts_scenarios, ts_confidence = parse_response(
+            response.content, trigger, router_files, domain_rules
+        )
+
+        if not ts_scenarios or not ts_scenarios[0].get("test_cases"):
+            return existing_ts, 0.3
+
+        new_tc = ts_scenarios[0]["test_cases"][0]
+        new_tc["tc_id"] = target_tc_id or new_tc.get("tc_id", "")
+        if not new_tc.get("req_id"):
+            new_tc["req_id"] = req.get("req_id")
+
+        updated_tcs = [
+            new_tc if tc.get("tc_id") == target_tc_id else tc
+            for tc in existing_ts.get("test_cases", [])
+        ]
+        if target_tc is None:
+            updated_tcs.append(new_tc)
+
+        updated_ts = {**existing_ts, "test_cases": updated_tcs}
+        return updated_ts, ts_confidence
+
+    async def _run_add_tv(
+        self,
+        req: dict,
+        existing_ts: dict,
+        scan_result: dict,
+        domain_rules: list,
+        trigger: str,
+        mismatch_text: str,
+    ) -> tuple[dict, float]:
+        """기존 TC에 새로운 TV(입력값 변형)를 추가한다.
+
+        target_tc_id가 있으면 해당 TC에만, 없으면 TS 내 전체 TC에 추가한다.
+        """
+        from qapilot.tools.domain_knowledge import DomainKnowledgeTool
+
+        target_tc_id = req.get("target_tc_id")
+        domain_area = req.get("domain_area") or "기타"
+        router_files = existing_ts.get("affected_files") or self._find_router_files_for_domain(domain_area, [req])
+        area_domain_rules = await self._fetch_domain_rules(domain_area, top_k=5)
+        area_domain_rules_text = DomainKnowledgeTool.format_rules_for_prompt(area_domain_rules) or "없음"
+
+        target_tcs = [
+            tc for tc in existing_ts.get("test_cases", [])
+            if (not target_tc_id) or tc.get("tc_id") == target_tc_id
+        ]
+        tc_summary = "\n".join(
+            f"  [{tc['tc_id']}] {tc.get('name', '')}: "
+            f"values={json.dumps([v.get('field') for v in tc.get('values', [])], ensure_ascii=False)}"
+            for tc in target_tcs
+        )
+        update_context = (
+            f"## TV 추가 모드 (ts_id: {existing_ts['ts_id']} 유지)\n"
+            f"대상 TC: {target_tc_id or '전체'}\n"
+            f"현재 TC 및 values:\n{tc_summary}\n\n"
+            f"위 TC에 추가할 새로운 입력값 변형(values)을 포함한 TC를 출력하라. "
+            f"기존 values를 유지하면서 새 values를 추가하라. "
+            f"tc_id는 기존 값을 유지하라. "
+            f"scenarios에 원소 1개, test_cases에 대상 TC만 출력하라."
+        )
+
+        user_prompt = self.prompts.render(
+            domain_rules=area_domain_rules_text,
+            requirements=self._format_requirements([req]),
+            scan_summary=self._format_scan_summary_for_domain(domain_area, router_files),
+            code_index=self._format_code_index_for_domain(router_files, scan_result),
+            affected_files=", ".join(router_files) if router_files else domain_area,
+            trigger=trigger,
+            mismatch_note=mismatch_text,
+            update_context=update_context,
+        )
+
+        response = await self.llm.chat(
+            system_prompt=self.prompts.system(),
+            user_prompt=user_prompt,
+        )
+        ts_scenarios, ts_confidence = parse_response(
+            response.content, trigger, router_files, domain_rules
+        )
+
+        if not ts_scenarios:
+            return existing_ts, 0.3
+
+        # LLM이 반환한 TC별로 values를 기존 TC에 병합한다.
+        new_tc_map = {tc["tc_id"]: tc for tc in ts_scenarios[0].get("test_cases", [])}
+        updated_tcs: list = []
+        for tc in existing_ts.get("test_cases", []):
+            new_tc = new_tc_map.get(tc["tc_id"])
+            if new_tc:
+                existing_fields = {v.get("field") for v in tc.get("values", [])}
+                extra_values = [
+                    v for v in new_tc.get("values", [])
+                    if v.get("field") not in existing_fields
+                ]
+                merged = {**tc, "values": tc.get("values", []) + extra_values}
+                updated_tcs.append(merged)
+            else:
+                updated_tcs.append(tc)
+
+        updated_ts = {**existing_ts, "test_cases": updated_tcs}
+        return updated_ts, ts_confidence
+
+    def _load_scenario_file(self, ts_id: str) -> dict | None:
+        """qapilot_dir 기준으로 기존 시나리오 파일을 로드한다."""
+        from qapilot.agents.scenario_generator.repository import load_scenario
+
+        qapilot_dir = getattr(self, "_qapilot_dir_override", None)
+        if qapilot_dir:
+            path = Path(qapilot_dir) / "scenarios" / f"{ts_id}.json"
+            if path.exists():
+                return json.loads(path.read_text(encoding="utf-8"))
+            return None
+        return load_scenario(ts_id)
 
     def _find_router_files_for_domain(self, domain_area: str, reqs: list[dict]) -> list[str]:
         """도메인 영역명과 요구사항 내용 키워드로 관련 라우터 파일 목록을 반환한다."""
@@ -579,10 +885,26 @@ class ScenarioGeneratorAgent(BaseAgent):
     def _format_requirements(self, requirements: list) -> str:
         if not requirements:
             return "없음"
-        return "\n".join(
-            f"[{r['req_id']}] ({r['req_type']}/{r['priority']}) {r['content']} [도메인: {r['domain_area']}]"
-            for r in requirements
-        )
+        lines: list[str] = []
+        for r in requirements:
+            base = (
+                f"[{r['req_id']}] ({r.get('req_type', '')}/{r.get('priority', '')}) "
+                f"{r['content']} [도메인: {r.get('domain_area', '')}]"
+            )
+            action_type = r.get("action_type", "create")
+            target_level = r.get("target_level", "ts")
+            target_ts_id = r.get("target_ts_id")
+            target_tc_id = r.get("target_tc_id")
+            if action_type == "update":
+                meta = f" [action=update level={target_level}"
+                if target_ts_id:
+                    meta += f" target_ts={target_ts_id}"
+                if target_tc_id:
+                    meta += f" target_tc={target_tc_id}"
+                meta += "]"
+                base += meta
+            lines.append(base)
+        return "\n".join(lines)
 
     def _build_router_map(self, affected_files: list[str]) -> dict[str, list[dict]]:
         """endpoints.json에서 라우터 파일 → 엔드포인트 목록 맵을 구성한다.
