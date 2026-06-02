@@ -1,0 +1,42 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: minibss-ingress
+  namespace: skala3-finalproj-class1-team3
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-body-size: 10m
+    nginx.ingress.kubernetes.io/rewrite-target: /$2
+spec:
+  ingressClassName: public-nginx
+  rules:
+    - host: minibss-team3.skala25a.project.skala-ai.com
+      http:
+        paths:
+          - path: /sut-db(/|$)(.*)
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: sut-db-agent
+                port:
+                  number: 80
+          - path: /api/contracts
+            pathType: Prefix
+            backend:
+              service:
+                name: minibss-contracts
+                port:
+                  number: 8001
+          - path: /api
+            pathType: Prefix
+            backend:
+              service:
+                name: minibss-backend
+                port:
+                  number: 8000
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: minibss-frontend
+                port:
+                  number: 80

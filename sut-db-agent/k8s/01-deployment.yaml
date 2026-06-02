@@ -1,0 +1,61 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sut-db-agent
+  namespace: skala3-finalproj-class1-team3
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: sut-db-agent
+  template:
+    metadata:
+      labels:
+        app: sut-db-agent
+    spec:
+      imagePullSecrets:
+        - name: harbor-cred
+      containers:
+        - name: sut-db-agent
+          image: amdp-registry.skala-ai.com/skala26a-ai1/team3-sut-db-agent:v1
+          ports:
+            - containerPort: 8000
+          envFrom:
+            - configMapRef:
+                name: minibss-config     # POSTGRES_HOST, PORT, USER, DB
+          env:
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: minibss-secret
+                  key: POSTGRES_PASSWORD
+            - name: API_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: sut-db-agent-secret
+                  key: API_TOKEN
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "256Mi"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: sut-db-agent
+  namespace: skala3-finalproj-class1-team3
+spec:
+  selector:
+    app: sut-db-agent
+  ports:
+    - port: 80
+      targetPort: 8000
