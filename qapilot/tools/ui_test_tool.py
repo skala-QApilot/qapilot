@@ -66,10 +66,18 @@ _GET_BY_METHODS = {  # noqa: F841 — spec §4.5.3 매핑표 참조용 (의미 �
     "title": "get_by_title",
 }
 
-# Fallback chain timeout 분배 (이슈 #111). 1차는 ActionMapper 의 결정에 가까운 timeout 유지,
-# 2차 이상은 short timeout 으로 총 시간 폭증 방지. 1 × 10s + N × 5s ≈ 단일 30s default 와 비슷.
-_CHAIN_PRIMARY_TIMEOUT_MS = 10_000
-_CHAIN_FALLBACK_TIMEOUT_MS = 5_000
+# Fallback chain timeout 분배 (이슈 #111).
+#
+# 2026-06-02 보강 (#197 후속): chain 최대 합산 시간 단축.
+# - 이전 v1: 1 × 10s + N × 5s = 25s (4 attempt) — BaseTool 60s timeout 안에 옵션 B (5s) +
+#   기타 처리 (수 초) 합치면 종종 60s 초과 → trace 전체 abort 사례 (TS-001 trace `f3a51fd5`
+#   의 click "회원가입" 누적 60s timeout).
+# - v2: 1 × 5s + N × 3s = 14s (4 attempt) — 옵션 B + 기타 합쳐도 ~25s. step 단위 fail 처리
+#   후 다음 step skip → ui_result.json 저장 → 다음 TC 진행 보장. ActionMapper 환각으로
+#   selector chain 이 모두 fail 하는 케이스도 trace abort 안 됨.
+# - LLM 추론 selector 가 대부분 1~2 attempt 안에 적중하므로 5s 1차도 충분 (e2e 통계).
+_CHAIN_PRIMARY_TIMEOUT_MS = 5_000
+_CHAIN_FALLBACK_TIMEOUT_MS = 3_000
 
 # 이슈 #121 (옵션 C): auto-navigate 의 api_endpoint 파싱 패턴.
 # 형식 예: "POST /login" / "GET /plans/{id}" / "/signup".
@@ -176,9 +184,15 @@ class UITestTool(BaseTool):
         # 이슈 #121 (옵션 C): ActionMapping 에 navigate step 부재 시 auto-navigate.
         # 첫 step 이 DOM action 인 경우 SUT 가 잘못된 페이지 (예: vue-router redirect)
         # 일 가능성 — api_endpoint 힌트로 frontend route 추론 + page.goto 자동 호출.
-        # 옵션 A chain / 옵션 B DOM scan 이 올바른 페이지에서 시작되도록 보장. 상세
-        # 배경: docs/e2e-navigate-gap-analysis.md
-        if steps and steps[0].get("action") in _DOM_ACTIONS:
+        # 옵션 A chain / 옵션 B DOM scan 이 올바른 페이지에서 시작되도록 보장.
+        #
+        # 2026-06-02 보강 (#197 후속): 발동 조건 확장. 첫 step 이 `wait` / assert 계열
+        # (DOM action 아님) 이지만 후속 step 에 `api_endpoint` 있는 경우도 발동.
+        # TS-002-TC-02/03 같은 `wait → assert(api_endpoint=GET /api/plans/1)` 패턴은
+        # 이전엔 첫 step wait 라 auto-navigate skip → SUT default page (`/plans` 목록)
+        # 머무름 → 의도한 `/plans/1` detail 페이지 아님 → assert fail. 본 보강으로
+        # api_endpoint 추론 가능하면 항상 발동.
+        if steps and self._should_auto_navigate(steps):
             await self._try_auto_navigate(page, steps, target_url)
 
         # 이슈 #174 (격차 12 D 영역 본질): TC 시작 시 인증 fail-safe.
@@ -429,9 +443,33 @@ class UITestTool(BaseTool):
 
         self.logger.info("ui_auth_fallback_success", final_url=new_url)
 
-        # 로그인 성공 후 원 의도 URL 재네비 (PR #122 와 동일)
-        if steps and steps[0].get("action") in _DOM_ACTIONS:
+        # 로그인 성공 후 원 의도 URL 재네비 (PR #122 와 동일 + #197 보강)
+        if steps and self._should_auto_navigate(steps):
             await self._try_auto_navigate(page, steps, target_url)
+
+    def _should_auto_navigate(self, steps: list[ActionStep]) -> bool:
+        """auto-navigate 발동 조건 (PR #122 + #197 보강).
+
+        - 시나리오가 명시 navigate step 으로 시작하면 발동 X (사용자 의도 존중).
+        - 첫 step 이 DOM action (fill/click/assert 등) 이면 발동 (PR #122 원본 조건).
+        - 첫 step 이 wait / assert 계열 이지만 후속 step 에 api_endpoint 가 있고 그것이
+          frontend route 로 추론 가능하면 발동 (#197 보강 — TS-002-TC-02/03 사례).
+
+        Returns:
+            True 면 _try_auto_navigate 호출 권장.
+        """
+        if not steps:
+            return False
+        first_action = steps[0].get("action")
+        # 명시 navigate 가 시나리오에 있으면 본인이 안 끼어듦
+        if first_action == "navigate":
+            return False
+        # 첫 step 이 DOM action — PR #122 원본 조건
+        if first_action in _DOM_ACTIONS:
+            return True
+        # #197 보강: 첫 step page-action (wait/assert_url 등) 이라도 api_endpoint
+        # 추론 가능하면 발동. 무한 루프 방지를 위해 _infer_target_route 결과 미리 확인.
+        return self._infer_target_route(steps) is not None
 
     async def _try_auto_navigate(
         self, page: Page, steps: list[ActionStep], target_url: str
@@ -503,6 +541,40 @@ class UITestTool(BaseTool):
                 code=ErrorCode.TOOL_UI_TARGET_UNREACHABLE,
             )
 
+    def _infer_route_from_path(self, path: str) -> str | None:
+        """단일 API path 에서 frontend route 추론 (v3 휴리스틱).
+
+        `_infer_target_route` 의 path → route 변환 로직만 추출 (#197 후속 — navigate
+        value 의 backend API URL 보정에도 재사용). 동일 휴리스틱 v3:
+        - `/api/` prefix 제거 → 1차 segment (`/plans`, `/orders`)
+        - `/auth/{action}` 그룹은 마지막 segment (`/signup`, `/login`)
+        - 경로 매개변수 (`{id}`, `:id`) 제거
+
+        예시:
+        - `/api/plans/-1` → `/plans`
+        - `/api/auth/signup` → `/signup`
+        - `/api/contracts/1/cancel` → `/contracts`
+
+        Returns:
+            추론된 frontend route 또는 추론 불가 시 None.
+        """
+        if not path or not isinstance(path, str):
+            return None
+        m = _API_ENDPOINT_PATTERN.match(path.strip())
+        if not m:
+            return None
+        cleaned = _ROUTE_PARAM_PATTERN.sub("", m.group(1)).rstrip("/")
+        if cleaned.startswith("/api/"):
+            cleaned = cleaned[4:]
+        elif cleaned == "/api":
+            return None
+        segments = [seg for seg in cleaned.split("/") if seg]
+        if not segments:
+            return None
+        if segments[0] == "auth" and len(segments) >= 2:
+            return "/" + segments[-1]
+        return "/" + segments[0]
+
     def _infer_target_route(self, steps: list[ActionStep]) -> str | None:
         """ActionMapping steps 의 `api_endpoint` 에서 frontend route 추론.
 
@@ -545,23 +617,10 @@ class UITestTool(BaseTool):
             m = _API_ENDPOINT_PATTERN.match(ep.strip())
             if not m:
                 continue
-            path = m.group(1)
-            # 경로 매개변수 (:id, {id}) 제거
-            cleaned = _ROUTE_PARAM_PATTERN.sub("", path).rstrip("/")
-            # 이슈 #123 P3: /api/ prefix 제거
-            if cleaned.startswith("/api/"):
-                cleaned = cleaned[4:]  # "/api/contracts" → "/contracts"
-            elif cleaned == "/api":
-                continue  # 의미 없는 /api 단독은 skip, 다음 step 시도
-            segments = [seg for seg in cleaned.split("/") if seg]
-            if not segments:
-                continue
-            # 휴리스틱 v3 (2026-06-02): well-known 인증 prefix 는 마지막 segment 사용.
-            # backend `/api/auth/{action}` 그룹 ↔ frontend `/login`, `/signup` 평탄 라우트.
-            if segments[0] == "auth" and len(segments) >= 2:
-                return "/" + segments[-1]
-            # 이슈 #123 P3: 그 외엔 1차 segment 만 사용 (frontend route 단순화)
-            return "/" + segments[0]
+            # 휴리스틱 v3 변환은 _infer_route_from_path 헬퍼 위임 (DRY — #197 후속).
+            inferred = self._infer_route_from_path(m.group(1))
+            if inferred:
+                return inferred
         return None
 
     async def _run_step(self, page: Page, step: ActionStep, target_url: str) -> None:
@@ -591,6 +650,21 @@ class UITestTool(BaseTool):
                 raise ToolExecutionError(
                     ErrorCode.TOOL_UI_NAVIGATION_FAIL, "navigate 에는 value 필요"
                 )
+            # 2026-06-02 보강 (#197 후속): ActionMapper 환각 — navigate value 에 backend API
+            # URL (예: "/api/plans/-1") 작성 시 SUT backend 가 JSON 응답 → 화면이 JSON 만
+            # 표시되어 후속 step 모두 fail. `/api/` 시작 path 는 frontend route 추론
+            # (_infer_target_route 의 휴리스틱 v3 동일 — /auth/ 마지막 segment + 그 외 1차).
+            if url.startswith("/api/") or url.startswith("/api"):
+                inferred = self._infer_route_from_path(url)
+                if inferred:
+                    self.logger.warning(
+                        "ui_navigate_api_url_coerced",
+                        original=url,
+                        inferred=inferred,
+                        code=ErrorCode.TOOL_UI_INVALID_SELECTOR,
+                        hint="ActionMapper 가 navigate value 에 backend API URL 을 생성. frontend route 로 보정.",
+                    )
+                    url = inferred
             full = (
                 url if url.startswith(("http://", "https://"))
                 else f"{target_url.rstrip('/')}{url}"
