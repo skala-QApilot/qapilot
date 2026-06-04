@@ -618,10 +618,63 @@ async def _domain_knowledge(state: PipelineState) -> dict:
     return {"domain_rules": rules}
 
 
-def _read_latest_prd_text() -> str:
-    """docs/ 디렉토리의 최신 PRD 파일을 읽어 텍스트로 반환한다."""
-    from qapilot.shared.config import load_config
+def _read_latest_prd_text(state: PipelineState | None = None) -> str:
+    """최신 PRD 텍스트를 반환한다. 3단 우선순위:
 
+      1) UI 업로드 (domain_documents + S3) — service_id 기반.
+      2) qapilot_dir/domain/ 디스크 mirror — Spring 이 dual-write 한 결과.
+      3) config.project.root/docs/ — CLI 흐름 호환.
+
+    어느 단계든 텍스트가 잡히면 그 단계만 반환 (낮은 단계로 fallback 안 함) —
+    UI 가 업로드한 PRD 와 무관한 CLI docs 가 섞이는 leak 방지.
+    """
+    from qapilot.db.domain_reader import list_latest_domain_documents
+    from qapilot.shared.config import load_config
+    from qapilot.storage import s3_client
+
+    # (1) UI 업로드 (DB+S3) — service_id 가 있을 때만.
+    if state is not None:
+        trace = load_trace(state["qapilot_dir"], state["trace_id"]) or {}
+        service_id = trace.get("service_id")
+        if service_id:
+            texts: list[str] = []
+            for doc in list_latest_domain_documents(service_id):
+                filename = doc.get("filename") or ""
+                s3_key = doc.get("s3_key") or ""
+                if not (filename and s3_key):
+                    continue
+                if Path(filename).suffix.lower() not in _SUPPORTED_DOC_SUFFIXES:
+                    continue
+                if "prd" not in filename.lower():
+                    continue
+                data = s3_client.get_bytes(s3_key)
+                if data is None:
+                    continue
+                try:
+                    texts.append(data.decode("utf-8"))
+                except UnicodeDecodeError:
+                    continue
+            if texts:
+                return "\n\n".join(texts)
+
+    # (2) qapilot_dir/domain/ — Spring 디스크 mirror.
+    if state is not None:
+        mirror_dir = Path(state["qapilot_dir"]) / "domain"
+        if mirror_dir.exists():
+            texts = []
+            for p in sorted(mirror_dir.iterdir()):
+                if not (p.is_file() and p.suffix.lower() in _SUPPORTED_DOC_SUFFIXES):
+                    continue
+                if "prd" not in p.name.lower():
+                    continue
+                try:
+                    texts.append(p.read_text(encoding="utf-8"))
+                except Exception:
+                    continue
+            if texts:
+                return "\n\n".join(texts)
+
+    # (3) config.project.root/docs/ — CLI 흐름.
     config = load_config()
     proj = config.project
     repo_root = Path(proj.root or proj.repo_path or ".")
@@ -636,7 +689,7 @@ def _read_latest_prd_text() -> str:
         p for p in _filter_latest_doc_versions(all_docs)
         if "prd" in p.name.lower()
     ]
-    texts: list[str] = []
+    texts = []
     for p in prd_docs:
         try:
             texts.append(p.read_text(encoding="utf-8"))
@@ -734,7 +787,7 @@ async def _requirement_extract(state: PipelineState) -> dict:
     from qapilot.shared.schemas import AgentInput
 
     user_input = (state["run_options"].get("user_input") or "").strip()
-    document_text = user_input or _read_latest_prd_text()
+    document_text = user_input or _read_latest_prd_text(state)
 
     if not document_text:
         return {"requirements": []}
