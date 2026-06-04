@@ -11,6 +11,9 @@ import fnmatch
 import json
 import re
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
+
+_KST = ZoneInfo("Asia/Seoul")
 from pathlib import Path
 from typing import Any
 
@@ -1082,7 +1085,7 @@ class CodebaseScannerTool(BaseTool):
         qapilot_dir.mkdir(exist_ok=True)
         manifest = {
             "last_commit_hash": commit_hash,
-            "scan_timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            "scan_timestamp": datetime.now(_KST).isoformat(),
             "scanned_files": scanned_files,
         }
         (qapilot_dir / "manifest.json").write_text(

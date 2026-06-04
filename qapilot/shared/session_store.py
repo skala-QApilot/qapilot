@@ -10,16 +10,19 @@ from __future__ import annotations
 
 import json
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
+
+_KST = ZoneInfo("Asia/Seoul")
 
 
 def _session_path(qapilot_dir: str | Path, session_id: str) -> Path:
     return Path(qapilot_dir) / "sessions" / f"{session_id}.json"
 
 
-def _utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+def _now_kst() -> str:
+    return datetime.now(_KST).isoformat()
 
 
 def new_session_id() -> str:
@@ -59,7 +62,7 @@ def save_exchange(
         "user": user_input,
         "query_status": query_status,
         "query_feedback": query_feedback,
-        "timestamp": _utc_now(),
+        "timestamp": _now_kst(),
     })
     path.write_text(json.dumps(session, ensure_ascii=False, indent=2), encoding="utf-8")
 

@@ -6,12 +6,15 @@ Created: 2026-05-11
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import DateTime, String, Text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from qapilot.shared.database import Base
+
+_KST = ZoneInfo("Asia/Seoul")
 
 
 class TraceTimestampMixin:
@@ -24,7 +27,7 @@ class TraceTimestampMixin:
     trace_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
-        default=lambda: datetime.now(timezone.utc),
+        default=lambda: datetime.now(_KST),
         nullable=False,
     )
 

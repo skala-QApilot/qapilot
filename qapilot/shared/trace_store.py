@@ -7,15 +7,17 @@ Created: 2026-05-15
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from qapilot.db.run_writer import upsert_run
 from qapilot.messaging.redis_pubsub import publish_run_event
 from qapilot.shared.logger import get_logger
 
 _logger = get_logger("trace_store")
+_KST = ZoneInfo("Asia/Seoul")
 
 
 def create_trace(
@@ -33,7 +35,7 @@ def create_trace(
         "command": command,
         "trigger": trigger,
         "status": "running",
-        "started_at": _utc_now(),
+        "started_at": _now_kst(),
         "completed_at": None,
         "error": None,
         "confidence": None,
@@ -58,7 +60,7 @@ def update_trace(qapilot_dir: str | Path, trace_id: str, state: dict) -> None:
     agent_logs = state.get("agent_logs", [])
     payload: dict = {
         "status": state.get("status") or "completed",
-        "completed_at": _utc_now(),
+        "completed_at": _now_kst(),
         "error": state.get("error"),
         "confidence": _average_confidence(agent_logs),
         "agent_logs": agent_logs,
@@ -111,7 +113,7 @@ def update_trace_aborted(qapilot_dir: str | Path, trace_id: str, error: str) -> 
     trace.update(
         {
             "status": "aborted",
-            "completed_at": _utc_now(),
+            "completed_at": _now_kst(),
             "error": error,
         }
     )
@@ -170,8 +172,8 @@ def _trace_path(qapilot_dir: str | Path, trace_id: str) -> Path:
     return _traces_dir(qapilot_dir) / f"{trace_id}.json"
 
 
-def _utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+def _now_kst() -> str:
+    return datetime.now(_KST).isoformat()
 
 
 def _result_summary(state: dict) -> dict:
