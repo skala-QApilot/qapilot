@@ -269,7 +269,7 @@ class ScenarioGeneratorAgent(BaseAgent):
                 req_ids=[req.get("req_id") for req in skipped_requirements],
             )
 
-        req_endpoint_map = await self._map_requirements_to_endpoints(target_requirements, all_endpoints)
+        req_endpoint_map = self._map_requirements_to_endpoints(target_requirements, all_endpoints)
 
         for req in target_requirements:
             domain_area = req.get("domain_area") or "기타"
@@ -1029,83 +1029,30 @@ class ScenarioGeneratorAgent(BaseAgent):
 
         return "\n".join(lines) if lines else "코드 인덱스 없음"
 
-    async def _map_requirements_to_endpoints(
+    def _map_requirements_to_endpoints(
         self, requirements: list, all_endpoints: list[dict]
     ) -> dict[str, list[dict]]:
-        """LLM 1회 호출로 REQ↔엔드포인트 매핑 테이블을 생성한다.
+        """규칙 기반으로 REQ↔엔드포인트 매핑 테이블을 생성한다.
+
+        요구사항 본문의 명시적 API 표기 → 운영성 키워드 → 도메인 키워드 → HTTP 메서드 순으로
+        결정적으로 매핑한다. LLM을 사용하지 않는다.
 
         Returns:
             {req_id: [endpoint_dict, ...]} — 매핑 없으면 빈 리스트.
         """
-        req_text = "\n".join(
-            f"[{r['req_id']}] ({r.get('req_type', '')}/{r.get('priority', '')}) {r['content']}"
-            for r in requirements
+        result: dict[str, list[dict]] = {}
+        for req in requirements:
+            req_id = req.get("req_id", "")
+            result[req_id] = self._select_endpoints_for_requirement(req, all_endpoints)
+
+        mapped = sum(1 for eps in result.values() if eps)
+        self.logger.info(
+            "req_endpoint_mapping_done",
+            total_reqs=len(requirements),
+            mapped=mapped,
+            unmapped=len(requirements) - mapped,
         )
-        ep_text = "\n".join(
-            f"{self._get_full_ep_path(ep)} "
-            f"[{ep.get('file', '').split('/')[-1]}] handler={ep.get('handler', '')}"
-            for ep in all_endpoints
-        )
-
-        system = (
-            "당신은 소프트웨어 요구사항과 API 엔드포인트를 매핑하는 전문가다. "
-            "요구사항 목록과 API 엔드포인트 목록을 분석하여 각 요구사항을 구현하는 엔드포인트를 정확히 찾아라."
-        )
-        user = f"""# 요구사항 목록
-{req_text}
-
-# API 엔드포인트 목록
-{ep_text}
-
-# 지시사항
-각 요구사항(req_id)에 대해 그 요구사항을 구현하는 엔드포인트를 매핑하라.
-하나의 요구사항이 여러 엔드포인트에 매핑될 수 있다. 구현 엔드포인트가 없으면 빈 배열로 표시하라.
-반드시 아래 JSON 형식으로만 출력하라:
-{{
-  "mappings": [
-    {{
-      "req_id": "FR-AUTH-01",
-      "endpoints": [
-        {{"method": "POST", "path": "/api/auth/login"}}
-      ]
-    }}
-  ]
-}}"""
-
-        try:
-            response = await self.llm.chat(system, user)
-            cleaned = re.sub(r"```(?:json)?\s*|\s*```", "", response.content).strip()
-            parsed = json.loads(cleaned)
-
-            ep_lookup: dict[tuple[str, str], dict] = {
-                (ep.get("method", ""), ep.get("path", "")): ep for ep in all_endpoints
-            }
-            ep_lookup.update({
-                (ep.get("method", ""), self._get_full_ep_path(ep).split(" ", 1)[1]): ep
-                for ep in all_endpoints
-            })
-
-            result: dict[str, list[dict]] = {}
-            for mapping in parsed.get("mappings", []):
-                req_id = mapping["req_id"]
-                matched: list[dict] = []
-                for m in mapping.get("endpoints", []):
-                    ep = ep_lookup.get((m.get("method", ""), m.get("path", "")))
-                    if ep:
-                        matched.append(ep)
-                result[req_id] = matched
-
-            self.logger.info(
-                "req_endpoint_mapping_done",
-                total_reqs=len(requirements),
-                mapped=sum(1 for eps in result.values() if eps),
-                unmapped=sum(1 for eps in result.values() if not eps),
-            )
-            return result
-
-        except Exception as e:
-            self.logger.warning("req_endpoint_mapping_failed", error=str(e))
-            return {}
+        return result
 
     def _deduplicate_scenarios(self, scenarios: list) -> list:
         """동일 API 집합을 커버하는 중복 시나리오를 병합한다.
