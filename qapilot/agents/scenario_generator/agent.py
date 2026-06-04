@@ -274,6 +274,10 @@ class ScenarioGeneratorAgent(BaseAgent):
         for req in target_requirements:
             domain_area = req.get("domain_area") or "기타"
             req_id = req.get("req_id", "")
+            action_type = req.get("action_type", "create")
+            target_ts_id = req.get("target_ts_id")
+            target_level = req.get("target_level", "ts")
+
             req_endpoints = req_endpoint_map.get(req_id) or self._select_endpoints_for_requirement(req, all_endpoints)
             req_endpoint_map[req_id] = req_endpoints
             router_files = list(dict.fromkeys(
@@ -287,6 +291,43 @@ class ScenarioGeneratorAgent(BaseAgent):
             area_domain_rules = domain_rules or await self._fetch_domain_rules(domain_area, top_k=5)
             area_domain_rules_text = DomainKnowledgeTool.format_rules_for_prompt(area_domain_rules) or "없음"
 
+            # ── update 분기: 기존 TS 로드 후 수정 ──────────────────────────────
+            if action_type == "update" and target_ts_id:
+                existing_ts = self._load_scenario_file(target_ts_id)
+                if existing_ts is None:
+                    self.logger.warning(
+                        "update_target_not_found_fallback_create",
+                        target_ts_id=target_ts_id,
+                        req_id=req_id,
+                    )
+                    # 대상 TS 없으면 create로 폴백
+                else:
+                    if target_level == "tc":
+                        updated_ts, ts_confidence = await self._run_update_tc(
+                            req, existing_ts, scan_result, area_domain_rules_text,
+                            trigger, mismatch_text, req_endpoints,
+                        )
+                    elif target_level == "tv":
+                        updated_ts, ts_confidence = await self._run_add_tv(
+                            req, existing_ts, scan_result, area_domain_rules_text,
+                            trigger, mismatch_text, req_endpoints,
+                        )
+                    else:  # "ts" (default)
+                        updated_ts, ts_confidence = await self._run_update_ts(
+                            req, existing_ts, scan_result, area_domain_rules_text,
+                            trigger, mismatch_text, req_endpoints,
+                        )
+                    all_updated.append(updated_ts)
+                    confidence_sum += ts_confidence
+                    self.logger.info(
+                        "scenario_updated",
+                        ts_id=target_ts_id,
+                        target_level=target_level,
+                        req_id=req_id,
+                    )
+                    continue
+
+            # ── create 분기 (기본) ────────────────────────────────────────────
             user_prompt = self.with_correction_hint(
                 self.prompts.render(
                     domain_rules=area_domain_rules_text,
@@ -296,6 +337,7 @@ class ScenarioGeneratorAgent(BaseAgent):
                     affected_files=", ".join(prompt_files) if prompt_files else domain_area,
                     trigger=trigger,
                     mismatch_note=mismatch_text,
+                    update_context="",
                 ),
                 last_error,
             )
@@ -322,17 +364,22 @@ class ScenarioGeneratorAgent(BaseAgent):
 
         confidence = round(confidence_sum / max(len(requirements), 1), 3)
 
-        if not all_scenarios:
-            # create 대상이 없고 update만 있는 경우
+        if not all_scenarios and all_updated:
+            # create 대상이 없고 update만 있는 경우 — coverage gap-fill 불필요
             self.logger.info(
-                "requirement_scenario_generated",
-                req_id=req_id,
-                domain=domain_area,
-                mapped_api_count=len(req_endpoints),
-                ts_count=len(ts_scenarios),
-                tc_count=sum(len(s["test_cases"]) for s in ts_scenarios),
+                "scenarios_updated_only",
+                updated_count=len(all_updated),
             )
-
+            confidence = round(confidence_sum / max(len(requirements), 1), 3)
+            return ExecuteResult(
+                result={
+                    "scenarios": all_updated,
+                    "prd_code_mismatches": mismatches,
+                    "coverage": {"rate": 1.0, "uncovered": [], "skipped": []},
+                    "skipped_requirements": skipped_requirements,
+                },
+                confidence=confidence,
+            )
         # ── 커버리지 gap-fill ─────────────────────────────────────────────────
         # 생성 후 미커버 요구사항이 있으면 해당 req만 재생성한다 (최대 1회).
         _MAX_FILL_RETRIES = 2
@@ -379,6 +426,7 @@ class ScenarioGeneratorAgent(BaseAgent):
                     affected_files=", ".join(prompt_files) if prompt_files else domain_area,
                     trigger=trigger,
                     mismatch_note=mismatch_text,
+                    update_context="",
                 )
                 fill_response = await self.llm.chat(
                     system_prompt=self.prompts.system(),
@@ -1266,6 +1314,205 @@ class ScenarioGeneratorAgent(BaseAgent):
             if any(k in r.get("content", "") + r.get("domain_area", "") for k in keywords)
         ]
         return matched[:10] if matched else requirements[:5]
+
+    # ── update 액션 헬퍼 (#201) ────────────────────────────────────────────────
+
+    def _load_scenario_file(self, ts_id: str) -> dict | None:
+        """qapilot_dir 기준으로 기존 시나리오 파일을 로드한다."""
+        import json
+        from pathlib import Path
+        from qapilot.agents.scenario_generator.repository import load_scenario
+
+        qapilot_dir = getattr(self, "_qapilot_dir_override", None)
+        if qapilot_dir:
+            path = Path(qapilot_dir) / "scenarios" / f"{ts_id}.json"
+            if path.exists():
+                return json.loads(path.read_text(encoding="utf-8"))
+            return None
+        return load_scenario(ts_id)
+
+    async def _run_update_ts(
+        self,
+        req: dict,
+        existing_ts: dict,
+        scan_result: dict,
+        area_domain_rules_text: str,
+        trigger: str,
+        mismatch_text: str,
+        req_endpoints: list,
+    ) -> tuple[dict, float]:
+        """기존 TS 전체를 재생성한다. ts_id는 기존 값을 유지한다."""
+        ts_id = existing_ts["ts_id"]
+        req_id = req.get("req_id", "")
+        router_files = list(dict.fromkeys(ep.get("file", "") for ep in req_endpoints if ep.get("file")))
+
+        existing_tc_summary = "\n".join(
+            f"  - [{tc.get('tc_id', '')}] {tc.get('name', '')}"
+            for tc in existing_ts.get("test_cases", [])
+        )
+        update_context = (
+            f"## 수정 대상 시나리오 (ts_id: {ts_id} 유지)\n"
+            f"현재 TS 이름: {existing_ts.get('name', '')}\n"
+            f"현재 TC 목록:\n{existing_tc_summary}\n\n"
+            f"위 TS를 아래 요구사항 변경에 맞게 전체 재생성하라. "
+            f"ts_id는 반드시 {ts_id}로 고정하라."
+        )
+
+        user_prompt = self.prompts.render(
+            domain_rules=area_domain_rules_text,
+            requirements=self._format_requirements([req]),
+            scan_summary=self._format_scan_summary_for_requirement(req_id, req, req_endpoints),
+            code_index=self._format_code_index_for_requirement(router_files, req_endpoints, scan_result),
+            affected_files=", ".join(router_files) if router_files else req.get("domain_area", ""),
+            trigger=trigger,
+            mismatch_note=mismatch_text,
+            update_context=update_context,
+        )
+
+        response = await self.llm.chat(system_prompt=self.prompts.system(), user_prompt=user_prompt)
+        ts_scenarios, ts_confidence = parse_response(response.content, trigger, router_files, [])
+
+        if not ts_scenarios:
+            return existing_ts, 0.3
+
+        updated = ts_scenarios[0]
+        updated["ts_id"] = ts_id
+        for j, tc in enumerate(updated.get("test_cases", [])):
+            tc["tc_id"] = f"{ts_id}-TC-{j + 1:02d}"
+            if not tc.get("req_id"):
+                tc["req_id"] = req_id
+        return updated, ts_confidence
+
+    async def _run_update_tc(
+        self,
+        req: dict,
+        existing_ts: dict,
+        scan_result: dict,
+        area_domain_rules_text: str,
+        trigger: str,
+        mismatch_text: str,
+        req_endpoints: list,
+    ) -> tuple[dict, float]:
+        """기존 TS에서 target_tc_id TC만 수정한다. 나머지 TC는 보존한다."""
+        ts_id = existing_ts["ts_id"]
+        req_id = req.get("req_id", "")
+        target_tc_id = req.get("target_tc_id")
+        router_files = list(dict.fromkeys(ep.get("file", "") for ep in req_endpoints if ep.get("file")))
+
+        target_tc = next(
+            (tc for tc in existing_ts.get("test_cases", []) if tc.get("tc_id") == target_tc_id),
+            None,
+        )
+        update_context = (
+            f"## TC 수정 모드 (ts_id: {ts_id} 유지)\n"
+            f"대상 TC: {target_tc_id or '신규 TC 추가'}\n"
+            f"현재 TC 내용: {target_tc}\n\n"
+            f"위 TC를 아래 요구사항에 맞게 수정하라. "
+            f"scenarios에 원소 1개, test_cases에 수정된 TC만 출력하라. "
+            f"tc_id는 {target_tc_id or '새 TC ID'}로 고정하라."
+        )
+
+        user_prompt = self.prompts.render(
+            domain_rules=area_domain_rules_text,
+            requirements=self._format_requirements([req]),
+            scan_summary=self._format_scan_summary_for_requirement(req_id, req, req_endpoints),
+            code_index=self._format_code_index_for_requirement(router_files, req_endpoints, scan_result),
+            affected_files=", ".join(router_files) if router_files else req.get("domain_area", ""),
+            trigger=trigger,
+            mismatch_note=mismatch_text,
+            update_context=update_context,
+        )
+
+        response = await self.llm.chat(system_prompt=self.prompts.system(), user_prompt=user_prompt)
+        ts_scenarios, ts_confidence = parse_response(response.content, trigger, router_files, [])
+
+        if not ts_scenarios or not ts_scenarios[0].get("test_cases"):
+            return existing_ts, 0.3
+
+        new_tc = ts_scenarios[0]["test_cases"][0]
+        new_tc["tc_id"] = target_tc_id or new_tc.get("tc_id", "")
+        if not new_tc.get("req_id"):
+            new_tc["req_id"] = req_id
+
+        if target_tc_id:
+            updated_tcs = [
+                new_tc if tc.get("tc_id") == target_tc_id else tc
+                for tc in existing_ts.get("test_cases", [])
+            ]
+        else:
+            updated_tcs = list(existing_ts.get("test_cases", [])) + [new_tc]
+
+        return {**existing_ts, "test_cases": updated_tcs}, ts_confidence
+
+    async def _run_add_tv(
+        self,
+        req: dict,
+        existing_ts: dict,
+        scan_result: dict,
+        area_domain_rules_text: str,
+        trigger: str,
+        mismatch_text: str,
+        req_endpoints: list,
+    ) -> tuple[dict, float]:
+        """기존 TC에 새로운 TV(입력값 변형)를 추가한다."""
+        import json as _json
+
+        ts_id = existing_ts["ts_id"]
+        req_id = req.get("req_id", "")
+        target_tc_id = req.get("target_tc_id")
+        router_files = list(dict.fromkeys(ep.get("file", "") for ep in req_endpoints if ep.get("file")))
+
+        target_tcs = [
+            tc for tc in existing_ts.get("test_cases", [])
+            if (not target_tc_id) or tc.get("tc_id") == target_tc_id
+        ]
+        tc_summary = "\n".join(
+            f"  [{tc.get('tc_id', '')}] {tc.get('name', '')}: "
+            f"values={_json.dumps([v.get('field') for v in tc.get('values', [])], ensure_ascii=False)}"
+            for tc in target_tcs
+        )
+        update_context = (
+            f"## TV 추가 모드 (ts_id: {ts_id} 유지)\n"
+            f"대상 TC: {target_tc_id or '전체'}\n"
+            f"현재 TC 및 values:\n{tc_summary}\n\n"
+            f"위 TC에 추가할 새로운 입력값 변형(values)을 포함한 TC를 출력하라. "
+            f"기존 values를 유지하면서 새 values를 추가하라. "
+            f"tc_id는 기존 값을 유지하라. "
+            f"scenarios에 원소 1개, test_cases에 대상 TC만 출력하라."
+        )
+
+        user_prompt = self.prompts.render(
+            domain_rules=area_domain_rules_text,
+            requirements=self._format_requirements([req]),
+            scan_summary=self._format_scan_summary_for_requirement(req_id, req, req_endpoints),
+            code_index=self._format_code_index_for_requirement(router_files, req_endpoints, scan_result),
+            affected_files=", ".join(router_files) if router_files else req.get("domain_area", ""),
+            trigger=trigger,
+            mismatch_note=mismatch_text,
+            update_context=update_context,
+        )
+
+        response = await self.llm.chat(system_prompt=self.prompts.system(), user_prompt=user_prompt)
+        ts_scenarios, ts_confidence = parse_response(response.content, trigger, router_files, [])
+
+        if not ts_scenarios:
+            return existing_ts, 0.3
+
+        new_tc_map = {tc.get("tc_id", ""): tc for tc in ts_scenarios[0].get("test_cases", [])}
+        updated_tcs: list = []
+        for tc in existing_ts.get("test_cases", []):
+            new_tc = new_tc_map.get(tc.get("tc_id", ""))
+            if new_tc:
+                existing_fields = {v.get("field") for v in tc.get("values", [])}
+                extra_values = [
+                    v for v in new_tc.get("values", [])
+                    if v.get("field") not in existing_fields
+                ]
+                updated_tcs.append({**tc, "values": tc.get("values", []) + extra_values})
+            else:
+                updated_tcs.append(tc)
+
+        return {**existing_ts, "test_cases": updated_tcs}, ts_confidence
 
     def _format_requirements(self, requirements: list) -> str:
         if not requirements:

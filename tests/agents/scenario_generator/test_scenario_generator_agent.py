@@ -396,3 +396,193 @@ def test_요구사항_본문의_명시적_API를_우선_매핑한다():
     )
 
     assert [agent._get_full_ep_path(ep) for ep in selected] == ["GET /api/tier"]
+
+
+# ── update 액션 테스트 (#201) ──────────────────────────────────────────────────
+
+EXISTING_TS = {
+    "ts_id": "TS-001",
+    "name": "로그인 시나리오",
+    "trigger": "init",
+    "test_cases": [
+        {
+            "tc_id": "TS-001-TC-01",
+            "name": "비밀번호 5회 이상 오류",
+            "given": "5회 이상 틀린 상태에서",
+            "when": "로그인 시도하면",
+            "then": "계정이 잠긴다",
+            "values": [{"field": "attempt", "value": "6", "type": "int", "purpose": "경계값"}],
+            "tags": ["edge_case"],
+            "req_id": "REQ-001",
+        }
+    ],
+}
+
+UPDATE_TC_LLM_JSON = {
+    "scenarios": [
+        {
+            "name": "로그인 시나리오",
+            "test_cases": [
+                {
+                    "tc_id": "TS-001-TC-NEW",
+                    "name": "비밀번호 4회 이상 오류",
+                    "given": "4회 이상 틀린 상태에서",
+                    "when": "로그인 시도하면",
+                    "then": "경고 메시지가 표시된다",
+                    "values": [{"field": "attempt", "value": "4", "type": "int", "purpose": "경계값"}],
+                    "tags": ["edge_case"],
+                    "req_id": "REQ-001",
+                }
+            ],
+        }
+    ],
+    "confidence": 0.85,
+}
+
+ADD_TV_LLM_JSON = {
+    "scenarios": [
+        {
+            "name": "로그인 시나리오",
+            "test_cases": [
+                {
+                    "tc_id": "TS-001-TC-01",
+                    "name": "비밀번호 5회 이상 오류",
+                    "given": "5회 이상 틀린 상태에서",
+                    "when": "로그인 시도하면",
+                    "then": "계정이 잠긴다",
+                    "values": [
+                        {"field": "attempt", "value": "6", "type": "int", "purpose": "경계값"},
+                        {"field": "email", "value": "naver@naver.com", "type": "str", "purpose": "네이버 도메인"},
+                    ],
+                    "tags": ["edge_case"],
+                    "req_id": "REQ-001",
+                }
+            ],
+        }
+    ],
+    "confidence": 0.85,
+}
+
+UPDATE_REQ = {
+    "req_id": "REQ-002",
+    "req_type": "functional",
+    "content": "비밀번호 4회 이상 오류 케이스 추가",
+    "priority": "medium",
+    "domain_area": "인증",
+    "action_type": "update",
+    "target_level": "tc",
+    "target_ts_id": "TS-001",
+    "target_tc_id": None,
+}
+
+
+@patch("qapilot.agents.scenario_generator.agent.save_scenarios")
+@patch("qapilot.agents.scenario_generator.repository.save_scenario")
+async def test_update_tc_기존_TC_보존하며_새_TC_추가(mock_save_one, mock_save_all):
+    """action_type=update + target_level=tc이면 기존 TC를 보존하고 새 TC를 추가한다."""
+    agent = ScenarioGeneratorAgent(trace_id="test-update")
+    agent.llm.chat = AsyncMock(return_value=_make_llm_response(UPDATE_TC_LLM_JSON))
+    agent._load_scenario_file = MagicMock(return_value=EXISTING_TS)  # type: ignore[method-assign]
+    _patch_index(agent, [{"method": "POST", "path": "/api/auth/login", "file": "auth.py"}])
+
+    input_data = AgentInput(
+        trace_id="test-update",
+        context={
+            "requirements": [UPDATE_REQ],
+            "domain_rules": [],
+            "scan_result": SAMPLE_SCAN_RESULT,
+            "qapilot_dir": "/tmp/test",
+        },
+        params={"trigger": "natural_lang", "affected_only": False},
+    )
+
+    output = await agent.run(input_data)
+    scenarios = output.result["scenarios"]
+
+    assert len(scenarios) == 1
+    ts = scenarios[0]
+    assert ts["ts_id"] == "TS-001"  # ts_id 고정
+
+    tc_names = [tc["name"] for tc in ts["test_cases"]]
+    assert "비밀번호 5회 이상 오류" in tc_names   # 기존 TC 보존
+    assert "비밀번호 4회 이상 오류" in tc_names   # 새 TC 추가
+    assert len(ts["test_cases"]) == 2
+    mock_save_one.assert_called_once()  # update는 save_scenario 사용
+    mock_save_all.assert_not_called()   # save_scenarios 미사용
+
+
+@patch("qapilot.agents.scenario_generator.agent.save_scenarios")
+@patch("qapilot.agents.scenario_generator.repository.save_scenario")
+async def test_update_ts_기존_ts_id_유지(mock_save_one, mock_save_all):
+    """action_type=update + target_level=ts이면 ts_id를 유지하며 전체 재생성한다."""
+    regen_json = {
+        "scenarios": [{"name": "로그인 시나리오 (재생성)", "test_cases": [
+            {"name": "정상 로그인", "given": "g", "when": "w", "then": "t",
+             "values": [], "tags": ["normal"], "req_id": "REQ-001"}
+        ]}],
+        "confidence": 0.9,
+    }
+    req = {**UPDATE_REQ, "target_level": "ts"}
+    agent = ScenarioGeneratorAgent(trace_id="test-update-ts")
+    agent.llm.chat = AsyncMock(return_value=_make_llm_response(regen_json))
+    agent._load_scenario_file = MagicMock(return_value=EXISTING_TS)  # type: ignore[method-assign]
+    _patch_index(agent, [{"method": "POST", "path": "/api/auth/login", "file": "auth.py"}])
+
+    input_data = AgentInput(
+        trace_id="test-update-ts",
+        context={"requirements": [req], "domain_rules": [], "scan_result": SAMPLE_SCAN_RESULT, "qapilot_dir": "/tmp"},
+        params={"trigger": "natural_lang", "affected_only": False},
+    )
+    output = await agent.run(input_data)
+    ts = output.result["scenarios"][0]
+
+    assert ts["ts_id"] == "TS-001"
+    assert ts["name"] == "로그인 시나리오 (재생성)"
+    mock_save_one.assert_called_once()
+
+
+@patch("qapilot.agents.scenario_generator.agent.save_scenarios")
+@patch("qapilot.agents.scenario_generator.repository.save_scenario")
+async def test_update_target_없으면_create_폴백(mock_save_one, mock_save_all):
+    """target_ts_id가 null이면 update 대신 create 경로로 폴백한다."""
+    req = {**UPDATE_REQ, "target_ts_id": None}
+    agent = ScenarioGeneratorAgent(trace_id="test-fallback")
+    agent.llm.chat = AsyncMock(return_value=_make_llm_response(VALID_LLM_JSON))
+    agent._load_scenario_file = MagicMock(return_value=None)  # type: ignore[method-assign]
+    _patch_index(agent, [{"method": "POST", "path": "/api/auth/login", "file": "auth.py"}])
+
+    input_data = AgentInput(
+        trace_id="test-fallback",
+        context={"requirements": [req], "domain_rules": [], "scan_result": SAMPLE_SCAN_RESULT, "qapilot_dir": "/tmp"},
+        params={"trigger": "natural_lang", "affected_only": False},
+    )
+    output = await agent.run(input_data)
+
+    assert len(output.result["scenarios"]) >= 1
+    mock_save_all.assert_called_once()  # create → save_scenarios 사용
+
+
+@patch("qapilot.agents.scenario_generator.agent.save_scenarios")
+@patch("qapilot.agents.scenario_generator.repository.save_scenario")
+async def test_add_tv_기존_values_보존하며_새_value_추가(mock_save_one, mock_save_all):
+    """action_type=update + target_level=tv이면 기존 values에 새 value를 병합한다."""
+    req = {**UPDATE_REQ, "target_level": "tv", "target_tc_id": "TS-001-TC-01"}
+    agent = ScenarioGeneratorAgent(trace_id="test-add-tv")
+    agent.llm.chat = AsyncMock(return_value=_make_llm_response(ADD_TV_LLM_JSON))
+    agent._load_scenario_file = MagicMock(return_value=EXISTING_TS)  # type: ignore[method-assign]
+    _patch_index(agent, [{"method": "POST", "path": "/api/auth/login", "file": "auth.py"}])
+
+    input_data = AgentInput(
+        trace_id="test-add-tv",
+        context={"requirements": [req], "domain_rules": [], "scan_result": SAMPLE_SCAN_RESULT, "qapilot_dir": "/tmp"},
+        params={"trigger": "natural_lang", "affected_only": False},
+    )
+    output = await agent.run(input_data)
+    ts = output.result["scenarios"][0]
+
+    assert ts["ts_id"] == "TS-001"
+    tc = ts["test_cases"][0]
+    fields = [v["field"] for v in tc["values"]]
+    assert "attempt" in fields   # 기존 value 보존
+    assert "email" in fields     # 새 value 추가
+    mock_save_one.assert_called_once()
