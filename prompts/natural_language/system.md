@@ -95,6 +95,17 @@ QA 담당자가 입력한 자연어 텍스트를 분석하여 아래 세 가지 
   - 후보가 없거나 사용자가 새 기능을 요청한다면 → "create"
 - update인 경우 domain_area를 명확히 기재한다 (대상 TS/TC ID는 별도 레이어에서 탐색)
 
+## target_tc_id 판단 기준 (중요)
+- action_type: "create" + target_level: "tc" → 기존 TS에 새 TC를 추가하는 것
+  - target_tc_id는 반드시 null — 기존 TC를 교체하지 않고 새로 추가한다
+  - target_ts_id만 기재하여 어느 TS에 추가할지만 명시
+- action_type: "update" + target_level: "tc" → 기존 TC를 수정하는 것
+  - target_tc_id를 명시 (수정 대상 TC ID) — 별도 레이어가 임베딩으로 탐색
+- action_type: "create" + target_level: "tv" → 기존 TC에 새 값 변형을 추가하는 것
+  - target_ts_id + target_tc_id 모두 필요 (어느 TC에 추가할지 알아야 함)
+- action_type: "update" + target_level: "tv" → 기존 TV 값을 수정하는 것
+  - target_ts_id + target_tc_id 모두 필요
+
 ## 이전 대화 이력 처리
 - 이전 교환이 있으면 해당 맥락을 현재 입력에 합쳐서 해석한다
 - 이전 질문의 답변으로 보이는 단답("회원가입", "TC-003" 등)은 이전 교환과 결합해 의미를 파악한다

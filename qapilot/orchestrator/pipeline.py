@@ -628,7 +628,12 @@ async def _resolve_scenario_targets(
         req["target_ts_id"] = matched_ts_id
 
         # ── TC/TV 매칭: Qdrant 우선 ──────────────────────────────────────
-        if req.get("target_level") in ("tc", "tv"):
+        # create + tc는 기존 TC를 교체하지 않도록 target_tc_id 매칭을 건너뛴다.
+        action_type = req.get("action_type", "create")
+        target_level = req.get("target_level", "ts")
+        skip_tc_match = action_type == "create" and target_level == "tc"
+
+        if target_level in ("tc", "tv") and not skip_tc_match:
             tc_matched: dict | None = None
 
             if service_id:
