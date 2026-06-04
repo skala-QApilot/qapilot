@@ -593,6 +593,13 @@ async def _resolve_scenario_targets(
         matched_ts_id: str | None = None
         matched_ts: dict | None = None
 
+        action_type = req.get("action_type", "create")
+        target_level = req.get("target_level", "ts")
+
+        # create + ts: 완전 새 TS 생성이므로 target_ts_id 스킵 (기존 TS 교체 방지)
+        if action_type == "create" and target_level == "ts":
+            continue
+
         if service_id:
             try:
                 from qapilot.tools.scenario_index import ScenarioVectorStore
@@ -629,8 +636,6 @@ async def _resolve_scenario_targets(
 
         # ── TC/TV 매칭: Qdrant 우선 ──────────────────────────────────────
         # create + tc는 기존 TC를 교체하지 않도록 target_tc_id 매칭을 건너뛴다.
-        action_type = req.get("action_type", "create")
-        target_level = req.get("target_level", "ts")
         skip_tc_match = action_type == "create" and target_level == "tc"
 
         if target_level in ("tc", "tv") and not skip_tc_match:

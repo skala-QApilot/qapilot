@@ -473,6 +473,7 @@ class ScenarioGeneratorAgent(BaseAgent):
         confidence = round(confidence_sum / call_count, 3) if call_count else 0.5
         all_scenarios = self._deduplicate_scenarios(all_scenarios)
         all_scenarios = self._renumber_and_set_depends_on(all_scenarios)
+        all_scenarios = self._avoid_ts_id_conflicts(all_scenarios)
         save_scenarios(all_scenarios)
 
         self.logger.info(
@@ -1271,6 +1272,44 @@ class ScenarioGeneratorAgent(BaseAgent):
         return matched[:10] if matched else requirements[:5]
 
     # ── update 액션 헬퍼 (#201) ────────────────────────────────────────────────
+
+    def _avoid_ts_id_conflicts(self, scenarios: list[dict]) -> list[dict]:
+        """create 경로 시나리오의 ts_id가 기존 파일과 충돌하면 다음 번호로 재할당한다.
+
+        natural_lang "추가해줘" 쿼리로 새 TS를 생성할 때 기존 TS를 덮어쓰는 문제를 방지한다.
+        qapilot_dir이 없으면 no-op.
+        """
+        from pathlib import Path
+
+        qapilot_dir = getattr(self, "_qapilot_dir_override", None)
+        if not qapilot_dir:
+            return scenarios
+
+        scenarios_dir = Path(qapilot_dir) / "scenarios"
+        if not scenarios_dir.exists():
+            return scenarios
+
+        existing_nums: set[int] = set()
+        for p in scenarios_dir.glob("TS-*.json"):
+            parts = p.stem.split("-")
+            if len(parts) == 2 and parts[1].isdigit():
+                existing_nums.add(int(parts[1]))
+
+        if not existing_nums:
+            return scenarios
+
+        next_num = max(existing_nums) + 1
+        result = []
+        for ts in scenarios:
+            ts_id = ts.get("ts_id", "")
+            parts = ts_id.split("-")
+            if len(parts) == 2 and parts[1].isdigit() and int(parts[1]) in existing_nums:
+                new_ts_id = f"TS-{next_num:03d}"
+                next_num += 1
+                ts = {**ts, "ts_id": new_ts_id}
+                self.logger.info("ts_id_conflict_resolved", old=ts_id, new=new_ts_id)
+            result.append(ts)
+        return result
 
     def _load_scenario_file(self, ts_id: str) -> dict | None:
         """기존 시나리오를 DB 우선, 필요 시 qapilot_dir fallback 으로 로드한다."""
