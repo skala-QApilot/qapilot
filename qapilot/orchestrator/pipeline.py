@@ -1594,16 +1594,17 @@ async def _run_ui_with_trace(
 async def _run_db_test_safe(*, tc_id: str, trace_id: str, DBTestTool, ToolInput) -> dict:
     """DBTestTool graceful — env 부재 시 Tool 호출 자체 차단 (로그 노이즈 0).
 
-    DBTestTool 본체가 `QAPILOT_MODULE_URL` 미설정 시 ValueError raise + BaseTool 가
+    DBTestTool 본체가 `QAPILOT_SUT_DB_URL` 미설정 시 ValueError raise + BaseTool 가
     error 로그 출력. TC 별 노이즈 누적 방지를 위해 env 사전 점검으로 호출 자체를 skip.
+    변수명은 PR #184 (이슈 #80) 와 정합 — sut-db-agent 의 클러스터 endpoint URL.
     """
     import os
 
-    if not os.getenv("QAPILOT_MODULE_URL"):
+    if not os.getenv("QAPILOT_SUT_DB_URL"):
         return {
             "tc_id": tc_id,
             "snapshots": [],
-            "summary": "DBTest skip: QAPILOT_MODULE_URL 미설정 (env 사전 점검)",
+            "summary": "DBTest skip: QAPILOT_SUT_DB_URL 미설정 (env 사전 점검)",
         }
 
     try:
