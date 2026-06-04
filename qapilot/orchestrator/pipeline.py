@@ -226,29 +226,23 @@ def _filter_latest_doc_versions(paths: list[Path]) -> list[Path]:
 
 
 async def _doc_import(state: PipelineState) -> dict:
-    """docs/ 디렉토리의 문서를 Qdrant에 임포트한다.
+    """업로드된 도메인 문서 (DB+S3) 와 docs/ 디스크 mirror 를 Qdrant 에 임포트.
 
+    우선순위:
+      1) DB (domain_documents) → S3 GET → 임시 파일로 풀어 import — SaaS / UI 흐름.
+      2) state.qapilot_dir/domain/ 디스크 mirror — Spring 이 dual-write 한 결과.
+      3) config.project.root/docs/ — CLI 흐름 호환.
     이미 임포트된 파일(index.json 존재 + 경로 일치)은 건너뛴다.
-    Qdrant 미가동 시 예외를 삼키고 진행한다.
     """
+    import tempfile
+
+    from qapilot.db.domain_reader import list_latest_domain_documents
     from qapilot.shared.config import load_config
     from qapilot.shared.schemas import ToolInput
+    from qapilot.storage import s3_client
     from qapilot.tools.domain_knowledge import DomainKnowledgeTool
 
     trace_id = state.get("trace_id") or str(_uuid.uuid4())
-    config = load_config()
-    proj = config.project
-    repo_root = Path(proj.root or proj.repo_path or ".")
-    docs_dir = repo_root / "docs"
-
-    if not docs_dir.exists():
-        return {}
-
-    doc_files = _filter_latest_doc_versions([
-        p for p in docs_dir.rglob("*")
-        if p.is_file() and p.suffix.lower() in _SUPPORTED_DOC_SUFFIXES
-    ])
-
     tool = DomainKnowledgeTool(trace_id=trace_id)
     logger = tool.logger
 
@@ -258,17 +252,16 @@ async def _doc_import(state: PipelineState) -> dict:
     if not collection_alive:
         logger.warning("qdrant_collection_missing_reimport", name="domain_knowledge")
 
-    for doc_path in sorted(doc_files):
+    async def _import_path(doc_path: Path) -> None:
         index_path = _qapilot_path(state, "domain", f"{doc_path.stem}.index.json")
-        if index_path.exists():
+        if collection_alive and index_path.exists():
             try:
                 saved = json.loads(index_path.read_text(encoding="utf-8"))
                 if saved.get("file") == str(doc_path):
                     logger.info("doc_import_skip", file=str(doc_path))
-                    continue
+                    return
             except Exception:
                 pass
-
         try:
             await tool.run(
                 ToolInput(
@@ -278,6 +271,53 @@ async def _doc_import(state: PipelineState) -> dict:
             )
         except Exception as e:
             logger.warning("doc_import_failed", file=str(doc_path), error=str(e))
+
+    # (1) DB + S3 — UI 에서 업로드한 PRD/정책 문서가 진실의 원천.
+    trace = load_trace(state["qapilot_dir"], state["trace_id"]) or {}
+    service_id = trace.get("service_id")
+    if service_id:
+        for doc in list_latest_domain_documents(service_id):
+            filename = doc.get("filename") or ""
+            s3_key = doc.get("s3_key") or ""
+            if not (filename and s3_key):
+                continue
+            if Path(filename).suffix.lower() not in _SUPPORTED_DOC_SUFFIXES:
+                continue
+            data = s3_client.get_bytes(s3_key)
+            if data is None:
+                logger.warning("doc_import_s3_miss", service_id=service_id, s3_key=s3_key)
+                continue
+            with tempfile.NamedTemporaryFile(
+                suffix=Path(filename).suffix, delete=False
+            ) as tmp:
+                tmp.write(data)
+                tmp_path = Path(tmp.name).with_name(filename)
+            # 원본 파일명 유지를 위해 임시 디렉토리 안에 rename — index 도 stem 기준이라 일관성 확보.
+            Path(tmp.name).rename(tmp_path)
+            try:
+                await _import_path(tmp_path)
+            finally:
+                tmp_path.unlink(missing_ok=True)
+
+    # (2) qapilot_dir/domain/ — Spring 디스크 mirror 직접 import (S3 miss fallback).
+    mirror_dir = Path(state["qapilot_dir"]) / "domain"
+    if mirror_dir.exists():
+        for doc_path in sorted(mirror_dir.iterdir()):
+            if doc_path.is_file() and doc_path.suffix.lower() in _SUPPORTED_DOC_SUFFIXES:
+                await _import_path(doc_path)
+
+    # (3) config.project.root/docs/ — CLI 흐름 호환.
+    config = load_config()
+    proj = config.project
+    repo_root = Path(proj.root or proj.repo_path or ".")
+    docs_dir = repo_root / "docs"
+    if docs_dir.exists():
+        doc_files = _filter_latest_doc_versions([
+            p for p in docs_dir.rglob("*")
+            if p.is_file() and p.suffix.lower() in _SUPPORTED_DOC_SUFFIXES
+        ])
+        for doc_path in sorted(doc_files):
+            await _import_path(doc_path)
 
     return {}
 
@@ -778,11 +818,22 @@ async def _save_scenarios(state: PipelineState) -> dict:
     trace = load_trace(state["qapilot_dir"], state["trace_id"]) or {}
     service_id = trace.get("service_id")
 
+    # requirements 가 비어있으면 RTM fallback 과 동일하게 TC.req_id 를 FR-{ts_id} 로 미리 채움.
+    # 디스크/DB 저장이 fallback 보다 먼저 일어나는 순서 문제 회피 — _write_initial_rtm_version 의
+    # 같은 블록은 멱등이라 그대로 둠.
+    def _backfill_req_id(ts_dict: dict, ts_id: str) -> None:
+        if requirements:
+            return
+        for tc in ts_dict.get("test_cases") or []:
+            if not tc.get("req_id"):
+                tc["req_id"] = f"FR-{ts_id}"
+
     if trigger == "natural_lang":
         # natural_lang: delta(신규/수정 시나리오)만 저장, 기존 시나리오 파일 유지 (이슈 #180)
         # ScenarioGeneratorAgent가 반환한 시나리오만 쓰고, 나머지는 건드리지 않음.
         for idx, ts in enumerate(scenarios, start=1):
             ts_id = ts.get("ts_id") or f"TS-{idx:03d}"
+            _backfill_req_id(ts, ts_id)
             path = scenarios_dir / f"{ts_id}.json"
             path.write_text(
                 json.dumps(ts, ensure_ascii=False, indent=2), encoding="utf-8"
@@ -798,6 +849,7 @@ async def _save_scenarios(state: PipelineState) -> dict:
     else:
         for idx, ts in enumerate(scenarios, start=1):
             ts_id = ts.get("ts_id") or f"TS-{idx:03d}"
+            _backfill_req_id(ts, ts_id)
             path = scenarios_dir / f"{ts_id}.json"
             path.write_text(
                 json.dumps(ts, ensure_ascii=False, indent=2), encoding="utf-8"

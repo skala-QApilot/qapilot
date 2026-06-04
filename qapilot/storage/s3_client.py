@@ -98,3 +98,16 @@ def put_file(key: str, path: str, content_type: str) -> dict | None:
     except OSError as e:
         _logger.warning("s3_put_file_read_failed", path=path, error=str(e))
         return None
+
+
+def get_bytes(key: str) -> bytes | None:
+    """S3 GET. 반환: bytes 또는 None (실패/비활성/미존재)."""
+    client, bucket = get_client()
+    if client is None:
+        return None
+    try:
+        resp = client.get_object(Bucket=bucket, Key=key)
+        return resp["Body"].read()
+    except Exception as e:
+        _logger.warning("s3_get_failed", key=key, error=str(e))
+        return None
