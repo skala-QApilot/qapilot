@@ -1,14 +1,16 @@
-"""agent_router / runner / state 의 test_account 주입 흐름 검증 (격차 12 SaaS 후속).
+"""agent_router / runner / state 의 domain_files 주입 흐름 검증 (격차 #207 sub-D).
 
-PR #176 (이슈 #174) 의 `_ensure_authenticated` 는 `cfg.project.test_account` 의존인데
-SaaS 흐름은 cfg 출처가 다름 (agent process 의 CWD). Spring 이 body 로 채워 보낸 test_account
-가 state.test_account → pipeline._test_execution → UITestTool 까지 전파되어야 함.
+격차 12 (test_account) 동형 패턴. Spring sub-C (이슈 #210) 가 body 에
+`domain_files=[{file_id, filename, s3_key, version, type, reflected?}, ...]` 채워
+보내면 → agent_router → state.domain_files → sub-F Part 2 (pipeline._doc_import) 가
+각 entry 의 s3_key 를 s3_client.download (sub-E) 로 받아 처리.
 
-본 테스트는 흐름의 두 지점 단위 검증:
-- runner.run_pipeline 시그니처 + initial_state.test_account 저장
-- agent_router._start_pipeline 의 body 추출 + _submit_pipeline 전달
+본 PR 은 **통로만** — 실제 활용은 sub-F Part 2 (#213) 가 담당.
+본 테스트는 통로 두 지점 단위 검증:
+- runner.run_pipeline 시그니처 + initial_state.domain_files 저장
+- agent_router._start_pipeline 의 body 추출 + _submit_pipeline 전달 + trace 보존
 
-상세: memory/project_qapilot_saas_test_account_gap.md
+상세: memory/project_qapilot_prd_docs_saas_wire_gap.md
 """
 from __future__ import annotations
 
@@ -16,62 +18,24 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, patch
 
-import pytest
-
 from qapilot.api import agent_router as router_module
 
 
 # ── runner.run_pipeline 시그니처 검증 ──────────────────────────────────────────
 
 
-def test_run_pipeline_accepts_test_account_kwarg():
-    """run_pipeline 시그니처에 test_account 인자가 추가되어야 함."""
+def test_run_pipeline_accepts_domain_files_kwarg():
+    """run_pipeline 시그니처에 domain_files 인자가 추가되어야 함."""
     import inspect
 
     from qapilot.orchestrator.runner import run_pipeline
     sig = inspect.signature(run_pipeline)
-    assert "test_account" in sig.parameters
-    assert sig.parameters["test_account"].default is None
+    assert "domain_files" in sig.parameters
+    assert sig.parameters["domain_files"].default is None
 
 
-def test_run_pipeline_initial_state_stores_test_account(tmp_path: Path):
-    """run_pipeline 진입 시 initial_state.test_account 에 dict 그대로 저장."""
-    import asyncio
-    from qapilot.orchestrator import runner as runner_module
-
-    captured: dict[str, Any] = {}
-
-    class _FakeGraph:
-        def compile(self):
-            async def _ainvoke(state):
-                captured["state"] = state
-                # 최소 필드만 채워서 run_pipeline 정상 완료 흐름 보장
-                state["status"] = "completed"
-                state["agent_logs"] = []
-                return state
-
-            mock_app = MagicMock()
-            mock_app.ainvoke = _ainvoke
-            return mock_app
-
-    with patch.object(runner_module, "build_pipeline", return_value=_FakeGraph()):
-        asyncio.run(
-            runner_module.run_pipeline(
-                options={"command": "test", "trigger": None, "user_input": None,
-                         "scenario_ids": None, "filter": None, "tags": None},
-                qapilot_dir=tmp_path,
-                trace_id="trace-x",
-                staging_url="http://sut.local",
-                test_account={"email": "a@b.com", "password": "secret"},
-            )
-        )
-
-    assert captured["state"]["test_account"] == {"email": "a@b.com", "password": "secret"}
-    assert captured["state"]["staging_url"] == "http://sut.local"
-
-
-def test_run_pipeline_test_account_none_when_missing(tmp_path: Path):
-    """test_account 미전달 시 initial_state.test_account = None (graceful)."""
+def test_run_pipeline_initial_state_stores_domain_files(tmp_path: Path):
+    """run_pipeline 진입 시 initial_state.domain_files 에 list 그대로 저장."""
     import asyncio
     from qapilot.orchestrator import runner as runner_module
 
@@ -89,6 +53,23 @@ def test_run_pipeline_test_account_none_when_missing(tmp_path: Path):
             mock_app.ainvoke = _ainvoke
             return mock_app
 
+    docs = [
+        {
+            "file_id": "f-1",
+            "filename": "PRD.md",
+            "s3_key": "services/svc-1/domain/f-1/v1/PRD.md",
+            "version": 1,
+            "type": "PRD",
+        },
+        {
+            "file_id": "f-2",
+            "filename": "정책_v3.md",
+            "s3_key": "services/svc-1/domain/f-2/v2/정책_v3.md",
+            "version": 2,
+            "type": "POLICY",
+        },
+    ]
+
     with patch.object(runner_module, "build_pipeline", return_value=_FakeGraph()):
         asyncio.run(
             runner_module.run_pipeline(
@@ -96,14 +77,15 @@ def test_run_pipeline_test_account_none_when_missing(tmp_path: Path):
                          "scenario_ids": None, "filter": None, "tags": None},
                 qapilot_dir=tmp_path,
                 trace_id="trace-x",
+                domain_files=docs,
             )
         )
 
-    assert captured["state"]["test_account"] is None
+    assert captured["state"]["domain_files"] == docs
 
 
-def test_run_pipeline_rejects_non_dict_test_account(tmp_path: Path):
-    """test_account 가 dict 아니면 None (방어적)."""
+def test_run_pipeline_domain_files_none_when_missing(tmp_path: Path):
+    """domain_files 미전달 시 initial_state.domain_files = None (CLI 호환)."""
     import asyncio
     from qapilot.orchestrator import runner as runner_module
 
@@ -128,11 +110,43 @@ def test_run_pipeline_rejects_non_dict_test_account(tmp_path: Path):
                          "scenario_ids": None, "filter": None, "tags": None},
                 qapilot_dir=tmp_path,
                 trace_id="trace-x",
-                test_account="not-a-dict",  # type: ignore[arg-type]
             )
         )
 
-    assert captured["state"]["test_account"] is None
+    assert captured["state"]["domain_files"] is None
+
+
+def test_run_pipeline_rejects_non_list_domain_files(tmp_path: Path):
+    """domain_files 가 list 아니면 None (방어적)."""
+    import asyncio
+    from qapilot.orchestrator import runner as runner_module
+
+    captured: dict[str, Any] = {}
+
+    class _FakeGraph:
+        def compile(self):
+            async def _ainvoke(state):
+                captured["state"] = state
+                state["status"] = "completed"
+                state["agent_logs"] = []
+                return state
+
+            mock_app = MagicMock()
+            mock_app.ainvoke = _ainvoke
+            return mock_app
+
+    with patch.object(runner_module, "build_pipeline", return_value=_FakeGraph()):
+        asyncio.run(
+            runner_module.run_pipeline(
+                options={"command": "test", "trigger": None, "user_input": None,
+                         "scenario_ids": None, "filter": None, "tags": None},
+                qapilot_dir=tmp_path,
+                trace_id="trace-x",
+                domain_files="not-a-list",  # type: ignore[arg-type]
+            )
+        )
+
+    assert captured["state"]["domain_files"] is None
 
 
 # ── agent_router._start_pipeline body 추출 + _submit_pipeline 전달 ──────────────
@@ -144,13 +158,16 @@ def _fake_request(trace_id: str = "trace-y") -> Any:
     return req
 
 
-def test_start_pipeline_extracts_test_account_from_body(tmp_path: Path):
-    """body 의 test_account dict 가 _submit_pipeline 호출 인자로 전달."""
+def test_start_pipeline_extracts_domain_files_from_body(tmp_path: Path):
+    """body 의 domain_files list 가 _submit_pipeline 호출 인자로 전달."""
+    docs = [
+        {"file_id": "f-1", "filename": "PRD.md",
+         "s3_key": "services/svc-1/domain/f-1/v1/PRD.md", "version": 1},
+    ]
     body = {
         "qapilot_dir": str(tmp_path),
         "service_id": "svc-1",
-        "staging_url": "http://sut.local",
-        "test_account": {"email": "demo@x.com", "password": "Passw0rd!"},
+        "domain_files": docs,
     }
     options = {
         "command": "test", "trigger": None, "user_input": None,
@@ -159,8 +176,7 @@ def test_start_pipeline_extracts_test_account_from_body(tmp_path: Path):
     captured: dict[str, Any] = {}
 
     def _fake_submit(qd, tid, opts, su, ta=None, df=None):
-        captured["test_account"] = ta
-        captured["staging_url"] = su
+        captured["domain_files"] = df
 
     with patch.object(router_module, "_submit_pipeline", side_effect=_fake_submit), \
          patch.object(router_module, "create_trace"), \
@@ -168,16 +184,14 @@ def test_start_pipeline_extracts_test_account_from_body(tmp_path: Path):
         resp = router_module._start_pipeline(_fake_request(), body, options)  # type: ignore[arg-type]
 
     assert resp.status_code == 202
-    assert captured["test_account"] == {"email": "demo@x.com", "password": "Passw0rd!"}
-    assert captured["staging_url"] == "http://sut.local"
+    assert captured["domain_files"] == docs
 
 
-def test_start_pipeline_test_account_none_when_body_missing(tmp_path: Path):
-    """body 에 test_account 없으면 None 전달 (CLI / 미주입 graceful)."""
+def test_start_pipeline_domain_files_none_when_body_missing(tmp_path: Path):
+    """body 에 domain_files 없으면 None 전달 (Spring sub-C 미머지 graceful)."""
     body = {
         "qapilot_dir": str(tmp_path),
         "service_id": "svc-1",
-        "staging_url": "http://sut.local",
     }
     options = {
         "command": "test", "trigger": None, "user_input": None,
@@ -186,22 +200,22 @@ def test_start_pipeline_test_account_none_when_body_missing(tmp_path: Path):
     captured: dict[str, Any] = {}
 
     def _fake_submit(qd, tid, opts, su, ta=None, df=None):
-        captured["test_account"] = ta
+        captured["domain_files"] = df
 
     with patch.object(router_module, "_submit_pipeline", side_effect=_fake_submit), \
          patch.object(router_module, "create_trace"), \
          patch.object(router_module, "annotate_trace"):
         router_module._start_pipeline(_fake_request(), body, options)  # type: ignore[arg-type]
 
-    assert captured["test_account"] is None
+    assert captured["domain_files"] is None
 
 
-def test_start_pipeline_rejects_non_dict_test_account(tmp_path: Path):
-    """body.test_account 가 str / list 등 비-dict 면 None (방어적)."""
+def test_start_pipeline_rejects_non_list_domain_files(tmp_path: Path):
+    """body.domain_files 가 dict / str 등 비-list 면 None (방어적)."""
     body = {
         "qapilot_dir": str(tmp_path),
         "service_id": "svc-1",
-        "test_account": "bogus-string",
+        "domain_files": {"not": "a list"},  # 잘못된 형식
     }
     options = {
         "command": "test", "trigger": None, "user_input": None,
@@ -210,22 +224,23 @@ def test_start_pipeline_rejects_non_dict_test_account(tmp_path: Path):
     captured: dict[str, Any] = {}
 
     def _fake_submit(qd, tid, opts, su, ta=None, df=None):
-        captured["test_account"] = ta
+        captured["domain_files"] = df
 
     with patch.object(router_module, "_submit_pipeline", side_effect=_fake_submit), \
          patch.object(router_module, "create_trace"), \
          patch.object(router_module, "annotate_trace"):
         router_module._start_pipeline(_fake_request(), body, options)  # type: ignore[arg-type]
 
-    assert captured["test_account"] is None
+    assert captured["domain_files"] is None
 
 
-def test_start_pipeline_annotates_trace_with_test_account(tmp_path: Path):
-    """trace.json 에 test_account 저장 — resume 시 복원 위한 보존."""
+def test_start_pipeline_annotates_trace_with_domain_files(tmp_path: Path):
+    """trace.json 에 domain_files 저장 — resume 시 복원 위한 보존."""
+    docs = [{"file_id": "f-1", "s3_key": "k", "version": 1}]
     body = {
         "qapilot_dir": str(tmp_path),
         "service_id": "svc-1",
-        "test_account": {"email": "x@y.com", "password": "p"},
+        "domain_files": docs,
     }
     options = {
         "command": "test", "trigger": None, "user_input": None,
@@ -241,6 +256,5 @@ def test_start_pipeline_annotates_trace_with_test_account(tmp_path: Path):
          patch.object(router_module, "annotate_trace", side_effect=_fake_annotate):
         router_module._start_pipeline(_fake_request(), body, options)  # type: ignore[arg-type]
 
-    # 첫 annotate_trace 호출 인자에 test_account 포함
     assert annotate_calls, "annotate_trace 가 호출되어야 함"
-    assert annotate_calls[0].get("test_account") == {"email": "x@y.com", "password": "p"}
+    assert annotate_calls[0].get("domain_files") == docs
