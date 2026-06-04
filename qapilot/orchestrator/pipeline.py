@@ -283,7 +283,7 @@ async def _doc_import(state: PipelineState) -> dict:
                 continue
             if Path(filename).suffix.lower() not in _SUPPORTED_DOC_SUFFIXES:
                 continue
-            data = s3_client.get_bytes(s3_key)
+            data = s3_client.get_object(s3_key)
             if data is None:
                 logger.warning("doc_import_s3_miss", service_id=service_id, s3_key=s3_key)
                 continue
@@ -647,7 +647,7 @@ def _read_latest_prd_text(state: PipelineState | None = None) -> str:
                     continue
                 if "prd" not in filename.lower():
                     continue
-                data = s3_client.get_bytes(s3_key)
+                data = s3_client.get_object(s3_key)
                 if data is None:
                     continue
                 try:
@@ -919,6 +919,18 @@ async def _save_scenarios(state: PipelineState) -> dict:
             # RTM 생성 실패는 본 시나리오 생성 흐름을 막지 않도록 silent.
             logger = get_logger(source="orchestrator", trace_id=state.get("trace_id"))
             logger.warning("rtm_version_write_failed", error=str(e))
+
+    # 첫 마일스톤 v1.0 자동 박제 — init 트리거 + service 의 첫 시나리오 생성일 때.
+    # UNIQUE(service_id, label) 제약 덕에 재실행해도 멱등 (이미 v1.0 있으면 skip).
+    if trigger == "init" and service_id and scenarios:
+        try:
+            from qapilot.db.scenario_version_writer import insert_initial_milestone
+
+            created = insert_initial_milestone(service_id, scenarios, label="v1.0",
+                                                description="초기 자동 생성")
+            logger.info("initial_milestone", created=created, label="v1.0")
+        except Exception as e:
+            logger.warning("initial_milestone_failed", error=str(e))
 
     return {
         "saved_scenario_paths": saved_paths,
@@ -1699,16 +1711,17 @@ async def _run_ui_with_trace(
 async def _run_db_test_safe(*, tc_id: str, trace_id: str, DBTestTool, ToolInput) -> dict:
     """DBTestTool graceful — env 부재 시 Tool 호출 자체 차단 (로그 노이즈 0).
 
-    DBTestTool 본체가 `QAPILOT_MODULE_URL` 미설정 시 ValueError raise + BaseTool 가
+    DBTestTool 본체가 `QAPILOT_SUT_DB_URL` 미설정 시 ValueError raise + BaseTool 가
     error 로그 출력. TC 별 노이즈 누적 방지를 위해 env 사전 점검으로 호출 자체를 skip.
+    변수명은 PR #184 (이슈 #80) 와 정합 — sut-db-agent 의 클러스터 endpoint URL.
     """
     import os
 
-    if not os.getenv("QAPILOT_MODULE_URL"):
+    if not os.getenv("QAPILOT_SUT_DB_URL"):
         return {
             "tc_id": tc_id,
             "snapshots": [],
-            "summary": "DBTest skip: QAPILOT_MODULE_URL 미설정 (env 사전 점검)",
+            "summary": "DBTest skip: QAPILOT_SUT_DB_URL 미설정 (env 사전 점검)",
         }
 
     try:
