@@ -225,12 +225,12 @@ code_context_not_found source=fix_recommender   confidence=0.0
 ### Spring (kshyun, E 영역)
 - **sub-B #209** — `ScenarioGenerationStartRequest` 에 `file_ids: List<String>` 추가
 - **sub-C #210** — `AgentExecutionService` 가 `DomainDocumentRepository` 참조 + FastAPI body 동봉
-- **sub-F Part 1 #213** — `DomainFileService.create` 가 `qapilot_dir/domain/<filename>` mirror (1줄, 즉시 효과)
+- **sub-F Part 1 #213** — `DashboardService.domainFiles()` 를 **DB read** 로 전환 (PR #19 청산 패턴 적용 — 잔존 file 의존 청산). ⚠️ v1 의 "qapilot_dir mirror" 안 — anti-pattern 으로 폐기, DB read 정답
 
 ### agent (본인, A 영역)
 - **sub-E #212** — `s3_client.py` 에 `get_object()` / `download()` (단독 가능, 의존 0)
 - **sub-D #211** — `RunOptions / PipelineState` 에 `domain_files` 필드 (격차 12 staging_url/test_account 동형)
-- **sub-F Part 2 #213** — `pipeline._doc_import` 가 `state.domain_files` 우선 → S3 download → tmp 디렉토리
+- **sub-F Part 2 #213** — `pipeline._doc_import` 가 `state.domain_files` → S3 download → tmp 디렉토리 (로컬 fallback 없음, cfg.project.root 는 CLI 호환 한정)
 
 ### C 영역 (ActionMapper 환각)
 - **이슈 #139** — testid 우선 강제 정규화
