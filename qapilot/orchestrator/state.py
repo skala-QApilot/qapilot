@@ -60,6 +60,15 @@ class PipelineState(TypedDict):
     # fallback 또는 graceful skip.
     test_account: dict | None
 
+    # 도메인 문서 메타 리스트 (격차 #207 sub-D). Spring 이 `DomainDocumentRepository` 에서
+    # 읽어 body 에 `domain_files=[{file_id, filename, s3_key, version, type, reflected?}, ...]`
+    # 형태로 채워 보내면 agent_router 가 state 에 주입.
+    # sub-F Part 2 의 pipeline._doc_import 가 각 entry 의 `s3_key` 를 `s3_client.download()`
+    # (sub-E) 로 tmp 디렉토리에 받아 기존 DomainKnowledgeTool / RequirementExtractor 로 처리.
+    # CLI 단독 실행 / Spring 미주입 시 None — pipeline 이 cfg.project.root/docs 로 fallback
+    # (CLI 호환 한정) 또는 graceful skip (requirements_count=0). 본 PR 은 통로만, 활용은 sub-F Part 2.
+    domain_files: list[dict] | None
+
     # ── Layer 1A: 컨텍스트 + 시나리오 생성 ──
     scan_result: ScanResult | None
     domain_rules: list[DomainRule]

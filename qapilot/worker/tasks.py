@@ -26,6 +26,7 @@ def run_pipeline_task(
     options: dict[str, Any],
     staging_url: str | None = None,
     test_account: dict | None = None,
+    domain_files: list[dict] | None = None,
 ) -> dict[str, Any]:
     """파이프라인 1회 실행. self.request.id 가 Celery task id (runs.task_id 에 저장).
 
@@ -34,6 +35,9 @@ def run_pipeline_task(
 
     test_account: 격차 12 SaaS 후속 — Spring 이 body 로 보낸 인증 정보 dict.
     None 이면 pipeline._test_execution 이 cfg.project.test_account 로 fallback.
+
+    domain_files: 격차 #207 sub-D — Spring 이 body 로 보낸 도메인 문서 메타 리스트.
+    None 이면 sub-F Part 2 가 graceful skip 또는 cfg.project.root/docs fallback (CLI 호환).
     """
     _logger.info("celery_task_started", trace_id=trace_id, task_id=self.request.id)
     try:
@@ -44,6 +48,7 @@ def run_pipeline_task(
                 options=options,
                 staging_url=staging_url,
                 test_account=test_account,
+                domain_files=domain_files,
             )
         )
     except Exception as e:

@@ -24,6 +24,7 @@ async def run_pipeline(
     trace_id: str | None = None,
     staging_url: str | None = None,
     test_account: dict | None = None,
+    domain_files: list[dict] | None = None,
 ) -> PipelineState:
     """파이프라인을 실행하고 최종 상태를 반환한다.
 
@@ -38,6 +39,11 @@ async def run_pipeline(
         test_account: SUT 인증 정보 ({email, password, login_path?}). 격차 12 SaaS 후속 —
             Spring 이 body 에 채워 보내면 _test_execution 이 cfg.project.test_account 보다
             우선 사용. None 이면 cfg fallback 또는 _ensure_authenticated graceful skip.
+        domain_files: 도메인 문서 메타 리스트 (격차 #207 sub-D). Spring 이 body 의 `domain_files`
+            ([{file_id, filename, s3_key, version, type, reflected?}, ...]) 를 채워 보내면
+            sub-F Part 2 의 pipeline._doc_import 가 각 entry 의 `s3_key` 를 S3 download 한 뒤
+            기존 DomainKnowledgeTool / RequirementExtractor 로 처리. None 이면 cfg.project.root/docs
+            (CLI 호환 한정) 또는 graceful skip. 본 시그니처는 통로만 — 활용은 sub-F Part 2.
 
     Returns:
         파이프라인 최종 상태.
@@ -65,6 +71,7 @@ async def run_pipeline(
         "qapilot_dir": str(Path(qapilot_dir).resolve()),
         "staging_url": staging_url or "",
         "test_account": test_account if isinstance(test_account, dict) else None,
+        "domain_files": domain_files if isinstance(domain_files, list) else None,
         # Layer 1A
         "scan_result": None,
         "domain_rules": [],
