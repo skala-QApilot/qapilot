@@ -2232,6 +2232,17 @@ async def _cross_check(state: PipelineState) -> dict:
                 "summary": "",
                 "error": f"CrossCheck skip: {type(e).__name__}: {e}",
             })
+            
+    for cc in cross_check_results:
+        upsert_tc_result(
+            run_id=trace_id,
+            ts_id="",
+            tc_id=cc.get("tc_id", ""),
+            kind="cross_check",
+            payload=cc,
+            status="fail" if cc.get("has_mismatch") else "pass",
+        )    
+        
 
     return {
         "cross_check_results": cross_check_results,
