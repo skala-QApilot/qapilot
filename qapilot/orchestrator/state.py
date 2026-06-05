@@ -109,3 +109,8 @@ class PipelineState(TypedDict):
     # ── 메타 ──
     agent_logs: list[AgentMeta]
     total_cost: float
+
+    # ── natural_lang 챗봇 응답 ──
+    query_status: str | None
+    query_feedback: str | None
+    change_summary: list[str] | None

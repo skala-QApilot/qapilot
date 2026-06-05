@@ -30,6 +30,7 @@ from langgraph.graph import END, START, StateGraph
 from qapilot.db.code_reader import load_codebase_index, load_latest_action_mapping, load_latest_generated_code
 from qapilot.db.code_writer import upsert_action_mapping, upsert_codebase_index, upsert_generated_code
 from qapilot.db.rtm_writer import write_rtm_version
+from qapilot.db.change_request_writer import upsert_change_request
 from qapilot.db.scenario_writer import upsert_scenario_version
 from qapilot.db.tc_result_writer import insert_tc_artifact, upsert_tc_result
 from qapilot.orchestrator.state import PipelineState
@@ -300,6 +301,11 @@ async def _doc_import(state: PipelineState) -> dict:
       2) config.project.root/docs/ — CLI 흐름 호환.
     이미 임포트된 파일(index.json 존재 + 경로 일치)은 건너뛴다.
     """
+    # natural_lang/code_change는 문서 재임포트 불필요 — 시나리오 조회/수정만 수행
+    trigger = (state["run_options"].get("trigger") or "init")
+    if trigger in ("natural_lang", "code_change"):
+        return {}
+
     import tempfile
 
     from qapilot.db.domain_reader import list_latest_domain_documents
@@ -559,7 +565,12 @@ async def _resolve_scenario_targets(
 
     from qapilot.tools.domain_knowledge._embedder import get_embedder
 
-    update_reqs = [r for r in requirements if r.get("action_type") == "update"]
+    # update + create(tc/tv) 모두 처리: create+ts는 target_ts_id 불필요
+    update_reqs = [
+        r for r in requirements
+        if r.get("action_type") == "update"
+        or (r.get("action_type") == "create" and r.get("target_level") in ("tc", "tv"))
+    ]
     if not update_reqs or not existing_scenarios:
         return requirements
 
@@ -634,14 +645,10 @@ async def _resolve_scenario_targets(
 
         req["target_ts_id"] = matched_ts_id
 
-        # ── TC/TV 매칭: Qdrant 우선 ──────────────────────────────────────
-        # create + tc는 기존 TC를 교체하지 않도록 target_tc_id 매칭을 건너뛴다.
-        skip_tc_match = action_type == "create" and target_level == "tc"
-
-        if target_level in ("tc", "tv") and not skip_tc_match:
+        if target_level in ("tc", "tv"):
             tc_matched: dict | None = None
 
-            if service_id:
+            if target_level == "tv" and service_id:
                 try:
                     from qapilot.tools.scenario_index import ScenarioVectorStore
 
@@ -658,26 +665,46 @@ async def _resolve_scenario_targets(
                         "resolve_targets_qdrant_tc_fallback", error=str(e)
                     )
 
-            if tc_matched is None:
-                # 인메모리 폴백
-                tcs = matched_ts.get("test_cases") or []
-                if tcs:
-                    tc_texts_local = [
-                        tc.get("title") or tc.get("tc_id", "") for tc in tcs
-                    ]
-                    tc_vecs = await _asyncio.to_thread(
-                        embedder.encode, tc_texts_local, normalize_embeddings=True
-                    )
-                    tc_sims = [float(np.dot(q_vec, tc_vec)) for tc_vec in tc_vecs]
-                    best_tc_idx = int(np.argmax(tc_sims))
-                    if tc_sims[best_tc_idx] >= threshold:
-                        tc_matched = {
-                            "tc_id": tcs[best_tc_idx].get("tc_id"),
-                            "_similarity": tc_sims[best_tc_idx],
-                        }
-
-            if tc_matched:
+            if target_level == "tv" and tc_matched:
                 req["target_tc_id"] = tc_matched.get("tc_id")
+                continue
+
+            # TC 레벨은 target_tc_id 설정 없이 유사 TC만 감지한다.
+            # TV 레벨은 어느 TC에 추가할지 알아야 하므로 인메모리 fallback 매칭을 유지한다.
+            tcs = matched_ts.get("test_cases") or []
+            if not tcs:
+                continue
+            tc_texts = [
+                tc.get("name") or tc.get("title") or tc.get("tc_id", "")
+                for tc in tcs
+            ]
+            tc_vecs = await _asyncio.to_thread(
+                embedder.encode, tc_texts, normalize_embeddings=True
+            )
+            tc_sims = [float(np.dot(q_vec, tc_vec)) for tc_vec in tc_vecs]
+            best_tc_idx = int(np.argmax(tc_sims))
+            get_logger(source="orchestrator").debug(
+                "tc_similarity_check",
+                query=query_texts[i][:60],
+                best_tc=tc_texts[best_tc_idx][:60],
+                similarity=round(tc_sims[best_tc_idx], 3),
+                threshold=0.75,
+                target_level=target_level,
+            )
+
+            if target_level == "tv" and tc_sims[best_tc_idx] >= threshold:
+                req["target_tc_id"] = tcs[best_tc_idx].get("tc_id")
+            elif target_level == "tc" and tc_sims[best_tc_idx] >= 0.75:
+                # create 또는 update+target_tc_id 미설정: 유사 TC 발견 시 사용자에게 확인 요청
+                # target_tc_id가 명시된 update는 의도적 수정이므로 감지 불필요
+                if action_type == "create" or not req.get("target_tc_id"):
+                    similar_tc = tcs[best_tc_idx]
+                    req["_similar_tc"] = {
+                        "tc_id": similar_tc.get("tc_id"),
+                        "name": similar_tc.get("name") or similar_tc.get("title", ""),
+                        "ts_id": matched_ts.get("ts_id"),
+                        "similarity": round(tc_sims[best_tc_idx], 3),
+                    }
 
     return requirements
 
@@ -971,6 +998,27 @@ async def _requirement_extract(state: PipelineState) -> dict:
         except Exception as e:
             get_logger("orchestrator").warning("scenario_target_resolve_failed", error=str(e))
 
+        # 4단계: 유사 TC 감지 → insufficient로 사용자 확인 요청
+        for req in requirements:
+            similar_tc = req.pop("_similar_tc", None)
+            if similar_tc:
+                tc_id = similar_tc.get("tc_id", "")
+                tc_name = similar_tc.get("name", "")
+                # similar_tc에 ts_id가 있으면 그쪽 사용, 없으면 req fallback
+                ts_id = similar_tc.get("ts_id") or req.get("target_ts_id", "")
+                tc_label = f"{tc_id} {tc_name}".strip() if tc_id else tc_name
+                feedback = (
+                    f"유사한 TC '{tc_label}'가 {ts_id}에 이미 있습니다. "
+                    f"이 TC를 수정할까요, 아니면 새로 추가할까요?"
+                )
+                if session_id and qapilot_dir:
+                    save_exchange(qapilot_dir, session_id, user_input, "insufficient", feedback)
+                return {
+                    "requirements": [],
+                    "query_status": "insufficient",
+                    "query_feedback": feedback,
+                }
+
         return {"requirements": requirements}
 
     # ── code_change: 요구사항 재추출 불필요 ──────────────────────────────────────
@@ -1009,8 +1057,18 @@ async def _scenario_generate(state: PipelineState) -> dict:
     from qapilot.agents.scenario_generator.agent import ScenarioGeneratorAgent
     from qapilot.shared.schemas import AgentInput
 
+    # insufficient/rejected 상태: 사용자 확인 대기 중 → 생성 불필요
+    query_status = state.get("query_status")
+    if query_status and query_status != "sufficient":
+        return {"scenarios": []}
+
     trigger = state["run_options"].get("trigger") or "code_change"
     affected_only = trigger == "code_change"
+
+    # natural_lang에서 requirements가 비어있으면 ScenarioGeneratorAgent 호출 불필요
+    # (router-based fallback을 막기 위해 명시적으로 early return)
+    if trigger == "natural_lang" and not (state.get("requirements") or []):
+        return {"scenarios": []}
 
     context: dict = {
         "scan_result": state.get("scan_result"),
@@ -1056,7 +1114,7 @@ async def _save_scenarios(state: PipelineState) -> dict:
         logger.info("save_scenarios_skipped", query_status=query_status)
         return {
             "saved_scenario_paths": [],
-            "status": "skipped",
+            "status": "completed",
             "query_status": query_status,
             "query_feedback": state.get("query_feedback"),
         }
@@ -1088,21 +1146,37 @@ async def _save_scenarios(state: PipelineState) -> dict:
     if trigger == "natural_lang":
         # natural_lang: delta(신규/수정 시나리오)만 저장, 기존 시나리오 파일 유지 (이슈 #180)
         # ScenarioGeneratorAgent가 반환한 시나리오만 쓰고, 나머지는 건드리지 않음.
+        change_summary: list[str] = []
         for idx, ts in enumerate(scenarios, start=1):
             ts_id = ts.get("ts_id") or f"TS-{idx:03d}"
             _backfill_req_id(ts, ts_id)
+            change_type = ts.pop("_change_type", "ts_created")
+            change_target = ts.pop("_change_target", None)
             path = scenarios_dir / f"{ts_id}.json"
             path.write_text(
                 json.dumps(ts, ensure_ascii=False, indent=2), encoding="utf-8"
             )
             saved_paths.append(str(path))
+            is_unchanged = ts.pop("_unchanged", False)
+            tc_count = len(ts.get("test_cases") or [])
+            logger.info("scenario_save_debug", ts_id=ts_id, tc_count=tc_count, unchanged=is_unchanged)
             if service_id:
                 upsert_scenario_version(service_id, ts_id, ts)
                 await _upsert_scenario_index(service_id, ts)
+                if not is_unchanged:
+                    upsert_change_request(
+                        service_id=service_id,
+                        scenario_id=ts_id,
+                        trigger="chatbot",
+                        reason=ts.get("name") or ts_id,
+                    )
+            if not is_unchanged:
+                _build_change_summary(change_summary, change_type, ts, ts_id, change_target)
             logger.info(
                 "scenario_merged",
                 ts_id=ts_id,
                 action_type=ts.get("action_type", "create"),
+                unchanged=is_unchanged,
             )
     else:
         for idx, ts in enumerate(scenarios, start=1):
@@ -1138,10 +1212,40 @@ async def _save_scenarios(state: PipelineState) -> dict:
         except Exception as e:
             logger.warning("initial_milestone_failed", error=str(e))
 
-    return {
+    result: dict = {
         "saved_scenario_paths": saved_paths,
         "status": "completed",
     }
+    if trigger == "natural_lang" and change_summary:
+        result["change_summary"] = change_summary
+    return result
+
+
+def _build_change_summary(
+    summary: list[str],
+    change_type: str,
+    ts: dict,
+    ts_id: str,
+    change_target: str | None,
+) -> None:
+    """변경 내용을 사람이 읽기 좋은 문장으로 요약해 summary에 추가한다."""
+    ts_name = ts.get("name", ts_id)
+    tcs = ts.get("test_cases") or []
+    if change_type == "ts_created":
+        tc_names = ", ".join(tc.get("name", "") for tc in tcs[:3])
+        suffix = f" 등 {len(tcs)}개 TC" if len(tcs) > 3 else f" {len(tcs)}개 TC"
+        summary.append(f"**{ts_id} '{ts_name}'** 시나리오 생성 ({tc_names}{suffix})")
+    elif change_type == "tc_added":
+        new_tc_names = ", ".join(tc.get("name", "") for tc in tcs if tc.get("tc_id") not in (change_target or ""))
+        added_tcs = [tc for tc in tcs if tc.get("_new")]  # 태그 있으면 사용, 없으면 마지막 TC
+        last_tc = tcs[-1] if tcs else {}
+        summary.append(f"**{change_target or ts_id}** 시나리오에 TC **'{last_tc.get('name', '')}'** 추가")
+    elif change_type == "tc_updated":
+        summary.append(f"**{change_target or ts_id}** TC 수정 완료")
+    elif change_type == "ts_updated":
+        summary.append(f"**{ts_id} '{ts_name}'** 시나리오 수정 ({len(tcs)}개 TC)")
+    else:
+        summary.append(f"**{ts_id}** 시나리오 업데이트")
 
 
 def _write_initial_rtm_version(state: PipelineState) -> None:

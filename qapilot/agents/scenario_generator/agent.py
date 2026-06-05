@@ -325,6 +325,15 @@ class ScenarioGeneratorAgent(BaseAgent):
                             req, existing_ts, scan_result, area_domain_rules_text,
                             trigger, mismatch_text, req_endpoints,
                         )
+                    # 변경 정보 태그 — _save_scenarios에서 change_summary 생성에 사용
+                    if target_level == "tc":
+                        # target_tc_id가 있으면 기존 TC 수정, 없으면 새 TC 추가
+                        updated_ts["_change_type"] = "tc_updated" if req.get("target_tc_id") else "tc_added"
+                    elif target_level == "tv":
+                        updated_ts["_change_type"] = "tv_updated"
+                    else:
+                        updated_ts["_change_type"] = "ts_updated"
+                    updated_ts["_change_target"] = req.get("target_tc_id") if target_level in ("tc", "tv") else target_ts_id
                     all_updated.append(updated_ts)
                     confidence_sum += ts_confidence
                     self.logger.info(
@@ -362,6 +371,14 @@ class ScenarioGeneratorAgent(BaseAgent):
             self._correct_api_method_mismatches(ts_scenarios)
             self._pin_req_id(ts_scenarios, req_id)
             self._fill_api_for_domain(ts_scenarios, req, router_files, req_endpoints)
+            # create 변경 정보 태그
+            target_ts_id_for_create = req.get("target_ts_id")
+            for ts in ts_scenarios:
+                if target_ts_id_for_create:
+                    ts["_change_type"] = "tc_added"
+                    ts["_change_target"] = target_ts_id_for_create
+                else:
+                    ts["_change_type"] = "ts_created"
             all_scenarios.extend(ts_scenarios)
             confidence_sum += ts_confidence
 
@@ -1306,7 +1323,12 @@ class ScenarioGeneratorAgent(BaseAgent):
             if len(parts) == 2 and parts[1].isdigit() and int(parts[1]) in existing_nums:
                 new_ts_id = f"TS-{next_num:03d}"
                 next_num += 1
-                ts = {**ts, "ts_id": new_ts_id}
+                # TC ID도 새 ts_id 기준으로 갱신 (TS-001-TC-01 → TS-010-TC-01)
+                updated_tcs = [
+                    {**tc, "tc_id": f"{new_ts_id}-TC-{j:02d}"}
+                    for j, tc in enumerate(ts.get("test_cases", []), start=1)
+                ]
+                ts = {**ts, "ts_id": new_ts_id, "test_cases": updated_tcs}
                 self.logger.info("ts_id_conflict_resolved", old=ts_id, new=new_ts_id)
             result.append(ts)
         return result
@@ -1377,7 +1399,7 @@ class ScenarioGeneratorAgent(BaseAgent):
         ts_scenarios, ts_confidence = parse_response(response.content, trigger, router_files, [])
 
         if not ts_scenarios:
-            return existing_ts, 0.3
+            return {**existing_ts, "_unchanged": True}, 0.3
 
         # tc_id 기준 병합: 기존 TC 보존 + 변경 TC 교체 + 신규 TC 추가
         delta_tcs = ts_scenarios[0].get("test_cases", [])
@@ -1431,19 +1453,20 @@ class ScenarioGeneratorAgent(BaseAgent):
             None,
         )
 
+        self.logger.info("run_update_tc_debug", ts_id=ts_id, target_tc_id=target_tc_id, mode="update" if (target_tc_id and target_tc) else "add")
+
         if target_tc_id and target_tc:
-            # update: 기존 TC 수정 — 변경 value만 delta 출력, field 기준 병합
+            # update: 기존 TC 전체 재작성 — 사용자가 명시적으로 지칭한 TC를 요구사항에 맞게 수정
             import json as _json
-            existing_value_summary = "\n".join(
-                f"  [{v.get('field', '')}] {v.get('value', '')} — {v.get('purpose', '')}"
-                for v in target_tc.get("values", [])
-            )
+            existing_tc_json = _json.dumps(target_tc, ensure_ascii=False, indent=2)
             update_context = (
                 f"## TC 수정 모드 (ts_id: {ts_id}, tc_id: {target_tc_id} 유지)\n"
-                f"현재 TC 이름: {target_tc.get('name', '')}\n"
-                f"현재 values:\n{existing_value_summary}\n\n"
-                f"변경이 필요한 value만 출력하라. 변경 없는 value는 출력하지 마라 — 코드에서 기존 value를 보존한다.\n"
-                f"tc_id는 반드시 {target_tc_id}로 고정하고, scenarios에 원소 1개, test_cases에 대상 TC만 출력하라."
+                f"수정 대상 TC 현재 내용:\n```json\n{existing_tc_json}\n```\n\n"
+                f"위 TC를 아래 요구사항에 맞게 수정하라.\n"
+                f"요구사항과 현재 TC의 목적이 다른 경우 TC 전체를 재작성하고, "
+                f"부분적으로 동일한 경우 관련 필드(name/given/when/then/values)만 변경하라.\n"
+                f"tc_id는 반드시 {target_tc_id}로 고정하고, "
+                f"scenarios에 원소 1개, test_cases에 수정된 TC 전체를 출력하라."
             )
         else:
             # create+tc: 새 TC 추가 — 완전한 새 TC 생성
@@ -1456,7 +1479,8 @@ class ScenarioGeneratorAgent(BaseAgent):
                 ) +
                 f"\n\n위 TS에 아래 요구사항에 맞는 새 TC를 추가하라. "
                 f"scenarios에 원소 1개, test_cases에 새 TC만 출력하라. "
-                f"기존 TC와 중복되지 않도록 하라."
+                f"기존 TC와 주제가 유사해도 조건(횟수·입력값·결과)이 다르면 별도 TC로 추가한다. "
+                f"given/when/then이 완전히 동일한 TC만 중복으로 간주하라."
             )
 
         user_prompt = self.prompts.render(
@@ -1474,26 +1498,26 @@ class ScenarioGeneratorAgent(BaseAgent):
         ts_scenarios, ts_confidence = parse_response(response.content, trigger, router_files, [])
 
         if not ts_scenarios or not ts_scenarios[0].get("test_cases"):
-            return existing_ts, 0.3
+            return {**existing_ts, "_unchanged": True}, 0.3
 
         output_tc = ts_scenarios[0]["test_cases"][0]
         if not output_tc.get("req_id"):
             output_tc["req_id"] = req_id
 
         if target_tc_id and target_tc:
-            # update: field 기준 병합 — 기존 value 보존 + 변경/신규 value 교체
-            existing_fields = {v.get("field"): v for v in target_tc.get("values", [])}
-            for v in output_tc.get("values", []):
-                existing_fields[v.get("field")] = v  # 교체 or 신규 추가
-            merged_tc = {**target_tc, **output_tc, "values": list(existing_fields.values())}
-            merged_tc["tc_id"] = target_tc_id
+            # update: LLM이 전체 TC를 재작성했으므로 output_tc를 그대로 교체
+            # tc_id는 반드시 원본 유지
+            output_tc["tc_id"] = target_tc_id
             updated_tcs = [
-                merged_tc if tc.get("tc_id") == target_tc_id else tc
+                output_tc if tc.get("tc_id") == target_tc_id else tc
                 for tc in existing_ts.get("test_cases", [])
             ]
         else:
-            # create+tc: 새 TC 추가
-            updated_tcs = list(existing_ts.get("test_cases", [])) + [output_tc]
+            # create+tc: 새 TC 추가 — LLM 생성 tc_id 대신 TS 기준으로 자동 부여
+            existing_tcs = list(existing_ts.get("test_cases", []))
+            next_num = len(existing_tcs) + 1
+            output_tc["tc_id"] = f"{ts_id}-TC-{next_num:02d}"
+            updated_tcs = existing_tcs + [output_tc]
 
         return {**existing_ts, "test_cases": updated_tcs}, ts_confidence
 
@@ -1549,7 +1573,7 @@ class ScenarioGeneratorAgent(BaseAgent):
         ts_scenarios, ts_confidence = parse_response(response.content, trigger, router_files, [])
 
         if not ts_scenarios:
-            return existing_ts, 0.3
+            return {**existing_ts, "_unchanged": True}, 0.3
 
         new_tc_map = {tc.get("tc_id", ""): tc for tc in ts_scenarios[0].get("test_cases", [])}
         updated_tcs: list = []

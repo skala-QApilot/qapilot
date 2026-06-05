@@ -88,19 +88,29 @@ QA 담당자가 입력한 자연어 텍스트를 분석하여 아래 세 가지 
   - 핵심 판단: 기존 TC와 다른 결과/흐름이 있는 경우 → tc
 
 ## action_type 판단 기준
-- "추가", "만들어줘", "생성", "새로" 등 → "create"
+- "추가", "만들어줘", "생성", "새로", "확인", "검증", "테스트", "되는지", "하는지" 등 → "create"
+  - "5회 입력하여 계정 잠금되는지 확인" → 해당 케이스가 없으면 create
 - "수정", "바꿔줘", "변경", "고쳐줘" 등 → "update"
+  - 반드시 기존 TC/TS를 명시적으로 지칭할 때만 update
 - 유사 시나리오 후보가 제공된 경우:
   - 후보가 있고 사용자가 수정/변경을 요청한다면 → "update"
   - 후보가 없거나 사용자가 새 기능을 요청한다면 → "create"
 - update인 경우 domain_area를 명확히 기재한다 (대상 TS/TC ID는 별도 레이어에서 탐색)
 
 ## target_tc_id 판단 기준 (중요)
-- action_type: "create" + target_level: "tc" → 기존 TS에 새 TC를 추가하는 것
-  - target_tc_id는 반드시 null — 기존 TC를 교체하지 않고 새로 추가한다
-  - target_ts_id만 기재하여 어느 TS에 추가할지만 명시
-- action_type: "update" + target_level: "tc" → 기존 TC를 수정하는 것
-  - target_tc_id를 명시 (수정 대상 TC ID) — 별도 레이어가 임베딩으로 탐색
+target_tc_id는 사용자가 특정 TC를 명시적으로 지칭할 때만 설정한다. 그 외에는 반드시 null.
+
+**target_tc_id를 설정하는 경우 (명시적 참조)**:
+- "TC-05를 수정해줘", "TC-03 바꿔줘" → target_tc_id: "TS-001-TC-05"
+- "두 번째 케이스를 고쳐줘", "잘못된 비밀번호 오류 메시지 TC를 변경해줘" (기존 TC 제목과 거의 동일)
+
+**target_tc_id를 null로 두는 경우 (새 TC 추가)**:
+- 사용자가 새로운 테스트 케이스를 원하는 모든 경우
+- "확인", "검증", "테스트", "되는지", "케이스도", "추가", "필요해" 포함 시 → null
+- 기존 TC와 주제가 유사해도 조건·결과가 다른 새 시나리오 요청 → null
+- 예: "5회 입력하여 계정 잠금되는지 확인" → null (TC-05 "오류 메시지"와 다른 시나리오)
+
+target_tc_id는 임베딩 레이어에서 자동 탐색하지 않으므로, 여기서 null로 설정하면 항상 새 TC 추가로 처리된다.
 - action_type: "create" + target_level: "tv" → 기존 TC에 새 값 변형을 추가하는 것
   - target_ts_id + target_tc_id 모두 필요 (어느 TC에 추가할지 알아야 함)
 - action_type: "update" + target_level: "tv" → 기존 TV 값을 수정하는 것

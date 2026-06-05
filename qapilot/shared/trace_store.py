@@ -122,14 +122,18 @@ def _now_kst() -> str:
 
 
 def _result_summary(state: dict) -> dict:
-    return {
+    summary = {
         "scenarios_count": len(state.get("scenarios", [])),
         "action_mappings_count": len(state.get("action_mappings", [])),
         "generated_codes_count": len(state.get("generated_codes", [])),
         "ui_results_count": len(state.get("ui_results", [])),
         "has_mismatch": state.get("has_mismatch", False),
         "report_path": state.get("report_path"),
+        "query_status": state.get("query_status"),
+        "query_feedback": state.get("query_feedback"),
+        "change_summary": state.get("change_summary"),
     }
+    return summary
 
 
 def _average_confidence(agent_logs: list[dict]) -> float | None:
