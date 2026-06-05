@@ -35,13 +35,18 @@ getByTestId > getByLabel > getByPlaceholder > getByText
 > getByAltText > getByTitle > CSS > XPath
 가능한 한 상위 우선순위를 사용한다.
 
-## selector 형식 규칙
-- label:       "사용자 이름"
-- placeholder: "이메일을 입력하세요"
-- text:        "환영합니다"
-- testid:      "submit-button"
-- css:         "button[type='submit']"
-- xpath:       "//button[contains(text(),'로그인')]"
+## selector 선택 규칙
+- selector 값은 예시 문자열을 새로 만들지 말고, 반드시 위 frontend DOM 인덱스에 있는 실제 값만 사용한다.
+- `fill` / `clear` / `select` / `press` / `upload`:
+  - 현재 페이지의 입력 계열 element만 선택한다.
+  - `testid > label > placeholder > text` 우선순위를 사용한다.
+- `click` / `dblclick` / `hover` / `check` / `uncheck`:
+  - 현재 페이지의 버튼/링크/체크박스 계열 element만 선택한다.
+  - `testid > text > label > placeholder` 우선순위를 사용한다.
+- `assert` 계열:
+  - 현재 페이지에 실제 존재하는 `text` 또는 `testid`만 사용한다.
+  - 비즈니스 설명 문장이나 API 응답 문구를 새로 만들지 않는다.
+- `css` / `xpath`는 frontend DOM 인덱스로도 대상을 특정할 수 없을 때만 마지막 수단으로 사용한다.
 
 ## selector 없는 액션 규칙
 - navigate: selector=null, selector_type=null, value에 이동 URL을 넣는다
@@ -80,44 +85,26 @@ getByTestId > getByLabel > getByPlaceholder > getByText
       {
         "step_no": 1,
         "action": "fill",
-        "selector": "이메일을 입력하세요",
-        "selector_type": "placeholder",
+        "selector": "<frontend.json의 실제 입력 요소 값>",
+        "selector_type": "<frontend.json에서 선택한 실제 타입>",
         "value": "test@example.com",
         "expected": null,
         "api_endpoint": null
       },
       {
         "step_no": 2,
-        "action": "fill",
-        "selector": "비밀번호",
-        "selector_type": "label",
-        "value": "password123",
+        "action": "click",
+        "selector": "<frontend.json의 실제 버튼 요소 값>",
+        "selector_type": "<frontend.json에서 선택한 실제 타입>",
+        "value": null,
         "expected": null,
-        "api_endpoint": null
+        "api_endpoint": "POST /api/example"
       },
       {
         "step_no": 3,
-        "action": "click",
-        "selector": "로그인",
-        "selector_type": "text",
-        "value": null,
-        "expected": null,
-        "api_endpoint": "POST /api/login"
-      },
-      {
-        "step_no": 4,
-        "action": "navigate",
-        "selector": null,
-        "selector_type": null,
-        "value": "/orders",
-        "expected": null,
-        "api_endpoint": null
-      },
-      {
-        "step_no": 5,
         "action": "assert",
-        "selector": "로그인이 완료되었습니다.",
-        "selector_type": "text",
+        "selector": "<frontend.json의 실제 text 또는 testid 값>",
+        "selector_type": "<text 또는 testid>",
         "value": null,
         "expected": null,
         "api_endpoint": null

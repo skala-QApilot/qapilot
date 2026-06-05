@@ -119,10 +119,6 @@ async def test_load_scenarios_for_test_prefers_remote_artifacts(tmp_path: Path, 
     monkeypatch.chdir(tmp_path)
 
     qapilot_dir = tmp_path / ".qapilot"
-    _write_json(qapilot_dir / "traces" / "trace-remote.json", {
-        "trace_id": "trace-remote",
-        "service_id": "svc-1",
-    })
     _write_json(qapilot_dir / "scenarios" / "TS-001.json", {
         "ts_id": "TS-001",
         "name": "회원가입",
@@ -142,6 +138,7 @@ async def test_load_scenarios_for_test_prefers_remote_artifacts(tmp_path: Path, 
             [{"tc_id": "TS-001-TC-01", "code": "// remote", "syntax_valid": True, "self_fix_count": 0}],
         ),
     )
+    monkeypatch.setattr(P, "load_trace", lambda trace_id: {"trace_id": trace_id, "service_id": "svc-1"})
 
     result = await P._load_scenarios_for_test(_state(trace_id="trace-remote", qapilot_dir=qapilot_dir))
     assert result["action_mappings"][0]["steps"][0]["value"] == "/remote"

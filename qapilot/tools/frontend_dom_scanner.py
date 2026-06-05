@@ -60,6 +60,7 @@ _VUE_EXPR_PATTERN = re.compile(r"\{\{[^}]*\}\}")
 _JSX_EXPR_PATTERN = re.compile(r"\{[^{}]*\}")
 _HTML_TAG_PATTERN = re.compile(r"<[^>]+>")  # nested element / SVG / break tag 등 제거
 _WHITESPACE_PATTERN = re.compile(r"\s+")
+_STRING_LITERAL_PATTERN = re.compile(r"""['"]([^'"]{1,100})['"]""")
 
 
 class FrontendElement(TypedDict, total=False):
@@ -76,6 +77,10 @@ class FrontendElement(TypedDict, total=False):
     name: str
     id: str
     file: str  # 출처 파일 (디버깅용, 상대 경로)
+    page: str
+    route: str
+    actionable: bool
+    control_type: str
 
 
 def scan_frontend_directory(project_root: Path) -> list[FrontendElement]:
@@ -84,7 +89,7 @@ def scan_frontend_directory(project_root: Path) -> list[FrontendElement]:
     Returns:
         FrontendElement list. 비어있을 수 있음 (frontend dir 없음 / 파일 없음).
     """
-    elements: list[FrontendElement] = []
+    files: list[tuple[str, str]] = []
     seen_files: set[Path] = set()  # 중복 스캔 방지 (frontend/src 같은 중첩 케이스)
 
     for fe_name in _FE_DIR_CANDIDATES:
@@ -101,8 +106,32 @@ def scan_frontend_directory(project_root: Path) -> list[FrontendElement]:
                 except OSError:
                     continue
                 rel = str(fpath.relative_to(project_root))
-                elements.extend(_extract_elements_from_text(text, rel))
+                files.append((rel, text))
+    return scan_frontend_files(files)
+
+
+def scan_frontend_files(files: list[tuple[str, str]]) -> list[FrontendElement]:
+    """파일 경로/본문 쌍에서 frontend element를 추출한다.
+
+    로컬 디렉토리 walk 뿐 아니라 Git REST API처럼 메모리 내 파일 목록만 가진
+    호출자도 같은 인덱싱 로직을 재사용할 수 있도록 분리한다.
+    """
+    elements: list[FrontendElement] = []
+    for file_rel, text in files:
+        suffix = Path(file_rel).suffix.lower()
+        if suffix not in _FE_EXTENSIONS:
+            continue
+        if not _is_frontend_candidate(file_rel):
+            continue
+        elements.extend(_extract_elements_from_text(text, file_rel))
     return elements
+
+
+def _is_frontend_candidate(file_rel: str) -> bool:
+    path = Path(file_rel)
+    if path.name.startswith("."):
+        return False
+    return any(part in _FE_DIR_CANDIDATES for part in path.parts)
 
 
 def _extract_elements_from_text(text: str, file_rel: str) -> list[FrontendElement]:
@@ -119,10 +148,15 @@ def _extract_elements_from_text(text: str, file_rel: str) -> list[FrontendElemen
     label_map = _build_label_map(text)
 
     found: list[FrontendElement] = []
+    page = _infer_page_name(file_rel)
+    route = _infer_route(file_rel)
     for match in _ELEMENT_PATTERN.finditer(text):
         tag = match.group("tag").lower()
         attrs = _parse_attrs(match.group("attrs") or "")
-        inner = _clean_inner_text(match.group("inner") or "")
+        raw_inner = match.group("inner") or ""
+        inner = _clean_inner_text(raw_inner)
+        if not inner:
+            inner = _extract_literal_text(raw_inner)
 
         target_id = attrs.get("id", "")
         label_text = attrs.get("aria-label", "") or (label_map.get(target_id, "") if target_id else "")
@@ -136,6 +170,10 @@ def _extract_elements_from_text(text: str, file_rel: str) -> list[FrontendElemen
             "name": attrs.get("name", ""),
             "id": target_id,
             "file": file_rel,
+            "page": page,
+            "route": route,
+            "actionable": tag in {"input", "button", "textarea", "select", "a"},
+            "control_type": _control_type_for_tag(tag, attrs),
         }
         if any(element[k] for k in ("text", "placeholder", "label", "testid", "name", "id")):
             found.append(element)
@@ -146,7 +184,10 @@ def _extract_elements_from_text(text: str, file_rel: str) -> list[FrontendElemen
         if tag in _TARGET_TAGS:
             continue  # 이미 _ELEMENT_PATTERN 에서 처리됨
         attrs = _parse_attrs(match.group("attrs") or "")
-        inner = _clean_inner_text(match.group("inner") or "")
+        raw_inner = match.group("inner") or ""
+        inner = _clean_inner_text(raw_inner)
+        if not inner:
+            inner = _extract_literal_text(raw_inner)
         element = {
             "tag": tag,
             "text": inner[:100] if inner else "",
@@ -156,6 +197,10 @@ def _extract_elements_from_text(text: str, file_rel: str) -> list[FrontendElemen
             "name": "",
             "id": attrs.get("id", ""),
             "file": file_rel,
+            "page": page,
+            "route": route,
+            "actionable": True,
+            "control_type": "button",
         }
         if any(element[k] for k in ("text", "label", "testid", "id")):
             found.append(element)
@@ -198,6 +243,51 @@ def _clean_inner_text(text: str) -> str:
     return text.strip()
 
 
+def _extract_literal_text(text: str) -> str:
+    """Vue/JSX 표현식 내부 문자열 리터럴을 보조 텍스트로 추출한다."""
+    literals = [
+        m.group(1).strip()
+        for m in _STRING_LITERAL_PATTERN.finditer(text)
+        if m.group(1).strip()
+    ]
+    if not literals:
+        return ""
+    return literals[-1][:100]
+
+
+def _infer_page_name(file_rel: str) -> str:
+    return Path(file_rel).stem or ""
+
+
+def _infer_route(file_rel: str) -> str:
+    stem = Path(file_rel).stem
+    if not stem:
+        return ""
+    lowered = stem.lower()
+    if lowered in {"index", "home"}:
+        return "/"
+    return f"/{lowered}"
+
+
+def _control_type_for_tag(tag: str, attrs: dict[str, str]) -> str:
+    if tag == "input":
+        input_type = attrs.get("type", "").lower()
+        if input_type in {"checkbox", "radio"}:
+            return input_type
+        return "form_input"
+    if tag == "button":
+        return "submit" if attrs.get("type", "").lower() == "submit" else "button"
+    if tag == "a":
+        return "link"
+    if tag == "select":
+        return "select"
+    if tag == "textarea":
+        return "textarea"
+    if tag == "label":
+        return "label"
+    return tag
+
+
 def write_frontend_index(elements: list[FrontendElement], output_path: Path) -> None:
     """frontend.json 으로 디스크 저장. spec §6.1 의 codebase-index/ 안에 위치."""
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -229,6 +319,7 @@ def load_frontend_index(output_path: Path) -> list[FrontendElement]:
 __all__ = [
     "FrontendElement",
     "scan_frontend_directory",
+    "scan_frontend_files",
     "write_frontend_index",
     "load_frontend_index",
 ]

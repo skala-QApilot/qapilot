@@ -319,6 +319,19 @@ def test_normalize_click_selector_fuzzy_match_to_testid(mock_llm_client):
     assert result == ("signup-submit", "testid")
 
 
+def test_normalize_click_selector_button_semantics_to_submit_testid(mock_llm_client):
+    """버튼 의미 + control_type 보너스로 '회원가입 버튼' -> submit testid 정규화."""
+    agent = _make_agent(mock_llm_client)
+    agent._frontend_dom_index = [
+        {"tag": "button", "text": "", "placeholder": "", "label": "",
+         "testid": "signup-submit", "name": "", "id": "", "file": "Signup.vue",
+         "page": "Signup", "route": "/signup", "control_type": "submit"},
+    ]
+
+    result = agent._normalize_selector_via_index("click", "회원가입 버튼", "text", "TC-1", 1)
+    assert result == ("signup-submit", "testid")
+
+
 def test_normalize_assert_selector_substring_bonus_breaks_threshold(mock_llm_client):
     """포함관계 가산점 (+0.2) 으로 임계값 (0.6) 통과 케이스."""
     agent = _make_agent(mock_llm_client)

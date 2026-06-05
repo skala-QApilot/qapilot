@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import difflib
 import json
+import re
 from pathlib import Path
 from typing import Any
 
@@ -28,6 +29,17 @@ from qapilot.tools.frontend_dom_scanner import load_frontend_index
 _MAX_CONCURRENT_LLM_CALLS = 5
 _FUZZY_MATCH_THRESHOLD = 0.6
 _FUZZY_MATCH_SUBSTRING_BONUS = 0.2
+_ENV_REF_RE = re.compile(r"^process\.env\.[A-Z0-9_]+$")
+_SEMANTIC_ALIASES: dict[str, tuple[str, ...]] = {
+    "회원가입": ("signup", "가입", "create account"),
+    "가입": ("signup", "회원가입"),
+    "로그인": ("login", "signin"),
+    "이메일": ("email", "mail"),
+    "비밀번호": ("password", "pwd", "pass"),
+    "이름": ("name", "user name", "username"),
+    "생년월일": ("birth", "birth date", "birth_date"),
+    "버튼": ("button", "submit"),
+}
 
 
 class CodeGeneratorAgent(BaseAgent):
@@ -135,6 +147,15 @@ class CodeGeneratorAgent(BaseAgent):
         scenario_slice = tc_to_scenario.get(tc_id)
         scenarios_for_prompt: list[dict] = [scenario_slice] if scenario_slice else []
 
+        deterministic_code = self._render_generated_code(action_mapping, scenario_slice)
+        if deterministic_code is not None:
+            return {
+                "tc_id": tc_id,
+                "code": deterministic_code,
+                "self_fix_count": 0,
+                "syntax_valid": self._validate_syntax(deterministic_code),
+            }
+
         # 이슈 #140: TC 마다 새 LLMClient — 누적 정책 충돌 해결
         tc_llm = self._create_tc_llm()
 
@@ -180,6 +201,162 @@ class CodeGeneratorAgent(BaseAgent):
             return load_frontend_index(Path(str(qapilot_dir)) / "codebase-index" / "frontend.json")
         return []
 
+    def _render_generated_code(
+        self, action_mapping: dict[str, Any], scenario_slice: dict[str, Any] | None
+    ) -> str | None:
+        steps = list(action_mapping.get("steps") or [])
+        if not steps:
+            return None
+
+        tc_id = str(action_mapping.get("tc_id") or "unknown")
+        tc = (scenario_slice or {}).get("test_cases", [{}])[0] if scenario_slice else {}
+        title = str(tc.get("name") or tc_id)
+        comments = [tc.get("given"), tc.get("when"), tc.get("then")]
+
+        lines = ["const { test, expect } = require('@playwright/test');", ""]
+        if comments[0]:
+            lines.append(f"// Given: {comments[0]}")
+        if comments[1]:
+            lines.append(f"// When: {comments[1]}")
+        if comments[2]:
+            lines.append(f"// Then: {comments[2]}")
+        if any(comments):
+            lines.append("")
+        lines.append(f"test({json.dumps(title, ensure_ascii=False)}, async ({{ page }}) => {{")
+
+        for step in steps:
+            rendered = self._render_step(step)
+            if not rendered:
+                continue
+            if isinstance(rendered, list):
+                lines.extend(f"  {line}" for line in rendered)
+            else:
+                lines.append(f"  {rendered}")
+
+        lines.append("});")
+        return "\n".join(lines)
+
+    def _render_step(self, step: dict[str, Any]) -> str | list[str] | None:
+        action = str(step.get("action") or "")
+        selector = step.get("selector")
+        selector_type = step.get("selector_type")
+        value = step.get("value")
+        expected = step.get("expected")
+
+        if action == "navigate":
+            return f"await page.goto({self._js_value(value)});"
+        if action == "reload":
+            return "await page.reload();"
+        if action == "go_back":
+            return "await page.goBack();"
+        if action == "go_forward":
+            return "await page.goForward();"
+        if action == "wait":
+            if self._is_number_like(value):
+                return f"await page.waitForTimeout({self._js_number(value)});"
+            return "await page.waitForLoadState('networkidle');"
+        if action == "wait_for_url":
+            return f"await page.waitForURL({self._js_value(value)});"
+        if action == "wait_for_load_state":
+            return f"await page.waitForLoadState({self._js_value(value or 'networkidle')});"
+        if action == "wait_for_response":
+            return f"await page.waitForResponse({self._js_value(value)});"
+        if action == "assert_url":
+            return f"await expect(page).toHaveURL({self._js_value(expected)});"
+
+        locator = self._locator_expr(selector_type, selector)
+        if not locator:
+            return f"test.skip(true, {json.dumps(f'missing selector for action: {action}', ensure_ascii=False)});"
+
+        if action == "fill":
+            return f"await {locator}.fill({self._js_value(self._sanitize_fill_value(selector, value))});"
+        if action == "clear":
+            return f"await {locator}.clear();"
+        if action == "click":
+            return f"await {locator}.click();"
+        if action == "dblclick":
+            return f"await {locator}.dblclick();"
+        if action == "hover":
+            return f"await {locator}.hover();"
+        if action == "select":
+            return f"await {locator}.selectOption({self._js_value(value)});"
+        if action == "check":
+            return f"await {locator}.check();"
+        if action == "uncheck":
+            return f"await {locator}.uncheck();"
+        if action == "press":
+            return f"await {locator}.press({self._js_value(value)});"
+        if action == "upload":
+            return f"await {locator}.setInputFiles({self._js_value(value)});"
+        if action in {"assert", "assert_visible"}:
+            return f"await expect({locator}).toBeVisible();"
+        if action == "assert_hidden":
+            return f"await expect({locator}).toBeHidden();"
+        if action == "assert_text":
+            return f"await expect({locator}).toHaveText({self._js_value(expected)});"
+        if action == "assert_value":
+            return f"await expect({locator}).toHaveValue({self._js_value(expected)});"
+        if action == "assert_enabled":
+            return f"await expect({locator}).toBeEnabled();"
+        if action == "assert_disabled":
+            return f"await expect({locator}).toBeDisabled();"
+        if action == "assert_count":
+            return f"await expect({locator}).toHaveCount({self._js_number(expected)});"
+
+        return [
+            f"// TODO: unsupported action {json.dumps(action, ensure_ascii=False)}",
+            f"test.skip(true, {json.dumps(f'unsupported action: {action}', ensure_ascii=False)});",
+        ]
+
+    def _locator_expr(self, selector_type: Any, selector: Any) -> str | None:
+        sel_type = str(selector_type or "").strip().lower()
+        sel = (selector or "").strip() if selector is not None else ""
+        if not sel:
+            return None
+        if sel_type == "testid":
+            return f"page.getByTestId({self._js_value(sel)})"
+        if sel_type == "label":
+            return f"page.getByLabel({self._js_value(sel)})"
+        if sel_type == "placeholder":
+            return f"page.getByPlaceholder({self._js_value(sel)})"
+        if sel_type == "text":
+            return f"page.getByText({self._js_value(sel)})"
+        if sel_type == "alttext":
+            return f"page.getByAltText({self._js_value(sel)})"
+        if sel_type == "title":
+            return f"page.getByTitle({self._js_value(sel)})"
+        if sel_type in {"css", "xpath"}:
+            return f"page.locator({self._js_value(sel)})"
+        return f"page.getByText({self._js_value(sel)})"
+
+    def _sanitize_fill_value(self, selector: Any, value: Any) -> Any:
+        selector_text = str(selector or "").lower()
+        if isinstance(value, str) and _ENV_REF_RE.match(value.strip()):
+            return value.strip()
+        if any(token in selector_text for token in ("비밀번호", "password", "pwd", "pass")):
+            return "process.env.E2E_USER_PASSWORD"
+        return value
+
+    def _js_value(self, value: Any) -> str:
+        if isinstance(value, str):
+            stripped = value.strip()
+            if _ENV_REF_RE.match(stripped):
+                return stripped
+        return json.dumps("" if value is None else value, ensure_ascii=False)
+
+    def _is_number_like(self, value: Any) -> bool:
+        try:
+            float(str(value))
+            return True
+        except (TypeError, ValueError):
+            return False
+
+    def _js_number(self, value: Any) -> str:
+        if self._is_number_like(value):
+            num = float(str(value))
+            return str(int(num)) if num.is_integer() else str(num)
+        return "0"
+
     def _format_frontend_dom(self, elements: list[dict]) -> str:
         if not elements:
             return "인덱스 없음"
@@ -199,20 +376,23 @@ class CodeGeneratorAgent(BaseAgent):
         if not frontend_dom:
             return action_mapping
         mapping = dict(action_mapping)
+        route_hint = self._extract_route_hint(mapping)
         steps = []
         for step in mapping.get("steps") or []:
-            steps.append(self._normalize_step_with_frontend_index(dict(step), frontend_dom))
+            steps.append(self._normalize_step_with_frontend_index(dict(step), frontend_dom, route_hint))
         mapping["steps"] = steps
         return mapping
 
-    def _normalize_step_with_frontend_index(self, step: dict[str, Any], frontend_dom: list[dict]) -> dict[str, Any]:
+    def _normalize_step_with_frontend_index(
+        self, step: dict[str, Any], frontend_dom: list[dict], route_hint: str | None
+    ) -> dict[str, Any]:
         selector = (step.get("selector") or "").strip()
         selector_type = step.get("selector_type")
         action = step.get("action") or ""
         if not selector:
             return step
 
-        best = self._best_frontend_match(selector, frontend_dom)
+        best = self._best_frontend_match(selector, frontend_dom, action=action, route_hint=route_hint)
         if not best:
             return step
         element, score = best
@@ -239,26 +419,44 @@ class CodeGeneratorAgent(BaseAgent):
 
         return step
 
-    def _best_frontend_match(self, selector: str, frontend_dom: list[dict]) -> tuple[dict, float] | None:
+    def _best_frontend_match(
+        self, selector: str, frontend_dom: list[dict], *, action: str = "", route_hint: str | None = None
+    ) -> tuple[dict, float] | None:
         target = selector.lower()
+        normalized_target = self._expand_aliases(target)
         best_el: dict | None = None
         best_score = 0.0
         for el in frontend_dom:
-            for key in ("label", "text", "placeholder", "testid", "id"):
+            for key in ("label", "text", "placeholder", "testid", "id", "page", "route"):
                 cand = (el.get(key) or "").strip().lower()
                 if not cand:
                     continue
-                score = difflib.SequenceMatcher(None, target, cand).ratio()
+                score = difflib.SequenceMatcher(None, normalized_target, self._expand_aliases(cand)).ratio()
                 if target == cand:
                     score = 1.0
                 elif target in cand or cand in target:
                     score += _FUZZY_MATCH_SUBSTRING_BONUS
+                score += self._semantic_bonus(target, cand)
+                score += self._action_bonus(action, el, target)
+                if route_hint and str(el.get("route") or "").strip() == route_hint:
+                    score += 0.4
+                page = str(el.get("page") or "").strip().lower()
+                if route_hint and page and route_hint.strip("/").lower() == page.lower():
+                    score += 0.2
                 if score > best_score:
                     best_score = score
                     best_el = el
         if best_el is None:
             return None
         return best_el, best_score
+
+    def _extract_route_hint(self, action_mapping: dict[str, Any]) -> str | None:
+        for step in action_mapping.get("steps") or []:
+            if step.get("action") == "navigate":
+                value = str(step.get("value") or "").strip()
+                if value.startswith("/"):
+                    return value
+        return None
 
     def _preferred_selector_for_action(self, action: str, element: dict) -> tuple[str, str] | None:
         if action in {"fill", "clear", "select", "press", "upload"}:
@@ -272,6 +470,33 @@ class CodeGeneratorAgent(BaseAgent):
             if val:
                 return key, val
         return None
+
+    def _expand_aliases(self, text: str) -> str:
+        expanded = [text]
+        for token, aliases in _SEMANTIC_ALIASES.items():
+            if token in text:
+                expanded.extend(aliases)
+        return " ".join(expanded)
+
+    def _semantic_bonus(self, target: str, candidate: str) -> float:
+        bonus = 0.0
+        for token, aliases in _SEMANTIC_ALIASES.items():
+            if token in target and any(alias in candidate for alias in aliases):
+                bonus += 0.25
+            if any(alias in target for alias in aliases) and token in candidate:
+                bonus += 0.25
+        return bonus
+
+    def _action_bonus(self, action: str, element: dict, target: str) -> float:
+        control_type = str(element.get("control_type") or "").lower()
+        bonus = 0.0
+        if action in {"fill", "clear", "select", "press", "upload"} and control_type in {"form_input", "select", "textarea"}:
+            bonus += 0.35
+        if action in {"click", "dblclick", "hover", "check", "uncheck"} and control_type in {"button", "submit", "link", "checkbox", "radio"}:
+            bonus += 0.35
+        if "버튼" in target and control_type in {"button", "submit"}:
+            bonus += 0.2
+        return bonus
 
     def _validate_syntax(self, code: str) -> bool:
         """tree_sitter를 활용해 자바스크립트 코드 구문을 검증한다."""
