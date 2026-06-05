@@ -50,6 +50,14 @@ _ROLE_BUTTON_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+# 성공/에러/알림 토스트 같은 비액션성 피드백 컨테이너도 assert 후보로 수집한다.
+_FEEDBACK_CONTAINER_PATTERN = re.compile(
+    r'<(?P<tag>div|span|p)\b(?P<attrs>[^>]*?(?:\bdata-testid\s*=\s*["\'][^"\']*(?:success|error|toast|alert|message|status)[^"\']*["\']|'
+    r'\bclass\s*=\s*["\'][^"\']*(?:success-toast|error-msg|alert|toast)[^"\']*["\'])[^>]*?)'
+    r"(?:/>|>(?P<inner>[\s\S]*?)</(?P=tag)>)",
+    re.IGNORECASE,
+)
+
 # attribute 단일 추출 (key="value" 또는 key='value'). v-bind / : prefix 도 인식.
 _ATTR_PATTERN = re.compile(
     r'(?:v-bind:|:)?(?P<key>[a-zA-Z][a-zA-Z0-9_:\-]*)\s*=\s*["\'](?P<val>[^"\']*)["\']'
@@ -205,6 +213,43 @@ def _extract_elements_from_text(text: str, file_rel: str) -> list[FrontendElemen
         if any(element[k] for k in ("text", "label", "testid", "id")):
             found.append(element)
 
+    # feedback/status container — success toast, error message, alert 등
+    for match in _FEEDBACK_CONTAINER_PATTERN.finditer(text):
+        tag = match.group("tag").lower()
+        attrs = _parse_attrs(match.group("attrs") or "")
+        raw_inner = match.group("inner") or ""
+        inner = _clean_inner_text(raw_inner)
+        if not inner:
+            inner = _extract_literal_text(raw_inner)
+        if not inner and not (attrs.get("data-testid") or attrs.get("data-test-id")):
+            continue
+
+        testid = attrs.get("data-testid") or attrs.get("data-test-id") or ""
+        element = {
+            "tag": tag,
+            "text": inner[:100] if inner else "",
+            "placeholder": "",
+            "label": "",
+            "testid": testid,
+            "name": "",
+            "id": attrs.get("id", ""),
+            "file": file_rel,
+            "page": page,
+            "route": route,
+            "actionable": False,
+            "control_type": _control_type_for_feedback(attrs, inner, testid),
+        }
+        if any(element[k] for k in ("text", "testid", "id")):
+            # 동일 testid/text 로 이미 잡힌 경우 중복 방지
+            if not any(
+                existing.get("tag") == element["tag"]
+                and existing.get("testid") == element["testid"]
+                and existing.get("text") == element["text"]
+                and existing.get("file") == element["file"]
+                for existing in found
+            ):
+                found.append(element)
+
     return found
 
 
@@ -286,6 +331,21 @@ def _control_type_for_tag(tag: str, attrs: dict[str, str]) -> str:
     if tag == "label":
         return "label"
     return tag
+
+
+def _control_type_for_feedback(attrs: dict[str, str], inner: str, testid: str) -> str:
+    signature = " ".join(
+        part for part in (
+            attrs.get("class", ""),
+            testid,
+            inner,
+        ) if part
+    ).lower()
+    if "success" in signature or "완료" in signature or "성공" in signature:
+        return "feedback_success"
+    if "error" in signature or "실패" in signature or "오류" in signature:
+        return "feedback_error"
+    return "feedback"
 
 
 def write_frontend_index(elements: list[FrontendElement], output_path: Path) -> None:

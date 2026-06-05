@@ -113,8 +113,8 @@ def test_normalize_mapping_with_frontend_index_prefers_testid_and_label(mock_llm
     normalized = agent._normalize_mapping_with_frontend_index(mapping, frontend_dom)
     assert normalized["steps"][0]["selector_type"] == "testid"
     assert normalized["steps"][0]["selector"] == "email"
-    assert normalized["steps"][1]["selector_type"] == "testid"
-    assert normalized["steps"][1]["selector"] == "signup-submit"
+    assert normalized["steps"][1]["selector_type"] == "text"
+    assert normalized["steps"][1]["selector"] == "가입하기"
 
 
 def test_render_generated_code_uses_normalized_selectors(mock_llm_client):
@@ -149,6 +149,134 @@ def test_render_generated_code_uses_normalized_selectors(mock_llm_client):
     assert "page.getByTestId(\"signup-submit\").click()" in code
     assert "page.getByPlaceholder(\"이메일을 입력하세요\")" not in code
     assert "page.getByText(\"회원가입\").click()" not in code
+
+
+def test_normalize_mapping_with_target_hints_without_selector(mock_llm_client):
+    agent = _make_agent(mock_llm_client)
+    frontend_dom = [
+        {
+            "tag": "input",
+            "text": "",
+            "placeholder": "example@email.com",
+            "label": "이메일",
+            "testid": "email",
+            "id": "email",
+            "name": "",
+            "file": "Signup.vue",
+            "page": "Signup",
+            "route": "/signup",
+            "control_type": "form_input",
+        },
+        {
+            "tag": "button",
+            "text": "가입하기",
+            "placeholder": "",
+            "label": "",
+            "testid": "signup-submit",
+            "id": "",
+            "name": "",
+            "file": "Signup.vue",
+            "page": "Signup",
+            "route": "/signup",
+            "control_type": "submit",
+        },
+    ]
+    mapping = {
+        "tc_id": "TS-001-TC-01",
+        "steps": [
+            {
+                "step_no": 1,
+                "action": "navigate",
+                "selector": None,
+                "selector_type": None,
+                "value": "/signup",
+                "expected": None,
+            },
+            {
+                "step_no": 2,
+                "action": "fill",
+                "selector": None,
+                "selector_type": None,
+                "target_name": "email",
+                "target_kind": "field",
+                "value": "newuser@example.com",
+                "expected": None,
+            },
+            {
+                "step_no": 3,
+                "action": "click",
+                "selector": None,
+                "selector_type": None,
+                "target_kind": "submit",
+                "value": None,
+                "expected": None,
+            },
+        ],
+    }
+
+    normalized = agent._normalize_mapping_with_frontend_index(mapping, frontend_dom)
+    assert normalized["steps"][1]["selector_type"] == "testid"
+    assert normalized["steps"][1]["selector"] == "email"
+    assert normalized["steps"][2]["selector_type"] == "testid"
+    assert normalized["steps"][2]["selector"] == "signup-submit"
+
+
+def test_normalize_mapping_preserves_existing_valid_selector(mock_llm_client):
+    agent = _make_agent(mock_llm_client)
+    frontend_dom = [
+        {
+            "tag": "button",
+            "text": "로그인",
+            "placeholder": "",
+            "label": "",
+            "testid": "login-submit",
+            "id": "",
+            "name": "",
+            "file": "Login.vue",
+            "page": "Login",
+            "route": "/login",
+            "control_type": "submit",
+        },
+        {
+            "tag": "button",
+            "text": "가입하기",
+            "placeholder": "",
+            "label": "",
+            "testid": "signup-submit",
+            "id": "",
+            "name": "",
+            "file": "Signup.vue",
+            "page": "Signup",
+            "route": "/signup",
+            "control_type": "submit",
+        },
+    ]
+    mapping = {
+        "tc_id": "TS-001-TC-01",
+        "steps": [
+            {
+                "step_no": 1,
+                "action": "navigate",
+                "selector": None,
+                "selector_type": None,
+                "value": "/signup",
+                "expected": None,
+            },
+            {
+                "step_no": 2,
+                "action": "click",
+                "selector": "signup-submit",
+                "selector_type": "testid",
+                "target_kind": "submit",
+                "value": None,
+                "expected": None,
+            },
+        ],
+    }
+
+    normalized = agent._normalize_mapping_with_frontend_index(mapping, frontend_dom)
+    assert normalized["steps"][1]["selector_type"] == "testid"
+    assert normalized["steps"][1]["selector"] == "signup-submit"
 
 
 def test_normalize_mapping_with_route_and_button_semantics_prefers_signup_submit(mock_llm_client):
@@ -214,6 +342,34 @@ async def test_execute_prefers_deterministic_render_for_mapped_steps(mock_llm_cl
     result = await agent._execute({"action_mappings": [mapping], "scenarios": scenarios}, {})
     code = result.result["generated_codes"][0]["code"]
     assert "page.getByTestId(\"email\").fill(\"newuser@example.com\")" in code
+    assert "page.getByTestId(\"signup-submit\").click()" in code
+
+
+@pytest.mark.asyncio
+async def test_execute_does_not_reload_or_remap_frontend_index(mock_llm_client):
+    agent = _make_agent(mock_llm_client)
+    agent.llm.chat = AsyncMock(side_effect=AssertionError("LLM should not be called for mapped steps"))
+    mapping = {
+        "tc_id": "TS-001-TC-01",
+        "steps": [
+            {"step_no": 1, "action": "navigate", "selector": None, "selector_type": None, "value": "/signup", "expected": None},
+            {"step_no": 2, "action": "click", "selector": "signup-submit", "selector_type": "testid", "value": None, "expected": None, "target_kind": "submit"},
+        ],
+    }
+    scenarios = [{
+        "ts_id": "TS-001",
+        "test_cases": [{"tc_id": "TS-001-TC-01", "name": "정상 회원가입"}],
+    }]
+
+    with patch.object(agent, "_load_frontend_dom", side_effect=AssertionError("frontend_dom should not be loaded")), \
+         patch.object(agent, "_normalize_mapping_with_frontend_index", side_effect=AssertionError("mapping should not be remapped")):
+        result = await agent._execute(
+            {"action_mappings": [mapping], "scenarios": scenarios, "frontend_dom": [{"testid": "login-submit"}]},
+            {},
+        )
+
+    code = result.result["generated_codes"][0]["code"]
+    assert "page.goto(\"/signup\")" in code
     assert "page.getByTestId(\"signup-submit\").click()" in code
 
 

@@ -47,6 +47,17 @@ _SEMANTIC_ALIASES: dict[str, tuple[str, ...]] = {
     "생년월일": ("birth", "birth date", "birth_date"),
     "버튼": ("button", "submit"),
 }
+_ACTION_TOKEN_SET = frozenset({
+    "click", "fill", "submit", "press", "upload", "check", "uncheck",
+    "select", "hover", "dblclick", "assert",
+})
+_FIELD_ALIASES: dict[str, tuple[str, ...]] = {
+    "email": ("email", "이메일", "mail"),
+    "password": ("password", "비밀번호", "pwd", "pass"),
+    "name": ("name", "이름", "user name", "username", "사용자 이름"),
+    "birth_date": ("birth_date", "birth date", "birth", "생년월일"),
+    "guardian_consent": ("guardian_consent", "guardian consent", "법정대리인 동의"),
+}
 
 # assert 계열 action — Step B 의 frontend.json 매칭 적용 대상.
 _ASSERT_ACTIONS = {
@@ -349,7 +360,7 @@ class ActionMapperAgent(BaseAgent):
         if not mappings:
             return None
         # 단일 TC 입력 — 응답도 단일 mapping. 다중 시 첫 항목.
-        return mappings[0]
+        return self._resolve_mapping_with_frontend(mappings[0], tc, frontend_candidates)
 
     def _load_frontend_dom(self, context: dict[str, Any]) -> list[dict]:
         """frontend DOM 인덱스 로드 — context 우선, 없으면 qapilot_dir/DB/S3 순 fallback.
@@ -612,7 +623,7 @@ class ActionMapperAgent(BaseAgent):
         )
         value = self._normalize_value(action, item, selector, tc_id, step_no)
         expected = self._normalize_expected(action, item, selector, value, tc_id, step_no)
-        return {
+        step: ActionStep = {
             "step_no": step_no,
             "action": action,
             "selector": selector,
@@ -621,6 +632,11 @@ class ActionMapperAgent(BaseAgent):
             "expected": expected,
             "api_endpoint": item.get("api_endpoint"),
         }
+        if item.get("target_name") is not None:
+            step["target_name"] = str(item.get("target_name") or "").strip() or None
+        if item.get("target_kind") is not None:
+            step["target_kind"] = str(item.get("target_kind") or "").strip() or None
+        return step
 
     def _normalize_action(self, item: dict, tc_id: str, step_no: int) -> str:
         """비표준 action을 표준 action vocabulary로 정규화한다."""
@@ -674,16 +690,332 @@ class ActionMapperAgent(BaseAgent):
         if action in _SELECTOR_OPTIONAL_ACTIONS:
             return None, None
         if selector and selector_type:
-            if self._frontend_dom_index:
-                normalized = self._normalize_selector_via_index(
-                    action, str(selector), selector_type, tc_id, step_no
-                )
-                if normalized is not None:
-                    return normalized
             return str(selector), selector_type
-        fallback = item.get("expected") or item.get("value") or action
-        self._log_normalization(tc_id, step_no, "selector", selector, fallback)
-        return str(fallback), selector_type or "text"
+        return None, None
+
+    def _resolve_mapping_with_frontend(
+        self, action_mapping: ActionMapping, tc: dict[str, Any], frontend_dom: list[dict]
+    ) -> ActionMapping:
+        """LLM 이 만든 step intent 를 frontend index 원소로만 resolve 한다."""
+        mapping = dict(action_mapping)
+        scenario_text = " ".join(str(tc.get(key) or "") for key in ("name", "given", "when", "then"))
+        route_hint = self._route_hint_from_elements(frontend_dom) or self._route_hint_from_tc(tc)
+        steps: list[ActionStep] = []
+
+        for raw_step in mapping.get("steps") or []:
+            step = dict(raw_step)
+            action = str(step.get("action") or "")
+            if action in _SELECTOR_OPTIONAL_ACTIONS:
+                step["selector"] = None
+                step["selector_type"] = None
+                steps.append(step)
+                continue
+
+            intent = self._infer_step_intent(step, tc, scenario_text)
+            resolved = self._resolve_selector_from_intent(action, intent, frontend_dom, route_hint, scenario_text)
+            if resolved is None:
+                self.logger.warning(
+                    "action_mapping_selector_unresolved",
+                    tc_id=mapping.get("tc_id"),
+                    step_no=step.get("step_no"),
+                    action=action,
+                    intent=intent,
+                )
+                step["selector"] = None
+                step["selector_type"] = None
+            else:
+                step["selector"] = resolved["selector"]
+                step["selector_type"] = resolved["selector_type"]
+            if intent.get("target_name"):
+                step["target_name"] = intent["target_name"]
+            if intent.get("target_kind"):
+                step["target_kind"] = intent["target_kind"]
+            if action in {"assert", "assert_visible"}:
+                step["expected"] = None
+            steps.append(step)
+
+        steps = self._ensure_navigate_step(steps, route_hint)
+        mapping["steps"] = steps
+        return mapping
+
+    def _ensure_navigate_step(
+        self, steps: list[ActionStep], route_hint: str | None
+    ) -> list[ActionStep]:
+        """DOM action 시나리오에 route 힌트가 있으면 선행 navigate 를 보장한다."""
+        if not route_hint or not steps:
+            return steps
+        first_action = str(steps[0].get("action") or "")
+        if first_action == "navigate":
+            return steps
+        if first_action not in _SELECTOR_REQUIRED_ACTIONS:
+            return steps
+
+        navigate_step: ActionStep = {
+            "step_no": 1,
+            "action": "navigate",
+            "selector": None,
+            "selector_type": None,
+            "value": route_hint,
+            "expected": None,
+            "api_endpoint": None,
+        }
+        renumbered: list[ActionStep] = [navigate_step]
+        for index, step in enumerate(steps, start=2):
+            updated = dict(step)
+            updated["step_no"] = index
+            renumbered.append(updated)
+        return renumbered
+
+    def _infer_step_intent(
+        self, step: dict[str, Any], tc: dict[str, Any], scenario_text: str
+    ) -> dict[str, str | None]:
+        action = str(step.get("action") or "")
+        selector = str(step.get("selector") or "").strip()
+        value = step.get("value")
+        expected = str(step.get("expected") or "").strip()
+        explicit_target_name = str(step.get("target_name") or "").strip()
+        explicit_target_kind = str(step.get("target_kind") or "").strip()
+
+        if explicit_target_name or explicit_target_kind:
+            return {
+                "target_name": explicit_target_name or None,
+                "target_kind": explicit_target_kind or None,
+                "target_text": expected or selector or None,
+            }
+
+        if action in {"fill", "clear", "select", "press", "upload"}:
+            return {
+                "target_name": (
+                    self._field_from_tc_value(tc, value)
+                    or self._field_from_hint(selector)
+                    or self._field_from_hint(scenario_text)
+                ),
+                "target_kind": "field",
+                "target_text": selector if self._is_meaningful_selector_hint(selector, value) else None,
+            }
+
+        if action in {"click", "dblclick", "hover", "check", "uncheck"}:
+            target_text = selector if self._is_meaningful_selector_hint(selector, value) else scenario_text
+            target_kind = "submit" if any(tok in scenario_text.lower() for tok in ("회원가입", "signup", "가입")) else "actionable"
+            return {
+                "target_name": self._field_from_hint(selector),
+                "target_kind": target_kind,
+                "target_text": target_text or None,
+            }
+
+        if action in _ASSERT_ACTIONS:
+            return {
+                "target_name": None,
+                "target_kind": "assertion",
+                "target_text": expected or selector or str(tc.get("then") or "") or None,
+            }
+
+        return {"target_name": None, "target_kind": None, "target_text": selector or None}
+
+    def _resolve_selector_from_intent(
+        self,
+        action: str,
+        intent: dict[str, str | None],
+        frontend_dom: list[dict],
+        route_hint: str | None,
+        scenario_text: str,
+    ) -> dict[str, str] | None:
+        candidates = self._frontend_candidates_for_action(action, frontend_dom, route_hint)
+        if not candidates:
+            return None
+
+        if len(candidates) == 1 and action in {"click", "dblclick", "hover"}:
+            selector, selector_type = self._preferred_selector_for_action(action, candidates[0])
+            if selector and selector_type:
+                return {"selector": selector, "selector_type": selector_type}
+
+        best_el: dict[str, Any] | None = None
+        best_score = 0.0
+        for el in candidates:
+            score = self._intent_match_score(action, intent, el, scenario_text, route_hint)
+            if score > best_score:
+                best_score = score
+                best_el = el
+
+        if best_el is None:
+            return None
+
+        threshold = 0.8 if action in _ASSERT_ACTIONS else 0.7
+        if best_score < threshold:
+            return None
+
+        selector, selector_type = self._preferred_selector_for_action(action, best_el)
+        if not selector or not selector_type:
+            return None
+        return {"selector": selector, "selector_type": selector_type}
+
+    def _frontend_candidates_for_action(
+        self, action: str, frontend_dom: list[dict], route_hint: str | None
+    ) -> list[dict]:
+        result: list[dict] = []
+        for el in frontend_dom:
+            if route_hint and str(el.get("route") or "").strip() not in {"", route_hint}:
+                continue
+            actionable = bool(el.get("actionable"))
+            control_type = str(el.get("control_type") or "").lower()
+            tag = str(el.get("tag") or "").lower()
+            if action in {"fill", "clear", "select", "press", "upload"}:
+                if actionable and (control_type in {"form_input", "select", "textarea"} or tag in {"input", "textarea", "select"}):
+                    result.append(el)
+                continue
+            if action in {"click", "dblclick", "hover", "check", "uncheck"}:
+                if actionable and (control_type in {"button", "submit", "link", "checkbox", "radio"} or tag in {"button", "a", "input"}):
+                    result.append(el)
+                continue
+            if action in _ASSERT_ACTIONS:
+                if any(str(el.get(k) or "").strip() for k in ("text", "testid", "label", "placeholder")):
+                    result.append(el)
+                continue
+            result.append(el)
+        return result
+
+    def _intent_match_score(
+        self,
+        action: str,
+        intent: dict[str, str | None],
+        element: dict[str, Any],
+        scenario_text: str,
+        route_hint: str | None,
+    ) -> float:
+        score = 0.0
+        target_name = str(intent.get("target_name") or "").strip().lower()
+        target_kind = str(intent.get("target_kind") or "").strip().lower()
+        target_text = str(intent.get("target_text") or "").strip().lower()
+        control_type = str(element.get("control_type") or "").lower()
+        tag = str(element.get("tag") or "").lower()
+
+        if route_hint and str(element.get("route") or "").strip() == route_hint:
+            score += 0.4
+
+        if target_name:
+            score += self._field_match_score(target_name, element)
+
+        if target_text:
+            for key in ("text", "label", "placeholder", "testid", "id", "name"):
+                cand = str(element.get(key) or "").strip().lower()
+                if not cand:
+                    continue
+                pair_score = difflib.SequenceMatcher(
+                    None, self._expand_aliases(target_text), self._expand_aliases(cand)
+                ).ratio()
+                if target_text == cand:
+                    pair_score = 1.0
+                elif target_text in cand or cand in target_text:
+                    pair_score += _FUZZY_MATCH_SUBSTRING_BONUS
+                pair_score += self._semantic_bonus(target_text, cand)
+                score += pair_score
+
+        if action in {"fill", "clear", "select", "press", "upload"} and (
+            control_type in {"form_input", "select", "textarea"} or tag in {"input", "textarea", "select"}
+        ):
+            score += 0.5
+        if action in {"click", "dblclick", "hover", "check", "uncheck"} and (
+            control_type in {"button", "submit", "link", "checkbox", "radio"} or tag in {"button", "a", "input"}
+        ):
+            score += 0.5
+        if action in _ASSERT_ACTIONS:
+            if not bool(element.get("actionable")):
+                score += 0.2
+            if control_type.startswith("feedback"):
+                score += 1.2
+            if target_kind == "assertion" and any(token in str(element.get("testid") or "").lower() for token in ("success", "error", "toast", "message", "status")):
+                score += 0.7
+            if target_kind == "assertion" and any(token in str(element.get("text") or "").lower() for token in ("완료", "성공", "이동")):
+                score += 0.5
+
+        if target_kind == "submit":
+            if any(token in str(element.get("text") or "").lower() for token in ("가입", "signup")):
+                score += 0.7
+            if any(token in str(element.get("testid") or "").lower() for token in ("signup", "submit")):
+                score += 0.7
+
+        if any(term in scenario_text.lower() for term in ("회원가입", "가입", "signup")) and "signup" in str(element.get("page") or "").lower():
+            score += 0.4
+        return score
+
+    def _field_match_score(self, field_name: str, element: dict[str, Any]) -> float:
+        aliases = _FIELD_ALIASES.get(field_name, (field_name,))
+        score = 0.0
+        for key in ("testid", "id", "label", "placeholder", "text", "name"):
+            cand = str(element.get(key) or "").strip().lower()
+            if not cand:
+                continue
+            if any(alias == cand for alias in aliases):
+                score += 1.2
+            elif any(alias in cand for alias in aliases):
+                score += 0.9
+        return score
+
+    def _field_from_tc_value(self, tc: dict[str, Any], value: Any) -> str | None:
+        if value is None:
+            return None
+        target = str(value).strip()
+        if not target:
+            return None
+        for item in tc.get("values") or []:
+            if str(item.get("value") or "").strip() == target:
+                return self._canonical_field_name(str(item.get("field") or ""))
+        return None
+
+    def _field_from_hint(self, hint: str) -> str | None:
+        lowered = hint.strip().lower()
+        if not lowered:
+            return None
+        for canonical, aliases in _FIELD_ALIASES.items():
+            if any(alias.lower() in lowered for alias in aliases):
+                return canonical
+        return None
+
+    def _canonical_field_name(self, field: str) -> str | None:
+        lowered = field.strip().lower()
+        if lowered in _FIELD_ALIASES:
+            return lowered
+        for canonical, aliases in _FIELD_ALIASES.items():
+            if lowered == canonical or any(lowered == alias.lower() for alias in aliases):
+                return canonical
+        return None
+
+    def _is_meaningful_selector_hint(self, selector: str, value: Any) -> bool:
+        cleaned = selector.strip()
+        if not cleaned:
+            return False
+        lowered = cleaned.lower()
+        if lowered in _ACTION_TOKEN_SET:
+            return False
+        if value is not None and cleaned == str(value):
+            return False
+        if self._looks_like_literal_value(cleaned):
+            return False
+        return True
+
+    def _looks_like_literal_value(self, text: str) -> bool:
+        lowered = text.strip().lower()
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", lowered):
+            return True
+        if re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", lowered):
+            return True
+        if re.fullmatch(r"[A-Za-z][A-Za-z0-9!@#$%^&*()_+=-]{7,}", text):
+            return True
+        return False
+
+    def _route_hint_from_elements(self, elements: list[dict]) -> str | None:
+        routes = [str(el.get("route") or "").strip() for el in elements if str(el.get("route") or "").strip()]
+        if not routes:
+            return None
+        return max(set(routes), key=routes.count)
+
+    def _route_hint_from_tc(self, tc: dict[str, Any]) -> str | None:
+        text = " ".join(str(tc.get(key) or "") for key in ("name", "given", "when", "then")).lower()
+        if any(term in text for term in ("회원가입", "가입", "signup")):
+            return "/signup"
+        if "로그인" in text or "login" in text:
+            return "/login"
+        return None
 
     def _normalize_selector_via_index(
         self, action: str, selector: str, selector_type: str, tc_id: str, step_no: int

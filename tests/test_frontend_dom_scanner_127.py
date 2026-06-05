@@ -133,6 +133,22 @@ def test_extract_button_text_from_vue_expression_literal():
     assert btn["route"] == "/signup"
 
 
+def test_extract_feedback_success_container_from_vue_template():
+    text = """
+<template>
+  <div v-if="success" class="success-toast" data-testid="signup-success-toast">
+    가입이 완료되었습니다! 로그인 페이지로 이동합니다.
+  </div>
+</template>
+"""
+    elements = _extract_elements_from_text(text, "frontend/src/pages/Signup.vue")
+    toast = next((e for e in elements if e.get("testid") == "signup-success-toast"), None)
+    assert toast is not None
+    assert toast["text"] == "가입이 완료되었습니다! 로그인 페이지로 이동합니다."
+    assert toast["actionable"] is False
+    assert toast["control_type"] == "feedback_success"
+
+
 def test_extract_ignores_script_section_in_vue():
     """Vue 의 <script> 부분은 제외 — <template> 만 처리."""
     text = """
