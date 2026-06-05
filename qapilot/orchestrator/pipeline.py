@@ -189,24 +189,26 @@ def _save_codebase_index_to_disk(scan: dict, state: PipelineState) -> None:
         ("manifest.json", manifest),
     ]
 
-    project_root = _resolve_project_root(state)
-    if project_root is not None:
-        frontend_elements = scan_frontend_directory(project_root)
-        indices.append(
-            (
-                "frontend.json",
-                {
-                    "version": 1,
-                    "element_count": len(frontend_elements),
-                    "elements": frontend_elements,
-                },
+    frontend_elements = list(scan.get("frontend_elements") or [])
+    if not frontend_elements:
+        project_root = _resolve_project_root(state)
+        if project_root is not None:
+            frontend_elements = scan_frontend_directory(project_root)
+        else:
+            get_logger("orchestrator").warning(
+                "frontend_index_project_root_unresolved",
+                qapilot_dir=state.get("qapilot_dir"),
             )
+    indices.append(
+        (
+            "frontend.json",
+            {
+                "version": 1,
+                "element_count": len(frontend_elements),
+                "elements": frontend_elements,
+            },
         )
-    else:
-        get_logger("orchestrator").warning(
-            "frontend_index_project_root_unresolved",
-            qapilot_dir=state.get("qapilot_dir"),
-        )
+    )
 
     for filename, payload in indices:
         (cache_dir / filename).write_text(
@@ -281,8 +283,7 @@ async def _doc_import(state: PipelineState) -> dict:
 
     우선순위:
       1) DB (domain_documents) → S3 GET → 임시 파일로 풀어 import — SaaS / UI 흐름.
-      2) state.qapilot_dir/domain/ 디스크 mirror — Spring 이 dual-write 한 결과.
-      3) config.project.root/docs/ — CLI 흐름 호환.
+      2) config.project.root/docs/ — CLI 흐름 호환.
     이미 임포트된 파일(index.json 존재 + 경로 일치)은 건너뛴다.
     """
     import tempfile
@@ -350,14 +351,7 @@ async def _doc_import(state: PipelineState) -> dict:
             finally:
                 tmp_path.unlink(missing_ok=True)
 
-    # (2) qapilot_dir/domain/ — Spring 디스크 mirror 직접 import (S3 miss fallback).
-    mirror_dir = Path(state["qapilot_dir"]) / "domain"
-    if mirror_dir.exists():
-        for doc_path in sorted(mirror_dir.iterdir()):
-            if doc_path.is_file() and doc_path.suffix.lower() in _SUPPORTED_DOC_SUFFIXES:
-                await _import_path(doc_path)
-
-    # (3) config.project.root/docs/ — CLI 흐름 호환.
+    # (2) config.project.root/docs/ — CLI 흐름 호환.
     config = load_config()
     proj = config.project
     repo_root = Path(proj.root or proj.repo_path or ".")
@@ -560,26 +554,16 @@ async def _resolve_scenario_targets(
 async def _codebase_scan(state: PipelineState) -> dict:
     """FR-000 코드베이스 스캔 + spec §6.1 디스크 캐시.
 
-    이슈 #156 (2026-05-21): **임시 분기** — `run_options.repo_url` / `repos`
-    유무로 두 Tool 선택. 회의 결정 (\"CLI 로컬 vs Git 분기 도입\") 반영.
-
-    - Git 모드 (`repo_url` 또는 `repos` 제공): GitCodebaseScannerTool (PR #154)
-      - GitHub/GitLab REST API 기반 스캔
-      - CI/CD / 외부 사용자 / 멀티 레포 시나리오
-    - 로컬 모드 (둘 다 부재): CodebaseScannerTool (`qapilot init` / `rescan`
-      에서 이미 사용 중)
-      - 로컬 디렉토리 walk
-      - 개발자 로컬 e2e (mini-bss-lite 등) 시나리오
-      - **테스트용 임시 유지** — 추후 Git REST API 전용 전환 시 본 분기 제거
-
-    제거 조건 (후속): CLI `generate scenarios` 가 `--local-path` 옵션 지원 +
-    GitCodebaseScannerTool 이 file:// 또는 로컬 디렉토리 어댑터 내장 →
-    본 분기 삭제 + 모든 호출이 GitCodebaseScannerTool 로 통일.
+    기본 정책:
+    - Git 입력 (`repo_url` 또는 `repos`) 이 있으면 **항상 GitCodebaseScannerTool 우선**
+    - Git 스캔이 실패하면 warning 로그를 남기고 CodebaseScannerTool 로컬 fallback
+    - Git 입력이 아예 없을 때만 로컬 스캔을 직접 사용
     """
     from qapilot.shared.schemas import ToolInput
 
     trace_id = state.get("trace_id") or str(_uuid.uuid4())
     run_options = state["run_options"]
+    logger = get_logger("orchestrator")
 
     is_git_mode = bool(run_options.get("repo_url") or run_options.get("repos"))
 
@@ -611,17 +595,52 @@ async def _codebase_scan(state: PipelineState) -> dict:
             except Exception:
                 pass
 
+    result = None
     if is_git_mode:
         from qapilot.tools.git_codebase_scanner_tool import GitCodebaseScannerTool
-        tool = GitCodebaseScannerTool(trace_id=trace_id)
-    else:
-        # 이슈 #156: 로컬 모드 임시 fallback — 추후 Git 전용 전환 시 제거
-        from qapilot.tools.codebase_scanner_tool import CodebaseScannerTool
-        tool = CodebaseScannerTool(trace_id=trace_id)
 
-    result = await tool.run(
-        ToolInput(trace_id=trace_id, params=params)
-    )
+        git_tool = GitCodebaseScannerTool(trace_id=trace_id)
+        try:
+            logger.info(
+                "codebase_scan_git_attempt",
+                trace_id=trace_id,
+                repo_url=run_options.get("repo_url"),
+                repo_count=len(run_options.get("repos") or []),
+            )
+            result = await git_tool.run(
+                ToolInput(trace_id=trace_id, params=params)
+            )
+            logger.info("codebase_scan_git_succeeded", trace_id=trace_id)
+        except Exception as e:
+            logger.warning(
+                "codebase_scan_git_failed_fallback_local",
+                trace_id=trace_id,
+                error=f"{type(e).__name__}: {e}",
+                repo_url=run_options.get("repo_url"),
+                repo_count=len(run_options.get("repos") or []),
+            )
+
+    if result is None:
+        # 이슈 #156: 로컬 모드 임시 fallback — Git 입력 부재 또는 Git 스캔 실패 시 사용
+        from qapilot.tools.codebase_scanner_tool import CodebaseScannerTool
+
+        local_tool = CodebaseScannerTool(trace_id=trace_id)
+        local_params = {"trigger": trigger}
+        if params.get("last_commit_hash"):
+            local_params["last_commit_hash"] = params["last_commit_hash"]
+        if params.get("local_path") is not None:
+            local_params["local_path"] = params["local_path"]
+
+        logger.info(
+            "codebase_scan_local_attempt",
+            trace_id=trace_id,
+            reason="git_failed" if is_git_mode else "git_input_missing",
+        )
+        result = await local_tool.run(
+            ToolInput(trace_id=trace_id, params=local_params)
+        )
+        logger.info("codebase_scan_local_succeeded", trace_id=trace_id)
+
     scan: dict[str, Any] = result.result["scan_result"]
 
     # L2: spec §6.1 정합 디스크 캐시 (Tool 본체 무수정)
@@ -673,8 +692,7 @@ def _read_latest_prd_text(state: PipelineState | None = None) -> str:
     """최신 PRD 텍스트를 반환한다. 3단 우선순위:
 
       1) UI 업로드 (domain_documents + S3) — service_id 기반.
-      2) qapilot_dir/domain/ 디스크 mirror — Spring 이 dual-write 한 결과.
-      3) config.project.root/docs/ — CLI 흐름 호환.
+      2) config.project.root/docs/ — CLI 흐름 호환.
 
     어느 단계든 텍스트가 잡히면 그 단계만 반환 (낮은 단계로 fallback 안 함) —
     UI 가 업로드한 PRD 와 무관한 CLI docs 가 섞이는 leak 방지.
@@ -708,24 +726,7 @@ def _read_latest_prd_text(state: PipelineState | None = None) -> str:
             if texts:
                 return "\n\n".join(texts)
 
-    # (2) qapilot_dir/domain/ — Spring 디스크 mirror.
-    if state is not None:
-        mirror_dir = Path(state["qapilot_dir"]) / "domain"
-        if mirror_dir.exists():
-            texts = []
-            for p in sorted(mirror_dir.iterdir()):
-                if not (p.is_file() and p.suffix.lower() in _SUPPORTED_DOC_SUFFIXES):
-                    continue
-                if "prd" not in p.name.lower():
-                    continue
-                try:
-                    texts.append(p.read_text(encoding="utf-8"))
-                except Exception:
-                    continue
-            if texts:
-                return "\n\n".join(texts)
-
-    # (3) config.project.root/docs/ — CLI 흐름.
+    # (2) config.project.root/docs/ — CLI 흐름.
     config = load_config()
     proj = config.project
     repo_root = Path(proj.root or proj.repo_path or ".")
@@ -866,6 +867,7 @@ async def _scenario_generate(state: PipelineState) -> dict:
         "scan_result": state.get("scan_result"),
         "domain_rules": state.get("domain_rules") or [],
         "requirements": state.get("requirements") or [],
+        "service_id": (load_trace(state["trace_id"]) or {}).get("service_id"),
         # codebase-index 디렉토리를 state.qapilot_dir 기준으로 read 하도록 전달.
         # 미주입 시 agent 가 config.project.root → CWD fallback → qapilot 자체 dir 을 읽음 (회귀 원인).
         "qapilot_dir": state.get("qapilot_dir"),
@@ -1087,7 +1089,7 @@ def _write_initial_rtm_version(state: PipelineState) -> None:
     )
 
     # DB mirror — service_id 가 trace.json 에 있어야 함. 없으면 graceful skip.
-    trace_loaded = load_trace(state["qapilot_dir"], state["trace_id"]) or {}
+    trace_loaded = load_trace(state["trace_id"]) or {}
     service_id_for_db = trace_loaded.get("service_id")
     if service_id_for_db:
         write_rtm_version(
@@ -1104,58 +1106,58 @@ async def _load_scenarios_for_codegen(state: PipelineState) -> dict:
     import json
     from pathlib import Path
     
-    scenarios_dir = _qapilot_path(state, "scenarios")
     scenario_ids = state["run_options"].get("scenario_ids") or []
     scenarios = []
-
-    if scenarios_dir.exists():
-        for path in scenarios_dir.glob("*.json"):
-            if path.name == "raw":
-                continue
-            if path.name == "regression":
-                continue
-            ts_id = path.stem
-            if scenario_ids and ts_id not in scenario_ids:
-                continue
-            try:
-                ts = json.loads(path.read_text(encoding="utf-8"))
-                scenarios.append(ts)
-            except Exception:
-                pass
-
+    service_id = state.get("service_id") or (load_trace(state.get("trace_id", "")) or {}).get("service_id")
+    if service_id:
+        from qapilot.db.scenario_reader import load_latest_scenarios
+        scenarios = load_latest_scenarios(str(service_id), scenario_ids or None)
     if not scenarios:
-        service_id = state.get("service_id") or (load_trace(state.get("trace_id", "")) or {}).get("service_id")
-        if service_id:
-            from qapilot.db.scenario_reader import load_latest_scenarios
-            scenarios = load_latest_scenarios(str(service_id), scenario_ids or None)
+        scenarios_dir = _qapilot_path(state, "scenarios")
+        if scenarios_dir.exists():
+            for path in scenarios_dir.glob("*.json"):
+                if path.name == "raw":
+                    continue
+                if path.name == "regression":
+                    continue
+                ts_id = path.stem
+                if scenario_ids and ts_id not in scenario_ids:
+                    continue
+                try:
+                    ts = json.loads(path.read_text(encoding="utf-8"))
+                    scenarios.append(ts)
+                except Exception:
+                    pass
 
     scenarios.sort(key=lambda x: x.get("ts_id", ""))
 
-    # scan_result: 디스크 캐시 → DB/S3 fallback (load_codebase_index)
+    # scan_result: DB/S3 → 디스크 fallback
     scan_result = None
     frontend_dom: list[dict] = []
-    try:
-        endpoints_path = _qapilot_path(state, "codebase-index", "endpoints.json")
-        if endpoints_path.exists():
-            endpoints = json.loads(endpoints_path.read_text(encoding="utf-8"))
-            scan_result = {"files": [{"path": "mock", "endpoints": endpoints}]}
-        frontend_path = _qapilot_path(state, "codebase-index", "frontend.json")
-        if frontend_path.exists():
-            frontend_payload = json.loads(frontend_path.read_text(encoding="utf-8"))
-            if isinstance(frontend_payload, dict):
-                frontend_dom = list(frontend_payload.get("elements") or [])
-    except Exception:
-        pass
-
+    if service_id:
+        endpoints_db = load_codebase_index(str(service_id), "endpoints")
+        if endpoints_db:
+            scan_result = {"files": [{"path": "mock", "endpoints": endpoints_db}]}
+        frontend_db = load_codebase_index(str(service_id), "frontend")
+        if isinstance(frontend_db, dict):
+            frontend_dom = list(frontend_db.get("elements") or [])
     if scan_result is None:
-        service_id = state.get("service_id")
-        if service_id:
-            endpoints_db = load_codebase_index(str(service_id), "endpoints")
-            if endpoints_db:
-                scan_result = {"files": [{"path": "mock", "endpoints": endpoints_db}]}
-            frontend_db = load_codebase_index(str(service_id), "frontend")
-            if isinstance(frontend_db, dict):
-                frontend_dom = list(frontend_db.get("elements") or [])
+        try:
+            endpoints_path = _qapilot_path(state, "codebase-index", "endpoints.json")
+            if endpoints_path.exists():
+                endpoints = json.loads(endpoints_path.read_text(encoding="utf-8"))
+                scan_result = {"files": [{"path": "mock", "endpoints": endpoints}]}
+        except Exception:
+            pass
+    if not frontend_dom:
+        try:
+            frontend_path = _qapilot_path(state, "codebase-index", "frontend.json")
+            if frontend_path.exists():
+                frontend_payload = json.loads(frontend_path.read_text(encoding="utf-8"))
+                if isinstance(frontend_payload, dict):
+                    frontend_dom = list(frontend_payload.get("elements") or [])
+        except Exception:
+            pass
 
     return {
         "scenarios": scenarios,
@@ -1402,11 +1404,13 @@ async def _load_scenarios_for_test(state: PipelineState) -> dict:
     trace = load_trace(trace_id) or {}
     service_id = trace.get("service_id") or state.get("service_id")
 
-    scenarios = _load_json_files(_qapilot_path(state, "scenarios"))
-    if not scenarios and service_id:
+    scenarios = []
+    if service_id:
         from qapilot.db.scenario_reader import load_latest_scenarios
         scenario_ids = (state.get("run_options") or {}).get("scenario_ids") or None
         scenarios = load_latest_scenarios(str(service_id), scenario_ids)
+    if not scenarios:
+        scenarios = _load_json_files(_qapilot_path(state, "scenarios"))
     tc_ids = [
         tc.get("tc_id")
         for s in scenarios

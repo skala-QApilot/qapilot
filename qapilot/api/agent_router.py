@@ -11,6 +11,7 @@ from typing import Any, Literal, cast
 
 from fastapi import APIRouter, Depends, Query, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
+from pydantic import BaseModel, Field
 
 from qapilot.api.internal_deps import verify_internal_token
 from qapilot.api.response import fail, ok
@@ -44,6 +45,63 @@ RunFilter = Literal["all", "failed", "affected"]
 _running_tasks: dict[str, asyncio.Task] = {}
 
 _CELERY_ENABLED = os.environ.get("CELERY_ENABLED", "false").lower() == "true"
+
+
+class RepoPayload(BaseModel):
+    repo_url: str
+    token: str | None = None
+    branch: str | None = None
+    role: str | None = None
+
+
+class ScenarioGenerationRequestBody(BaseModel):
+    service_id: str = Field(..., description="서비스 ID")
+    trigger: ScenarioTrigger = Field(..., description="시나리오 생성 트리거")
+    user_input: str | None = Field(None, description="natural_lang 트리거용 사용자 입력")
+    scenario_ids: list[str] | None = Field(None, description="대상 시나리오 ID 목록")
+    filter: RunFilter | None = Field(None, description="실행 필터")
+    tags: list[str] | None = Field(None, description="태그 필터")
+    session_id: str | None = Field(None, description="natural_lang 세션 ID")
+    staging_url: str | None = Field(None, description="SUT base URL")
+    test_account: dict[str, Any] | None = Field(None, description="테스트 계정 정보")
+    domain_files: list[dict[str, Any]] | None = Field(None, description="도메인 문서 메타 목록")
+    repo_url: str | None = Field(None, description="단일 Git 저장소 URL")
+    token: str | None = Field(None, description="단일 Git 저장소 접근 토큰")
+    branch: str | None = Field(None, description="단일 Git 저장소 브랜치")
+    local_path: str | None = Field(None, description="로컬 스캔 경로")
+    repos: list[RepoPayload] | None = Field(None, description="멀티 Git 저장소 설정")
+    qapilot_dir: str | None = Field(None, description="레거시 호환용 qapilot 작업 디렉터리")
+
+
+class CodeGenerationRequestBody(BaseModel):
+    service_id: str = Field(..., description="서비스 ID")
+    scenario_ids: list[str] | None = Field(None, description="대상 시나리오 ID 목록")
+    staging_url: str | None = Field(None, description="SUT base URL")
+    test_account: dict[str, Any] | None = Field(None, description="테스트 계정 정보")
+    domain_files: list[dict[str, Any]] | None = Field(None, description="도메인 문서 메타 목록")
+    repo_url: str | None = Field(None, description="단일 Git 저장소 URL")
+    token: str | None = Field(None, description="단일 Git 저장소 접근 토큰")
+    branch: str | None = Field(None, description="단일 Git 저장소 브랜치")
+    local_path: str | None = Field(None, description="로컬 스캔 경로")
+    repos: list[RepoPayload] | None = Field(None, description="멀티 Git 저장소 설정")
+    qapilot_dir: str | None = Field(None, description="레거시 호환용 qapilot 작업 디렉터리")
+
+
+class TestRunRequestBody(BaseModel):
+    service_id: str = Field(..., description="서비스 ID")
+    scenario_ids: list[str] | None = Field(None, description="대상 시나리오 ID 목록")
+    filter: RunFilter | None = Field("all", description="실행 필터")
+    tags: list[str] | None = Field(None, description="태그 필터")
+    resume_from_trace: str | None = Field(None, description="이어 실행할 이전 trace ID")
+    staging_url: str | None = Field(None, description="SUT base URL")
+    test_account: dict[str, Any] | None = Field(None, description="테스트 계정 정보")
+    domain_files: list[dict[str, Any]] | None = Field(None, description="도메인 문서 메타 목록")
+    repo_url: str | None = Field(None, description="단일 Git 저장소 URL")
+    token: str | None = Field(None, description="단일 Git 저장소 접근 토큰")
+    branch: str | None = Field(None, description="단일 Git 저장소 브랜치")
+    local_path: str | None = Field(None, description="로컬 스캔 경로")
+    repos: list[RepoPayload] | None = Field(None, description="멀티 Git 저장소 설정")
+    qapilot_dir: str | None = Field(None, description="레거시 호환용 qapilot 작업 디렉터리")
 
 
 def _submit_pipeline(
@@ -88,28 +146,28 @@ def _revoke_pipeline(trace_id: str) -> bool:
 
 
 @router.post("/scenario-generation")
-async def scenario_generation(request: Request) -> Any:
-    body = await _json_body(request)
-    error = _validate_scenario_generation(body)
+async def scenario_generation(request: Request, body: ScenarioGenerationRequestBody) -> Any:
+    body_dict = body.model_dump(exclude_none=True)
+    error = _validate_scenario_generation(body_dict)
     if error:
         return error
 
-    trigger = _scenario_trigger(body)
-    session_id = _optional_str(body, "session_id")
+    trigger = _scenario_trigger(body_dict)
+    session_id = _optional_str(body_dict, "session_id")
     if trigger == "natural_lang" and not session_id:
         session_id = new_session_id()
 
     options: RunOptions = {
         "command": "generate_scenarios",
         "trigger": trigger,
-        "user_input": _optional_str(body, "user_input"),
-        "scenario_ids": _optional_list(body, "scenario_ids"),
-        "filter": _optional_filter(body),
-        "tags": _optional_list(body, "tags"),
+        "user_input": _optional_str(body_dict, "user_input"),
+        "scenario_ids": _optional_list(body_dict, "scenario_ids"),
+        "filter": _optional_filter(body_dict),
+        "tags": _optional_list(body_dict, "tags"),
         "session_id": session_id,
     }
-    _inject_git_options(body, options)
-    return _start_pipeline(request, body, options)
+    _inject_git_options(body_dict, options)
+    return _start_pipeline(request, body_dict, options)
 
 
 @router.post("/code-change-detection")
@@ -132,9 +190,9 @@ async def code_change_detection(request: Request) -> Any:
 
 
 @router.post("/code-generation")
-async def code_generation(request: Request) -> Any:
-    body = await _json_body(request)
-    error = _validate_common_body(body)
+async def code_generation(request: Request, body: CodeGenerationRequestBody) -> Any:
+    body_dict = body.model_dump(exclude_none=True)
+    error = _validate_common_body(body_dict)
     if error:
         return error
 
@@ -142,18 +200,18 @@ async def code_generation(request: Request) -> Any:
         "command": "generate_code",
         "trigger": None,
         "user_input": None,
-        "scenario_ids": _optional_list(body, "scenario_ids"),
+        "scenario_ids": _optional_list(body_dict, "scenario_ids"),
         "filter": None,
         "tags": None,
     }
-    _inject_git_options(body, options)
-    return _start_pipeline(request, body, options)
+    _inject_git_options(body_dict, options)
+    return _start_pipeline(request, body_dict, options)
 
 
 @router.post("/test-run")
-async def test_run(request: Request) -> Any:
-    body = await _json_body(request)
-    error = _validate_common_body(body)
+async def test_run(request: Request, body: TestRunRequestBody) -> Any:
+    body_dict = body.model_dump(exclude_none=True)
+    error = _validate_common_body(body_dict)
     if error:
         return error
 
@@ -161,13 +219,13 @@ async def test_run(request: Request) -> Any:
         "command": "test",
         "trigger": None,
         "user_input": None,
-        "scenario_ids": _optional_list(body, "scenario_ids"),
-        "filter": _optional_filter(body) or "all",
-        "tags": _optional_list(body, "tags"),
-        "resume_from_trace": _optional_str(body, "resume_from_trace"),
+        "scenario_ids": _optional_list(body_dict, "scenario_ids"),
+        "filter": _optional_filter(body_dict) or "all",
+        "tags": _optional_list(body_dict, "tags"),
+        "resume_from_trace": _optional_str(body_dict, "resume_from_trace"),
     }
-    _inject_git_options(body, options)
-    return _start_pipeline(request, body, options)
+    _inject_git_options(body_dict, options)
+    return _start_pipeline(request, body_dict, options)
 
 
 @router.post("/scenario-chat")

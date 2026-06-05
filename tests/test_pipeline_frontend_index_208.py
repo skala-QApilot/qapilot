@@ -55,6 +55,32 @@ def test_save_codebase_index_writes_and_mirrors_frontend_index(tmp_path: Path):
     assert "frontend" in mirror_calls
 
 
+def test_save_codebase_index_uses_scan_frontend_elements_without_local_rescan(tmp_path: Path):
+    state = _make_state(tmp_path)
+    scan = {
+        "files": [],
+        "git_diff": {"commit_hash": "abc123"},
+        "framework": "vue",
+        "language": "typescript",
+        "endpoint_count": 0,
+        "frontend_elements": [
+            {"tag": "input", "text": "", "placeholder": "example@email.com", "label": "이메일",
+             "testid": "email", "name": "", "id": "email", "file": "frontend/src/pages/Signup.vue"}
+        ],
+    }
+
+    with patch("qapilot.orchestrator.pipeline.load_trace", return_value={"service_id": "svc-1"}), \
+         patch("qapilot.orchestrator.pipeline._resolve_project_root", return_value=None), \
+         patch("qapilot.orchestrator.pipeline.scan_frontend_directory") as scan_local, \
+         patch("qapilot.orchestrator.pipeline.upsert_codebase_index", return_value=True):
+        _save_codebase_index_to_disk(scan, state)  # type: ignore[arg-type]
+
+    payload = json.loads((Path(state["qapilot_dir"]) / "codebase-index" / "frontend.json").read_text(encoding="utf-8"))
+    assert payload["element_count"] == 1
+    assert payload["elements"][0]["testid"] == "email"
+    scan_local.assert_not_called()
+
+
 @pytest.mark.asyncio
 async def test_load_scenarios_for_codegen_restores_frontend_dom(tmp_path: Path):
     state = _make_state(tmp_path)

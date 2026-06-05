@@ -35,6 +35,18 @@ _MAX_CONCURRENT_LLM_CALLS = 5
 _FUZZY_MATCH_THRESHOLD = 0.6
 _FUZZY_MATCH_SUBSTRING_BONUS = 0.2
 _FUZZY_MATCH_SHARED_SUBSTRING_BONUS = 0.15
+_FRONTEND_CANDIDATE_FILE_LIMIT = 4
+_FRONTEND_CANDIDATE_ELEMENT_LIMIT = 40
+_SEMANTIC_ALIASES: dict[str, tuple[str, ...]] = {
+    "회원가입": ("signup", "가입", "create account"),
+    "가입": ("signup", "회원가입"),
+    "로그인": ("login", "signin"),
+    "이메일": ("email", "mail"),
+    "비밀번호": ("password", "pwd", "pass"),
+    "이름": ("name", "user name", "username"),
+    "생년월일": ("birth", "birth date", "birth_date"),
+    "버튼": ("button", "submit"),
+}
 
 # assert 계열 action — Step B 의 frontend.json 매칭 적용 대상.
 _ASSERT_ACTIONS = {
@@ -258,10 +270,11 @@ class ActionMapperAgent(BaseAgent):
         주: 이슈 #129 Step A 이후 `_execute` 는 TC-별 분할 (`_call_single_tc`) 을 사용.
         본 메서드는 하위 호환·외부 caller 가능성·테스트 참조용으로 유지.
         """
+        frontend_candidates = self._select_frontend_candidates(batch, frontend_dom)
         user_prompt = self.prompts.render(
             scenarios=self._format_scenarios(batch),
             endpoints=self._format_endpoints(endpoints),
-            frontend_dom=self._format_frontend_dom(frontend_dom),
+            frontend_dom=self._format_frontend_dom(frontend_candidates),
         )
         user_prompt = self.with_correction_hint(user_prompt, last_error)
         response = await self.llm.chat(
@@ -310,6 +323,7 @@ class ActionMapperAgent(BaseAgent):
         sliced_ts = dict(ts)
         sliced_ts["test_cases"] = [tc]
         batch = [sliced_ts]
+        frontend_candidates = self._select_frontend_candidates(batch, frontend_dom)
 
         # 이슈 #140: TC 마다 새 LLMClient — 누적 정책 충돌 해결
         tc_llm = self._create_tc_llm()
@@ -318,7 +332,7 @@ class ActionMapperAgent(BaseAgent):
             user_prompt = self.prompts.render(
                 scenarios=self._format_scenarios(batch),
                 endpoints=self._format_endpoints(endpoints),
-                frontend_dom=self._format_frontend_dom(frontend_dom),
+                frontend_dom=self._format_frontend_dom(frontend_candidates),
             )
             user_prompt = self.with_correction_hint(user_prompt, last_error)
             response = await tc_llm.chat(
@@ -431,6 +445,107 @@ class ActionMapperAgent(BaseAgent):
             if parts:
                 lines.append("- " + " ".join(parts))
         return "\n".join(lines) if lines else "인덱스 없음"
+
+    def _select_frontend_candidates(self, batch: list[dict], frontend_dom: list[dict]) -> list[dict]:
+        """시나리오와 관련된 frontend 후보만 추려 LLM 컨텍스트를 줄인다."""
+        if not frontend_dom:
+            return []
+
+        scenario_text = self._scenario_text_for_candidates(batch)
+        if not scenario_text.strip():
+            return frontend_dom[:_FRONTEND_CANDIDATE_ELEMENT_LIMIT]
+
+        scored: list[tuple[float, dict]] = []
+        for el in frontend_dom:
+            score = self._frontend_candidate_score(scenario_text, el)
+            if score > 0:
+                scored.append((score, el))
+
+        if not scored:
+            return frontend_dom[:_FRONTEND_CANDIDATE_ELEMENT_LIMIT]
+
+        file_counts: dict[str, int] = {}
+        file_best: dict[str, float] = {}
+        for score, el in scored:
+            file_key = str(el.get("file") or "")
+            file_counts[file_key] = file_counts.get(file_key, 0) + 1
+            file_best[file_key] = max(file_best.get(file_key, 0.0), score)
+
+        max_file_score = max(file_best.values()) if file_best else 0.0
+        score_cutoff = max(1.0, max_file_score * 0.7)
+        top_files = {
+            file_key
+            for file_key, _ in sorted(
+                (
+                    item for item in file_best.items()
+                    if item[1] >= score_cutoff
+                ),
+                key=lambda item: (item[1], file_counts.get(item[0], 0)),
+                reverse=True,
+            )[:_FRONTEND_CANDIDATE_FILE_LIMIT]
+        }
+
+        picked = [
+            el
+            for _, el in sorted(scored, key=lambda item: item[0], reverse=True)
+            if str(el.get("file") or "") in top_files
+        ]
+        return picked[:_FRONTEND_CANDIDATE_ELEMENT_LIMIT]
+
+    def _scenario_text_for_candidates(self, batch: list[dict]) -> str:
+        parts: list[str] = []
+        for ts in batch:
+            parts.extend([
+                str(ts.get("ts_id") or ""),
+                str(ts.get("title") or ts.get("name") or ""),
+            ])
+            for tc in ts.get("test_cases") or []:
+                parts.extend([
+                    str(tc.get("tc_id") or ""),
+                    str(tc.get("name") or ""),
+                    str(tc.get("given") or ""),
+                    str(tc.get("when") or ""),
+                    str(tc.get("then") or ""),
+                ])
+        return " ".join(part for part in parts if part).lower()
+
+    def _frontend_candidate_score(self, scenario_text: str, el: dict) -> float:
+        score = 0.0
+        file_path = str(el.get("file") or "").lower()
+        page = str(el.get("page") or "").lower()
+        route = str(el.get("route") or "").lower()
+        control_type = str(el.get("control_type") or "").lower()
+
+        for token, aliases in _SEMANTIC_ALIASES.items():
+            if token in scenario_text:
+                if any(alias in file_path or alias in page or alias in route for alias in aliases):
+                    score += 1.0
+                if any(alias in control_type for alias in aliases):
+                    score += 0.3
+
+        if any(term in scenario_text for term in ("회원가입", "가입")):
+            if "signup" in file_path or route == "/signup" or page == "signup":
+                score += 2.0
+        if any(term in scenario_text for term in ("로그인",)):
+            if "login" in file_path or route == "/login" or page == "login":
+                score += 2.0
+
+        for key in ("text", "placeholder", "label", "testid", "id", "name"):
+            value = str(el.get(key) or "").lower()
+            if not value:
+                continue
+            for token in self._extract_meaningful_tokens(scenario_text):
+                if token and token in value:
+                    score += 0.6
+
+        if control_type in {"submit", "button"} and "버튼" in scenario_text:
+            score += 0.5
+        if control_type == "form_input" and any(tok in scenario_text for tok in ("이메일", "비밀번호", "이름", "생년월일")):
+            score += 0.2
+        return score
+
+    def _extract_meaningful_tokens(self, text: str) -> list[str]:
+        return [tok for tok in re.split(r"[^0-9a-zA-Z가-힣_/-]+", text) if len(tok) >= 2]
 
     def _format_scenarios(self, batch: list[dict]) -> str:
         """시나리오 배치를 JSON 문자열로 직렬화한다."""
@@ -591,6 +706,8 @@ class ActionMapperAgent(BaseAgent):
                 ("placeholder", el.get("placeholder", "")),
                 ("label", el.get("label", "")),
                 ("testid", el.get("testid", "")),
+                ("page", el.get("page", "")),
+                ("route", el.get("route", "")),
             ]
             for _, candidate in candidates:
                 cand = (candidate or "").strip().lower()
@@ -601,11 +718,15 @@ class ActionMapperAgent(BaseAgent):
                     best_score = 1.0
                     exact_match = True
                     break
-                score = difflib.SequenceMatcher(None, target, cand).ratio()
+                score = difflib.SequenceMatcher(
+                    None, self._expand_aliases(target), self._expand_aliases(cand)
+                ).ratio()
                 if target in cand or cand in target:
                     score += _FUZZY_MATCH_SUBSTRING_BONUS
                 elif self._has_meaningful_shared_substring(target, cand):
                     score += _FUZZY_MATCH_SHARED_SUBSTRING_BONUS
+                score += self._semantic_bonus(target, cand)
+                score += self._action_bonus(action, el, target)
                 if score > best_score:
                     best_score = score
                     best_el = el
@@ -683,6 +804,33 @@ class ActionMapperAgent(BaseAgent):
         )
         min_len = min(len(left), len(right))
         return match.size >= max(2, min_len // 2)
+
+    def _expand_aliases(self, text: str) -> str:
+        expanded = [text]
+        for token, aliases in _SEMANTIC_ALIASES.items():
+            if token in text:
+                expanded.extend(aliases)
+        return " ".join(expanded)
+
+    def _semantic_bonus(self, target: str, candidate: str) -> float:
+        bonus = 0.0
+        for token, aliases in _SEMANTIC_ALIASES.items():
+            if token in target and any(alias in candidate for alias in aliases):
+                bonus += 0.25
+            if any(alias in target for alias in aliases) and token in candidate:
+                bonus += 0.25
+        return bonus
+
+    def _action_bonus(self, action: str, element: dict, target: str) -> float:
+        control_type = str(element.get("control_type") or "").lower()
+        bonus = 0.0
+        if action in {"fill", "clear", "select", "press", "upload"} and control_type in {"form_input", "select", "textarea"}:
+            bonus += 0.35
+        if action in {"click", "dblclick", "hover", "check", "uncheck"} and control_type in {"button", "submit", "link", "checkbox", "radio"}:
+            bonus += 0.35
+        if "버튼" in target and control_type in {"button", "submit"}:
+            bonus += 0.2
+        return bonus
 
     def _normalize_value(
         self, action: str, item: dict, selector: str | None, tc_id: str, step_no: int

@@ -233,7 +233,7 @@ def test_start_pipeline_annotates_trace_with_test_account(tmp_path: Path):
     }
     annotate_calls: list[dict[str, Any]] = []
 
-    def _fake_annotate(qd, tid, **kwargs):
+    def _fake_annotate(tid, **kwargs):
         annotate_calls.append(kwargs)
 
     with patch.object(router_module, "_submit_pipeline"), \

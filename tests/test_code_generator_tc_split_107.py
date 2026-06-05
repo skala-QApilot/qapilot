@@ -117,6 +117,106 @@ def test_normalize_mapping_with_frontend_index_prefers_testid_and_label(mock_llm
     assert normalized["steps"][1]["selector"] == "signup-submit"
 
 
+def test_render_generated_code_uses_normalized_selectors(mock_llm_client):
+    agent = _make_agent(mock_llm_client)
+    mapping = {
+        "tc_id": "TS-001-TC-01",
+        "steps": [
+            {"step_no": 1, "action": "navigate", "selector": None, "selector_type": None, "value": "/signup", "expected": None},
+            {"step_no": 2, "action": "fill", "selector": "email", "selector_type": "testid", "value": "newuser@example.com", "expected": None},
+            {"step_no": 3, "action": "fill", "selector": "password", "selector_type": "testid", "value": "plaintext", "expected": None},
+            {"step_no": 4, "action": "fill", "selector": "이름", "selector_type": "label", "value": "John Doe", "expected": None},
+            {"step_no": 5, "action": "click", "selector": "signup-submit", "selector_type": "testid", "value": None, "expected": None},
+            {"step_no": 6, "action": "assert", "selector": "가입이 완료되었습니다! 로그인 페이지로 이동합니다.", "selector_type": "text", "value": None, "expected": None},
+        ],
+    }
+    scenario = {
+        "ts_id": "TS-001",
+        "test_cases": [{
+            "tc_id": "TS-001-TC-01",
+            "name": "정상 회원가입",
+            "given": "유효한 이메일, 비밀번호, 이름, 생년월일을 제공한 상태에서",
+            "when": "회원가입 요청을 하면",
+            "then": "회원가입이 성공적으로 완료된다",
+        }],
+    }
+
+    code = agent._render_generated_code(mapping, scenario)
+    assert code is not None
+    assert "page.getByTestId(\"email\").fill(\"newuser@example.com\")" in code
+    assert "page.getByTestId(\"password\").fill(process.env.E2E_USER_PASSWORD)" in code
+    assert "page.getByLabel(\"이름\").fill(\"John Doe\")" in code
+    assert "page.getByTestId(\"signup-submit\").click()" in code
+    assert "page.getByPlaceholder(\"이메일을 입력하세요\")" not in code
+    assert "page.getByText(\"회원가입\").click()" not in code
+
+
+def test_normalize_mapping_with_route_and_button_semantics_prefers_signup_submit(mock_llm_client):
+    agent = _make_agent(mock_llm_client)
+    frontend_dom = [
+        {
+            "tag": "input",
+            "text": "",
+            "placeholder": "example@email.com",
+            "label": "이메일",
+            "testid": "email",
+            "id": "email",
+            "name": "",
+            "file": "system-under-test/frontend/src/pages/Login.vue",
+            "page": "Login",
+            "route": "/login",
+            "control_type": "form_input",
+        },
+        {
+            "tag": "button",
+            "text": "가입하기",
+            "placeholder": "",
+            "label": "",
+            "testid": "signup-submit",
+            "id": "",
+            "name": "",
+            "file": "system-under-test/frontend/src/pages/Signup.vue",
+            "page": "Signup",
+            "route": "/signup",
+            "control_type": "submit",
+        },
+    ]
+    mapping = {
+        "tc_id": "TS-001-TC-01",
+        "steps": [
+            {"step_no": 1, "action": "navigate", "selector": None, "selector_type": None, "value": "/signup", "expected": None},
+            {"step_no": 2, "action": "click", "selector": "회원가입 버튼", "selector_type": "text", "value": None, "expected": None},
+        ],
+    }
+
+    normalized = agent._normalize_mapping_with_frontend_index(mapping, frontend_dom)
+    assert normalized["steps"][1]["selector_type"] == "testid"
+    assert normalized["steps"][1]["selector"] == "signup-submit"
+
+
+@pytest.mark.asyncio
+async def test_execute_prefers_deterministic_render_for_mapped_steps(mock_llm_client):
+    agent = _make_agent(mock_llm_client)
+    agent.llm.chat = AsyncMock(side_effect=AssertionError("LLM should not be called for mapped steps"))
+    mapping = {
+        "tc_id": "TS-001-TC-01",
+        "steps": [
+            {"step_no": 1, "action": "navigate", "selector": None, "selector_type": None, "value": "/signup", "expected": None},
+            {"step_no": 2, "action": "fill", "selector": "email", "selector_type": "testid", "value": "newuser@example.com", "expected": None},
+            {"step_no": 3, "action": "click", "selector": "signup-submit", "selector_type": "testid", "value": None, "expected": None},
+        ],
+    }
+    scenarios = [{
+        "ts_id": "TS-001",
+        "test_cases": [{"tc_id": "TS-001-TC-01", "name": "정상 회원가입"}],
+    }]
+
+    result = await agent._execute({"action_mappings": [mapping], "scenarios": scenarios}, {})
+    code = result.result["generated_codes"][0]["code"]
+    assert "page.getByTestId(\"email\").fill(\"newuser@example.com\")" in code
+    assert "page.getByTestId(\"signup-submit\").click()" in code
+
+
 # ── _execute graceful 동작 ─────────────────────────────────────────────────
 
 

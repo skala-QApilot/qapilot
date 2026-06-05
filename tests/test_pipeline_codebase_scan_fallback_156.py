@@ -1,4 +1,4 @@
-"""이슈 #156 — pipeline._codebase_scan 의 로컬/Git 임시 분기 검증.
+"""이슈 #156 — pipeline._codebase_scan 의 로컬/Git 분기 및 fallback 검증.
 
 PR #154 가 무조건 GitCodebaseScannerTool 로 교체하여 로컬 디렉토리 e2e
 (mini-bss-lite 등) 가 `KeyError: 'repos'` 로 즉시 fail 하던 회귀 해결.
@@ -6,8 +6,9 @@ PR #154 가 무조건 GitCodebaseScannerTool 로 교체하여 로컬 디렉토�
 회의 결정 (\"CLI 로컬 vs Git 분기 도입\") 반영 + 추후 Git 전용 전환 시 제거 예정.
 
 분기 정책:
-- run_options.repo_url 또는 repos 있음 → GitCodebaseScannerTool
-- 둘 다 없음 → CodebaseScannerTool (로컬, 임시 fallback)
+- run_options.repo_url 또는 repos 있음 → GitCodebaseScannerTool 우선
+- Git 스캔 실패 시 → CodebaseScannerTool 로컬 fallback + warning 로그
+- 둘 다 없음 → CodebaseScannerTool
 """
 from __future__ import annotations
 
@@ -93,6 +94,37 @@ async def test_git_mode_uses_git_scanner_when_repos_list_provided(mock_base_tool
 
     git_cls.assert_called_once()
     local_cls.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_git_mode_falls_back_to_local_scanner_when_git_scan_fails(mock_base_tool):
+    """Git 모드 — Git 스캔 예외 시 로컬 스캔 fallback + warning 로그."""
+    state = _make_state({
+        "trigger": "init",
+        "repo_url": "https://github.com/example/repo",
+        "token": "tok",
+        "branch": "main",
+    })
+
+    git_tool = AsyncMock()
+    git_tool.run.side_effect = RuntimeError("git scan failed")
+
+    local_tool = AsyncMock()
+    local_tool.run.return_value = MagicMock(result={"scan_result": _mock_scan_result()})
+
+    logger = MagicMock()
+
+    with patch("qapilot.tools.git_codebase_scanner_tool.GitCodebaseScannerTool", return_value=git_tool) as git_cls, \
+         patch("qapilot.tools.codebase_scanner_tool.CodebaseScannerTool", return_value=local_tool) as local_cls, \
+         patch("qapilot.orchestrator.pipeline.get_logger", return_value=logger), \
+         patch("qapilot.orchestrator.pipeline._save_codebase_index_to_disk"):
+        result = await _codebase_scan(state)  # type: ignore[arg-type]
+
+    git_cls.assert_called_once()
+    local_cls.assert_called_once()
+    logger.warning.assert_called_once()
+    assert logger.warning.call_args.args[0] == "codebase_scan_git_failed_fallback_local"
+    assert result["scan_result"]["framework"] == "fastapi"
 
 
 @pytest.mark.asyncio
