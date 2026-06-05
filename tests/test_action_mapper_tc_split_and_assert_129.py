@@ -282,19 +282,22 @@ def test_normalize_assert_selector_falls_back_to_label_when_no_testid(mock_llm_c
     assert result is None  # text 정확 매치이므로 원본 유지
 
 
-def test_normalize_assert_selector_called_only_for_assert_actions(mock_llm_client):
-    """_normalize_selector_fields 는 assert action 에서만 인덱스 정규화 호출."""
+def test_normalize_selector_fields_applies_to_fill_and_assert(mock_llm_client):
+    """일반 DOM action 과 assert 모두 frontend index 정규화가 적용된다."""
     agent = _make_agent(mock_llm_client)
     agent._frontend_dom_index = [
         {"tag": "button", "text": "환영합니다", "testid": "welcome-banner",
-         "placeholder": "", "label": "", "name": "", "id": "", "file": "x.vue"}
+         "placeholder": "", "label": "", "name": "", "id": "", "file": "x.vue"},
+        {"tag": "input", "text": "", "testid": "email", "placeholder": "example@email.com",
+         "label": "이메일", "name": "", "id": "email", "file": "Signup.vue"},
     ]
-    # fill action — 정규화 적용 안 됨
+
+    # fill action — 일반 DOM 정규화
     sel, st = agent._normalize_selector_fields(
-        "fill", "환영", "text", {"value": "x"}, "TC-1", 1
+        "fill", "이메일을 입력하세요", "placeholder", {"value": "x"}, "TC-1", 1
     )
-    assert sel == "환영"
-    assert st == "text"
+    assert sel == "email"
+    assert st == "testid"
 
     # assert action — 정규화 적용
     sel2, st2 = agent._normalize_selector_fields(
@@ -302,6 +305,18 @@ def test_normalize_assert_selector_called_only_for_assert_actions(mock_llm_clien
     )
     assert sel2 == "welcome-banner"
     assert st2 == "testid"
+
+
+def test_normalize_click_selector_fuzzy_match_to_testid(mock_llm_client):
+    """click step 도 환각 text selector 를 testid 로 정규화한다."""
+    agent = _make_agent(mock_llm_client)
+    agent._frontend_dom_index = [
+        {"tag": "button", "text": "가입하기", "placeholder": "", "label": "",
+         "testid": "signup-submit", "name": "", "id": "", "file": "Signup.vue"}
+    ]
+
+    result = agent._normalize_selector_via_index("click", "회원가입", "text", "TC-1", 1)
+    assert result == ("signup-submit", "testid")
 
 
 def test_normalize_assert_selector_substring_bonus_breaks_threshold(mock_llm_client):

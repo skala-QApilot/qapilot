@@ -115,6 +115,40 @@ async def test_load_scenarios_for_test_reads_three_artifact_kinds(tmp_path: Path
 
 
 @pytest.mark.asyncio
+async def test_load_scenarios_for_test_prefers_remote_artifacts(tmp_path: Path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+
+    qapilot_dir = tmp_path / ".qapilot"
+    _write_json(qapilot_dir / "traces" / "trace-remote.json", {
+        "trace_id": "trace-remote",
+        "service_id": "svc-1",
+    })
+    _write_json(qapilot_dir / "scenarios" / "TS-001.json", {
+        "ts_id": "TS-001",
+        "name": "회원가입",
+        "depends_on": [],
+        "test_cases": [{"tc_id": "TS-001-TC-01", "tags": []}],
+    })
+    _write_json(qapilot_dir / "action-mappings" / "TS-001-TC-01.json", {
+        "tc_id": "TS-001-TC-01",
+        "steps": [{"step_no": 1, "action": "navigate", "value": "/disk"}],
+    })
+
+    monkeypatch.setattr(
+        P,
+        "_load_remote_tc_artifacts",
+        lambda service_id, tc_ids: (
+            [{"tc_id": "TS-001-TC-01", "steps": [{"step_no": 1, "action": "navigate", "value": "/remote"}]}],
+            [{"tc_id": "TS-001-TC-01", "code": "// remote", "syntax_valid": True, "self_fix_count": 0}],
+        ),
+    )
+
+    result = await P._load_scenarios_for_test(_state(trace_id="trace-remote", qapilot_dir=qapilot_dir))
+    assert result["action_mappings"][0]["steps"][0]["value"] == "/remote"
+    assert result["generated_codes"][0]["code"] == "// remote"
+
+
+@pytest.mark.asyncio
 async def test_load_scenarios_for_test_preserves_explicit_trace_id(tmp_path: Path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     result = await P._load_scenarios_for_test(_state(trace_id="fixed-trace-123"))
@@ -174,6 +208,7 @@ async def test_load_scenarios_for_test_empty_dirs_graceful(tmp_path: Path, monke
 async def test_save_codes_persists_action_mappings(tmp_path: Path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     state = {
+        "trace_id": "trace-save-codes",
         "qapilot_dir": str(tmp_path / ".qapilot"),
         "generated_codes": [{"tc_id": "TC-1", "code": "// stub"}],
         "action_mappings": [{"tc_id": "TC-1", "steps": [
@@ -191,6 +226,29 @@ async def test_save_codes_persists_action_mappings(tmp_path: Path, monkeypatch):
     code_path = tmp_path / ".qapilot" / "generated-code" / "TC-1.js"
     assert code_path.exists()
     assert result["status"] == "completed"
+
+
+def test_action_mapping_from_generated_code_parses_basic_playwright_script():
+    code_obj = {
+        "tc_id": "TS-001-TC-01",
+        "code": "\n".join([
+            "const { test, expect } = require('@playwright/test');",
+            "test('정상 회원가입', async ({ page }) => {",
+            "  const submit = page.getByTestId('signup-submit');",
+            "  await page.goto('/signup');",
+            "  await page.getByLabel('이메일').fill('newuser@example.com');",
+            "  await submit.click();",
+            "  await expect(page.getByText('가입 완료')).toBeVisible();",
+            "});",
+        ]),
+    }
+
+    mapping = P._action_mapping_from_generated_code(code_obj)
+    assert mapping["tc_id"] == "TS-001-TC-01"
+    assert [s["action"] for s in mapping["steps"]] == ["navigate", "fill", "click", "assert_visible"]
+    assert mapping["steps"][1]["selector_type"] == "label"
+    assert mapping["steps"][2]["selector_type"] == "testid"
+    assert mapping["steps"][2]["selector"] == "signup-submit"
 
 
 # ── _report ───────────────────────────────────────────────────────────────────

@@ -50,6 +50,13 @@
 - `"title"` → `page.getByTitle(selector)`
 - `"css"` / `"xpath"` → `page.locator(selector)`
 
+## 프론트엔드 DOM 인덱스 사용 규칙
+- 프롬프트에는 실제 `frontend.json` 기반 DOM 인덱스가 함께 제공된다.
+- `fill` / `clear` / `select` / `press` / `upload` 같은 입력 계열 액션은 **`getByText`를 사용하지 말 것**.
+- 입력 계열 액션은 반드시 `getByTestId` > `getByLabel` > `getByPlaceholder` 순으로 선택한다.
+- `click` 계열도 버튼/링크의 실제 testid 가 있으면 `getByTestId`를 우선한다.
+- `assert` 계열은 화면에 실제 있는 문구 또는 testid 만 사용한다. 비즈니스 설명 문장을 새로 만들지 말 것.
+
 ## 일반 규칙
 1. Playwright Test(`@playwright/test`) 프레임워크 기반이어야 한다.
 2. `TestScenario`의 `tc_id`, `name`, `given`, `when`, `then` 등 원래 의도를 주석(Comment) 또는 테스트 명(`test('...', async () => {})`)으로 충분히 살려야 한다. 기계적인 스텝만 나열하지 말고, 사람이 읽을 수 있는 테스트 코드를 만든다.

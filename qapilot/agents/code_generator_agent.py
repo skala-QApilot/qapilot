@@ -11,7 +11,9 @@ ActionMapping 리스트 → Playwright JS 코드. TC 단위 LLM 호출 + 부분 
 from __future__ import annotations
 
 import asyncio
+import difflib
 import json
+from pathlib import Path
 from typing import Any
 
 import tree_sitter_javascript as tsjs
@@ -20,9 +22,12 @@ from tree_sitter import Language, Parser
 from qapilot.agents.base_agent import BaseAgent
 from qapilot.shared.llm_client import LLMClient
 from qapilot.shared.schemas import ExecuteResult
+from qapilot.tools.frontend_dom_scanner import load_frontend_index
 
 # OpenAI rate limit 안전 동시 호출 제한. gpt-4o-mini 의 TPM 한도 + 토큰 사용량 고려.
 _MAX_CONCURRENT_LLM_CALLS = 5
+_FUZZY_MATCH_THRESHOLD = 0.6
+_FUZZY_MATCH_SUBSTRING_BONUS = 0.2
 
 
 class CodeGeneratorAgent(BaseAgent):
@@ -39,8 +44,13 @@ class CodeGeneratorAgent(BaseAgent):
     async def _execute(
         self, context: dict[str, Any], params: dict[str, Any], last_error: str | None = None
     ) -> ExecuteResult:
+        frontend_dom = self._load_frontend_dom(context)
         action_mappings = context.get("action_mappings") or params.get("action_mappings") or []
         scenarios = context.get("scenarios") or params.get("scenarios") or []
+        action_mappings = [
+            self._normalize_mapping_with_frontend_index(am, frontend_dom)
+            for am in action_mappings
+        ]
 
         if not action_mappings:
             return ExecuteResult(result={"generated_codes": [], "failed_tcs": []}, confidence=1.0)
@@ -50,7 +60,7 @@ class CodeGeneratorAgent(BaseAgent):
 
         sem = asyncio.Semaphore(_MAX_CONCURRENT_LLM_CALLS)
         tasks = [
-            self._generate_single(sem, system_prompt, am, tc_to_scenario, last_error)
+            self._generate_single(sem, system_prompt, am, tc_to_scenario, frontend_dom, last_error)
             for am in action_mappings
         ]
         outcomes = await asyncio.gather(*tasks, return_exceptions=True)
@@ -109,6 +119,7 @@ class CodeGeneratorAgent(BaseAgent):
         system_prompt: str,
         action_mapping: dict[str, Any],
         tc_to_scenario: dict[str, dict],
+        frontend_dom: list[dict],
         last_error: str | None,
     ) -> dict[str, Any]:
         """단일 TC 의 ActionMapping → Playwright JS 코드. 부분 응답 graceful 흡수.
@@ -132,6 +143,7 @@ class CodeGeneratorAgent(BaseAgent):
                 self.prompts.render(
                     scenarios=json.dumps(scenarios_for_prompt, ensure_ascii=False),
                     action_mappings=json.dumps([action_mapping], ensure_ascii=False),
+                    frontend_dom=self._format_frontend_dom(frontend_dom),
                 ),
                 last_error,
             )
@@ -158,6 +170,108 @@ class CodeGeneratorAgent(BaseAgent):
         code_obj["syntax_valid"] = self._validate_syntax(code_obj.get("code", ""))
         code_obj.setdefault("self_fix_count", 0)
         return code_obj
+
+    def _load_frontend_dom(self, context: dict[str, Any]) -> list[dict]:
+        ctx_dom = context.get("frontend_dom")
+        if isinstance(ctx_dom, list):
+            return ctx_dom
+        qapilot_dir = context.get("qapilot_dir")
+        if qapilot_dir:
+            return load_frontend_index(Path(str(qapilot_dir)) / "codebase-index" / "frontend.json")
+        return []
+
+    def _format_frontend_dom(self, elements: list[dict]) -> str:
+        if not elements:
+            return "인덱스 없음"
+        lines: list[str] = []
+        for el in elements[:120]:
+            parts = [f"<{el.get('tag') or 'element'}>"]
+            for key in ("text", "label", "placeholder", "testid", "id", "file"):
+                val = (el.get(key) or "").strip()
+                if val:
+                    parts.append(f'{key}="{val}"')
+            lines.append("- " + " ".join(parts))
+        return "\n".join(lines)
+
+    def _normalize_mapping_with_frontend_index(
+        self, action_mapping: dict[str, Any], frontend_dom: list[dict]
+    ) -> dict[str, Any]:
+        if not frontend_dom:
+            return action_mapping
+        mapping = dict(action_mapping)
+        steps = []
+        for step in mapping.get("steps") or []:
+            steps.append(self._normalize_step_with_frontend_index(dict(step), frontend_dom))
+        mapping["steps"] = steps
+        return mapping
+
+    def _normalize_step_with_frontend_index(self, step: dict[str, Any], frontend_dom: list[dict]) -> dict[str, Any]:
+        selector = (step.get("selector") or "").strip()
+        selector_type = step.get("selector_type")
+        action = step.get("action") or ""
+        if not selector:
+            return step
+
+        best = self._best_frontend_match(selector, frontend_dom)
+        if not best:
+            return step
+        element, score = best
+        if score < _FUZZY_MATCH_THRESHOLD:
+            return step
+
+        preferred = self._preferred_selector_for_action(action, element)
+        if not preferred:
+            return step
+        preferred_type, preferred_value = preferred
+
+        # fill 계열은 text selector 금지에 가깝게 보정
+        if action in {"fill", "clear", "select", "press", "upload"}:
+            step["selector_type"] = preferred_type
+            step["selector"] = preferred_value
+            return step
+
+        # click/check 류도 더 안정적인 testid/label 이 있으면 교체
+        if action in {"click", "dblclick", "hover", "check", "uncheck"}:
+            if preferred_type in {"testid", "label", "placeholder"} or selector_type == "text":
+                step["selector_type"] = preferred_type
+                step["selector"] = preferred_value
+            return step
+
+        return step
+
+    def _best_frontend_match(self, selector: str, frontend_dom: list[dict]) -> tuple[dict, float] | None:
+        target = selector.lower()
+        best_el: dict | None = None
+        best_score = 0.0
+        for el in frontend_dom:
+            for key in ("label", "text", "placeholder", "testid", "id"):
+                cand = (el.get(key) or "").strip().lower()
+                if not cand:
+                    continue
+                score = difflib.SequenceMatcher(None, target, cand).ratio()
+                if target == cand:
+                    score = 1.0
+                elif target in cand or cand in target:
+                    score += _FUZZY_MATCH_SUBSTRING_BONUS
+                if score > best_score:
+                    best_score = score
+                    best_el = el
+        if best_el is None:
+            return None
+        return best_el, best_score
+
+    def _preferred_selector_for_action(self, action: str, element: dict) -> tuple[str, str] | None:
+        if action in {"fill", "clear", "select", "press", "upload"}:
+            priority = ("testid", "label", "placeholder", "text")
+        elif action in {"click", "dblclick", "hover", "check", "uncheck"}:
+            priority = ("testid", "text", "label", "placeholder")
+        else:
+            priority = ("testid", "text", "label", "placeholder")
+        for key in priority:
+            val = (element.get(key) or "").strip()
+            if val:
+                return key, val
+        return None
 
     def _validate_syntax(self, code: str) -> bool:
         """tree_sitter를 활용해 자바스크립트 코드 구문을 검증한다."""

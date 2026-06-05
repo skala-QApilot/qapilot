@@ -26,7 +26,7 @@ def _make_agent(mock_llm_client: MagicMock) -> CodeGeneratorAgent:
     agent.llm = mock_llm_client
     agent.prompts = MagicMock()
     agent.prompts.system = MagicMock(return_value="SYSTEM")
-    agent.prompts.render = MagicMock(side_effect=lambda **kw: f"USER<{kw.get('action_mappings','')}>")
+    agent.prompts.render = MagicMock(side_effect=lambda **kw: f"USER<{kw.get('action_mappings','')}|frontend={kw.get('frontend_dom','')[:80]}>")
     agent.logger = MagicMock()
     agent.with_correction_hint = MagicMock(side_effect=lambda p, e: p)
 
@@ -76,6 +76,45 @@ def test_tc_index_slices_single_tc_per_entry():
 
 def test_tc_index_empty_when_no_scenarios():
     assert _build_tc_to_scenario_index([]) == {}
+
+
+def test_normalize_mapping_with_frontend_index_prefers_testid_and_label(mock_llm_client):
+    agent = _make_agent(mock_llm_client)
+    frontend_dom = [
+        {
+            "tag": "input",
+            "text": "",
+            "placeholder": "example@email.com",
+            "label": "이메일",
+            "testid": "email",
+            "id": "email",
+            "name": "",
+            "file": "Signup.vue",
+        },
+        {
+            "tag": "button",
+            "text": "가입하기",
+            "placeholder": "",
+            "label": "",
+            "testid": "signup-submit",
+            "id": "",
+            "name": "",
+            "file": "Signup.vue",
+        },
+    ]
+    mapping = {
+        "tc_id": "TS-001-TC-01",
+        "steps": [
+            {"step_no": 1, "action": "fill", "selector": "이메일", "selector_type": "text", "value": "a", "expected": None},
+            {"step_no": 2, "action": "click", "selector": "가입하기", "selector_type": "text", "value": None, "expected": None},
+        ],
+    }
+
+    normalized = agent._normalize_mapping_with_frontend_index(mapping, frontend_dom)
+    assert normalized["steps"][0]["selector_type"] == "testid"
+    assert normalized["steps"][0]["selector"] == "email"
+    assert normalized["steps"][1]["selector_type"] == "testid"
+    assert normalized["steps"][1]["selector"] == "signup-submit"
 
 
 # ── _execute graceful 동작 ─────────────────────────────────────────────────
@@ -233,6 +272,7 @@ async def test_execute_passes_scenario_slice_to_prompt(mock_llm_client):
     # 호출별 TC id 매칭
     tc_ids_in_calls = [s[0]["test_cases"][0]["tc_id"] for s in rendered_scenarios]
     assert sorted(tc_ids_in_calls) == ["TC-A", "TC-B"]
+    assert all("frontend_dom" in c.kwargs for c in calls)
 
 
 # ── 이슈 #140: per-TC LLMClient 분리 검증 ─────────────────────────────────

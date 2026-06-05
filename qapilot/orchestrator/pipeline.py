@@ -18,6 +18,7 @@ Created: 2026-05-07
 """
 
 import json
+import os
 import re
 import uuid as _uuid
 from datetime import datetime, timezone
@@ -26,6 +27,7 @@ from typing import Any
 
 from langgraph.graph import END, START, StateGraph
 
+from qapilot.db.code_reader import load_codebase_index, load_latest_action_mapping, load_latest_generated_code
 from qapilot.db.code_writer import upsert_action_mapping, upsert_codebase_index, upsert_generated_code
 from qapilot.db.rtm_writer import write_rtm_version
 from qapilot.db.scenario_writer import upsert_scenario_version
@@ -34,6 +36,7 @@ from qapilot.orchestrator.state import PipelineState
 from qapilot.shared.logger import get_logger
 from qapilot.shared.trace_store import load_trace
 from qapilot.storage import s3_client
+from qapilot.tools.frontend_dom_scanner import scan_frontend_directory
 
 
 def _qapilot_path(state: PipelineState, *parts: str) -> Path:
@@ -178,20 +181,40 @@ def _save_codebase_index_to_disk(scan: dict, state: PipelineState) -> None:
         "endpoint_count": int(scan.get("endpoint_count", 0) or 0),
     }
 
-    indices: tuple[tuple[str, Any], ...] = (
+    indices: list[tuple[str, Any]] = [
         ("endpoints.json", endpoints),
         ("models.json", models),
         ("functions.json", functions),
         ("callgraph.json", callgraph),
         ("manifest.json", manifest),
-    )
+    ]
+
+    project_root = _resolve_project_root(state)
+    if project_root is not None:
+        frontend_elements = scan_frontend_directory(project_root)
+        indices.append(
+            (
+                "frontend.json",
+                {
+                    "version": 1,
+                    "element_count": len(frontend_elements),
+                    "elements": frontend_elements,
+                },
+            )
+        )
+    else:
+        get_logger("orchestrator").warning(
+            "frontend_index_project_root_unresolved",
+            qapilot_dir=state.get("qapilot_dir"),
+        )
+
     for filename, payload in indices:
         (cache_dir / filename).write_text(
             json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
         )
 
     # PR-17 — DB+S3 mirror. service_id 는 trace.json 에서.
-    trace = load_trace(state["qapilot_dir"], state["trace_id"]) or {}
+    trace = load_trace(state["trace_id"]) or {}
     service_id = trace.get("service_id")
     if service_id:
         commit_hash = manifest.get("commit_hash") or None
@@ -200,6 +223,34 @@ def _save_codebase_index_to_disk(scan: dict, state: PipelineState) -> None:
             kind = filename.replace(".json", "")
             upsert_codebase_index(service_id, commit_hash, kind, payload,
                                   file_count=file_count if kind == "manifest" else None)
+
+
+def _resolve_project_root(state: PipelineState) -> Path | None:
+    """frontend 스캔용 SUT 루트를 추론한다.
+
+    우선순위:
+    1) qapilot.config.yaml 의 project.root / repo_path
+    2) state.qapilot_dir 가 `<root>/.qapilot[/service]` 형태일 때 `<root>`
+    """
+    from qapilot.shared.config import load_config
+
+    cfg = load_config()
+    for raw in (cfg.project.root, cfg.project.repo_path):
+        if raw:
+            path = Path(raw).expanduser().resolve()
+            if path.is_dir():
+                return path
+
+    qapilot_dir = state.get("qapilot_dir")
+    if not qapilot_dir:
+        return None
+
+    path = Path(qapilot_dir).resolve()
+    if path.name == ".qapilot" and path.parent.is_dir():
+        return path.parent
+    if path.parent.name == ".qapilot" and path.parent.parent.is_dir():
+        return path.parent.parent
+    return None
 
 
 # ── Layer 1A 노드 (generate_scenarios) ────────────────────────────────────────
@@ -273,7 +324,7 @@ async def _doc_import(state: PipelineState) -> dict:
             logger.warning("doc_import_failed", file=str(doc_path), error=str(e))
 
     # (1) DB + S3 — UI 에서 업로드한 PRD/정책 문서가 진실의 원천.
-    trace = load_trace(state["qapilot_dir"], state["trace_id"]) or {}
+    trace = load_trace(state["trace_id"]) or {}
     service_id = trace.get("service_id")
     if service_id:
         for doc in list_latest_domain_documents(service_id):
@@ -634,7 +685,7 @@ def _read_latest_prd_text(state: PipelineState | None = None) -> str:
 
     # (1) UI 업로드 (DB+S3) — service_id 가 있을 때만.
     if state is not None:
-        trace = load_trace(state["qapilot_dir"], state["trace_id"]) or {}
+        trace = load_trace(state["trace_id"]) or {}
         service_id = trace.get("service_id")
         if service_id:
             texts: list[str] = []
@@ -868,7 +919,7 @@ async def _save_scenarios(state: PipelineState) -> dict:
     trigger = state["run_options"].get("trigger") or "init"
     saved_paths: list[str] = []
     # service_id 는 trace.json 에서 — Spring 이 create_trace 시점에 넣어둔 값.
-    trace = load_trace(state["qapilot_dir"], state["trace_id"]) or {}
+    trace = load_trace(state["trace_id"]) or {}
     service_id = trace.get("service_id")
 
     # requirements 가 비어있으면 RTM fallback 과 동일하게 TC.req_id 를 FR-{ts_id} 로 미리 채움.
@@ -1054,40 +1105,62 @@ async def _load_scenarios_for_codegen(state: PipelineState) -> dict:
     from pathlib import Path
     
     scenarios_dir = _qapilot_path(state, "scenarios")
-    if not scenarios_dir.exists():
-        return {"scenarios": [], "error": "시나리오 디렉토리가 없습니다."}
-
     scenario_ids = state["run_options"].get("scenario_ids") or []
     scenarios = []
 
-    for path in scenarios_dir.glob("*.json"):
-        if path.name == "raw": continue
-        if path.name == "regression": continue
-        
-        ts_id = path.stem
-        if scenario_ids and ts_id not in scenario_ids:
-            continue
-        try:
-            ts = json.loads(path.read_text(encoding="utf-8"))
-            scenarios.append(ts)
-        except Exception:
-            pass
+    if scenarios_dir.exists():
+        for path in scenarios_dir.glob("*.json"):
+            if path.name == "raw":
+                continue
+            if path.name == "regression":
+                continue
+            ts_id = path.stem
+            if scenario_ids and ts_id not in scenario_ids:
+                continue
+            try:
+                ts = json.loads(path.read_text(encoding="utf-8"))
+                scenarios.append(ts)
+            except Exception:
+                pass
+
+    if not scenarios:
+        service_id = state.get("service_id") or (load_trace(state.get("trace_id", "")) or {}).get("service_id")
+        if service_id:
+            from qapilot.db.scenario_reader import load_latest_scenarios
+            scenarios = load_latest_scenarios(str(service_id), scenario_ids or None)
 
     scenarios.sort(key=lambda x: x.get("ts_id", ""))
-    
-    # scan_result 를 디스크 캐시에서 복원 (ActionMapperAgent 가 사용)
+
+    # scan_result: 디스크 캐시 → DB/S3 fallback (load_codebase_index)
     scan_result = None
+    frontend_dom: list[dict] = []
     try:
         endpoints_path = _qapilot_path(state, "codebase-index", "endpoints.json")
         if endpoints_path.exists():
             endpoints = json.loads(endpoints_path.read_text(encoding="utf-8"))
             scan_result = {"files": [{"path": "mock", "endpoints": endpoints}]}
+        frontend_path = _qapilot_path(state, "codebase-index", "frontend.json")
+        if frontend_path.exists():
+            frontend_payload = json.loads(frontend_path.read_text(encoding="utf-8"))
+            if isinstance(frontend_payload, dict):
+                frontend_dom = list(frontend_payload.get("elements") or [])
     except Exception:
         pass
+
+    if scan_result is None:
+        service_id = state.get("service_id")
+        if service_id:
+            endpoints_db = load_codebase_index(str(service_id), "endpoints")
+            if endpoints_db:
+                scan_result = {"files": [{"path": "mock", "endpoints": endpoints_db}]}
+            frontend_db = load_codebase_index(str(service_id), "frontend")
+            if isinstance(frontend_db, dict):
+                frontend_dom = list(frontend_db.get("elements") or [])
 
     return {
         "scenarios": scenarios,
         "scan_result": scan_result,
+        "frontend_dom": frontend_dom,
         "current_layer": "L1B",
     }
 
@@ -1102,7 +1175,9 @@ async def _action_mapping(state: PipelineState) -> dict:
             trace_id=state.get("trace_id") or "",
             context={
                 "scenarios": state.get("scenarios") or [],
-                "scan_result": state.get("scan_result")
+                "scan_result": state.get("scan_result"),
+                "frontend_dom": state.get("frontend_dom") or [],
+                "qapilot_dir": state.get("qapilot_dir"),
             },
             params={},
         )
@@ -1123,9 +1198,9 @@ async def _code_generate(state: PipelineState) -> dict:
     후 AgentExecutionError 가 pipeline 전체를 중단시켰음. 그 결과 직전 노드의
     ActionMapping 78건이 `_save_codes` 미도달로 모두 휘발.
 
-    spec §4.5 (C/D 정책): UITestTool 은 ActionMapping 으로 직접 실행, .js 는 별도
-    deliverable. 따라서 CodeGen 실패해도 ActionMapping 만 디스크 저장되면 Layer 2~3
-    진행 가능. `_save_codes` 가 ActionMapping/generated_codes 둘 다 처리하므로 여기서는
+    CodeGen 실패 시에도 Layer 2 는 ActionMapping fallback 으로 계속 진행 가능해야 한다.
+    현재 Layer 2 는 generated code 실행을 우선하되, 코드가 없으면 ActionMapping fallback
+    을 사용한다. `_save_codes` 가 ActionMapping/generated_codes 둘 다 처리하므로 여기서는
     fail 흡수만 한다.
     """
     from qapilot.agents.code_generator_agent import CodeGeneratorAgent
@@ -1144,7 +1219,9 @@ async def _code_generate(state: PipelineState) -> dict:
                 trace_id=state.get("trace_id") or "",
                 context={
                     "action_mappings": action_mappings,
-                    "scenarios": state.get("scenarios", [])
+                    "scenarios": state.get("scenarios", []),
+                    "frontend_dom": state.get("frontend_dom") or [],
+                    "qapilot_dir": state.get("qapilot_dir"),
                 },
                 params={},
             )
@@ -1176,7 +1253,7 @@ async def _code_generate(state: PipelineState) -> dict:
             trace_id=state.get("trace_id"),
             error=f"{type(e).__name__}: {e}",
             action_mapping_count=len(action_mappings),
-            note="ActionMapping 만 디스크 저장됩니다 (spec §4.5 — UITestTool 은 ActionMapping 직접 실행)",
+            note="ActionMapping 만 저장됩니다. Layer 2 는 generated code 부재 시 ActionMapping fallback 으로 진행합니다.",
         )
         return {"generated_codes": [], "agent_logs": agent_logs}
 
@@ -1203,7 +1280,7 @@ async def _save_codes(state: PipelineState) -> dict:
 
     saved_code_paths: list[str] = []
     # PR-17 — DB+S3 dual-write. trace.json 에서 service_id lookup. 없으면 graceful skip.
-    trace = load_trace(state["qapilot_dir"], state["trace_id"]) or {}
+    trace = load_trace(state["trace_id"]) or {}
     service_id = trace.get("service_id")
 
     for code_obj in generated_codes:
@@ -1247,6 +1324,20 @@ def _load_json_files(directory: Path) -> list[dict]:
         except Exception:
             continue
     return items
+
+
+def _load_remote_tc_artifacts(service_id: str, tc_ids: list[str]) -> tuple[list[dict], list[dict]]:
+    """S3/DB mirror 에서 최신 action mapping / generated code 를 로드한다."""
+    action_mappings: list[dict] = []
+    generated_codes: list[dict] = []
+    for tc_id in tc_ids:
+        am = load_latest_action_mapping(service_id, tc_id)
+        if isinstance(am, dict):
+            action_mappings.append(am)
+        gc = load_latest_generated_code(service_id, tc_id)
+        if isinstance(gc, dict):
+            generated_codes.append(gc)
+    return action_mappings, generated_codes
 
 
 def _topo_sort_scenarios(scenarios: list[Any]) -> list[dict]:
@@ -1308,21 +1399,42 @@ async def _load_scenarios_for_test(state: PipelineState) -> dict:
     import uuid as _uuid
 
     trace_id = state.get("trace_id") or str(_uuid.uuid4())
+    trace = load_trace(trace_id) or {}
+    service_id = trace.get("service_id") or state.get("service_id")
 
     scenarios = _load_json_files(_qapilot_path(state, "scenarios"))
-    action_mappings = _load_json_files(_qapilot_path(state, "action-mappings"))
+    if not scenarios and service_id:
+        from qapilot.db.scenario_reader import load_latest_scenarios
+        scenario_ids = (state.get("run_options") or {}).get("scenario_ids") or None
+        scenarios = load_latest_scenarios(str(service_id), scenario_ids)
+    tc_ids = [
+        tc.get("tc_id")
+        for s in scenarios
+        for tc in (s.get("test_cases") or [])
+        if tc.get("tc_id")
+    ]
 
-    # generated_codes 는 .js 파일 — 검증·디버그용 (실행에 필수 X)
-    codes_dir = _qapilot_path(state, "generated-code")
-    generated_codes: list[dict] = []
-    if codes_dir.exists():
-        for path in sorted(codes_dir.glob("*.js")):
-            generated_codes.append({
-                "tc_id": path.stem,
-                "code": path.read_text(encoding="utf-8"),
-                "syntax_valid": True,
-                "self_fix_count": 0,
-            })
+    remote_action_mappings: list[dict] = []
+    remote_generated_codes: list[dict] = []
+    if service_id and tc_ids:
+        remote_action_mappings, remote_generated_codes = _load_remote_tc_artifacts(
+            str(service_id), [str(tc_id) for tc_id in tc_ids]
+        )
+
+    action_mappings = remote_action_mappings or _load_json_files(_qapilot_path(state, "action-mappings"))
+
+    # generated_codes 는 S3 mirror 우선, 없으면 디스크 fallback.
+    generated_codes: list[dict] = remote_generated_codes
+    if not generated_codes:
+        codes_dir = _qapilot_path(state, "generated-code")
+        if codes_dir.exists():
+            for path in sorted(codes_dir.glob("*.js")):
+                generated_codes.append({
+                    "tc_id": path.stem,
+                    "code": path.read_text(encoding="utf-8"),
+                    "syntax_valid": True,
+                    "self_fix_count": 0,
+                })
 
     # 필터 — run_options.scenario_ids (TS 단위)
     scenario_ids = state["run_options"].get("scenario_ids") or []
@@ -1343,9 +1455,9 @@ async def _load_scenarios_for_test(state: PipelineState) -> dict:
     )
     try:
         from qapilot.shared.trace_store import annotate_trace as _annotate
-        _annotate(state["qapilot_dir"], trace_id, selected_total_tc_count=selected_total_tc_count)
+        _annotate(trace_id, selected_total_tc_count=selected_total_tc_count)
     except Exception:
-        pass  # 디스크 쓰기 실패는 무시 — 메인 흐름 보존
+        pass
 
     # 필터 — run_options.resume_from_trace (이어서 실행)
     # 이전 trace 의 results 디렉토리에 ui_result.json 이 있는 TC 는 이미 실행 완료된 것으로
@@ -1357,6 +1469,9 @@ async def _load_scenarios_for_test(state: PipelineState) -> dict:
         if prev_results.exists():
             for ui_path in prev_results.rglob("ui_result.json"):
                 completed_tc_ids.add(ui_path.parent.name)
+        if not completed_tc_ids:
+            from qapilot.db.tc_result_reader import load_completed_tc_ids as _load_done
+            completed_tc_ids = _load_done(resume_from)
         if completed_tc_ids:
             action_mappings = [a for a in action_mappings if a.get("tc_id") not in completed_tc_ids]
             generated_codes = [c for c in generated_codes if c.get("tc_id") not in completed_tc_ids]
@@ -1413,6 +1528,7 @@ async def _test_execution(state: PipelineState) -> dict:
     trace_id = state["trace_id"]
     scenarios = state.get("scenarios") or []
     action_mappings = state.get("action_mappings") or []
+    generated_codes = state.get("generated_codes") or []
     cfg = load_config()
     headless = bool(getattr(cfg.test, "headless", True)) if hasattr(cfg, "test") else True
     # SaaS 호출 경로(Spring) 에서는 state.staging_url 이 service.stagingUrl 로 채워져 있다.
@@ -1451,17 +1567,33 @@ async def _test_execution(state: PipelineState) -> dict:
         page = await context.new_page()
 
         try:
-            for am in action_mappings:
-                tc_id = am.get("tc_id") or "unknown"
+            execution_items = generated_codes or action_mappings
+            action_mapping_by_tc = {
+                str(am.get("tc_id")): am for am in action_mappings if am.get("tc_id")
+            }
+
+            for item in execution_items:
+                tc_id = item.get("tc_id") or "unknown"
                 ts_id = _ts_id_of_tc(tc_id, scenarios)
                 tc_dir = results_root / ts_id / tc_id
                 screenshots_dir = tc_dir / "screenshots"
                 tc_dir.mkdir(parents=True, exist_ok=True)
 
+                if generated_codes:
+                    exec_mapping = _action_mapping_from_generated_code(item)
+                    # api_endpoint 힌트는 기존 ActionMapping 의 값을 최대한 유지.
+                    original = action_mapping_by_tc.get(str(tc_id)) or {}
+                    original_steps = list(original.get("steps") or [])
+                    for idx, step in enumerate(exec_mapping.get("steps") or []):
+                        if idx < len(original_steps):
+                            step["api_endpoint"] = original_steps[idx].get("api_endpoint")
+                else:
+                    exec_mapping = item
+
                 ui_res = await _run_ui_with_trace(
                     page=page,
                     tc_id=tc_id,
-                    action_mapping=am,
+                    action_mapping=exec_mapping,
                     target_url=target_url,
                     screenshots_dir=screenshots_dir,
                     trace_id=trace_id,
@@ -1649,6 +1781,184 @@ def _aggregate_scenario_results(
             "failed" if any(tc_results[tc_id] == "failed" for tc_id in ran) else "passed"
         )
     return scenario_results
+
+
+_LOCATOR_ASSIGN_RE = re.compile(
+    r"""const\s+(?P<var>[A-Za-z_]\w*)\s*=\s*(?P<expr>page\.(?:getByLabel|getByPlaceholder|getByText|getByTestId|getByAltText|getByTitle|locator)\(.+?\))\s*;"""
+)
+_PAGE_CALL_RE = re.compile(
+    r"""await\s+page\.(?P<method>goto|reload|goBack|goForward|waitForTimeout|waitForURL|waitForLoadState|waitForResponse)\((?P<args>.*)\)\s*;"""
+)
+_LOCATOR_CALL_RE = re.compile(
+    r"""await\s+(?P<expr>page\.(?:getByLabel|getByPlaceholder|getByText|getByTestId|getByAltText|getByTitle|locator)\(.+?\)|[A-Za-z_]\w*)\.(?P<method>fill|clear|click|dblclick|hover|selectOption|check|uncheck|press|setInputFiles)\((?P<args>.*)\)\s*;"""
+)
+_EXPECT_RE = re.compile(
+    r"""await\s+expect\((?P<expr>page(?:\.(?:getByLabel|getByPlaceholder|getByText|getByTestId|getByAltText|getByTitle|locator)\(.+?\))?|[A-Za-z_]\w*)\)\.(?P<method>toBeVisible|toBeHidden|toHaveText|toHaveValue|toBeEnabled|toBeDisabled|toHaveCount|toHaveURL)\((?P<args>.*)\)\s*;"""
+)
+_LOCATOR_EXPR_RE = re.compile(
+    r"""page\.(?P<kind>getByLabel|getByPlaceholder|getByText|getByTestId|getByAltText|getByTitle|locator)\((?P<args>.*)\)"""
+)
+
+
+def _action_mapping_from_generated_code(code_obj: dict[str, Any]) -> dict[str, Any]:
+    """생성된 Playwright JS 코드의 표준 패턴을 ActionMapping 으로 복원한다."""
+    tc_id = str(code_obj.get("tc_id") or "unknown")
+    code = str(code_obj.get("code") or "")
+    locator_vars: dict[str, tuple[str, str]] = {}
+    steps: list[dict[str, Any]] = []
+
+    for raw_line in code.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("//"):
+            continue
+
+        assign = _LOCATOR_ASSIGN_RE.match(line)
+        if assign:
+            parsed = _parse_locator_expr(assign.group("expr"))
+            if parsed:
+                locator_vars[assign.group("var")] = parsed
+            continue
+
+        page_call = _PAGE_CALL_RE.match(line)
+        if page_call:
+            method = page_call.group("method")
+            arg = _first_arg(page_call.group("args"))
+            if method == "goto":
+                steps.append(_step("navigate", None, None, _resolve_js_value(arg), None, len(steps) + 1))
+            elif method == "reload":
+                steps.append(_step("reload", None, None, None, None, len(steps) + 1))
+            elif method == "goBack":
+                steps.append(_step("go_back", None, None, None, None, len(steps) + 1))
+            elif method == "goForward":
+                steps.append(_step("go_forward", None, None, None, None, len(steps) + 1))
+            elif method == "waitForTimeout":
+                steps.append(_step("wait", None, None, _resolve_js_value(arg), None, len(steps) + 1))
+            elif method == "waitForURL":
+                steps.append(_step("wait_for_url", None, None, _resolve_js_value(arg), None, len(steps) + 1))
+            elif method == "waitForLoadState":
+                steps.append(_step("wait_for_load_state", None, None, _resolve_js_value(arg), None, len(steps) + 1))
+            elif method == "waitForResponse":
+                steps.append(_step("wait_for_response", None, None, _resolve_js_value(arg), None, len(steps) + 1))
+            continue
+
+        loc_call = _LOCATOR_CALL_RE.match(line)
+        if loc_call:
+            locator = _resolve_locator_ref(loc_call.group("expr"), locator_vars)
+            if locator:
+                selector_type, selector = locator
+                method = loc_call.group("method")
+                action = {
+                    "selectOption": "select",
+                    "setInputFiles": "upload",
+                }.get(method, method)
+                value = _resolve_js_value(_first_arg(loc_call.group("args")))
+                if action in {"clear", "click", "dblclick", "hover", "check", "uncheck"}:
+                    value = None
+                steps.append(_step(action, selector, selector_type, value, None, len(steps) + 1))
+            continue
+
+        exp = _EXPECT_RE.match(line)
+        if exp:
+            expr = exp.group("expr")
+            method = exp.group("method")
+            arg = _resolve_js_value(_first_arg(exp.group("args")))
+            if expr == "page" and method == "toHaveURL":
+                steps.append(_step("assert_url", None, None, None, arg, len(steps) + 1))
+                continue
+            locator = _resolve_locator_ref(expr, locator_vars)
+            if not locator:
+                continue
+            selector_type, selector = locator
+            action = {
+                "toBeVisible": "assert_visible",
+                "toBeHidden": "assert_hidden",
+                "toHaveText": "assert_text",
+                "toHaveValue": "assert_value",
+                "toBeEnabled": "assert_enabled",
+                "toBeDisabled": "assert_disabled",
+                "toHaveCount": "assert_count",
+            }[method]
+            expected = arg if action in {"assert_text", "assert_value", "assert_count"} else None
+            steps.append(_step(action, selector, selector_type, None, expected, len(steps) + 1))
+            continue
+
+    return {
+        "tc_id": tc_id,
+        "steps": steps,
+        "selector_confidence": 1.0 if steps else 0.0,
+        "source": "generated_code",
+    }
+
+
+def _resolve_locator_ref(expr: str, locator_vars: dict[str, tuple[str, str]]) -> tuple[str, str] | None:
+    expr = expr.strip()
+    if expr in locator_vars:
+        return locator_vars[expr]
+    return _parse_locator_expr(expr)
+
+
+def _parse_locator_expr(expr: str) -> tuple[str, str] | None:
+    match = _LOCATOR_EXPR_RE.match(expr.strip())
+    if not match:
+        return None
+    kind = match.group("kind")
+    arg = _resolve_js_value(_first_arg(match.group("args")))
+    if not arg:
+        return None
+    selector_type = {
+        "getByLabel": "label",
+        "getByPlaceholder": "placeholder",
+        "getByText": "text",
+        "getByTestId": "testid",
+        "getByAltText": "alttext",
+        "getByTitle": "title",
+        "locator": "css",
+    }.get(kind)
+    if not selector_type:
+        return None
+    return selector_type, arg
+
+
+def _first_arg(args: str) -> str:
+    return args.split(",", 1)[0].strip()
+
+
+def _resolve_js_value(token: str | None) -> str | None:
+    if token is None:
+        return None
+    token = token.strip().rstrip(";")
+    if not token:
+        return None
+    if token in {"null", "undefined"}:
+        return None
+    if token.startswith(("'", '"')) and token.endswith(("'", '"')) and len(token) >= 2:
+        return token[1:-1]
+    env_match = re.fullmatch(r"process\.env\.([A-Z0-9_]+)", token)
+    if env_match:
+        return os.getenv(env_match.group(1)) or ""
+    number_match = re.fullmatch(r"-?\d+(?:\.\d+)?", token)
+    if number_match:
+        return token
+    return token
+
+
+def _step(
+    action: str,
+    selector: str | None,
+    selector_type: str | None,
+    value: str | None,
+    expected: str | None,
+    step_no: int,
+) -> dict[str, Any]:
+    return {
+        "step_no": step_no,
+        "action": action,
+        "selector": selector,
+        "selector_type": selector_type,
+        "value": value,
+        "expected": expected,
+        "api_endpoint": None,
+    }
 
 
 async def _run_ui_with_trace(

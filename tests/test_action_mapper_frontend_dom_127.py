@@ -74,6 +74,23 @@ def test_load_frontend_dom_returns_empty_when_no_source(mock_llm_client, tmp_pat
     assert result == []
 
 
+def test_load_frontend_dom_from_qapilot_dir_runtime_cache(mock_llm_client, tmp_path: Path):
+    """context.qapilot_dir 우선 fallback — 서비스별 runtime cache 경로 사용."""
+    qapilot_dir = tmp_path / ".qapilot" / "svc-a"
+    (qapilot_dir / "codebase-index").mkdir(parents=True)
+    (qapilot_dir / "codebase-index" / "frontend.json").write_text(
+        json.dumps({"version": 1, "element_count": 1, "elements": [
+            {"tag": "button", "text": "가입하기", "testid": "signup-submit", "file": "Signup.vue"}
+        ]}),
+        encoding="utf-8",
+    )
+
+    agent = _make_agent(mock_llm_client)
+    result = agent._load_frontend_dom({"qapilot_dir": str(qapilot_dir)})
+    assert len(result) == 1
+    assert result[0]["testid"] == "signup-submit"
+
+
 # ── _format_frontend_dom ────────────────────────────────────────────────────
 
 

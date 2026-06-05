@@ -34,6 +34,7 @@ _MAX_CONCURRENT_LLM_CALLS = 5
 # 와 동일 알고리즘 — Agent 단 정규화 + Tool 런타임 보정 의 일관성.
 _FUZZY_MATCH_THRESHOLD = 0.6
 _FUZZY_MATCH_SUBSTRING_BONUS = 0.2
+_FUZZY_MATCH_SHARED_SUBSTRING_BONUS = 0.15
 
 # assert 계열 action — Step B 의 frontend.json 매칭 적용 대상.
 _ASSERT_ACTIONS = {
@@ -337,20 +338,61 @@ class ActionMapperAgent(BaseAgent):
         return mappings[0]
 
     def _load_frontend_dom(self, context: dict[str, Any]) -> list[dict]:
-        """frontend DOM 인덱스 로드 — context 우선, 없으면 디스크 (.qapilot/codebase-index/frontend.json).
+        """frontend DOM 인덱스 로드 — context 우선, 없으면 qapilot_dir/DB/S3 순 fallback.
 
-        이슈 #127: `qapilot init` / `qapilot rescan` 시점에 디스크 저장된 frontend.json
-        을 LLM 호출 시점에 로드. context 에 직접 주입된 경우 (테스트/외부 caller) 도 지원.
+        우선순위:
+        1) context["frontend_dom"] 직접 주입
+        2) context["frontend_index_path"]
+        3) context["qapilot_dir"]/codebase-index/frontend.json
+        4) DB 메타 + S3 mirror (service_id / commit_hash 제공 시)
+        5) 레거시 CWD `.qapilot/codebase-index/frontend.json`
         """
         from pathlib import Path
+
+        from qapilot.db.code_reader import load_codebase_index
+        from qapilot.tools.frontend_dom_scanner import load_frontend_index
 
         # 1) context 우선 (테스트/외부 caller 가 직접 전달 가능)
         ctx_dom = context.get("frontend_dom")
         if isinstance(ctx_dom, list):
             return ctx_dom
 
-        # 2) 디스크 fallback
-        from qapilot.tools.frontend_dom_scanner import load_frontend_index
+        # 2) 명시 경로
+        index_path = context.get("frontend_index_path")
+        if index_path:
+            elements = load_frontend_index(Path(str(index_path)))
+            if elements:
+                return elements
+
+        # 3) qapilot_dir 기준 디스크 fallback
+        qapilot_dir = context.get("qapilot_dir")
+        if qapilot_dir:
+            elements = load_frontend_index(
+                Path(str(qapilot_dir)) / "codebase-index" / "frontend.json"
+            )
+            if elements:
+                self.logger.info("frontend_dom_index_loaded", element_count=len(elements))
+                return elements
+
+        # 4) DB+S3 mirror fallback
+        service_id = context.get("service_id")
+        if service_id:
+            payload = load_codebase_index(
+                str(service_id),
+                "frontend",
+                commit_hash=context.get("commit_hash"),
+            )
+            if isinstance(payload, dict):
+                elements = list(payload.get("elements") or [])
+                if elements:
+                    self.logger.info(
+                        "frontend_dom_index_loaded_from_mirror",
+                        element_count=len(elements),
+                        service_id=service_id,
+                    )
+                    return elements
+
+        # 5) 레거시 CWD fallback
         elements = load_frontend_index(Path(".qapilot") / "codebase-index" / "frontend.json")
         if elements:
             self.logger.info(
@@ -517,10 +559,9 @@ class ActionMapperAgent(BaseAgent):
         if action in _SELECTOR_OPTIONAL_ACTIONS:
             return None, None
         if selector and selector_type:
-            # 이슈 #129 Step B — assert 계열 + 인덱스 보유 시 정규화 적용
-            if action in _ASSERT_ACTIONS and self._frontend_dom_index:
-                normalized = self._normalize_assert_selector_via_index(
-                    str(selector), selector_type, tc_id, step_no
+            if self._frontend_dom_index:
+                normalized = self._normalize_selector_via_index(
+                    action, str(selector), selector_type, tc_id, step_no
                 )
                 if normalized is not None:
                     return normalized
@@ -528,6 +569,76 @@ class ActionMapperAgent(BaseAgent):
         fallback = item.get("expected") or item.get("value") or action
         self._log_normalization(tc_id, step_no, "selector", selector, fallback)
         return str(fallback), selector_type or "text"
+
+    def _normalize_selector_via_index(
+        self, action: str, selector: str, selector_type: str, tc_id: str, step_no: int
+    ) -> tuple[str, str] | None:
+        """selector 를 frontend index 의 실제 element 로 정규화한다.
+
+        assert 뿐 아니라 fill/click 류에도 적용해, 시나리오 자연어가 selector 로 새는
+        문제를 LLM 이후 단계에서 한 번 더 줄인다.
+        """
+        target = selector.strip().lower()
+        if not target or not self._frontend_dom_index:
+            return None
+
+        best_el: dict | None = None
+        best_score = 0.0
+        exact_match = False
+        for el in self._frontend_dom_index:
+            candidates = [
+                ("text", el.get("text", "")),
+                ("placeholder", el.get("placeholder", "")),
+                ("label", el.get("label", "")),
+                ("testid", el.get("testid", "")),
+            ]
+            for _, candidate in candidates:
+                cand = (candidate or "").strip().lower()
+                if not cand:
+                    continue
+                if cand == target:
+                    best_el = el
+                    best_score = 1.0
+                    exact_match = True
+                    break
+                score = difflib.SequenceMatcher(None, target, cand).ratio()
+                if target in cand or cand in target:
+                    score += _FUZZY_MATCH_SUBSTRING_BONUS
+                elif self._has_meaningful_shared_substring(target, cand):
+                    score += _FUZZY_MATCH_SHARED_SUBSTRING_BONUS
+                if score > best_score:
+                    best_score = score
+                    best_el = el
+            if exact_match:
+                break
+
+        if best_el is None:
+            return None
+        if not exact_match and best_score < _FUZZY_MATCH_THRESHOLD:
+            return None
+
+        new_selector, new_type = self._preferred_selector_for_action(action, best_el)
+        if not new_selector or not new_type:
+            return None
+        if new_selector == selector and new_type == selector_type:
+            return None
+
+        if exact_match and action in _ASSERT_ACTIONS:
+            # 기존 assert exact-match 동작은 유지한다.
+            return None
+
+        self.logger.info(
+            "selector_normalized_via_index",
+            tc_id=tc_id,
+            step_no=step_no,
+            action=action,
+            original=selector,
+            original_type=selector_type,
+            normalized=new_selector,
+            normalized_type=new_type,
+            score=round(best_score, 3),
+        )
+        return new_selector, new_type
 
     def _normalize_assert_selector_via_index(
         self, selector: str, selector_type: str, tc_id: str, step_no: int
@@ -548,67 +659,30 @@ class ActionMapperAgent(BaseAgent):
         - Agent 정적 정규화 (본 메서드) + Tool 런타임 보정 (UITestTool `_fallback_dom_scan`)
         - 동일 difflib.SequenceMatcher + 동일 임계값 — 이중 방어
         """
-        target = selector.strip().lower()
-        if not target:
-            return None
+        return self._normalize_selector_via_index("assert", selector, selector_type, tc_id, step_no)
 
-        # 1) 정확 매치 — 인덱스에 이미 그 텍스트 존재 시 정규화 불필요
-        for el in self._frontend_dom_index:
-            for key in ("testid", "text", "label", "placeholder"):
-                val = (el.get(key) or "").strip()
-                if val and val.lower() == target:
-                    return None  # 원본 유지
-
-        # 2) Fuzzy match — UITestTool 옵션 B 와 동일 알고리즘
-        best_el: dict | None = None
-        best_score = 0.0
-        for el in self._frontend_dom_index:
-            candidates = [
-                el.get("text", ""), el.get("placeholder", ""), el.get("label", ""),
-                el.get("testid", ""), el.get("name", ""), el.get("id", ""),
-            ]
-            for candidate in candidates:
-                cand = (candidate or "").strip().lower()
-                if not cand:
-                    continue
-                score = difflib.SequenceMatcher(None, target, cand).ratio()
-                if target in cand or cand in target:
-                    score += _FUZZY_MATCH_SUBSTRING_BONUS
-                if score > best_score:
-                    best_score = score
-                    best_el = el
-
-        if not best_el or best_score < _FUZZY_MATCH_THRESHOLD:
-            # 매치 실패 — 원본 유지 (UITestTool 런타임 보정에 위임)
-            return None
-
-        # 3) 정규화 — testid > placeholder > label > text 우선순위
-        if best_el.get("testid"):
-            new_selector, new_type = best_el["testid"], "testid"
-        elif best_el.get("placeholder"):
-            new_selector, new_type = best_el["placeholder"], "placeholder"
-        elif best_el.get("label"):
-            new_selector, new_type = best_el["label"], "label"
-        elif best_el.get("text"):
-            new_selector, new_type = best_el["text"], "text"
+    def _preferred_selector_for_action(self, action: str, element: dict) -> tuple[str | None, str | None]:
+        """action 성격에 맞는 가장 안정적인 selector 필드를 선택한다."""
+        if action in {"fill", "clear", "select", "press", "upload"}:
+            priority = ("testid", "label", "placeholder", "text")
         else:
-            return None  # 식별자 모두 빈 element — 정규화 불가
+            priority = ("testid", "text", "label", "placeholder")
 
-        # 원본과 동일하면 그대로
-        if new_selector == selector and new_type == selector_type:
-            return None
+        for key in priority:
+            value = (element.get(key) or "").strip()
+            if value:
+                return value, key
+        return None, None
 
-        self.logger.info(
-            "assert_selector_normalized_via_index",
-            tc_id=tc_id,
-            step_no=step_no,
-            original=selector,
-            original_type=selector_type,
-            normalized=new_selector,
-            normalized_type=new_type,
-            score=round(best_score, 3),
+    def _has_meaningful_shared_substring(self, left: str, right: str) -> bool:
+        """한국어 UI 문구의 부분 겹침(예: '회원가입' vs '가입하기')을 약하게 보정한다."""
+        if not left or not right:
+            return False
+        match = difflib.SequenceMatcher(None, left, right).find_longest_match(
+            0, len(left), 0, len(right)
         )
-        return new_selector, new_type
+        min_len = min(len(left), len(right))
+        return match.size >= max(2, min_len // 2)
 
     def _normalize_value(
         self, action: str, item: dict, selector: str | None, tc_id: str, step_no: int
