@@ -231,6 +231,8 @@ class ActionStep(TypedDict):
     value: str | None
     expected: str | None
     api_endpoint: str | None
+    target_name: NotRequired[str | None]
+    target_kind: NotRequired[str | None]
 
 
 class ActionMapping(TypedDict):

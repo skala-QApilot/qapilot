@@ -56,13 +56,10 @@ class CodeGeneratorAgent(BaseAgent):
     async def _execute(
         self, context: dict[str, Any], params: dict[str, Any], last_error: str | None = None
     ) -> ExecuteResult:
-        frontend_dom = self._load_frontend_dom(context)
         action_mappings = context.get("action_mappings") or params.get("action_mappings") or []
         scenarios = context.get("scenarios") or params.get("scenarios") or []
-        action_mappings = [
-            self._normalize_mapping_with_frontend_index(am, frontend_dom)
-            for am in action_mappings
-        ]
+        # source of truth 는 ActionMapping. CodeGenerator 단계에서는 frontend.json 재매핑 금지.
+        frontend_dom: list[dict] = []
 
         if not action_mappings:
             return ExecuteResult(result={"generated_codes": [], "failed_tcs": []}, confidence=1.0)
@@ -389,10 +386,17 @@ class CodeGeneratorAgent(BaseAgent):
         selector = (step.get("selector") or "").strip()
         selector_type = step.get("selector_type")
         action = step.get("action") or ""
-        if not selector:
+
+        # 이미 frontend index 에 존재하는 유효 selector 는 codegen 에서 재매핑하지 않는다.
+        if self._selector_exists_in_frontend(selector_type, selector, frontend_dom, route_hint=route_hint):
             return step
 
-        best = self._best_frontend_match(selector, frontend_dom, action=action, route_hint=route_hint)
+        target_hint = self._step_target_hint(step)
+        lookup_target = target_hint or selector
+        if not lookup_target:
+            return step
+
+        best = self._best_frontend_match(lookup_target, frontend_dom, action=action, route_hint=route_hint)
         if not best:
             return step
         element, score = best
@@ -418,6 +422,52 @@ class CodeGeneratorAgent(BaseAgent):
             return step
 
         return step
+
+    def _selector_exists_in_frontend(
+        self,
+        selector_type: Any,
+        selector: Any,
+        frontend_dom: list[dict],
+        *,
+        route_hint: str | None = None,
+    ) -> bool:
+        sel_type = str(selector_type or "").strip().lower()
+        sel = str(selector or "").strip()
+        if not sel_type or not sel:
+            return False
+
+        key_map = {
+            "testid": "testid",
+            "label": "label",
+            "placeholder": "placeholder",
+            "text": "text",
+            "css": None,
+            "xpath": None,
+            "alttext": None,
+            "title": None,
+        }
+        lookup_key = key_map.get(sel_type)
+        if not lookup_key:
+            return False
+
+        for el in frontend_dom:
+            value = str(el.get(lookup_key) or "").strip()
+            if value != sel:
+                continue
+            if route_hint:
+                el_route = str(el.get("route") or "").strip()
+                if el_route and el_route != route_hint:
+                    continue
+            return True
+        return False
+
+    def _step_target_hint(self, step: dict[str, Any]) -> str:
+        parts = [
+            str(step.get("target_name") or "").strip(),
+            str(step.get("target_kind") or "").strip(),
+            str(step.get("expected") or "").strip() if step.get("action") in {"assert", "assert_visible", "assert_text"} else "",
+        ]
+        return " ".join(part for part in parts if part)
 
     def _best_frontend_match(
         self, selector: str, frontend_dom: list[dict], *, action: str = "", route_hint: str | None = None
