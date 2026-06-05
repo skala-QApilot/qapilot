@@ -868,7 +868,7 @@ class ActionMapperAgent(BaseAgent):
                     result.append(el)
                 continue
             if action in _ASSERT_ACTIONS:
-                if any(str(el.get(k) or "").strip() for k in ("text", "testid", "label", "placeholder")):
+                if any(str(el.get(k) or "").strip() for k in ("text", "testid", "label", "placeholder", "dynamic_testid_pattern")):
                     result.append(el)
                 continue
             result.append(el)
@@ -1115,7 +1115,11 @@ class ActionMapperAgent(BaseAgent):
         return self._normalize_selector_via_index("assert", selector, selector_type, tc_id, step_no)
 
     def _preferred_selector_for_action(self, action: str, element: dict) -> tuple[str | None, str | None]:
-        """action 성격에 맞는 가장 안정적인 selector 필드를 선택한다."""
+        """action 성격에 맞는 가장 안정적인 selector 필드를 선택한다.
+
+        우선순위: 고정 testid → 사용자 가시 text → route context → dynamic pattern
+        dynamic_testid_pattern 은 런타임 값 미확정이므로 최후 수단으로만 사용.
+        """
         if action in {"fill", "clear", "select", "press", "upload"}:
             priority = ("testid", "label", "placeholder", "text")
         else:
@@ -1125,6 +1129,12 @@ class ActionMapperAgent(BaseAgent):
             value = (element.get(key) or "").strip()
             if value:
                 return value, key
+
+        # fallback: dynamic_testid_pattern (예: plan-select-${plan.id}) — 패턴 힌트용
+        dyn = (element.get("dynamic_testid_pattern") or "").strip()
+        if dyn:
+            return dyn, "testid"
+
         return None, None
 
     def _has_meaningful_shared_substring(self, left: str, right: str) -> bool:
