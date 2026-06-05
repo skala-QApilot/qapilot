@@ -293,6 +293,45 @@ async def resume_run(trace_id: str) -> Any:
     return ok({"trace_id": trace_id, "status": "running"})
 
 
+@router.post("/scenarios/reindex")
+async def reindex_scenarios(request: Request) -> Any:
+    """Spring 수동 편집·삭제·추가 시 Qdrant scenario_index를 갱신한다.
+
+    Body: { "service_id": "...", "scenarios": [ { ts JSON } ] }
+    scenarios가 빈 배열이면 해당 service_id의 전체 인덱스를 재구성하지 않고
+    개별 ts를 삭제 처리해야 하므로 caller가 ts_id 목록을 별도 제공해야 한다.
+    """
+    body = await request.json()
+    service_id = body.get("service_id", "")
+    scenarios = body.get("scenarios") or []
+    deleted_ts_ids: list[str] = body.get("deleted_ts_ids") or []
+
+    if not service_id:
+        return fail("AGENT_API_003", "service_id가 필요합니다.")
+
+    try:
+        from qapilot.tools.scenario_index import ScenarioVectorStore
+        store = ScenarioVectorStore()
+
+        upserted = 0
+        for ts in scenarios:
+            ok_flag = await store.upsert_scenario(service_id=service_id, ts=ts)
+            if ok_flag:
+                upserted += 1
+
+        deleted = 0
+        for ts_id in deleted_ts_ids:
+            ok_flag = await store.delete_scenario(service_id=service_id, ts_id=ts_id, tc_ids=[])
+            if ok_flag:
+                deleted += 1
+
+        logger.info("scenario_reindex_done", service_id=service_id, upserted=upserted, deleted=deleted)
+        return ok({"upserted": upserted, "deleted": deleted})
+    except Exception as e:
+        logger.warning("scenario_reindex_failed", error=str(e))
+        return fail("AGENT_API_500", f"reindex 실패: {e}")
+
+
 @router.post("/runs/{trace_id}/stop")
 async def stop_run(trace_id: str) -> Any:
     """진행 중인 파이프라인을 즉시 중단한다."""
