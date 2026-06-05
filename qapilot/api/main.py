@@ -4,6 +4,9 @@
 Created: 2026-05-07
 """
 
+import asyncio
+from contextlib import asynccontextmanager
+
 import structlog
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request
@@ -12,9 +15,60 @@ from qapilot.api.agent_router import router as agent_router
 from qapilot.api.response import fail
 from qapilot.modules.trace_module import TraceModule
 from qapilot.shared.errors import AuthError, QApilotError
-from qapilot.shared.logger import setup_logger
+from qapilot.shared.logger import get_logger, setup_logger
 
 _TRACE_HEADER = "X-Trace-Id"
+
+
+async def _rebuild_scenario_index() -> None:
+    """서버 시작 시 DB의 기존 시나리오를 Qdrant scenario_index에 일괄 인덱싱한다.
+
+    이미 최신 상태면 upsert가 덮어쓰므로 멱등하다.
+    DB 미연결·Qdrant 미가동 시 graceful skip.
+    """
+    logger = get_logger("startup")
+    try:
+        from qapilot.db.connection import get_pool
+        from qapilot.db.scenario_reader import load_latest_scenarios
+        from qapilot.tools.scenario_index import ScenarioVectorStore
+
+        pool = get_pool()
+        if pool is None:
+            logger.info("scenario_index_rebuild_skip", reason="db_unavailable")
+            return
+
+        # 등록된 서비스 목록 조회
+        with pool.connection() as conn, conn.cursor() as cur:
+            cur.execute("SELECT id::text FROM services WHERE is_deleted = false")
+            service_ids = [row[0] for row in cur.fetchall()]
+
+        if not service_ids:
+            return
+
+        store = ScenarioVectorStore()
+        total_upserted = 0
+
+        for service_id in service_ids:
+            scenarios = await asyncio.to_thread(load_latest_scenarios, service_id)
+            for ts in scenarios:
+                ok = await store.upsert_scenario(service_id=service_id, ts=ts)
+                if ok:
+                    total_upserted += 1
+
+        logger.info(
+            "scenario_index_rebuild_complete",
+            services=len(service_ids),
+            upserted=total_upserted,
+        )
+    except Exception as e:
+        get_logger("startup").warning("scenario_index_rebuild_failed", error=str(e))
+
+
+@asynccontextmanager
+async def _lifespan(app: FastAPI):
+    """서버 시작/종료 수명주기 — 시나리오 인덱스 초기 빌드."""
+    await _rebuild_scenario_index()
+    yield
 
 
 async def _trace_id_middleware(request: Request, call_next):
@@ -45,7 +99,8 @@ def create_app() -> FastAPI:
     from qapilot.storage.s3_client import get_client
     get_pool()
     get_client()
-    app = FastAPI(title="QApilot", version="0.1.0")
+
+    app = FastAPI(title="QApilot", version="0.1.0", lifespan=_lifespan)
 
     app.middleware("http")(_trace_id_middleware)
     app.exception_handler(AuthError)(_auth_error_handler)
@@ -56,11 +111,7 @@ def create_app() -> FastAPI:
         """서버 상태를 확인한다."""
         return {"status": "ok", "version": "0.1.0"}
 
-    # 최종 FastAPI는 AI 실행 서버로 축소한다.
     app.include_router(agent_router)
-
-    # React 빌드 결과물 정적 서빙
-    # app.mount("/", StaticFiles(directory="qapilot/web/dist", html=True))
 
     return app
 
