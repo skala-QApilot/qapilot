@@ -208,36 +208,33 @@ code_context_not_found source=fix_recommender   confidence=0.0
 
 ## 6. 본 e2e 가 노출시킨 잔여 격차 4건 (영역별 협업)
 
-| # | 잔여 | 영역 | 본인 발의 / 상태 |
+> ⚠️ **2026-06-05 갱신** — #2 (PRD/docs SaaS wire) 는 kshyun 의 develop 직접 commit (`36440a8` / `412b7d9` / `fe5ee06`) 으로 본질 wire 됨 (옵션 a 형태). Phase 2 cleanup 시한폭탄으로 전환. #1 + #3 (ActionMapper 환각 + frontend.json SaaS) 는 yuvnn 이 이슈 #218 로 통합 발의함 (본인 #139 / #128 후속 흡수).
+
+| # | 잔여 | 영역 | 상태 (2026-06-05) |
 |---|---|---|---|
-| 1 | ActionMapper 환각 ("회원가입" vs "가입하기") | C (selector specificity) | 기존 이슈 #139 / 본 e2e 가 다시 정량화 (TS-001 6/6 fail 의 본질 원인) |
-| 2 | PRD/docs SaaS wire 본질 (UI 업로드 → agent read) | E + F + A | **본인 master 이슈 #207 + sub #208~213 발의 / docs PR #214** |
-| 3 | frontend.json SaaS 미생성 (ActionMapper 컨텍스트 부재) | C+A | 기존 이슈 #128 후속 |
+| 1 | ActionMapper 환각 ("회원가입" vs "가입하기") | C (selector specificity) | **yuvnn 이슈 #218 통합 발의 + 작업 진행 (본인 #139 흡수)** |
+| 2 | PRD/docs SaaS wire 본질 (UI 업로드 → agent read) | E + F + A | ✅ **wire 완료 (옵션 a 형태) — kshyun `36440a8` / `412b7d9` / `fe5ee06` + 본인 `get_object` (PR #216) 활용**. Phase 2 cleanup 시한폭탄 등록 |
+| 3 | frontend.json SaaS 미생성 (ActionMapper 컨텍스트 부재) | C+A | **yuvnn 이슈 #218 통합 발의 (본인 #128 후속 흡수)** |
 | 4 | `codebase_index_empty base_dir=.` (Layer 3 path 버그) | B | 미발의 (별도 이슈 등록 필요) |
 
 ---
 
-## 7. 영역별 다음 액션
+## 7. 영역별 다음 액션 — 2026-06-05 갱신 (격차 #207 wire 완료 후)
 
-### UI 팀
-- **sub-A #208** — `files.ts` 의 `uploadFile()` + `ServiceSetupPage` onClick 에서 호출
+### ✅ 완료 (격차 #207 wire 됨, 옵션 a 형태)
+- UI sub-A `36440a8` / agent _doc_import 3단 `412b7d9` / Spring mirror `fe5ee06` / 본인 PR #216 (s3_client get_object) + PR #217 (state.domain_files 통로 보존)
 
-### Spring (kshyun, E 영역)
-- **sub-B #209** — `ScenarioGenerationStartRequest` 에 `file_ids: List<String>` 추가
-- **sub-C #210** — `AgentExecutionService` 가 `DomainDocumentRepository` 참조 + FastAPI body 동봉
-- **sub-F Part 1 #213** — `DashboardService.domainFiles()` 를 **DB read** 로 전환 (PR #19 청산 패턴 적용 — 잔존 file 의존 청산). ⚠️ v1 의 "qapilot_dir mirror" 안 — anti-pattern 으로 폐기, DB read 정답
+### ⏳ Phase 2 cleanup 시한폭탄 (k8s replica > 1 운영 직전)
+- Spring `DomainFileService.mirrorToDisk` revert + pipeline `(2) qapilot_dir/domain mirror` 분기 제거
+- 본인 sub-D state.domain_files 통로 활용 (Spring 이 body 동봉) 또는 service_id → DB read 유지
+- 본인 sub-E `s3_client.download` 활용 결정 (현재 dead)
 
-### agent (본인, A 영역)
-- **sub-E #212** — `s3_client.py` 에 `get_object()` / `download()` (단독 가능, 의존 0)
-- **sub-D #211** — `RunOptions / PipelineState` 에 `domain_files` 필드 (격차 12 staging_url/test_account 동형)
-- **sub-F Part 2 #213** — `pipeline._doc_import` 가 `state.domain_files` → S3 download → tmp 디렉토리 (로컬 fallback 없음, cfg.project.root 는 CLI 호환 한정)
+### ⏳ C + D 영역 (yuvnn 협업 — 이슈 #218 진행 중)
+- frontend.json DB/S3 mirror + ActionMapper selector 후보 선택 구조 + UITestTool fallback 정합
+- 본인 #139 / #128 후속 흡수
 
-### C 영역 (ActionMapper 환각)
-- **이슈 #139** — testid 우선 강제 정규화
-- **이슈 #128 후속** — frontend.json SaaS 흐름 생성 (ActionMapper 컨텍스트 주입)
-
-### B 영역 (Layer 3 path)
-- 신규 이슈 — root_cause / fix_recommender 가 `state.qapilot_dir` 사용하도록 fix
+### ⏳ B 영역 (Layer 3 path)
+- 신규 이슈 — root_cause / fix_recommender 가 `state.qapilot_dir` 사용하도록 fix (미발의)
 
 ---
 

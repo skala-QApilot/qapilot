@@ -1,11 +1,62 @@
 # PRD/도메인 문서 SaaS 통로 격차 분석
 
-> **상태**: OPEN
-> **작성일**: 2026-06-04 (v2: anti-pattern 교정)
-> **담당**: A (본인, agent) + E (Spring) + F (UI)
+> **상태**: 본질 wire 완료 (옵션 a 형태, 2026-06-05 v3 갱신) / Phase 2 cleanup 추적
+> **작성일**: 2026-06-04 (v2: anti-pattern 교정) → 2026-06-05 (v3: 현실 인정 + Phase 2)
+> **담당**: A (본인, agent) + E (kshyun, Spring) + F (UI)
 > **메모리**: [[project_qapilot_prd_docs_saas_wire_gap]]
 > **격차 12 후속 동형 패턴**: [[project_qapilot_saas_test_account_gap]] / `docs/web-direction-and-github-e2e-gap.md`
-> **PR #19 청산 방향 정합**: file → DB/S3 청산 (qapilot-server 의 41 file-store → src/legacy/) 정합 유지
+> **PR #19 청산 방향 정합**: file → DB/S3 청산 (qapilot-server 의 41 file-store → src/legacy/). Phase 1 옵션 a 채택 후 Phase 2 cleanup 시한폭탄 등록.
+
+## ⚠️ v3 갱신 (2026-06-05) — 현실 인정 + Phase 2 추적
+
+격차 본질 (UI 업로드 ↔ Spring 저장 ↔ agent read) 은 **kshyun 의 develop 직접 commit 으로 본질 wire 완료** — 단, 본인 v2 교정에서 폐기한 옵션 a (qapilot_dir/domain mirror) 채택. Phase 2 cleanup 필요.
+
+### 본인 v2 → v3 흐름 (책임 명시)
+
+본인이 2026-06-04 v2 교정 (옵션 a/c 폐기) 을 다음에 반영:
+- ✅ 본 docs (commit `2ce8f8c`)
+- ✅ sub-issue #213 본문
+- ❌ **master 이슈 #207 본문** — v1 (P0 옵션 a 추천) 그대로 유지 → 2026-06-05 v3 로 갱신
+
+→ kshyun 가 P0 옵션 a 따라 `fe5ee06` (Spring mirror) + `412b7d9` (pipeline 3단) 채택 가능성 매우 높음. 본인 master 본문 갱신 누락이 직접 원인.
+
+### kshyun 가 구현한 흐름 (2026-06-04 develop 직접 push)
+
+| sub | commit | 내용 | v2 정합도 |
+|---|---|---|---|
+| A (UI uploadFile) | `36440a8` (QApilot-UI) | ServiceSetupPage PRD 업로드 → POST /files | ✅ 본질 동일 |
+| B (Spring DTO file_ids) | — | 미구현 — service_id → DB 직접 read 채택해 미필요화 | ✅ 본질 등가 |
+| C (Spring body 동봉) | — | 동상 미필요화 | ✅ 본질 등가 |
+| D (state.domain_files) | (본인 PR #217 머지됨) | 본인 통로 미사용 — pipeline 이 trace.service_id → DB read | ⚠️ Dead code 통로 (Phase 2 활용) |
+| E (s3_client.get_object/download) | (본인 PR #216 머지됨) | `get_object` 만 활용 (pipeline `(1)`), `download` Phase 2 결정 | ✅ 부분 활용 |
+| F Part 1 (Spring) | `fe5ee06` (qapilot-server) | **옵션 a 채택** — `DomainFileService.mirrorToDisk` neoul dual-write | ❌ v2 무시 (anti-pattern) |
+| F Part 2 (agent _doc_import) | `412b7d9` + `e22aa6d` (qapilot) | 3단 우선순위: (1) trace.service_id → DB+S3 / (2) qapilot_dir/domain mirror / (3) cfg.root/docs | ⚠️ (1) 본질 정합 / (2) anti-pattern |
+
+### 격차 본질 — wire 됨 (옵션 a 형태)
+
+**SaaS 흐름 동작 가능**: UI 업로드 → Spring (S3+DB primary + disk mirror) → agent (DB read → S3 `get_object` → tmp + `DomainKnowledgeTool import`). PRD 컨텍스트 정상 주입.
+
+### Phase 2 cleanup 시한폭탄 (별도 이슈)
+
+**조건**: k8s replica > 1 운영 직전
+**작업**:
+- Spring `DomainFileService.mirrorToDisk` revert
+- pipeline `_doc_import (2) qapilot_dir/domain` + `_read_latest_prd_text (2) qapilot_dir/domain` 분기 제거
+- 본인 sub-D `state.domain_files` 통로 활용 — Spring sub-C body 동봉 (이슈 #209/#210 재발의) 또는 service_id → DB read 경로 그대로 유지
+- 본인 sub-E `s3_client.download` 활용 결정 (현재 dead, Phase 2 진입 시 본인이 점검)
+
+### sub-issue 정리 (2026-06-05)
+
+| 이슈 | 상태 | 근거 |
+|---|---|---|
+| #208 (UI uploadFile) | CLOSED | kshyun `36440a8` 정합 구현 |
+| #209 (Spring DTO file_ids) | CLOSED | service_id → DB read 채택으로 미필요화 |
+| #210 (Spring body 동봉) | CLOSED | 동상 미필요화 |
+| #211 (state.domain_files) | CLOSED (PR #217 머지) | 통로 보존 — Phase 2 활용 |
+| #212 (s3_client get_object/download) | CLOSED (PR #216 머지) | get_object 활용 / download Phase 2 |
+| #213 (sub-F) | CLOSED | Part 1+2 옵션 a 형태로 wire 됨 |
+
+---
 
 ## ⚠️ v2 교정 (2026-06-04) — 옵션 a/c 폐기
 
