@@ -412,6 +412,15 @@ def _load_scan_result_from_disk(state: PipelineState) -> dict:
         return {"scan_result": None, "current_layer": "L1A"}
 
 
+async def _upsert_scenario_index(service_id: str, ts: dict) -> None:
+    """시나리오 저장 후 Qdrant scenario_index를 비동기로 업데이트한다. 실패는 silent."""
+    try:
+        from qapilot.tools.scenario_index import ScenarioVectorStore
+        await ScenarioVectorStore().upsert_scenario(service_id=service_id, ts=ts)
+    except Exception as e:
+        get_logger(source="orchestrator").warning("scenario_index_upsert_error", error=str(e))
+
+
 def _build_existing_scenarios_summary(state: PipelineState) -> list[dict]:
     """기존 시나리오를 TS+TC 요약으로 반환한다.
 
@@ -443,14 +452,15 @@ async def _rough_match_scenarios(
     existing_scenarios: list[dict],
     top_n: int = 5,
     threshold: float = 0.40,
+    service_id: str | None = None,
 ) -> list[dict]:
-    """user_input을 직접 임베딩하여 기존 시나리오 중 top-N 후보를 반환한다.
+    """user_input을 임베딩하여 기존 시나리오 중 top-N 후보를 반환한다.
+
+    service_id가 제공되면 Qdrant scenario_index에서 검색(사전 임베딩 활용).
+    Qdrant 미가동·장애 시 인메모리 코사인 유사도로 폴백한다.
 
     NaturalLanguageAgent 호출 전에 실행되며, LLM에게 전체 목록 대신
     유사도 높은 후보만 전달하여 프롬프트 크기를 제한한다.
-
-    threshold는 후보 탐색용으로 _resolve_scenario_targets보다 낮게 설정한다.
-    (후보가 없으면 LLM이 create로 판단하도록 유도)
     """
     import asyncio as _asyncio
 
@@ -462,10 +472,36 @@ async def _rough_match_scenarios(
         return []
 
     embedder = get_embedder()
-    ts_texts = [ts.get("title") or ts.get("ts_id", "") for ts in existing_scenarios]
-    ts_vecs = await _asyncio.to_thread(embedder.encode, ts_texts, normalize_embeddings=True)
     query_vecs = await _asyncio.to_thread(embedder.encode, [user_input], normalize_embeddings=True)
     query_vec = query_vecs[0]
+
+    # ── Qdrant 검색 (service_id 있을 때) ─────────────────────────────────
+    if service_id:
+        try:
+            from qapilot.tools.scenario_index import ScenarioVectorStore
+
+            store = ScenarioVectorStore()
+            hits = await store.search_ts(
+                service_id=service_id,
+                query_vec=query_vec.tolist(),
+                top_n=top_n,
+                threshold=threshold,
+            )
+            if hits:
+                # Qdrant 결과를 existing_scenarios 원본 dict과 merge
+                ts_by_id = {ts.get("ts_id"): ts for ts in existing_scenarios}
+                return [
+                    {**ts_by_id.get(h["ts_id"], {"ts_id": h["ts_id"], "title": h["title"]}),
+                     "_similarity": h["_similarity"]}
+                    for h in hits
+                    if h["ts_id"] in ts_by_id or True
+                ]
+        except Exception as e:
+            get_logger(source="orchestrator").debug("scenario_index_fallback", error=str(e))
+
+    # ── 인메모리 폴백 ──────────────────────────────────────────────────────
+    ts_texts = [ts.get("title") or ts.get("ts_id", "") for ts in existing_scenarios]
+    ts_vecs = await _asyncio.to_thread(embedder.encode, ts_texts, normalize_embeddings=True)
 
     sims = [float(np.dot(query_vec, ts_vec)) for ts_vec in ts_vecs]
     candidates = [
@@ -481,20 +517,20 @@ async def _resolve_scenario_targets(
     requirements: list[dict],
     existing_scenarios: list[dict],
     threshold: float = 0.50,
+    service_id: str | None = None,
 ) -> list[dict]:
     """action_type: update인 요구사항에 임베딩 매칭으로 target_ts_id / target_tc_id를 주입한다.
 
     LLM이 아닌 코드 레벨에서 대상을 탐색하므로 존재하지 않는 ID를 반환하지 않는다.
 
+    service_id가 제공되면 Qdrant scenario_index 사용 (사전 임베딩).
+    Qdrant 미가동·장애 시 인메모리 코사인 유사도로 폴백한다.
+
     흐름:
     1. update 요구사항의 domain_area + content를 쿼리 텍스트로 임베딩
-    2. 기존 시나리오 TS 제목을 임베딩하여 코사인 유사도 계산
-    3. threshold 이상의 TS 매칭 → target_ts_id 주입
-    4. target_level이 tc/tv이면 해당 TS 내 TC 제목과 재매칭 → target_tc_id 주입
-    5. threshold 미달 시 null 유지 (ScenarioGeneratorAgent가 create처럼 처리)
-
-    Args:
-        threshold: 코사인 유사도 기준값. 0.68 미만이면 매칭 실패로 처리.
+    2. Qdrant(또는 인메모리)로 TS 매칭 → target_ts_id 주입
+    3. target_level이 tc/tv이면 TS 내 TC 매칭 → target_tc_id 주입
+    4. threshold 미달 시 null 유지 (ScenarioGeneratorAgent가 create처럼 처리)
     """
     import asyncio as _asyncio
 
@@ -508,51 +544,109 @@ async def _resolve_scenario_targets(
 
     embedder = get_embedder()
 
-    # TS 텍스트 임베딩 — ts_id 접두사 제외, 제목만 사용 (ts_id가 임베딩 오염 방지)
-    ts_texts = [
-        ts.get("title") or ts.get("ts_id", "")
-        for ts in existing_scenarios
-    ]
+    # 쿼리 텍스트 임베딩 (요청당 1회 — TS/TC는 Qdrant에 사전 임베딩)
     query_texts = [
         f"{r.get('domain_area', '')} {r.get('content', '')}"
         for r in update_reqs
     ]
-
-    ts_vecs = await _asyncio.to_thread(
-        embedder.encode, ts_texts, normalize_embeddings=True
-    )
     query_vecs = await _asyncio.to_thread(
         embedder.encode, query_texts, normalize_embeddings=True
     )
 
+    # TS 인메모리 폴백용 벡터 (Qdrant 실패 시)
+    ts_vecs_cache: list | None = None
+    ts_texts = [ts.get("title") or ts.get("ts_id", "") for ts in existing_scenarios]
+
+    async def _get_ts_vecs():
+        nonlocal ts_vecs_cache
+        if ts_vecs_cache is None:
+            ts_vecs_cache = await _asyncio.to_thread(
+                embedder.encode, ts_texts, normalize_embeddings=True
+            )
+        return ts_vecs_cache
+
     for i, req in enumerate(update_reqs):
         q_vec = query_vecs[i]
-        ts_sims = [float(np.dot(q_vec, ts_vec)) for ts_vec in ts_vecs]
-        best_ts_idx = int(np.argmax(ts_sims))
 
-        if ts_sims[best_ts_idx] < threshold:
-            continue  # 매칭 실패 — null 유지
+        # ── TS 매칭: Qdrant 우선 ──────────────────────────────────────────
+        matched_ts_id: str | None = None
+        matched_ts: dict | None = None
 
-        matched_ts = existing_scenarios[best_ts_idx]
-        req["target_ts_id"] = matched_ts.get("ts_id")
+        if service_id:
+            try:
+                from qapilot.tools.scenario_index import ScenarioVectorStore
 
-        # TC/TV 레벨 매칭
-        if req.get("target_level") in ("tc", "tv"):
-            tcs = matched_ts.get("test_cases") or []
-            if not tcs:
+                hits = await ScenarioVectorStore().search_ts(
+                    service_id=service_id,
+                    query_vec=q_vec.tolist(),
+                    top_n=1,
+                    threshold=threshold,
+                )
+                if hits:
+                    matched_ts_id = hits[0]["ts_id"]
+                    ts_by_id = {ts.get("ts_id"): ts for ts in existing_scenarios}
+                    matched_ts = ts_by_id.get(matched_ts_id)
+            except Exception as e:
+                get_logger(source="orchestrator").debug(
+                    "resolve_targets_qdrant_ts_fallback", error=str(e)
+                )
+
+        if matched_ts_id is None:
+            # 인메모리 폴백
+            ts_vecs = await _get_ts_vecs()
+            ts_sims = [float(np.dot(q_vec, ts_vec)) for ts_vec in ts_vecs]
+            best_ts_idx = int(np.argmax(ts_sims))
+            if ts_sims[best_ts_idx] < threshold:
                 continue
-            tc_texts = [
-                tc.get("title") or tc.get("tc_id", "")
-                for tc in tcs
-            ]
-            tc_vecs = await _asyncio.to_thread(
-                embedder.encode, tc_texts, normalize_embeddings=True
-            )
-            tc_sims = [float(np.dot(q_vec, tc_vec)) for tc_vec in tc_vecs]
-            best_tc_idx = int(np.argmax(tc_sims))
+            matched_ts = existing_scenarios[best_ts_idx]
+            matched_ts_id = matched_ts.get("ts_id")
 
-            if tc_sims[best_tc_idx] >= threshold:
-                req["target_tc_id"] = tcs[best_tc_idx].get("tc_id")
+        if not matched_ts_id or not matched_ts:
+            continue
+
+        req["target_ts_id"] = matched_ts_id
+
+        # ── TC/TV 매칭: Qdrant 우선 ──────────────────────────────────────
+        if req.get("target_level") in ("tc", "tv"):
+            tc_matched: dict | None = None
+
+            if service_id:
+                try:
+                    from qapilot.tools.scenario_index import ScenarioVectorStore
+
+                    tc_hits = await ScenarioVectorStore().search_tc(
+                        service_id=service_id,
+                        ts_id=matched_ts_id,
+                        query_vec=q_vec.tolist(),
+                        threshold=threshold,
+                    )
+                    if tc_hits:
+                        tc_matched = tc_hits[0]
+                except Exception as e:
+                    get_logger(source="orchestrator").debug(
+                        "resolve_targets_qdrant_tc_fallback", error=str(e)
+                    )
+
+            if tc_matched is None:
+                # 인메모리 폴백
+                tcs = matched_ts.get("test_cases") or []
+                if tcs:
+                    tc_texts_local = [
+                        tc.get("title") or tc.get("tc_id", "") for tc in tcs
+                    ]
+                    tc_vecs = await _asyncio.to_thread(
+                        embedder.encode, tc_texts_local, normalize_embeddings=True
+                    )
+                    tc_sims = [float(np.dot(q_vec, tc_vec)) for tc_vec in tc_vecs]
+                    best_tc_idx = int(np.argmax(tc_sims))
+                    if tc_sims[best_tc_idx] >= threshold:
+                        tc_matched = {
+                            "tc_id": tcs[best_tc_idx].get("tc_id"),
+                            "_similarity": tc_sims[best_tc_idx],
+                        }
+
+            if tc_matched:
+                req["target_tc_id"] = tc_matched.get("tc_id")
 
     return requirements
 
@@ -782,10 +876,16 @@ async def _requirement_extract(state: PipelineState) -> dict:
         # 전체 시나리오 목록 로드
         existing_scenarios_summary = _build_existing_scenarios_summary(state)
 
-        # 1단계: user_input 직접 임베딩 → top-N 후보 탐색 (이슈 #186)
-        # LLM에는 전체 목록 대신 후보만 전달 → 프롬프트 크기 제한, 확장성 확보
+        # service_id: Qdrant 검색에 필요 (trace.json에서 추출)
+        _trace_for_svc = load_trace(qapilot_dir, state["trace_id"]) or {}
+        _service_id = _trace_for_svc.get("service_id") or None
+
+        # 1단계: user_input 직접 임베딩 → top-N 후보 탐색 (이슈 #186, #221)
+        # Qdrant scenario_index 우선 검색, 장애 시 인메모리 폴백
         try:
-            top_candidates = await _rough_match_scenarios(user_input, existing_scenarios_summary)
+            top_candidates = await _rough_match_scenarios(
+                user_input, existing_scenarios_summary, service_id=_service_id
+            )
         except Exception as e:
             get_logger("orchestrator").warning("rough_match_failed", error=str(e))
             top_candidates = []
@@ -821,9 +921,11 @@ async def _requirement_extract(state: PipelineState) -> dict:
 
         requirements = output.result.get("requirements", []) or []
 
-        # 3단계: top_candidates 안에서 target_ts_id / target_tc_id 확정 주입 (이슈 #186)
+        # 3단계: top_candidates 안에서 target_ts_id / target_tc_id 확정 주입 (이슈 #186, #221)
         try:
-            requirements = await _resolve_scenario_targets(requirements, top_candidates)
+            requirements = await _resolve_scenario_targets(
+                requirements, top_candidates, service_id=_service_id
+            )
         except Exception as e:
             get_logger("orchestrator").warning("scenario_target_resolve_failed", error=str(e))
 
@@ -945,6 +1047,7 @@ async def _save_scenarios(state: PipelineState) -> dict:
             saved_paths.append(str(path))
             if service_id:
                 upsert_scenario_version(service_id, ts_id, ts)
+                await _upsert_scenario_index(service_id, ts)
             logger.info(
                 "scenario_merged",
                 ts_id=ts_id,
@@ -961,6 +1064,7 @@ async def _save_scenarios(state: PipelineState) -> dict:
             saved_paths.append(str(path))
             if service_id:
                 upsert_scenario_version(service_id, ts_id, ts)
+                await _upsert_scenario_index(service_id, ts)
 
     # RTM 버전 자동 생성 — natural_lang delta 저장 시에는 skip (전체 시나리오 기준이 아니므로)
     if trigger != "natural_lang":
