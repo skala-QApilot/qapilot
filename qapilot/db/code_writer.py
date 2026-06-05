@@ -49,11 +49,13 @@ def upsert_generated_code(service_id: str, tc_id: str, code_text: str) -> bool:
             )
             next_version = int(cur.fetchone()[0])
             s3_key = f"services/{service_id}/generated-code/{tc_id}/v{next_version}.js"
+            latest_s3_key = f"services/{service_id}/generated-code/{tc_id}/latest.js"
 
             # S3 PUT — DB INSERT 전에. 실패 시 DB 안 씀.
             if s3_client.put_bytes(s3_key, code_bytes, "application/javascript") is None:
                 _logger.warning("generated_code_s3_skip", tc_id=tc_id)
                 return False
+            s3_client.put_bytes(latest_s3_key, code_bytes, "application/javascript")
 
             cur.execute(
                 """
@@ -80,6 +82,7 @@ def upsert_action_mapping(service_id: str, tc_id: str, payload: dict) -> bool:
         return False
 
     payload_json = json.dumps(payload, ensure_ascii=False, default=str)
+    payload_bytes = json.dumps(payload, ensure_ascii=False, indent=2, default=str).encode("utf-8")
     new_id = str(uuid.uuid4())
 
     try:
@@ -90,6 +93,12 @@ def upsert_action_mapping(service_id: str, tc_id: str, payload: dict) -> bool:
                 (service_id, tc_id),
             )
             next_version = int(cur.fetchone()[0])
+            s3_key = f"services/{service_id}/action-mappings/{tc_id}/v{next_version}.json"
+            latest_s3_key = f"services/{service_id}/action-mappings/{tc_id}/latest.json"
+            if s3_client.put_bytes(s3_key, payload_bytes, "application/json") is None:
+                _logger.warning("action_mapping_s3_skip", tc_id=tc_id)
+                return False
+            s3_client.put_bytes(latest_s3_key, payload_bytes, "application/json")
             cur.execute(
                 """
                 INSERT INTO action_mappings (id, service_id, tc_id, version, payload)

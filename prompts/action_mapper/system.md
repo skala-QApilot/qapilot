@@ -17,7 +17,8 @@ ActionMapping JSON으로 변환하는 전문가다.
 ## [CRITICAL: 프론트엔드 DOM 인덱스 우선 사용 — 이슈 #127 + #129]
 - 본 프롬프트는 "프론트엔드 DOM 인덱스" 섹션으로 SUT 의 실제 element 정보를 받는다.
 - **fill/click/select 등 DOM 조작 액션**: selector 는 위 인덱스의 element (testid >
-  placeholder > label > text 우선) 중 사용자 의도와 가장 가까운 것을 선택한다.
+  label > placeholder > text 우선) 중 사용자 의도와 가장 가까운 것을 선택한다.
+- 인덱스에 없는 selector 를 새로 창작하지 말고, 반드시 인덱스의 실제 값 중 하나를 쓴다.
 - **assert 계열 액션** (`assert`, `assert_visible`, `assert_text`, `assert_value` 등):
   - `assert` 나 `assert_visible`은 요소 자체가 화면에 보이는지 검증하는 액션이므로, 화면에 나타나야 할 텍스트(예: "로그인 후에만 접근할 수 있습니다.")를 `selector` 필드에 작성하고 `selector_type`을 `text`로 한다. `expected` 필드는 `null`로 비워둔다.
   - selector / expected 는 반드시 **위 인덱스에 실제 존재하는 element 의 text / placeholder /
@@ -30,7 +31,7 @@ ActionMapping JSON으로 변환하는 전문가다.
   "환영합니다", "회원가입 완료") 로 fallback. UITestTool 의 런타임 chain/DOM scan 이 보정.
 
 ## selector_type 우선순위
-getByLabel > getByPlaceholder > getByText > getByTestId
+getByTestId > getByLabel > getByPlaceholder > getByText
 > getByAltText > getByTitle > CSS > XPath
 가능한 한 상위 우선순위를 사용한다.
 

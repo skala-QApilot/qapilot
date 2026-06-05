@@ -20,7 +20,7 @@ _logger = get_logger("db.run_writer")
 
 # trace dict 의 어떤 top-level 키를 runs.options JSONB 로 묶을지.
 # annotate_trace 가 보존하는 실행 옵션 그룹과 일치.
-_OPTIONS_KEYS = ("scenario_ids", "filter", "tags", "staging_url", "resume_from_trace")
+_OPTIONS_KEYS = ("scenario_ids", "filter", "tags", "staging_url", "resume_from_trace", "test_account", "domain_files")
 
 
 def upsert_run(trace: dict) -> None:
@@ -125,9 +125,20 @@ def _to_params(trace: dict) -> dict:
         "total_cost": trace.get("total_cost"),
         "selected_total_tc_count": trace.get("selected_total_tc_count"),
         "options": _json(options) if options else None,
-        "summary": _json(trace.get("result_summary")) if trace.get("result_summary") else None,
+        "summary": _json(_build_summary(trace)),
         "agent_logs": _json(trace.get("agent_logs")) if trace.get("agent_logs") else None,
     }
+
+
+def _build_summary(trace: dict) -> dict | None:
+    summary: dict[str, Any] = {}
+    if trace.get("result_summary"):
+        summary.update(trace["result_summary"])
+    if trace.get("tc_results"):
+        summary["tc_results"] = trace["tc_results"]
+    if trace.get("scenario_results"):
+        summary["scenario_results"] = trace["scenario_results"]
+    return summary or None
 
 
 def _parse_dt(value: Any) -> datetime | None:

@@ -80,6 +80,7 @@ class PipelineState(TypedDict):
     action_mappings: list[ActionMapping]
     generated_codes: list[GeneratedCode]
     saved_code_paths: list[str]  # generate_code 결과: 저장된 코드 파일 경로
+    frontend_dom: list[dict]
 
     # ── Layer 2: 테스트 실행 ──
     ui_results: list[UITestResult]
