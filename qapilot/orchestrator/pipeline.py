@@ -327,6 +327,7 @@ async def _doc_import(state: PipelineState) -> dict:
     # (1) DB + S3 — UI 에서 업로드한 PRD/정책 문서가 진실의 원천.
     trace = load_trace(state["trace_id"]) or {}
     service_id = trace.get("service_id")
+    imported_from_saas = 0
     if service_id:
         for doc in list_latest_domain_documents(service_id):
             filename = doc.get("filename") or ""
@@ -348,8 +349,20 @@ async def _doc_import(state: PipelineState) -> dict:
             Path(tmp.name).rename(tmp_path)
             try:
                 await _import_path(tmp_path)
+                imported_from_saas += 1
             finally:
                 tmp_path.unlink(missing_ok=True)
+
+    # SaaS 흐름 — (1) 에서 1건 이상 import 했으면 (2) CLI 호환 분기 skip (#229).
+    # 미설정 cfg.project.root → Path(".") fallback → CWD = qapilot 레포 → qapilot/docs/
+    # 의 19개 본인 docs 가 Qdrant domain_knowledge 오염시키던 격차 차단.
+    # _read_latest_prd_text (line 819-) 의 `if texts: return` 동형 패턴.
+    if imported_from_saas > 0:
+        logger.info(
+            "doc_import_saas_complete",
+            service_id=service_id, imported_count=imported_from_saas,
+        )
+        return {}
 
     # (2) config.project.root/docs/ — CLI 흐름 호환.
     config = load_config()
