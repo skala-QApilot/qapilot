@@ -954,7 +954,13 @@ async def _requirement_extract(state: PipelineState) -> dict:
             params={"document_text": document_text, "existing_count": 0},
         )
     )
-    return {"requirements": output.result.get("requirements", []) or []}
+    # agent_logs append — runner.run_pipeline 의 total_cost 집계가 누락되던 격차 (#227).
+    # action_mapper / code_generator 와 동형 패턴 (line 1292 / 1337).
+    agent_logs = state.get("agent_logs", []) + [output.metadata.model_dump()]
+    return {
+        "requirements": output.result.get("requirements", []) or [],
+        "agent_logs": agent_logs,
+    }
 
 
 async def _scenario_generate(state: PipelineState) -> dict:
@@ -987,7 +993,9 @@ async def _scenario_generate(state: PipelineState) -> dict:
         )
     )
     scenarios = output.result.get("scenarios", []) or []
-    return {"scenarios": scenarios}
+    # agent_logs append — runner.run_pipeline 의 total_cost 집계 (#227).
+    agent_logs = state.get("agent_logs", []) + [output.metadata.model_dump()]
+    return {"scenarios": scenarios, "agent_logs": agent_logs}
 
 
 async def _save_scenarios(state: PipelineState) -> dict:
@@ -1761,6 +1769,33 @@ async def _test_execution(state: PipelineState) -> dict:
     }
 
 
+def _derive_api_status(payload: dict | None) -> str | None:
+    """api kind 의 tc_results.status 도출 (#227).
+
+    APITraceResult schema 에 status 키가 없어 자동 추출 None — error_calls 기반 명시 분류.
+    """
+    if not isinstance(payload, dict):
+        return None
+    try:
+        return "pass" if int(payload.get("error_calls", 0)) == 0 else "fail"
+    except (TypeError, ValueError):
+        return None
+
+
+def _derive_db_status(payload: dict | None) -> str | None:
+    """db kind 의 tc_results.status 도출 (#227).
+
+    DBTestResult schema 에 status 키가 없어 자동 추출 None — summary "skip" 시작이면 skip,
+    snapshots 비면 pass (기본 — DB 변화 없음 정상), else pass. 의미적 mismatch 검증은 cross_check kind 책임.
+    """
+    if not isinstance(payload, dict):
+        return None
+    summary = str(payload.get("summary", "")).strip()
+    if summary.lower().startswith("dbtest skip") or summary.lower().startswith("skip"):
+        return "skip"
+    return "pass"
+
+
 def _mirror_tc_results_and_artifacts(
     *,
     trace_id: str,
@@ -1778,11 +1813,15 @@ def _mirror_tc_results_and_artifacts(
     ui_result_id = upsert_tc_result(
         run_id=trace_id, ts_id=ts_id, tc_id=tc_id, kind="ui", payload=ui_result,
     )
+    # api/db kind 의 payload 에는 status 키가 없어 (APITraceResult / DBTestResult schema)
+    # upsert_tc_result 의 자동 추출이 None → DB status 컬럼 null 저장됨. 명시적 도출 (#227).
     upsert_tc_result(
         run_id=trace_id, ts_id=ts_id, tc_id=tc_id, kind="api", payload=api_result,
+        status=_derive_api_status(api_result),
     )
     upsert_tc_result(
         run_id=trace_id, ts_id=ts_id, tc_id=tc_id, kind="db", payload=db_result,
+        status=_derive_db_status(db_result),
     )
 
     # 스크린샷은 UI result 에 묶음. tc_result_id 없으면 (DB 비활성) S3 도 skip.
