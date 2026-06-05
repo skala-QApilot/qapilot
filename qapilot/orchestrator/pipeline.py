@@ -2008,6 +2008,29 @@ async def _report(state: PipelineState) -> dict:
     report_path = reports_dir / f"{trace_id}.md"
     report_path.write_text("\n".join(lines), encoding="utf-8")
 
+    # 결함 영속화 — root_cause + fix 결과를 defects 테이블에 INSERT.
+    # 실패는 silent (리포트 흐름 보존).
+    try:
+        from qapilot.db.defect_writer import insert_defects
+
+        trace = load_trace(state["qapilot_dir"], trace_id) or {}
+        service_id = trace.get("service_id")
+        if service_id:
+            inserted = insert_defects(
+                service_id=service_id,
+                run_id=trace_id,
+                cross_check_results=cross_check_results,
+                root_cause_results=root_cause_results,
+                fix_results=fix_results,
+            )
+            get_logger(source="orchestrator", trace_id=trace_id).info(
+                "defects_persisted", count=inserted
+            )
+    except Exception as e:
+        get_logger(source="orchestrator", trace_id=trace_id).warning(
+            "defects_persist_failed", error=str(e)
+        )
+
     return {
         "report_path": str(report_path),
         "status": "completed",
