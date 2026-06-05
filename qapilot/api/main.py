@@ -4,6 +4,10 @@
 Created: 2026-05-07
 """
 
+import asyncio
+import time
+from contextlib import asynccontextmanager
+
 import structlog
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request
@@ -12,9 +16,41 @@ from qapilot.api.agent_router import router as agent_router
 from qapilot.api.response import fail
 from qapilot.modules.trace_module import TraceModule
 from qapilot.shared.errors import AuthError, QApilotError
-from qapilot.shared.logger import setup_logger
+from qapilot.shared.logger import get_logger, setup_logger
 
 _TRACE_HEADER = "X-Trace-Id"
+
+
+async def _warmup_embedder() -> None:
+    """서버 시작 시 BGE-M3 모델을 사전 로드하여 첫 요청 콜드스타트를 제거한다.
+
+    SentenceTransformer 모델 로딩(~570MB)과 MPS/CUDA 캐시 초기화를
+    asyncio.to_thread로 비동기 실행하므로 uvicorn 이벤트 루프를 블로킹하지 않는다.
+    실패해도 서버 시작을 막지 않는다(graceful skip).
+    """
+    logger = get_logger("startup")
+    t0 = time.perf_counter()
+    try:
+        from qapilot.tools.domain_knowledge._embedder import get_embedder
+
+        def _load_and_encode():
+            embedder = get_embedder()
+            embedder.encode(["warmup"], normalize_embeddings=True)
+
+        await asyncio.to_thread(_load_and_encode)
+        elapsed = round(time.perf_counter() - t0, 2)
+        logger.info("bge_warmup_complete", elapsed_sec=elapsed)
+    except Exception as e:
+        logger.warning("bge_warmup_failed", error=str(e))
+
+
+@asynccontextmanager
+async def _lifespan(app: FastAPI):
+    """서버 시작/종료 수명주기 관리."""
+    # startup
+    await _warmup_embedder()
+    yield
+    # shutdown — 별도 정리 불필요
 
 
 async def _trace_id_middleware(request: Request, call_next):
@@ -45,7 +81,8 @@ def create_app() -> FastAPI:
     from qapilot.storage.s3_client import get_client
     get_pool()
     get_client()
-    app = FastAPI(title="QApilot", version="0.1.0")
+
+    app = FastAPI(title="QApilot", version="0.1.0", lifespan=_lifespan)
 
     app.middleware("http")(_trace_id_middleware)
     app.exception_handler(AuthError)(_auth_error_handler)
@@ -58,9 +95,6 @@ def create_app() -> FastAPI:
 
     # 최종 FastAPI는 AI 실행 서버로 축소한다.
     app.include_router(agent_router)
-
-    # React 빌드 결과물 정적 서빙
-    # app.mount("/", StaticFiles(directory="qapilot/web/dist", html=True))
 
     return app
 
