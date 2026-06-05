@@ -3,6 +3,7 @@
 project:
   name: "my-project"
   target_url: "http://localhost:3000"
+  root: "/Users/yubin/playground/skala_playground2/QApilot/system-under-test"
   # 격차 12 SaaS 후속 (2026-06-02) — Spring 측 body 채움 PR 머지 전까지 dev 검증용.
   # mini-bss-lite/backend/app/seed.py 의 첫 customer (demo1@minibss.test / Passw0rd!).
   # SaaS 흐름이 body 에 test_account 채워 보내면 state.test_account 가 우선 — 본 cfg 는 fallback.

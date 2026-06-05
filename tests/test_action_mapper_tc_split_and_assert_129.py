@@ -454,6 +454,72 @@ def test_resolve_mapping_with_frontend_prefers_success_feedback_for_assert(mock_
     assert resolved["steps"][1]["selector"] == "signup-success-toast"
 
 
+def test_resolve_mapping_with_frontend_forces_ui_assertion_on_plans_page(mock_llm_client):
+    agent = _make_agent(mock_llm_client)
+    frontend_dom = [
+        {
+            "tag": "h1",
+            "text": "요금제 카탈로그",
+            "placeholder": "",
+            "label": "",
+            "testid": "",
+            "name": "",
+            "id": "",
+            "file": "Plans.vue",
+            "page": "Plans",
+            "route": "/plans",
+            "actionable": False,
+            "control_type": "heading",
+        },
+        {
+            "tag": "div",
+            "text": "",
+            "placeholder": "",
+            "label": "",
+            "testid": "plan-list",
+            "name": "",
+            "id": "",
+            "file": "Plans.vue",
+            "page": "Plans",
+            "route": "/plans",
+            "actionable": False,
+            "control_type": "list",
+        },
+    ]
+    tc = {
+        "tc_id": "TS-004-TC-10",
+        "name": "비활성화된 부가서비스 목록 조회",
+        "given": "비활성화된 부가서비스가 존재하는 상태에서",
+        "when": "사용자가 부가서비스 목록을 조회하면",
+        "then": "비활성화된 부가서비스는 반환되지 않는다",
+        "api": "GET /api/plans",
+        "values": [],
+    }
+    mapping = {
+        "tc_id": "TS-004-TC-10",
+        "steps": [
+            {
+                "step_no": 1,
+                "action": "assert",
+                "selector": None,
+                "selector_type": None,
+                "value": None,
+                "expected": None,
+                "api_endpoint": "GET /api/plans",
+                "target_kind": "assertion",
+            }
+        ],
+        "selector_confidence": 0.8,
+    }
+
+    resolved = agent._resolve_mapping_with_frontend(mapping, tc, frontend_dom)
+    assert resolved["steps"][0]["action"] == "navigate"
+    assert resolved["steps"][0]["value"] == "/plans"
+    assert resolved["steps"][1]["action"] == "assert"
+    assert resolved["steps"][1]["selector_type"] == "testid"
+    assert resolved["steps"][1]["selector"] == "plan-list"
+
+
 def test_resolve_mapping_with_frontend_prepends_navigate_from_route_hint(mock_llm_client):
     agent = _make_agent(mock_llm_client)
     frontend_dom = [

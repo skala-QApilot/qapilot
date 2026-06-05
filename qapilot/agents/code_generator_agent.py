@@ -221,14 +221,48 @@ class CodeGeneratorAgent(BaseAgent):
             lines.append("")
         lines.append(f"test({json.dumps(title, ensure_ascii=False)}, async ({{ page }}) => {{")
 
-        for step in steps:
+        _TRIGGER_ACTIONS = {"navigate", "click", "dblclick"}
+        i = 0
+        while i < len(steps):
+            step = steps[i]
+            action = str(step.get("action") or "")
+
+            # navigate/click + wait_for_response 쌍 → Promise.all 패턴으로 병합
+            if (
+                action in _TRIGGER_ACTIONS
+                and i + 1 < len(steps)
+                and str(steps[i + 1].get("action") or "") == "wait_for_response"
+            ):
+                next_step = steps[i + 1]
+                response_url = self._js_value(next_step.get("value"))
+                trigger = self._render_step(step)
+                if trigger:
+                    # "await X;" → "X," (await·세미콜론 제거)
+                    trigger_expr = str(trigger).lstrip().removeprefix("await ").rstrip(";")
+                    lines.extend([
+                        f"  await Promise.all([",
+                        f"    page.waitForResponse({response_url}),",
+                        f"    {trigger_expr},",
+                        f"  ]);",
+                    ])
+                i += 2
+                continue
+
+            # 트리거 없는 단독 wait_for_response → networkidle fallback
+            if action == "wait_for_response":
+                lines.append("  await page.waitForLoadState('networkidle');")
+                i += 1
+                continue
+
             rendered = self._render_step(step)
             if not rendered:
+                i += 1
                 continue
             if isinstance(rendered, list):
                 lines.extend(f"  {line}" for line in rendered)
             else:
                 lines.append(f"  {rendered}")
+            i += 1
 
         lines.append("});")
         return "\n".join(lines)
@@ -332,12 +366,21 @@ class CodeGeneratorAgent(BaseAgent):
             return value.strip()
         if any(token in selector_text for token in ("비밀번호", "password", "pwd", "pass")):
             return "process.env.E2E_USER_PASSWORD"
+        # signup 이메일 필드: 정적 주소는 재실행 시 중복 오류 발생 → Date.now() 유니크값 사용
+        if any(token in selector_text for token in ("email", "이메일", "mail")):
+            val_str = str(value or "")
+            if "@" in val_str and not val_str.startswith("process.env"):
+                local, domain = val_str.rsplit("@", 1)
+                return f"`{local}_${{Date.now()}}@{domain}`"
         return value
 
     def _js_value(self, value: Any) -> str:
         if isinstance(value, str):
             stripped = value.strip()
             if _ENV_REF_RE.match(stripped):
+                return stripped
+            # JS template literal (`...`) 은 그대로 반환
+            if stripped.startswith("`") and stripped.endswith("`"):
                 return stripped
         return json.dumps("" if value is None else value, ensure_ascii=False)
 

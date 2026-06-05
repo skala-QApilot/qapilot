@@ -149,6 +149,67 @@ def test_extract_feedback_success_container_from_vue_template():
     assert toast["control_type"] == "feedback_success"
 
 
+def test_extract_plans_page_heading_and_list_anchor():
+    text = """
+<template>
+  <div class="page-wrap wide-page">
+    <div class="page-head">
+      <div>
+        <h1>요금제 카탈로그</h1>
+      </div>
+    </div>
+    <div class="plan-grid" data-testid="plan-list">
+      <div class="plan-card">...</div>
+    </div>
+  </div>
+</template>
+"""
+    elements = _extract_elements_from_text(text, "system-under-test/frontend/src/pages/Plans.vue")
+    heading = next((e for e in elements if e.get("control_type") == "heading"), None)
+    assert heading is not None
+    assert heading["text"] == "요금제 카탈로그"
+    assert heading["route"] == "/plans"
+
+    listing = next((e for e in elements if e.get("testid") == "plan-list"), None)
+    assert listing is not None
+    assert listing["control_type"] == "list"
+    assert listing["route"] == "/plans"
+
+
+def test_extract_dynamic_testid_is_split_into_pattern():
+    text = """
+<template>
+  <button :data-testid="`plan-select-${plan.id}`">신청하기</button>
+</template>
+"""
+    elements = _extract_elements_from_text(text, "system-under-test/frontend/src/pages/Plans.vue")
+    button = next((e for e in elements if e.get("text") == "신청하기"), None)
+    assert button is not None
+    assert button["testid"] == ""
+    assert button["dynamic_testid_pattern"] == "`plan-select-${plan.id}`"
+
+
+def test_extract_filters_expression_like_text():
+    text = """
+<template>
+  <button>{{ tierOrder(t.code), 'tc-future': !tier?.has_active_plan || tierOrder(currentTierCode) }}</button>
+</template>
+"""
+    elements = _extract_elements_from_text(text, "system-under-test/frontend/src/pages/Membership.vue")
+    assert elements == []
+
+
+def test_component_route_is_not_inferred_for_shared_component():
+    text = """
+<template>
+  <button>로그아웃</button>
+</template>
+"""
+    elements = _extract_elements_from_text(text, "system-under-test/frontend/src/components/Navbar.vue")
+    assert len(elements) == 1
+    assert elements[0]["route"] == ""
+
+
 def test_extract_ignores_script_section_in_vue():
     """Vue 의 <script> 부분은 제외 — <template> 만 처리."""
     text = """

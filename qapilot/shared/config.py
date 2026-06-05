@@ -10,7 +10,7 @@ import re
 from pathlib import Path
 
 import yaml
-from dotenv import load_dotenv
+from dotenv import find_dotenv, load_dotenv
 from pydantic import BaseModel, Field
 
 
@@ -105,7 +105,7 @@ class QApilotConfig(BaseModel):
 
 def load_config(config_path: Path | None = None) -> QApilotConfig:
     """qapilot.config.yaml에서 설정을 로드한다."""
-    load_dotenv()
+    load_dotenv(find_dotenv(usecwd=False))
 
     if config_path is None:
         config_path = Path("qapilot.config.yaml")

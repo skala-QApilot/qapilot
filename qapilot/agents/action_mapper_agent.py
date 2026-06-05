@@ -517,6 +517,7 @@ class ActionMapperAgent(BaseAgent):
                     str(tc.get("given") or ""),
                     str(tc.get("when") or ""),
                     str(tc.get("then") or ""),
+                    str(tc.get("api") or ""),
                 ])
         return " ".join(part for part in parts if part).lower()
 
@@ -598,11 +599,113 @@ class ActionMapperAgent(BaseAgent):
         if not isinstance(item["steps"], list):
             raise ValueError("steps는 배열이어야 합니다.")
         tc_id = str(item["tc_id"])
+        steps = [self._validate_step(step, tc_id) for step in item["steps"]]
+        steps = self._fix_orphan_wait_for_response(steps, tc_id)
         return {
             "tc_id": tc_id,
-            "steps": [self._validate_step(step, tc_id) for step in item["steps"]],
+            "steps": steps,
             "selector_confidence": float(item["selector_confidence"]),
         }
+
+    def _fix_orphan_wait_for_response(
+        self, steps: list, tc_id: str
+    ) -> list:
+        """navigate 없이 시작하는 action mapping 에 navigate step 을 삽입한다.
+
+        커버하는 케이스:
+        1. wait_for_response 가 navigate 없이 등장
+        2. wait (waitForTimeout) 만으로 시작하고 navigate 없음
+        3. 전체 steps 에 navigate/click 이 아예 없는 API-only TC
+
+        경로 추론 우선순위:
+        1. wait_for_response value ("GET /api/plans/1" → "/api/plans/1")
+        2. 임의 step 의 api_endpoint
+        3. "/" (fallback)
+        """
+        _TRIGGER_ACTIONS = {"navigate", "click", "dblclick"}
+        if not steps:
+            return steps
+
+        has_trigger = any(s.get("action") in _TRIGGER_ACTIONS for s in steps)
+        if has_trigger:
+            return steps
+
+        # navigate 가 없음 → 경로 추론 후 삽입
+        path = self._infer_navigate_path(steps)
+
+        navigate_step: ActionStep = {
+            "step_no": 1,
+            "action": "navigate",
+            "selector": None,
+            "selector_type": None,
+            "value": path,
+            "expected": None,
+            "api_endpoint": None,
+        }
+        fixed = [navigate_step] + [{**s, "step_no": s["step_no"] + 1} for s in steps]
+        self.logger.info(
+            "navigate_inserted_for_api_only_tc",
+            tc_id=tc_id,
+            inserted_path=path,
+        )
+        return fixed
+
+    def _infer_navigate_path(self, steps: list) -> str:
+        """steps 에서 navigate 에 사용할 frontend 경로를 추론한다.
+
+        API URL → frontend route 변환 (ui_test_tool._infer_route_from_path 동일 휴리스틱):
+        - /api/auth/signup → /signup
+        - /api/plans/{id}  → /plans
+        - /api/auth/me     → /mypage (auth 그룹의 me는 /mypage 로 매핑)
+        """
+        def _api_to_frontend(raw: str) -> str | None:
+            path = raw.split(" ", 1)[-1] if " " in raw else raw
+            path = path.split("?")[0].rstrip("/")
+            if not path.startswith("/"):
+                return None
+            # /api/ prefix 제거
+            if path.startswith("/api/"):
+                path = path[4:]  # "/auth/me", "/plans/1" 등
+            elif not path.startswith("/"):
+                return None
+
+            # 경로 파라미터 제거 ({id}, :id, 숫자)
+            import re as _re
+            path = _re.sub(r'/(\{[^}]+\}|:[^/]+|\d+)(?=/|$)', '', path)
+            segments = [s for s in path.split("/") if s]
+            if not segments:
+                return "/"
+
+            # /auth/xxx → /xxx (login, signup, me 등)
+            if segments[0] == "auth":
+                if len(segments) >= 2:
+                    action = segments[-1]
+                    # me → /mypage
+                    if action == "me":
+                        return "/mypage"
+                    return "/" + action
+                return "/"
+
+            return "/" + segments[0]
+
+        # 1) wait_for_response value 에서 추출 후 변환
+        for s in steps:
+            if s.get("action") == "wait_for_response":
+                value = str(s.get("value") or "")
+                if value:
+                    route = _api_to_frontend(value)
+                    if route:
+                        return route
+
+        # 2) api_endpoint 에서 추출 후 변환
+        for s in steps:
+            ep = str(s.get("api_endpoint") or "")
+            if ep:
+                route = _api_to_frontend(ep)
+                if route:
+                    return route
+
+        return "/"
 
     def _validate_step(self, item: Any, tc_id: str) -> ActionStep:
         """단일 ActionStep 구조와 enum 값을 검증한다."""
@@ -699,7 +802,11 @@ class ActionMapperAgent(BaseAgent):
         """LLM 이 만든 step intent 를 frontend index 원소로만 resolve 한다."""
         mapping = dict(action_mapping)
         scenario_text = " ".join(str(tc.get(key) or "") for key in ("name", "given", "when", "then"))
-        route_hint = self._route_hint_from_elements(frontend_dom) or self._route_hint_from_tc(tc)
+        route_hint = (
+            self._route_hint_from_elements(frontend_dom)
+            or self._route_hint_from_steps(mapping.get("steps") or [])
+            or self._route_hint_from_tc(tc)
+        )
         steps: list[ActionStep] = []
 
         for raw_step in mapping.get("steps") or []:
@@ -714,15 +821,21 @@ class ActionMapperAgent(BaseAgent):
             intent = self._infer_step_intent(step, tc, scenario_text)
             resolved = self._resolve_selector_from_intent(action, intent, frontend_dom, route_hint, scenario_text)
             if resolved is None:
-                self.logger.warning(
-                    "action_mapping_selector_unresolved",
-                    tc_id=mapping.get("tc_id"),
-                    step_no=step.get("step_no"),
-                    action=action,
-                    intent=intent,
-                )
-                step["selector"] = None
-                step["selector_type"] = None
+                if action in _ASSERT_ACTIONS:
+                    resolved = self._fallback_assertion_selector(frontend_dom, route_hint, scenario_text)
+                if resolved is None:
+                    self.logger.warning(
+                        "action_mapping_selector_unresolved",
+                        tc_id=mapping.get("tc_id"),
+                        step_no=step.get("step_no"),
+                        action=action,
+                        intent=intent,
+                    )
+                    step["selector"] = None
+                    step["selector_type"] = None
+                else:
+                    step["selector"] = resolved["selector"]
+                    step["selector_type"] = resolved["selector_type"]
             else:
                 step["selector"] = resolved["selector"]
                 step["selector_type"] = resolved["selector_type"]
@@ -1015,7 +1128,88 @@ class ActionMapperAgent(BaseAgent):
             return "/signup"
         if "로그인" in text or "login" in text:
             return "/login"
+        api_route = self._route_hint_from_api_endpoint(str(tc.get("api") or ""))
+        if api_route:
+            return api_route
+        if any(term in text for term in ("요금제", "부가서비스", "plans", "plan")):
+            return "/plans"
         return None
+
+    def _route_hint_from_steps(self, steps: list[dict[str, Any]]) -> str | None:
+        for step in steps:
+            route = self._route_hint_from_api_endpoint(str(step.get("api_endpoint") or ""))
+            if route:
+                return route
+        return None
+
+    def _route_hint_from_api_endpoint(self, api_endpoint: str) -> str | None:
+        lowered = api_endpoint.strip().lower()
+        if not lowered:
+            return None
+        if "/api/auth/signup" in lowered or "/signup" in lowered:
+            return "/signup"
+        if "/api/auth/login" in lowered or "/login" in lowered:
+            return "/login"
+        if "/api/plans" in lowered:
+            return "/plans"
+        if "/api/orders" in lowered:
+            return "/orders"
+        if "/api/auth/me" in lowered or "/profile" in lowered:
+            return "/profile"
+        return None
+
+    def _fallback_assertion_selector(
+        self,
+        frontend_dom: list[dict],
+        route_hint: str | None,
+        scenario_text: str,
+    ) -> dict[str, str] | None:
+        candidates = self._frontend_candidates_for_action("assert", frontend_dom, route_hint)
+        if not candidates:
+            return None
+
+        lowered = scenario_text.lower()
+        best_el: dict[str, Any] | None = None
+        best_score = -1.0
+        for el in candidates:
+            score = 0.0
+            route = str(el.get("route") or "").strip()
+            control_type = str(el.get("control_type") or "").lower()
+            testid = str(el.get("testid") or "").lower()
+            text = str(el.get("text") or "").lower()
+            tag = str(el.get("tag") or "").lower()
+
+            if route_hint and route == route_hint:
+                score += 1.0
+            if control_type.startswith("feedback"):
+                score += 1.0
+            if any(token in testid for token in ("list", "grid", "card", "status", "message", "toast")):
+                score += 0.7
+            if tag in {"h1", "h2", "h3"}:
+                score += 0.6
+            if any(token in text for token in ("카탈로그", "목록", "상세", "로딩", "오류")):
+                score += 0.4
+            if route_hint == "/plans":
+                if "plan" in testid:
+                    score += 0.8
+                if any(token in testid for token in ("list", "grid", "card")):
+                    score += 0.5
+                if any(token in text for token in ("요금제", "카탈로그")):
+                    score += 0.8
+            if any(term in lowered for term in ("부가서비스", "요금제", "plans", "plan")):
+                if "plan" in testid or any(token in text for token in ("요금제", "카탈로그")):
+                    score += 0.8
+
+            if score > best_score:
+                best_score = score
+                best_el = el
+
+        if best_el is None or best_score <= 0:
+            return None
+        selector, selector_type = self._preferred_selector_for_action("assert", best_el)
+        if not selector or not selector_type:
+            return None
+        return {"selector": selector, "selector_type": selector_type}
 
     def _normalize_selector_via_index(
         self, action: str, selector: str, selector_type: str, tc_id: str, step_no: int
@@ -1169,12 +1363,38 @@ class ActionMapperAgent(BaseAgent):
     ) -> str | None:
         """value 필수 action에서 실행 가능한 기본값을 보정한다."""
         value = item.get("value")
+        if action == "navigate" and isinstance(value, str):
+            return self._validate_navigate_url(value, tc_id, step_no)
         if value is not None or action not in _VALUE_REQUIRED_ACTIONS:
             return value
         defaults = {"wait": "1000", "wait_for_load_state": "networkidle"}
         fallback = defaults.get(action, item.get("expected") or selector or "")
         self._log_normalization(tc_id, step_no, "value", value, fallback)
         return str(fallback)
+
+    def _validate_navigate_url(self, value: str, tc_id: str, step_no: int) -> str:
+        """navigate URL 이 DOM 인덱스에 없으면 가장 유사한 route 로 보정한다."""
+        known_routes = {
+            str(el.get("route") or "")
+            for el in self._frontend_dom_index
+            if el.get("route")
+        }
+        if not known_routes or value in known_routes:
+            return value
+
+        # 경로 세그먼트 overlap 으로 유사도 계산
+        def _similarity(route: str) -> float:
+            v_parts = set(value.strip("/").split("/"))
+            r_parts = set(route.strip("/").split("/"))
+            if not v_parts or not r_parts:
+                return 0.0
+            return len(v_parts & r_parts) / max(len(v_parts), len(r_parts))
+
+        best = max(known_routes, key=_similarity)
+        if _similarity(best) > 0:
+            self._log_normalization(tc_id, step_no, "navigate_url", value, best)
+            return best
+        return value
 
     def _normalize_expected(
         self, action: str, item: dict, selector: str | None,

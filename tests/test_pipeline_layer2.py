@@ -248,6 +248,121 @@ def test_action_mapping_from_generated_code_parses_basic_playwright_script():
     assert mapping["steps"][2]["selector"] == "signup-submit"
 
 
+@pytest.mark.asyncio
+async def test_run_generated_code_with_js_runner_reads_output(tmp_path: Path, monkeypatch):
+    output_payload = {
+        "ui_result": {
+            "tc_id": "TS-001-TC-01",
+            "status": "pass",
+            "steps": [],
+            "total_duration_ms": 12,
+        },
+        "api_result": {
+            "tc_id": "TS-001-TC-01",
+            "calls": [],
+            "total_calls": 0,
+            "error_calls": 0,
+        },
+    }
+
+    class _Proc:
+        returncode = 0
+
+        async def communicate(self):
+            return b"", b""
+
+    async def _fake_create_subprocess_exec(*args, **kwargs):
+        if args[:2] == ("npm", "install"):
+            runner_dir = Path(kwargs["cwd"])
+            (runner_dir / "node_modules" / "playwright").mkdir(parents=True, exist_ok=True)
+        else:
+            input_path = Path(args[2])
+            cfg = json.loads(input_path.read_text(encoding="utf-8"))
+            Path(cfg["output_file"]).write_text(
+                json.dumps(output_payload, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        return _Proc()
+
+    monkeypatch.setattr(P.asyncio, "create_subprocess_exec", _fake_create_subprocess_exec)
+    monkeypatch.setattr(P, "_ensure_js_runner_dependencies", lambda *a, **k: _fake_noop())
+
+    async def _fake_noop():
+        return None
+
+    result = await P._run_generated_code_with_js_runner(
+        code_obj={"tc_id": "TS-001-TC-01", "code": "test('x', async ({ page }) => {});"},
+        tc_id="TS-001-TC-01",
+        trace_id="trace-1",
+        target_url="http://example.com",
+        screenshots_dir=tmp_path / "screenshots",
+        tc_dir=tmp_path / "tc",
+        headless=True,
+        test_account=None,
+    )
+
+    assert result["ui_result"]["tc_id"] == "TS-001-TC-01"
+    assert result["ui_result"]["status"] == "pass"
+    assert result["api_result"]["total_calls"] == 0
+
+
+@pytest.mark.asyncio
+async def test_ensure_js_runner_dependencies_runs_npm_install_when_missing(tmp_path: Path, monkeypatch):
+    runner_dir = tmp_path / "js_runner"
+    runner_dir.mkdir(parents=True, exist_ok=True)
+    (runner_dir / "package.json").write_text("{}", encoding="utf-8")
+    calls: list[tuple] = []
+
+    class _Proc:
+        returncode = 0
+
+        async def communicate(self):
+            return b"ok", b""
+
+    async def _fake_create_subprocess_exec(*args, **kwargs):
+        calls.append(args)
+        if args[:2] == ("npm", "install"):
+            (runner_dir / "node_modules" / "playwright").mkdir(parents=True, exist_ok=True)
+        return _Proc()
+
+    monkeypatch.setattr(P.asyncio, "create_subprocess_exec", _fake_create_subprocess_exec)
+
+    await P._ensure_js_runner_dependencies(runner_dir, "TC-1")
+    assert ("npm", "install") in calls
+    assert (runner_dir / "node_modules" / "playwright").exists()
+
+
+@pytest.mark.asyncio
+async def test_ensure_js_runner_dependencies_runs_playwright_install_when_browser_missing(tmp_path: Path, monkeypatch):
+    runner_dir = tmp_path / "js_runner"
+    runner_dir.mkdir(parents=True, exist_ok=True)
+    (runner_dir / "package.json").write_text("{}", encoding="utf-8")
+    (runner_dir / "node_modules" / "playwright").mkdir(parents=True, exist_ok=True)
+    calls: list[tuple] = []
+
+    class _Proc:
+        def __init__(self, returncode: int, stdout: bytes = b"", stderr: bytes = b""):
+            self.returncode = returncode
+            self._stdout = stdout
+            self._stderr = stderr
+
+        async def communicate(self):
+            return self._stdout, self._stderr
+
+    async def _fake_create_subprocess_exec(*args, **kwargs):
+        calls.append(args)
+        if args[:2] == ("node", "-e"):
+            return _Proc(10, b"/tmp/fake-chromium", b"")
+        if args[:3] == ("npx", "playwright", "install"):
+            return _Proc(0, b"installed", b"")
+        return _Proc(0, b"", b"")
+
+    monkeypatch.setattr(P.asyncio, "create_subprocess_exec", _fake_create_subprocess_exec)
+
+    await P._ensure_js_runner_dependencies(runner_dir, "TC-2")
+    assert ("npx", "playwright", "install", "chromium") in calls
+
+
 # ── _report ───────────────────────────────────────────────────────────────────
 
 

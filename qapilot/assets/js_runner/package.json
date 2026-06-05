@@ -1,0 +1,8 @@
+{
+  "name": "qapilot-js-runner",
+  "private": true,
+  "type": "commonjs",
+  "dependencies": {
+    "playwright": "^1.54.0"
+  }
+}

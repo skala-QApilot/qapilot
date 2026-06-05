@@ -18,6 +18,7 @@
 **[CRITICAL: intent-first 규칙 — selector 자유 생성 금지]**
 - DOM action (`fill`/`click`/`assert_*` 등) 은 먼저 `target_name` / `target_kind` / `target_text`
   로 **의도(step intent)** 를 표현하라.
+- 모든 step 은 **UI 관점**에서 표현하라. `api_endpoint` 는 네트워크 검증용 힌트일 뿐, step 자체를 API 호출/응답 검증으로 만들지 마라.
 - `selector` / `selector_type` 은 위 "프론트엔드 DOM 인덱스" 에 실제 존재하는 원소로
   확실히 resolve 할 수 있을 때만 채운다.
 - 인덱스에 없는 selector 를 새로 만들지 말고, resolve 불가 시 `selector=null`,

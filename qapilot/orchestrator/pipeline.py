@@ -17,6 +17,7 @@ HITL은 별도 모듈로 두지 않고, generate_scenarios 와 generate_code 명
 Created: 2026-05-07
 """
 
+import asyncio
 import json
 import os
 import re
@@ -33,6 +34,7 @@ from qapilot.db.rtm_writer import write_rtm_version
 from qapilot.db.scenario_writer import upsert_scenario_version
 from qapilot.db.tc_result_writer import insert_tc_artifact, upsert_tc_result
 from qapilot.orchestrator.state import PipelineState
+from qapilot.shared.errors import ErrorCode, ToolExecutionError
 from qapilot.shared.logger import get_logger
 from qapilot.shared.trace_store import load_trace
 from qapilot.storage import s3_client
@@ -1159,6 +1161,22 @@ async def _load_scenarios_for_codegen(state: PipelineState) -> dict:
         except Exception:
             pass
 
+    # DB/S3/disk 모두 실패 시 config project.root 에서 직접 스캔 (로컬 환경 fallback)
+    if not frontend_dom:
+        project_root = _resolve_project_root(state)
+        if project_root is not None:
+            try:
+                frontend_dom = scan_frontend_directory(project_root)
+                get_logger("orchestrator").info(
+                    "frontend_dom_scanned_from_project_root",
+                    root=str(project_root),
+                    element_count=len(frontend_dom),
+                )
+            except Exception as _fe:
+                get_logger("orchestrator").warning(
+                    "frontend_dom_scan_failed", root=str(project_root), error=str(_fe)
+                )
+
     return {
         "scenarios": scenarios,
         "scan_result": scan_result,
@@ -1563,52 +1581,46 @@ async def _test_execution(state: PipelineState) -> dict:
     api_results: list[dict] = []
     db_results: list[dict] = []
 
-    async with async_playwright() as pw:
-        browser = await pw.chromium.launch(headless=headless)
-        context = await browser.new_context(
-            extra_http_headers={"X-Trace-Id": trace_id}
-        )
-        page = await context.new_page()
+    if generated_codes:
+        execution_items = generated_codes
+        for item in execution_items:
+            tc_id = item.get("tc_id") or "unknown"
+            ts_id = _ts_id_of_tc(tc_id, scenarios)
+            tc_dir = results_root / ts_id / tc_id
+            screenshots_dir = tc_dir / "screenshots"
+            tc_dir.mkdir(parents=True, exist_ok=True)
 
-        try:
-            execution_items = generated_codes or action_mappings
-            action_mapping_by_tc = {
-                str(am.get("tc_id")): am for am in action_mappings if am.get("tc_id")
-            }
-
-            for item in execution_items:
-                tc_id = item.get("tc_id") or "unknown"
-                ts_id = _ts_id_of_tc(tc_id, scenarios)
-                tc_dir = results_root / ts_id / tc_id
-                screenshots_dir = tc_dir / "screenshots"
-                tc_dir.mkdir(parents=True, exist_ok=True)
-
-                if generated_codes:
-                    exec_mapping = _action_mapping_from_generated_code(item)
-                    # api_endpoint 힌트는 기존 ActionMapping 의 값을 최대한 유지.
-                    original = action_mapping_by_tc.get(str(tc_id)) or {}
-                    original_steps = list(original.get("steps") or [])
-                    for idx, step in enumerate(exec_mapping.get("steps") or []):
-                        if idx < len(original_steps):
-                            step["api_endpoint"] = original_steps[idx].get("api_endpoint")
-                else:
-                    exec_mapping = item
-
-                ui_res = await _run_ui_with_trace(
-                    page=page,
-                    tc_id=tc_id,
-                    action_mapping=exec_mapping,
+            get_logger("orchestrator").info(
+                "tc_execution_start", tc_id=tc_id, trace_id=trace_id
+            )
+            try:
+                ui_res = await _run_generated_code_with_js_runner(
+                    code_obj=item,
+                    tc_id=str(tc_id),
+                    trace_id=trace_id,
                     target_url=target_url,
                     screenshots_dir=screenshots_dir,
-                    trace_id=trace_id,
-                    UITestTool=UITestTool,
-                    APITraceTool=APITraceTool,
-                    ToolInput=ToolInput,
+                    tc_dir=tc_dir,
+                    headless=headless,
                     test_account=test_account_dict,
                 )
-                ui_results.append(ui_res["ui_result"])
-                api_results.append(ui_res["api_result"])
-
+            except Exception as _tc_err:
+                from qapilot.shared.logger import get_logger as _gl
+                _gl("orchestrator").error(
+                    "tc_js_runner_failed",
+                    tc_id=tc_id,
+                    error=str(_tc_err),
+                )
+                _failed_ui = {"tc_id": tc_id, "status": "fail", "steps": [], "error": str(_tc_err)}
+                _failed_api = {"tc_id": tc_id, "status": "fail", "steps": []}
+                ui_results.append(_failed_ui)
+                api_results.append(_failed_api)
+                (tc_dir / "ui_result.json").write_text(
+                    json.dumps(_failed_ui, ensure_ascii=False, indent=2), "utf-8"
+                )
+                (tc_dir / "api_result.json").write_text(
+                    json.dumps(_failed_api, ensure_ascii=False, indent=2), "utf-8"
+                )
                 db_res = await _run_db_test_safe(
                     tc_id=tc_id,
                     trace_id=trace_id,
@@ -1616,31 +1628,114 @@ async def _test_execution(state: PipelineState) -> dict:
                     ToolInput=ToolInput,
                 )
                 db_results.append(db_res)
-
-                # L2 디스크 저장 (spec §6.1)
-                (tc_dir / "ui_result.json").write_text(
-                    json.dumps(ui_res["ui_result"], ensure_ascii=False, indent=2), "utf-8"
-                )
-                (tc_dir / "api_result.json").write_text(
-                    json.dumps(ui_res["api_result"], ensure_ascii=False, indent=2), "utf-8"
-                )
                 (tc_dir / "db_result.json").write_text(
                     json.dumps(db_res, ensure_ascii=False, indent=2), "utf-8"
                 )
-
-                # L3 DB / S3 mirror — 실패해도 디스크 진실은 보존됨
                 _mirror_tc_results_and_artifacts(
                     trace_id=trace_id,
                     ts_id=ts_id,
                     tc_id=tc_id,
-                    ui_result=ui_res["ui_result"],
-                    api_result=ui_res["api_result"],
+                    ui_result=_failed_ui,
+                    api_result=_failed_api,
                     db_result=db_res,
                     screenshots_dir=screenshots_dir,
                 )
-        finally:
-            await context.close()
-            await browser.close()
+                continue
+
+            ui_results.append(ui_res["ui_result"])
+            api_results.append(ui_res["api_result"])
+
+            db_res = await _run_db_test_safe(
+                tc_id=tc_id,
+                trace_id=trace_id,
+                DBTestTool=DBTestTool,
+                ToolInput=ToolInput,
+            )
+            db_results.append(db_res)
+
+            (tc_dir / "ui_result.json").write_text(
+                json.dumps(ui_res["ui_result"], ensure_ascii=False, indent=2), "utf-8"
+            )
+            (tc_dir / "api_result.json").write_text(
+                json.dumps(ui_res["api_result"], ensure_ascii=False, indent=2), "utf-8"
+            )
+            (tc_dir / "db_result.json").write_text(
+                json.dumps(db_res, ensure_ascii=False, indent=2), "utf-8"
+            )
+
+            _mirror_tc_results_and_artifacts(
+                trace_id=trace_id,
+                ts_id=ts_id,
+                tc_id=tc_id,
+                ui_result=ui_res["ui_result"],
+                api_result=ui_res["api_result"],
+                db_result=db_res,
+                screenshots_dir=screenshots_dir,
+            )
+    else:
+        async with async_playwright() as pw:
+            browser = await pw.chromium.launch(headless=headless)
+            context = await browser.new_context(
+                extra_http_headers={"X-Trace-Id": trace_id}
+            )
+            page = await context.new_page()
+
+            try:
+                execution_items = action_mappings
+                for item in execution_items:
+                    tc_id = item.get("tc_id") or "unknown"
+                    ts_id = _ts_id_of_tc(tc_id, scenarios)
+                    tc_dir = results_root / ts_id / tc_id
+                    screenshots_dir = tc_dir / "screenshots"
+                    tc_dir.mkdir(parents=True, exist_ok=True)
+
+                    ui_res = await _run_ui_with_trace(
+                        page=page,
+                        tc_id=tc_id,
+                        action_mapping=item,
+                        target_url=target_url,
+                        screenshots_dir=screenshots_dir,
+                        trace_id=trace_id,
+                        UITestTool=UITestTool,
+                        APITraceTool=APITraceTool,
+                        ToolInput=ToolInput,
+                        test_account=test_account_dict,
+                    )
+                    ui_results.append(ui_res["ui_result"])
+                    api_results.append(ui_res["api_result"])
+
+                    db_res = await _run_db_test_safe(
+                        tc_id=tc_id,
+                        trace_id=trace_id,
+                        DBTestTool=DBTestTool,
+                        ToolInput=ToolInput,
+                    )
+                    db_results.append(db_res)
+
+                    # L2 디스크 저장 (spec §6.1)
+                    (tc_dir / "ui_result.json").write_text(
+                        json.dumps(ui_res["ui_result"], ensure_ascii=False, indent=2), "utf-8"
+                    )
+                    (tc_dir / "api_result.json").write_text(
+                        json.dumps(ui_res["api_result"], ensure_ascii=False, indent=2), "utf-8"
+                    )
+                    (tc_dir / "db_result.json").write_text(
+                        json.dumps(db_res, ensure_ascii=False, indent=2), "utf-8"
+                    )
+
+                    # L3 DB / S3 mirror — 실패해도 디스크 진실은 보존됨
+                    _mirror_tc_results_and_artifacts(
+                        trace_id=trace_id,
+                        ts_id=ts_id,
+                        tc_id=tc_id,
+                        ui_result=ui_res["ui_result"],
+                        api_result=ui_res["api_result"],
+                        db_result=db_res,
+                        screenshots_dir=screenshots_dir,
+                    )
+            finally:
+                await context.close()
+                await browser.close()
 
     # tc_results / scenario_results 집계는 디스크 기반 — 같은 trace_id 로 resume 한 경우
     # 이전 run 의 결과도 results 디렉토리에 누적되어 있으므로 디스크 스캔이 진실의 source.
@@ -1963,6 +2058,215 @@ def _step(
         "expected": expected,
         "api_endpoint": None,
     }
+
+
+async def _run_generated_code_with_js_runner(
+    *,
+    code_obj: dict[str, Any],
+    tc_id: str,
+    trace_id: str,
+    target_url: str,
+    screenshots_dir: Path,
+    tc_dir: Path,
+    headless: bool,
+    test_account: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """generated code 를 Node/Playwright JS runner 로 직접 실행한다."""
+    runner_dir = Path(__file__).resolve().parents[1] / "assets" / "js_runner"
+    runner_script = runner_dir / "run_generated_code.cjs"
+    if not runner_script.exists():
+        raise ToolExecutionError(
+            ErrorCode.TOOL_001,
+            f"JS runner script 가 없습니다: {runner_script}",
+        )
+
+    await _ensure_js_runner_dependencies(runner_dir, tc_id)
+
+    code_file = tc_dir / "generated_code.js"
+    input_file = tc_dir / "js_runner_input.json"
+    output_file = tc_dir / "js_runner_output.json"
+    tc_dir.mkdir(parents=True, exist_ok=True)
+    screenshots_dir.mkdir(parents=True, exist_ok=True)
+    code_file.write_text(str(code_obj.get("code") or ""), encoding="utf-8")
+    input_file.write_text(
+        json.dumps(
+            {
+                "trace_id": trace_id,
+                "tc_id": tc_id,
+                "target_url": target_url,
+                "headless": headless,
+                "screenshots_dir": str(screenshots_dir),
+                "code_file": str(code_file),
+                "output_file": str(output_file),
+                "test_account": test_account or {},
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+    import os as _os
+    _env = {**_os.environ}
+    if test_account:
+        if test_account.get("password"):
+            _env["E2E_USER_PASSWORD"] = str(test_account["password"])
+        if test_account.get("email"):
+            _env["E2E_USER_EMAIL"] = str(test_account["email"])
+
+    process = await asyncio.create_subprocess_exec(
+        "node",
+        str(runner_script),
+        str(input_file),
+        cwd=str(runner_dir),
+        env=_env,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+
+    _js_logger = get_logger("js_runner")
+    stdout_lines: list[str] = []
+    stderr_lines: list[str] = []
+
+    async def _stream(stream: asyncio.StreamReader, buf: list[str], level: str) -> None:
+        async for raw in stream:
+            line = raw.decode("utf-8", errors="ignore").rstrip()
+            if not line:
+                continue
+            buf.append(line)
+            if level == "info":
+                _js_logger.info("js_runner_stdout", tc_id=tc_id, line=line)
+            else:
+                _js_logger.warning("js_runner_stderr", tc_id=tc_id, line=line)
+
+    await asyncio.gather(
+        _stream(process.stdout, stdout_lines, "info"),
+        _stream(process.stderr, stderr_lines, "warn"),
+    )
+    await process.wait()
+
+    stdout = "\n".join(stdout_lines)
+    stderr = "\n".join(stderr_lines)
+
+    if process.returncode != 0:
+        _js_logger.error(
+            "js_runner_failed", tc_id=tc_id, exit_code=process.returncode
+        )
+        raise ToolExecutionError(
+            ErrorCode.TOOL_001,
+            "JS runner 실행 실패"
+            f" (tc_id={tc_id}, exit={process.returncode})"
+            f"\nstdout:\n{stdout}\nstderr:\n{stderr}",
+        )
+
+    if not output_file.exists():
+        raise ToolExecutionError(
+            ErrorCode.TOOL_001,
+            f"JS runner output 이 생성되지 않았습니다. (tc_id={tc_id})",
+        )
+
+    try:
+        payload = json.loads(output_file.read_text(encoding="utf-8"))
+    except Exception as e:  # pragma: no cover - defensive
+        raise ToolExecutionError(
+            ErrorCode.TOOL_005,
+            f"JS runner output 파싱 실패 (tc_id={tc_id}): {type(e).__name__}: {e}",
+        ) from e
+
+    ui_result = payload.get("ui_result")
+    api_result = payload.get("api_result")
+    if not isinstance(ui_result, dict) or not isinstance(api_result, dict):
+        raise ToolExecutionError(
+            ErrorCode.TOOL_005,
+            f"JS runner output 형식 오류 (tc_id={tc_id})",
+        )
+    return {"ui_result": ui_result, "api_result": api_result}
+
+
+async def _ensure_js_runner_dependencies(runner_dir: Path, tc_id: str) -> None:
+    """JS runner 의 npm 의존성과 Chromium 브라우저를 필요 시 자동 설치한다."""
+    playwright_dir = runner_dir / "node_modules" / "playwright"
+    package_json = runner_dir / "package.json"
+    if not package_json.exists():
+        raise ToolExecutionError(
+            ErrorCode.TOOL_001,
+            f"JS runner package.json 이 없습니다: {package_json}",
+        )
+
+    async def _run_bootstrap_command(*args: str, error_prefix: str) -> tuple[int, str, str]:
+        process = await asyncio.create_subprocess_exec(
+            *args,
+            cwd=str(runner_dir),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout_bytes, stderr_bytes = await process.communicate()
+        stdout = stdout_bytes.decode("utf-8", errors="ignore")
+        stderr = stderr_bytes.decode("utf-8", errors="ignore")
+        if process.returncode != 0:
+            raise ToolExecutionError(
+                ErrorCode.TOOL_001,
+                f"{error_prefix} (tc_id={tc_id}, exit={process.returncode})"
+                f"\nstdout:\n{stdout}\nstderr:\n{stderr}",
+            )
+        return process.returncode, stdout, stderr
+
+    if not playwright_dir.exists():
+        get_logger("orchestrator").info(
+            "js_runner_bootstrap_npm_install",
+            tc_id=tc_id,
+            runner_dir=str(runner_dir),
+            reason="missing_node_modules_playwright",
+        )
+        await _run_bootstrap_command("npm", "install", error_prefix="JS runner npm install 실패")
+
+        if not playwright_dir.exists():
+            raise ToolExecutionError(
+                ErrorCode.TOOL_001,
+                f"JS runner npm install 이후에도 playwright 패키지가 없습니다. (tc_id={tc_id})",
+            )
+
+    browser_check = (
+        "const fs=require('fs');"
+        "const { chromium } = require('playwright');"
+        "const p = chromium.executablePath();"
+        "process.stdout.write(p);"
+        "process.exit(fs.existsSync(p) ? 0 : 10);"
+    )
+    process = await asyncio.create_subprocess_exec(
+        "node",
+        "-e",
+        browser_check,
+        cwd=str(runner_dir),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout_bytes, stderr_bytes = await process.communicate()
+    stdout = stdout_bytes.decode("utf-8", errors="ignore")
+    stderr = stderr_bytes.decode("utf-8", errors="ignore")
+    if process.returncode == 0:
+        return
+    if process.returncode != 10:
+        raise ToolExecutionError(
+            ErrorCode.TOOL_001,
+            "JS runner Chromium 경로 확인 실패"
+            f" (tc_id={tc_id}, exit={process.returncode})"
+            f"\nstdout:\n{stdout}\nstderr:\n{stderr}",
+        )
+
+    get_logger("orchestrator").info(
+        "js_runner_bootstrap_playwright_install",
+        tc_id=tc_id,
+        runner_dir=str(runner_dir),
+        reason="missing_chromium_executable",
+    )
+    await _run_bootstrap_command(
+        "npx",
+        "playwright",
+        "install",
+        "chromium",
+        error_prefix="JS runner playwright install 실패",
+    )
 
 
 async def _run_ui_with_trace(

@@ -58,6 +58,18 @@ _FEEDBACK_CONTAINER_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+# 리스트/카드 컨테이너 및 heading/title anchor 도 별도 수집한다.
+_CONTAINER_PATTERN = re.compile(
+    r'<(?P<tag>div|section|ul|ol)\b(?P<attrs>[^>]*?(?:\bdata-testid\s*=\s*["\'][^"\']*(?:list|grid|card)[^"\']*["\']|'
+    r'\bclass\s*=\s*["\'][^"\']*(?:list|grid|card)[^"\']*["\'])[^>]*?)'
+    r"(?:/>|>(?P<inner>[\s\S]*?)</(?P=tag)>)",
+    re.IGNORECASE,
+)
+_HEADING_PATTERN = re.compile(
+    r"<(?P<tag>h1|h2|h3)\b(?P<attrs>[^>]*?)>(?P<inner>[\s\S]*?)</(?P=tag)>",
+    re.IGNORECASE,
+)
+
 # attribute 단일 추출 (key="value" 또는 key='value'). v-bind / : prefix 도 인식.
 _ATTR_PATTERN = re.compile(
     r'(?:v-bind:|:)?(?P<key>[a-zA-Z][a-zA-Z0-9_:\-]*)\s*=\s*["\'](?P<val>[^"\']*)["\']'
@@ -84,6 +96,7 @@ class FrontendElement(TypedDict, total=False):
     testid: str
     name: str
     id: str
+    dynamic_testid_pattern: str
     file: str  # 출처 파일 (디버깅용, 상대 경로)
     page: str
     route: str
@@ -168,13 +181,16 @@ def _extract_elements_from_text(text: str, file_rel: str) -> list[FrontendElemen
 
         target_id = attrs.get("id", "")
         label_text = attrs.get("aria-label", "") or (label_map.get(target_id, "") if target_id else "")
+        raw_testid = attrs.get("data-testid") or attrs.get("data-test-id") or ""
+        testid, dynamic_testid_pattern = _normalize_testid(raw_testid)
 
         element: FrontendElement = {
             "tag": tag,
-            "text": inner[:100] if inner else "",
+            "text": _normalize_text(inner),
             "placeholder": attrs.get("placeholder", ""),
             "label": label_text,
-            "testid": attrs.get("data-testid") or attrs.get("data-test-id") or "",
+            "testid": testid,
+            "dynamic_testid_pattern": dynamic_testid_pattern,
             "name": attrs.get("name", ""),
             "id": target_id,
             "file": file_rel,
@@ -196,12 +212,15 @@ def _extract_elements_from_text(text: str, file_rel: str) -> list[FrontendElemen
         inner = _clean_inner_text(raw_inner)
         if not inner:
             inner = _extract_literal_text(raw_inner)
+        raw_testid = attrs.get("data-testid") or attrs.get("data-test-id") or ""
+        testid, dynamic_testid_pattern = _normalize_testid(raw_testid)
         element = {
             "tag": tag,
-            "text": inner[:100] if inner else "",
+            "text": _normalize_text(inner),
             "placeholder": "",
             "label": attrs.get("aria-label", ""),
-            "testid": attrs.get("data-testid") or attrs.get("data-test-id") or "",
+            "testid": testid,
+            "dynamic_testid_pattern": dynamic_testid_pattern,
             "name": "",
             "id": attrs.get("id", ""),
             "file": file_rel,
@@ -224,13 +243,16 @@ def _extract_elements_from_text(text: str, file_rel: str) -> list[FrontendElemen
         if not inner and not (attrs.get("data-testid") or attrs.get("data-test-id")):
             continue
 
-        testid = attrs.get("data-testid") or attrs.get("data-test-id") or ""
+        testid, dynamic_testid_pattern = _normalize_testid(
+            attrs.get("data-testid") or attrs.get("data-test-id") or ""
+        )
         element = {
             "tag": tag,
-            "text": inner[:100] if inner else "",
+            "text": _normalize_text(inner),
             "placeholder": "",
             "label": "",
             "testid": testid,
+            "dynamic_testid_pattern": dynamic_testid_pattern,
             "name": "",
             "id": attrs.get("id", ""),
             "file": file_rel,
@@ -249,6 +271,71 @@ def _extract_elements_from_text(text: str, file_rel: str) -> list[FrontendElemen
                 for existing in found
             ):
                 found.append(element)
+
+    for match in _CONTAINER_PATTERN.finditer(text):
+        tag = match.group("tag").lower()
+        attrs = _parse_attrs(match.group("attrs") or "")
+        raw_inner = match.group("inner") or ""
+        inner = _clean_inner_text(raw_inner)
+        if not inner:
+            inner = _extract_literal_text(raw_inner)
+        testid, dynamic_testid_pattern = _normalize_testid(
+            attrs.get("data-testid") or attrs.get("data-test-id") or ""
+        )
+        control_type = _control_type_for_container(attrs, testid, inner)
+        element = {
+            "tag": tag,
+            "text": _normalize_text(inner),
+            "placeholder": "",
+            "label": "",
+            "testid": testid,
+            "dynamic_testid_pattern": dynamic_testid_pattern,
+            "name": "",
+            "id": attrs.get("id", ""),
+            "file": file_rel,
+            "page": page,
+            "route": route,
+            "actionable": False,
+            "control_type": control_type,
+        }
+        if any(element[k] for k in ("text", "testid", "id")):
+            if not any(
+                existing.get("tag") == element["tag"]
+                and existing.get("testid") == element["testid"]
+                and existing.get("text") == element["text"]
+                and existing.get("file") == element["file"]
+                for existing in found
+            ):
+                found.append(element)
+
+    for match in _HEADING_PATTERN.finditer(text):
+        tag = match.group("tag").lower()
+        attrs = _parse_attrs(match.group("attrs") or "")
+        raw_inner = match.group("inner") or ""
+        inner = _clean_inner_text(raw_inner)
+        if not inner:
+            inner = _extract_literal_text(raw_inner)
+        heading_text = _normalize_text(inner)
+        if not heading_text:
+            continue
+        testid, dynamic_testid_pattern = _normalize_testid(
+            attrs.get("data-testid") or attrs.get("data-test-id") or ""
+        )
+        found.append({
+            "tag": tag,
+            "text": heading_text,
+            "placeholder": "",
+            "label": "",
+            "testid": testid,
+            "dynamic_testid_pattern": dynamic_testid_pattern,
+            "name": "",
+            "id": attrs.get("id", ""),
+            "file": file_rel,
+            "page": page,
+            "route": route,
+            "actionable": False,
+            "control_type": "heading",
+        })
 
     return found
 
@@ -290,6 +377,8 @@ def _clean_inner_text(text: str) -> str:
 
 def _extract_literal_text(text: str) -> str:
     """Vue/JSX 표현식 내부 문자열 리터럴을 보조 텍스트로 추출한다."""
+    if _looks_like_expression_text(text):
+        return ""
     literals = [
         m.group(1).strip()
         for m in _STRING_LITERAL_PATTERN.finditer(text)
@@ -300,12 +389,43 @@ def _extract_literal_text(text: str) -> str:
     return literals[-1][:100]
 
 
+def _normalize_testid(raw_testid: str) -> tuple[str, str]:
+    cleaned = raw_testid.strip()
+    if not cleaned:
+        return "", ""
+    if any(token in cleaned for token in ("${", "`", "{", "}")):
+        return "", cleaned
+    return cleaned, ""
+
+
+def _normalize_text(text: str) -> str:
+    cleaned = (text or "").strip()[:100]
+    if not cleaned:
+        return ""
+    if _looks_like_expression_text(cleaned):
+        return ""
+    return cleaned
+
+
+def _looks_like_expression_text(text: str) -> bool:
+    if any(token in text for token in ("${", "?.", "=>")):
+        return True
+    if "(" in text and ")" in text:
+        return True
+    if ":" in text and "," in text:
+        return True
+    return False
+
+
 def _infer_page_name(file_rel: str) -> str:
     return Path(file_rel).stem or ""
 
 
 def _infer_route(file_rel: str) -> str:
-    stem = Path(file_rel).stem
+    path = Path(file_rel)
+    if "pages" not in {part.lower() for part in path.parts}:
+        return ""
+    stem = path.stem
     if not stem:
         return ""
     lowered = stem.lower()
@@ -346,6 +466,21 @@ def _control_type_for_feedback(attrs: dict[str, str], inner: str, testid: str) -
     if "error" in signature or "실패" in signature or "오류" in signature:
         return "feedback_error"
     return "feedback"
+
+
+def _control_type_for_container(attrs: dict[str, str], testid: str, inner: str) -> str:
+    signature = " ".join(
+        part for part in (
+            attrs.get("class", ""),
+            testid,
+            inner,
+        ) if part
+    ).lower()
+    if "grid" in signature or "list" in signature:
+        return "list"
+    if "card" in signature:
+        return "card"
+    return "container"
 
 
 def write_frontend_index(elements: list[FrontendElement], output_path: Path) -> None:
