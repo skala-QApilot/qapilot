@@ -68,6 +68,31 @@ _JUDGE_PROMPT_FALLBACK = """\
 _VALID_EVIDENCE_TYPES = frozenset({"code_location", "runtime_data"})
 
 
+def _load_codebase_index_from_db_mirror(service_id: str) -> dict[str, Any]:
+    """codebase_indices DB+S3 mirror 에서 CodebaseContextLoader 호환 dict 구성.
+
+    각 kind (endpoints / models / functions / callgraph / manifest) 를 service_id 기준
+    최신 commit 으로 조회. SaaS test trace 가 generate_code trace 와 다른 temp dir 라
+    디스크 fallback 실패 시 본 함수로 복원 (PR #245).
+    """
+    from qapilot.db.code_reader import load_codebase_index
+
+    kinds = ("endpoints", "models", "functions", "callgraph", "manifest")
+    result: dict[str, Any] = {}
+    for kind in kinds:
+        data = load_codebase_index(service_id, kind)
+        result[kind] = data if data is not None else ([] if kind != "callgraph" and kind != "manifest" else ({} if kind == "callgraph" else {}))
+    # _dir_found: 의미 있는 데이터 있으면 True (manifest 만 있어도 dir 발견으로 간주)
+    has_data = (
+        bool(result.get("endpoints"))
+        or bool(result.get("models"))
+        or bool(result.get("callgraph"))
+        or bool(result.get("manifest"))
+    )
+    result["_dir_found"] = has_data
+    return result
+
+
 class RootCauseAgent(BaseAgent):
     """원인 추론 Agent.
 
@@ -123,7 +148,10 @@ class RootCauseAgent(BaseAgent):
         # state.qapilot_dir (SaaS temp 또는 CLI 명시) 를 context 로 받아 우선 사용.
         # e2e trace `40fce3fa` 격차.
         qapilot_dir = context.get("qapilot_dir") if context else None
-        code_context_raw = self._load_from_codebase_index(clues, error_code, qapilot_dir=qapilot_dir)
+        service_id = context.get("service_id") if context else None
+        code_context_raw = self._load_from_codebase_index(
+            clues, error_code, qapilot_dir=qapilot_dir, service_id=service_id,
+        )
 
         # runtime_context 가용성 경고 (tc_id가 지정됐는데 없을 때)
         runtime_missing = tc_id and not runtime_context_raw
@@ -374,34 +402,50 @@ class RootCauseAgent(BaseAgent):
         clues: dict[str, Any],
         error_code: str = "",
         qapilot_dir: str | None = None,
+        service_id: str | None = None,
     ) -> str:
         """codebase-index 메타데이터를 로드하고 관련 항목을 선별하여 반환한다.
 
-        인덱스가 없거나 모든 파일이 비어 있으면 warning을 남기고 빈 문자열을 반환한다.
-
-        SaaS 흐름에서는 qapilot_dir 가 temp 디렉토리 (pipeline state.qapilot_dir).
-        CodebaseContextLoader 는 base_dir 가 그 root 이면 그 하위의 `.qapilot/codebase-index`
-        를 찾음. SaaS 의 qapilot_dir 는 이미 그 안에 `codebase-index/` 가 직접 들어있어
-        한 단계 깊은 구조 — `base_dir = qapilot_dir.parent` 또는 loader 가 직접 디렉토리
-        명을 받도록 우회. CodebaseContextLoader 의 _INDEX_SUBDIR = ".qapilot/codebase-index"
-        기준이라 qapilot_dir 의 parent 가 root 처럼 동작.
+        우선순위:
+        1) qapilot_dir 하위의 codebase-index 디스크 (SaaS generate_code trace 의 잔존 dir)
+        2) service_id 기준 DB+S3 mirror (PR #245 — SaaS test trace 는 generate_code trace
+           와 다른 temp dir 이므로 디스크에 없음. mirror 에서 복원)
+        3) cfg.project.repo_path (CLI 흐름)
+        4) Path(".") fallback
         """
+        index: dict[str, Any] | None = None
+
+        # (1) qapilot_dir 디스크
         if qapilot_dir:
             qd = Path(qapilot_dir).resolve()
-            # qapilot_dir 명이 ".qapilot" 이면 parent 가 root (CLI 흐름)
-            # qapilot_dir 명이 임의 (SaaS temp) 이면 qapilot_dir 자체가 root 처럼 + .qapilot 가상
-            # 가장 간단: qapilot_dir 의 parent 를 base_dir 로 — 단 qapilot_dir 명이 .qapilot 이거나
-            # 아니거나 모두 동일하게 작동하려면 별도 helper.
-            # 본인은 직접 codebase-index/ 경로를 알므로 loader 우회 + 동등 로직 inline.
             base_dir = qd if (qd / "codebase-index").is_dir() else qd.parent
-        else:
+            disk_index = CodebaseContextLoader.load(base_dir=base_dir)
+            if disk_index.get("_dir_found"):
+                index = disk_index
+
+        # (2) DB+S3 mirror — SaaS test trace 격차 해결
+        if index is None and service_id:
+            mirror_index = _load_codebase_index_from_db_mirror(service_id)
+            if mirror_index.get("_dir_found"):
+                index = mirror_index
+                self.logger.info(
+                    "codebase_index_loaded_from_mirror",
+                    service_id=service_id,
+                    endpoints_count=len(mirror_index.get("endpoints") or []),
+                )
+
+        # (3) cfg.project.repo_path / (4) Path(".") fallback
+        if index is None:
             repo_path = self._config.project.repo_path
             base_dir = Path(repo_path) if repo_path else Path(".")
-
-        index = CodebaseContextLoader.load(base_dir=base_dir)
+            index = CodebaseContextLoader.load(base_dir=base_dir)
 
         if not index["_dir_found"]:
-            self.logger.warning("codebase_index_not_found", base_dir=str(base_dir))
+            self.logger.warning(
+                "codebase_index_not_found",
+                qapilot_dir=qapilot_dir,
+                service_id=service_id,
+            )
             return ""
 
         all_empty = (

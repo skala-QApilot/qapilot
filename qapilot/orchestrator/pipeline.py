@@ -905,7 +905,11 @@ async def _requirement_extract(state: PipelineState) -> dict:
         existing_scenarios_summary = _build_existing_scenarios_summary(state)
 
         # service_id: Qdrant 검색에 필요 (trace.json에서 추출)
-        _trace_for_svc = load_trace(qapilot_dir, state["trace_id"]) or {}
+        # `load_trace(trace_id: str) -> dict | None` — 1 arg signature.
+        # 이전: load_trace(qapilot_dir, state["trace_id"]) — 2 args (signature mismatch)
+        # → `defects_persist_failed error='load_trace() takes 1 positional argument but
+        # 2 were given'` 직접 원인 (kshyun PR `6e37349` defect INSERT 와 동작 충돌).
+        _trace_for_svc = load_trace(state["trace_id"]) or {}
         _service_id = _trace_for_svc.get("service_id") or None
 
         # 1단계: user_input 직접 임베딩 → top-N 후보 탐색 (이슈 #186, #221)
@@ -2199,9 +2203,11 @@ async def _run_db_test_safe(*, tc_id: str, trace_id: str, DBTestTool, ToolInput)
     error 로그 출력. TC 별 노이즈 누적 방지를 위해 env 사전 점검으로 호출 자체를 skip.
     변수명은 PR #184 (이슈 #80) 와 정합 — sut-db-agent 의 클러스터 endpoint URL.
     """
-    import os
+    # db_test_tool._module_url() 사용 — _ensure_dotenv 자동 호출로 .env 강제 로드 보장
+    # (PR #235 override revert 후 본질 fix #242). main.py 의 load_dotenv 타이밍 무관.
+    from qapilot.tools.db_test_tool import _module_url
 
-    if not os.getenv("QAPILOT_SUT_DB_URL"):
+    if not _module_url():
         return {
             "tc_id": tc_id,
             "snapshots": [],
@@ -2394,7 +2400,10 @@ async def _root_cause(state: PipelineState) -> dict:
                         # state.qapilot_dir 가 필요. cfg.project.repo_path 는 None →
                         # fallback Path(".") = qapilot 디렉토리에서 .qapilot/codebase-index
                         # 찾기 실패 → `codebase_index_empty` warning. 본 fix.
+                        # service_id 추가 (#245) — test trace 는 generate_code trace 와
+                        # 다른 temp dir 라 디스크 fallback 실패 → DB+S3 mirror 로 복원.
                         "qapilot_dir": state.get("qapilot_dir"),
+                        "service_id": state.get("service_id"),
                     },
                     params={
                         "tc_id": tc_id,
@@ -2450,7 +2459,10 @@ async def _fix_recommend(state: PipelineState) -> dict:
             output = await agent.run(
                 AgentInput(
                     trace_id=trace_id,
-                    context={},
+                    context={
+                        # FixRecommender 가 codebase-index fallback 사용 시 필요 (#244)
+                        "qapilot_dir": state.get("qapilot_dir"),
+                    },
                     params={
                         "tc_id": tc_id,
                         "candidates": candidates,
