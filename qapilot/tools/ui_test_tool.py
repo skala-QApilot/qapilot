@@ -1025,12 +1025,42 @@ class UITestTool(BaseTool):
 
         if action == "fill":
             await locator.fill(value or "", **kw)
+            # #41 후속 (#249): Vue 3 v-model / React controlled input 호환성 강화.
+            # e2e trace `b59996fe` 진단: Playwright fill() 후 button click → form submit
+            # → POST /api/auth/signup 호출 0건 (HTML snapshot 변화 0). 일부 framework 의
+            # reactive state binding 이 input event 외 change/blur 도 listen 하는 경우
+            # 대비. 실패해도 graceful (이미 fill 정상이면 noop).
+            try:
+                await locator.dispatch_event("change")
+                await locator.blur(timeout=500)
+            except Exception:
+                pass
             return
         if action == "clear":
             await locator.clear(**kw)
             return
         if action == "click":
             await locator.click(**kw)
+            # #41 후속 (#249): button[type=submit] click 시 form 의 submit event 가
+            # 일부 환경 (Vue 3 + Playwright headless chrome 조합) 에서 trigger 안 되는
+            # 격차 — trace `b59996fe` 의 회원가입 form HTML snapshot 변화 0. 본 fallback:
+            # button 의 closest form 을 찾아 requestSubmit() 호출. browser 의 native
+            # form submit chain (validation + submit event) 정상 발동. 일반 click 영향 X
+            # (button[type=submit] 만 선별 + Vue 의 @submit.prevent 가 cancel + handler
+            # 중복 호출 방지). 실패해도 graceful.
+            try:
+                await locator.evaluate(
+                    """el => {
+                        if (el && el.tagName === 'BUTTON' && el.type === 'submit') {
+                            const form = el.closest('form');
+                            if (form && typeof form.requestSubmit === 'function') {
+                                form.requestSubmit(el);
+                            }
+                        }
+                    }"""
+                )
+            except Exception:
+                pass
             return
         if action == "dblclick":
             await locator.dblclick(**kw)
