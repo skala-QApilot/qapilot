@@ -1047,6 +1047,15 @@ class UITestTool(BaseTool):
 
         if action == "fill":
             await locator.fill(value or "", **kw)
+            # #252 fill history cache — click submit 직전 form_state.empty_required
+            # 발견 시 cache 에서 재주입. trace `2dc1a980` 진단: fill verify (ui_fill_
+            # mismatch 없음) 통과했음에도 click 직전 form_state 의 password 만 빈 채
+            # = fill 후~click 사이에 Vue v-model 가 reset. 본 cache 로 재주입 가능.
+            sel = step.get("selector")
+            if sel:
+                if not hasattr(self, "_fill_history"):
+                    self._fill_history = {}
+                self._fill_history[sel] = value or ""
             # PR #244 native setter — Vue 3 v-model / React controlled input 호환성.
             try:
                 await locator.evaluate(
@@ -1127,6 +1136,61 @@ class UITestTool(BaseTool):
                         tag_type=tag_type,
                         form_state=form_state,
                     )
+                    # #252 본질 fix — empty_required 있으면 cache 에서 재주입.
+                    # trace `2dc1a980` 진단: TC-01~03/06 의 form_state empty_required=
+                    # [password]. TC-04 = [email, password] (email 시나리오 의도 빈,
+                    # password 는 ActionMapping 에 SecurePass123! 있는데 빈 = race).
+                    # fill_history cache (selector→value) 에서 빈 input 재주입 →
+                    # 100ms wait 후 click. e2e race 본질 흡수.
+                    empty = (form_state or {}).get("empty_required") or []
+                    cache = getattr(self, "_fill_history", {})
+                    if empty and cache:
+                        page = locator.page
+                        retry_count = 0
+                        for em in empty:
+                            name = em.get("name") if isinstance(em, dict) else em
+                            # cache 매칭: selector 가 testid 이면 name=testid 정합
+                            cached = cache.get(name)
+                            if not cached:
+                                # data-testid 외 id/name 매칭도 시도 (cache 의 모든 키 검색)
+                                for cs, cv in cache.items():
+                                    if cs == name:
+                                        cached = cv
+                                        break
+                            if not cached:
+                                continue
+                            try:
+                                await page.evaluate(
+                                    """({sel, v}) => {
+                                        const el = document.querySelector(
+                                            `[data-testid="${sel}"], #${sel}, [name="${sel}"]`
+                                        );
+                                        if (!el) return false;
+                                        const proto = el instanceof HTMLTextAreaElement
+                                            ? HTMLTextAreaElement.prototype
+                                            : HTMLInputElement.prototype;
+                                        const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+                                        if (setter) setter.call(el, v);
+                                        else el.value = v;
+                                        el.dispatchEvent(new Event('input', {bubbles: true}));
+                                        el.dispatchEvent(new Event('change', {bubbles: true}));
+                                        return true;
+                                    }""",
+                                    {"sel": name, "v": cached},
+                                )
+                                retry_count += 1
+                            except Exception:
+                                pass
+                        if retry_count:
+                            try:
+                                await page.wait_for_timeout(150)
+                            except Exception:
+                                pass
+                            self.logger.warning(
+                                "ui_fill_retry_before_submit",
+                                retried=retry_count,
+                                empty_required=empty,
+                            )
             except Exception:
                 pass
             await locator.click(**kw)
