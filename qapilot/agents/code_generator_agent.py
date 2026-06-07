@@ -18,6 +18,7 @@ import tree_sitter_javascript as tsjs
 from tree_sitter import Language, Parser
 
 from qapilot.agents.base_agent import BaseAgent
+from qapilot.shared import progress
 from qapilot.shared.llm_client import LLMClient
 from qapilot.shared.schemas import ExecuteResult
 
@@ -49,8 +50,24 @@ class CodeGeneratorAgent(BaseAgent):
         tc_to_scenario = _build_tc_to_scenario_index(scenarios)
 
         sem = asyncio.Semaphore(_MAX_CONCURRENT_LLM_CALLS)
+        total = len(action_mappings)
+        done = 0
+
+        async def _tracked(coro: Any) -> Any:
+            """TC 1건 완료(성공/실패 무관) 시마다 progress 이벤트 발행.
+
+            asyncio 단일 스레드라 done 증가~emit 사이에 await 가 없어 race-free.
+            가드레일이 정수 % 단위로 발행을 줄이므로 TC 가 수백이어도 이벤트는 상한선 이내.
+            """
+            nonlocal done
+            try:
+                return await coro
+            finally:
+                done += 1
+                progress.item(getattr(self, "trace_id", None), "code_generate", done, total)
+
         tasks = [
-            self._generate_single(sem, system_prompt, am, tc_to_scenario, last_error)
+            _tracked(self._generate_single(sem, system_prompt, am, tc_to_scenario, last_error))
             for am in action_mappings
         ]
         outcomes = await asyncio.gather(*tasks, return_exceptions=True)

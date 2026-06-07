@@ -14,6 +14,7 @@ from zoneinfo import ZoneInfo
 
 from qapilot.db.run_writer import upsert_run
 from qapilot.messaging.redis_pubsub import publish_run_event
+from qapilot.shared import progress
 from qapilot.shared.logger import get_logger
 
 _logger = get_logger("trace_store")
@@ -76,6 +77,7 @@ def update_trace(qapilot_dir: str | Path, trace_id: str, state: dict) -> None:
     trace.update(payload)
     _save_trace(qapilot_dir, trace_id, trace)
     upsert_run(trace)
+    progress.reset(trace_id)
     publish_run_event(trace_id, "status", {
         "status": trace.get("status"),
         "completed_at": trace.get("completed_at"),
@@ -119,6 +121,7 @@ def update_trace_aborted(qapilot_dir: str | Path, trace_id: str, error: str) -> 
     )
     _save_trace(qapilot_dir, trace_id, trace)
     upsert_run(trace)
+    progress.reset(trace_id)
     publish_run_event(trace_id, "status", {"status": "aborted", "error": error})
 
 

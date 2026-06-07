@@ -31,6 +31,7 @@ from qapilot.db.rtm_writer import write_rtm_version
 from qapilot.db.scenario_writer import upsert_scenario_version
 from qapilot.db.tc_result_writer import insert_tc_artifact, upsert_tc_result
 from qapilot.orchestrator.state import PipelineState
+from qapilot.shared import progress
 from qapilot.shared.logger import get_logger
 from qapilot.shared.trace_store import load_trace
 from qapilot.storage import s3_client
@@ -52,6 +53,19 @@ def _qapilot_path(state: PipelineState, *parts: str) -> Path:
     return Path(base).joinpath(*parts)
 
 
+def _progress_node(name: str, fn):
+    """노드 진입 시 progress 이벤트 1건 발행 후 원래 노드를 실행하는 래퍼.
+
+    Layer 1A/1B 노드에만 적용 — 생성 오버레이 프로그레스바를 실제 노드 전환과 맞춘다.
+    발행 실패/Redis 미설정은 progress 모듈이 알아서 흡수하므로 노드 실행에 영향 없다.
+    """
+    async def wrapped(state: PipelineState) -> dict:
+        progress.node(state.get("trace_id"), name)
+        return await fn(state)
+
+    return wrapped
+
+
 def build_pipeline() -> StateGraph:
     """파이프라인 그래프를 구성하고 반환한다."""
     graph = StateGraph(PipelineState)
@@ -59,12 +73,12 @@ def build_pipeline() -> StateGraph:
     # ═══════════════════════════════════════════════════
     # Layer 1A — generate_scenarios
     # ═══════════════════════════════════════════════════
-    graph.add_node("doc_import", _doc_import)
-    graph.add_node("codebase_scan", _codebase_scan)
-    graph.add_node("domain_knowledge", _domain_knowledge)
-    graph.add_node("requirement_extract", _requirement_extract)
-    graph.add_node("scenario_generate", _scenario_generate)
-    graph.add_node("save_scenarios", _save_scenarios)
+    graph.add_node("doc_import", _progress_node("doc_import", _doc_import))
+    graph.add_node("codebase_scan", _progress_node("codebase_scan", _codebase_scan))
+    graph.add_node("domain_knowledge", _progress_node("domain_knowledge", _domain_knowledge))
+    graph.add_node("requirement_extract", _progress_node("requirement_extract", _requirement_extract))
+    graph.add_node("scenario_generate", _progress_node("scenario_generate", _scenario_generate))
+    graph.add_node("save_scenarios", _progress_node("save_scenarios", _save_scenarios))
 
     graph.add_edge("doc_import", "codebase_scan")
     graph.add_edge("codebase_scan", "domain_knowledge")
@@ -76,10 +90,10 @@ def build_pipeline() -> StateGraph:
     # ═══════════════════════════════════════════════════
     # Layer 1B — generate_code
     # ═══════════════════════════════════════════════════
-    graph.add_node("load_scenarios_for_codegen", _load_scenarios_for_codegen)
-    graph.add_node("action_mapping", _action_mapping)
-    graph.add_node("code_generate", _code_generate)
-    graph.add_node("save_codes", _save_codes)
+    graph.add_node("load_scenarios_for_codegen", _progress_node("load_scenarios_for_codegen", _load_scenarios_for_codegen))
+    graph.add_node("action_mapping", _progress_node("action_mapping", _action_mapping))
+    graph.add_node("code_generate", _progress_node("code_generate", _code_generate))
+    graph.add_node("save_codes", _progress_node("save_codes", _save_codes))
 
     graph.add_edge("load_scenarios_for_codegen", "action_mapping")
     graph.add_edge("action_mapping", "code_generate")

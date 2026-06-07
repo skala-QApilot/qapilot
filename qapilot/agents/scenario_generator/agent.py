@@ -26,6 +26,7 @@ from qapilot.agents.scenario_generator.parser import (
 )
 from qapilot.agents.scenario_generator.repository import save_scenarios
 from qapilot.agents.base_agent import BaseAgent
+from qapilot.shared import progress
 from qapilot.shared.schemas import ExecuteResult
 
 # 라우터별 도메인 검색 키워드 — Qdrant 검색 쿼리 및 requirements 필터링에 사용
@@ -197,7 +198,8 @@ class ScenarioGeneratorAgent(BaseAgent):
         all_scenarios: list = []
         confidence_sum = 0.0
 
-        for router_file, endpoints in router_map.items():
+        for _idx, (router_file, endpoints) in enumerate(router_map.items()):
+            progress.item(getattr(self, "trace_id", None), "scenario_generate", _idx, len(router_map))
             basename = router_file.split("/")[-1].replace(".py", "").replace(".ts", "").replace(".js", "")
             keywords = _ROUTER_KEYWORDS.get(basename, [])
             query = " ".join(keywords) if keywords else basename
@@ -271,7 +273,8 @@ class ScenarioGeneratorAgent(BaseAgent):
 
         req_endpoint_map = self._map_requirements_to_endpoints(target_requirements, all_endpoints)
 
-        for req in target_requirements:
+        for _idx, req in enumerate(target_requirements):
+            progress.item(getattr(self, "trace_id", None), "scenario_generate", _idx, len(target_requirements))
             domain_area = req.get("domain_area") or "기타"
             req_id = req.get("req_id", "")
             action_type = req.get("action_type", "create")
