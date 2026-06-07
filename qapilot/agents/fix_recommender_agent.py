@@ -74,7 +74,8 @@ class FixRecommenderAgent(BaseAgent):
             code_context_raw = self._extract_context_from_candidates(candidates)
         if not code_context_raw:
             qapilot_dir = context.get("qapilot_dir") if context else None
-            code_context_raw = self._load_from_codebase_index(qapilot_dir)
+            service_id = context.get("service_id") if context else None
+            code_context_raw = self._load_from_codebase_index(qapilot_dir, service_id)
         if not code_context_raw and tc_id:
             code_context_raw = self._load_dummy_context(tc_id, "code_context")
 
@@ -216,33 +217,53 @@ class FixRecommenderAgent(BaseAgent):
         return "\n".join(code_locations) if code_locations else ""
 
     @staticmethod
-    def _load_from_codebase_index(qapilot_dir: str | None) -> str:
+    def _load_from_codebase_index(qapilot_dir: str | None, service_id: str | None = None) -> str:
         """SaaS qapilot_dir 의 codebase-index 메타데이터를 요약하여 반환.
 
-        root_cause 의 _load_from_codebase_index 와 동형 — 단 fix_recommender 는 clue
-        없이 전체 endpoints 요약만 (root_cause 가 이미 cause 식별 후라 fix 단계는 일반
-        컨텍스트 충분). 인덱스 없으면 빈 문자열.
+        root_cause 의 _load_from_codebase_index 와 동형 4단계 fallback (#248):
+        1) qapilot_dir 디스크 → 2) service_id DB+S3 mirror → 3) Path(".") fallback.
+        SaaS test trace 가 generate_code trace 와 다른 temp dir 이라 디스크 fallback
+        실패. service_id 로 mirror 에서 복원 (PR #239 의 root_cause 와 동형).
         """
-        if not qapilot_dir:
-            return ""
-        qd = Path(qapilot_dir).resolve()
-        base_dir = qd if (qd / "codebase-index").is_dir() else qd.parent
-        try:
-            index = CodebaseContextLoader.load(base_dir=base_dir)
-        except Exception:
-            return ""
-        if not index.get("_dir_found"):
-            return ""
-        endpoints = (index.get("endpoints") or [])[:20]
-        models = (index.get("models") or [])[:10]
-        manifest = index.get("manifest") or {}
-        if not endpoints and not models and not manifest:
-            return ""
-        return json.dumps(
-            {"endpoints": endpoints, "models": models, "manifest": manifest},
-            ensure_ascii=False,
-            indent=2,
-        )
+        # (1) qapilot_dir 디스크 — 의미 있는 데이터 있을 때만 사용
+        if qapilot_dir:
+            qd = Path(qapilot_dir).resolve()
+            base_dir = qd if (qd / "codebase-index").is_dir() else qd.parent
+            try:
+                index = CodebaseContextLoader.load(base_dir=base_dir)
+            except Exception:
+                index = {}
+            if index.get("_dir_found") and (
+                index.get("endpoints") or index.get("models") or index.get("manifest")
+            ):
+                endpoints = (index.get("endpoints") or [])[:20]
+                models = (index.get("models") or [])[:10]
+                manifest = index.get("manifest") or {}
+                return json.dumps(
+                    {"endpoints": endpoints, "models": models, "manifest": manifest},
+                    ensure_ascii=False, indent=2,
+                )
+
+        # (2) DB+S3 mirror — SaaS test trace 격차 (#245)
+        if service_id:
+            try:
+                from qapilot.db.code_reader import load_codebase_index
+                endpoints = load_codebase_index(service_id, "endpoints") or []
+                models = load_codebase_index(service_id, "models") or []
+                manifest = load_codebase_index(service_id, "manifest") or {}
+                if endpoints or models or manifest:
+                    return json.dumps(
+                        {
+                            "endpoints": endpoints[:20] if isinstance(endpoints, list) else endpoints,
+                            "models": models[:10] if isinstance(models, list) else models,
+                            "manifest": manifest,
+                        },
+                        ensure_ascii=False, indent=2,
+                    )
+            except Exception:
+                pass
+
+        return ""
 
     @staticmethod
     def _stringify(val: Any) -> str:

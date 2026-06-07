@@ -2400,10 +2400,12 @@ async def _root_cause(state: PipelineState) -> dict:
                         # state.qapilot_dir 가 필요. cfg.project.repo_path 는 None →
                         # fallback Path(".") = qapilot 디렉토리에서 .qapilot/codebase-index
                         # 찾기 실패 → `codebase_index_empty` warning. 본 fix.
-                        # service_id 추가 (#245) — test trace 는 generate_code trace 와
-                        # 다른 temp dir 라 디스크 fallback 실패 → DB+S3 mirror 로 복원.
+                        # service_id (#245, #248): state.service_id 가 LangGraph state
+                        # propagation 에서 누락되는 격차 (PipelineState schema 추가 +
+                        # load_trace fallback). 다른 노드 (line 1254/1548) 와 동일 패턴.
                         "qapilot_dir": state.get("qapilot_dir"),
-                        "service_id": state.get("service_id"),
+                        "service_id": state.get("service_id")
+                            or (load_trace(state["trace_id"]) or {}).get("service_id"),
                     },
                     params={
                         "tc_id": tc_id,
@@ -2460,8 +2462,10 @@ async def _fix_recommend(state: PipelineState) -> dict:
                 AgentInput(
                     trace_id=trace_id,
                     context={
-                        # FixRecommender 가 codebase-index fallback 사용 시 필요 (#244)
+                        # FixRecommender 가 codebase-index fallback 사용 시 필요 (#244, #248)
                         "qapilot_dir": state.get("qapilot_dir"),
+                        "service_id": state.get("service_id")
+                            or (load_trace(state["trace_id"]) or {}).get("service_id"),
                     },
                     params={
                         "tc_id": tc_id,
