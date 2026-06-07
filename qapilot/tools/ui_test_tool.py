@@ -1130,20 +1130,24 @@ class UITestTool(BaseTool):
                             };
                         }"""
                     )
+                    # #253 진단 강화 — cache_keys 함께 log 로 cache 의 actual content 노출
+                    cache = getattr(self, "_fill_history", {})
                     self.logger.info(
                         "ui_click_submit_attempted",
                         selector=step.get("selector"),
                         tag_type=tag_type,
                         form_state=form_state,
+                        fill_history_keys=list(cache.keys()),
                     )
                     # #252 본질 fix — empty_required 있으면 cache 에서 재주입.
-                    # trace `2dc1a980` 진단: TC-01~03/06 의 form_state empty_required=
-                    # [password]. TC-04 = [email, password] (email 시나리오 의도 빈,
-                    # password 는 ActionMapping 에 SecurePass123! 있는데 빈 = race).
-                    # fill_history cache (selector→value) 에서 빈 input 재주입 →
-                    # 100ms wait 후 click. e2e race 본질 흡수.
                     empty = (form_state or {}).get("empty_required") or []
-                    cache = getattr(self, "_fill_history", {})
+                    # #253: 본인 PR #252 retry 가 actually 발동했는지 명시적 log
+                    self.logger.info(
+                        "ui_fill_retry_check",
+                        empty_count=len(empty),
+                        cache_count=len(cache),
+                        will_retry=bool(empty and cache),
+                    )
                     if empty and cache:
                         page = locator.page
                         retry_count = 0
@@ -1160,12 +1164,12 @@ class UITestTool(BaseTool):
                             if not cached:
                                 continue
                             try:
-                                await page.evaluate(
+                                result = await page.evaluate(
                                     """({sel, v}) => {
                                         const el = document.querySelector(
                                             `[data-testid="${sel}"], #${sel}, [name="${sel}"]`
                                         );
-                                        if (!el) return false;
+                                        if (!el) return {ok: false, reason: 'no_el'};
                                         const proto = el instanceof HTMLTextAreaElement
                                             ? HTMLTextAreaElement.prototype
                                             : HTMLInputElement.prototype;
@@ -1174,13 +1178,21 @@ class UITestTool(BaseTool):
                                         else el.value = v;
                                         el.dispatchEvent(new Event('input', {bubbles: true}));
                                         el.dispatchEvent(new Event('change', {bubbles: true}));
-                                        return true;
+                                        return {ok: true, value_len: el.value.length};
                                     }""",
                                     {"sel": name, "v": cached},
                                 )
+                                # #253: retry per-input log — 어느 input 어떻게 처리됐는지
+                                self.logger.info(
+                                    "ui_fill_retry_input",
+                                    name=name, cached_len=len(cached), result=result,
+                                )
                                 retry_count += 1
-                            except Exception:
-                                pass
+                            except Exception as e:
+                                self.logger.warning(
+                                    "ui_fill_retry_evaluate_failed",
+                                    name=name, error=f"{type(e).__name__}: {str(e)[:120]}",
+                                )
                         if retry_count:
                             try:
                                 await page.wait_for_timeout(150)
