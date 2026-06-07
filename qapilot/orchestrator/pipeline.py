@@ -1953,6 +1953,16 @@ async def _test_execution(state: PipelineState) -> dict:
                     for idx, step in enumerate(exec_mapping.get("steps") or []):
                         if idx < len(original_steps):
                             step["api_endpoint"] = original_steps[idx].get("api_endpoint")
+                            # #256 본질 fix — generated_code 가 password 등을 process.env.*
+                            # 로 마스킹. _resolve_js_value 가 환경변수 미설정 시 "" 반환 →
+                            # fill('') → form 빈 채 → POST 0건. e2e trace `87041b5e` 진단
+                            # (ui_fill_cached password value_len=0). 본인 누적 10 PR (D 영역
+                            # race fix) 모두 본질 아니었음 — 진짜 본질은 generated_code 변환.
+                            # ActionMapping 원본 value 가 있고 generated_code 의 value 가
+                            # 빈 채면 원본으로 fallback (password masking 회피).
+                            orig_value = original_steps[idx].get("value")
+                            if orig_value and not step.get("value"):
+                                step["value"] = orig_value
                 else:
                     exec_mapping = item
 
