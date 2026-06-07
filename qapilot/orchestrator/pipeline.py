@@ -2229,6 +2229,9 @@ async def _cross_check(state: PipelineState) -> dict:
 
     cross_check_results: list[dict] = []
     any_mismatch = False
+    # agent_logs 누적 append — runner.run_pipeline 의 total_cost 합산 (#232).
+    # Layer 3 노드는 for loop 안 multi-TC 호출이라 매 TC 마다 누적 (PR #228 단일 호출 패턴 확장).
+    agent_logs = state.get("agent_logs", [])
 
     # UI 단계 fail 도 mismatch 신호로 — CrossCheck 의 정합성 정의 (UI↔API↔DB) 만으론
     # UI 전체 실패 (locator timeout 등) 케이스가 Layer 3 진입 못 함. 본인 노드에서 보강.
@@ -2257,6 +2260,7 @@ async def _cross_check(state: PipelineState) -> dict:
                     params={"tc_id": tc_id},
                 )
             )
+            agent_logs = agent_logs + [output.metadata.model_dump()]
             cc = dict(output.result.get("cross_check") or {})
             if not cc:
                 cc = {
@@ -2299,6 +2303,7 @@ async def _cross_check(state: PipelineState) -> dict:
     return {
         "cross_check_results": cross_check_results,
         "has_mismatch": any_mismatch,
+        "agent_logs": agent_logs,
     }
 
 
@@ -2315,6 +2320,8 @@ async def _root_cause(state: PipelineState) -> dict:
     cross_check_results = state.get("cross_check_results") or []
 
     root_cause_results: list[dict] = []
+    # agent_logs 누적 append — Layer 3 cost 집계 (#232).
+    agent_logs = state.get("agent_logs", [])
 
     for cc in cross_check_results:
         if not cc.get("has_mismatch"):
@@ -2336,6 +2343,7 @@ async def _root_cause(state: PipelineState) -> dict:
                     },
                 )
             )
+            agent_logs = agent_logs + [output.metadata.model_dump()]
             root_causes = output.result.get("root_causes") or []
             # 단일 또는 list — list 첫 번째를 결과로
             if isinstance(root_causes, list) and root_causes:
@@ -2353,7 +2361,7 @@ async def _root_cause(state: PipelineState) -> dict:
                 "error": f"RootCause skip: {type(e).__name__}: {e}",
             })
 
-    return {"root_cause_results": root_cause_results}
+    return {"root_cause_results": root_cause_results, "agent_logs": agent_logs}
 
 
 async def _fix_recommend(state: PipelineState) -> dict:
@@ -2368,6 +2376,8 @@ async def _fix_recommend(state: PipelineState) -> dict:
     root_cause_results = state.get("root_cause_results") or []
 
     fix_results: list[dict] = []
+    # agent_logs 누적 append — Layer 3 cost 집계 (#232).
+    agent_logs = state.get("agent_logs", [])
 
     for rc in root_cause_results:
         tc_id = rc.get("tc_id", "unknown")
@@ -2385,6 +2395,7 @@ async def _fix_recommend(state: PipelineState) -> dict:
                     },
                 )
             )
+            agent_logs = agent_logs + [output.metadata.model_dump()]
             fr_list = output.result.get("fix_results") or []
             if isinstance(fr_list, list) and fr_list:
                 fix_results.append(dict(fr_list[0]))
@@ -2399,7 +2410,7 @@ async def _fix_recommend(state: PipelineState) -> dict:
                 "error": f"FixRecommender skip: {type(e).__name__}: {e}",
             })
 
-    return {"fix_results": fix_results}
+    return {"fix_results": fix_results, "agent_logs": agent_logs}
 
 
 async def _report(state: PipelineState) -> dict:

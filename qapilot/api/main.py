@@ -4,12 +4,17 @@
 Created: 2026-05-07
 """
 
+# .env 를 다른 module import 전에 강제 로드 (#232) — db_test_tool.py:20 의
+# module-level `MODULE_URL = os.getenv("QAPILOT_SUT_DB_URL", "")` 같은 eager
+# capture 가 빈 값으로 잡혀 DBTestTool 이 "환경변수 미설정" 에러 내던 격차.
+from dotenv import load_dotenv
+load_dotenv()
+
 import asyncio
 import time
 from contextlib import asynccontextmanager
 
 import structlog
-from dotenv import load_dotenv
 from fastapi import FastAPI, Request
 
 from qapilot.api.agent_router import router as agent_router
@@ -70,9 +75,7 @@ async def _trace_id_middleware(request: Request, call_next):
 
 def create_app() -> FastAPI:
     """FastAPI 앱을 생성한다."""
-    # .env 파일을 시작 시 1회 로드 — verify_internal_token 등 요청 처리 시점에
-    # os.getenv 로 환경변수를 읽는 경로가 있어 반드시 부팅 시 채워줘야 한다.
-    load_dotenv()
+    # load_dotenv() 는 module 최상단에서 이미 호출 (#232) — 여기서는 중복 제거.
     setup_logger()
 
     # DB / S3 pool lazy init 을 startup 에 강제 트리거 — 환경변수 누락이나
