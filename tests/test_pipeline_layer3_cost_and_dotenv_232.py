@@ -167,17 +167,22 @@ def test_main_py_calls_load_dotenv_at_module_top():
     assert main_py.exists()
     content = main_py.read_text(encoding="utf-8")
 
-    # module-level (def 들 전에) load_dotenv() 호출 있어야 함
-    # 단순 검증: 첫 def / class 등장 전 라인에 "load_dotenv()" 포함
+    # module-level (def 들 전에) load_dotenv 호출 있어야 함
+    # 단순 검증: 첫 def / class 등장 전 라인에 "load_dotenv(" 포함 (override=True 인자 허용)
     lines = content.splitlines()
     first_def_idx = next(
         (i for i, line in enumerate(lines) if line.startswith(("def ", "class ", "async def "))),
         len(lines),
     )
     module_level_section = "\n".join(lines[:first_def_idx])
-    assert "load_dotenv()" in module_level_section, (
+    assert "load_dotenv(" in module_level_section, (
         "load_dotenv() 호출이 module 최상단 (첫 def 전) 에 없음. "
         "create_app() 내부에만 있으면 다른 module 의 module-level os.getenv 가 빈 값 캡쳐 (#232)."
+    )
+    # PR #233 후속: override=True 가 있어야 shell stale env 덮어쓰기 (e2e trace `40fce3fa` 격차).
+    assert "load_dotenv(override=True)" in module_level_section, (
+        "load_dotenv(override=True) 필요 — shell 에 빈 값 export 가 있으면 .env 값 덮어쓰지 못함. "
+        "e2e trace `40fce3fa` 의 DBTestTool env 부재 격차 원인."
     )
 
 

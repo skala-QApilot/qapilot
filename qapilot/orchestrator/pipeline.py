@@ -2256,6 +2256,22 @@ async def _cross_check(state: PipelineState) -> dict:
     if ui_failed_tc_ids:
         any_mismatch = True
 
+    # DB / API 검증 부재 (env 부재 / k8s trace 캡쳐 실패 등) 도 식별 — 묵시 PASS 차단.
+    # has_mismatch 는 변경 X (cost 폭증 방지) — cross_check tc_results.status 를
+    # "unverified" 로 분리하여 false PASS 차단 + 리포트에 명시. 사용자가 환경 fix 후
+    # 재실행하면 정상 검증. e2e trace `40fce3fa` 의 DB env 부재로 5/6 TC false PASS 격차.
+    db_unverified_tc_ids = {
+        tc_id for tc_id, r in db_map.items()
+        if not r or (r.get("summary") or "").lower().startswith("dbtest skip")
+    }
+    api_unverified_tc_ids = {
+        tc_id for tc_id, r in api_map.items()
+        if not r or (
+            (r.get("total_calls") or 0) == 0
+            and not (r.get("calls") or [])
+        )
+    }
+
     for tc_id in ui_map.keys():
         ui_result = ui_map.get(tc_id, {})
         api_trace = api_map.get(tc_id, {})
@@ -2285,6 +2301,11 @@ async def _cross_check(state: PipelineState) -> dict:
             if tc_id in ui_failed_tc_ids:
                 cc["has_mismatch"] = True
                 cc.setdefault("ui_failed", True)
+            # DB / API 검증 부재 표시 — has_mismatch 변경 X (root_cause 호출 안 함)
+            if tc_id in db_unverified_tc_ids:
+                cc["db_unverified"] = True
+            if tc_id in api_unverified_tc_ids:
+                cc["api_unverified"] = True
             # RootCauseAgent에 직결되도록 error_code/summary를 cc에 보존
             cc["error_code"] = output.result.get("error_code") or ""
             cc["summary"] = output.result.get("summary") or ""
@@ -2298,20 +2319,41 @@ async def _cross_check(state: PipelineState) -> dict:
                 "mismatched_fields": 0, "mismatches": [],
                 "has_mismatch": tc_id in ui_failed_tc_ids,
                 "ui_failed": tc_id in ui_failed_tc_ids,
+                "db_unverified": tc_id in db_unverified_tc_ids,
+                "api_unverified": tc_id in api_unverified_tc_ids,
                 "error_code": "",
                 "summary": "",
                 "error": f"CrossCheck skip: {type(e).__name__}: {e}",
             })
-            
+
+    # status 도출: has_mismatch → "fail", 검증 부재 → "unverified", 정상 → "pass".
+    # "unverified" 분리는 e2e false PASS 차단의 본질 fix — DB env 부재 또는 API trace
+    # capture 실패 시 묵시 PASS 처리 차단. 사용자가 리포트에서 명시 인식 → 환경 fix.
+    def _derive_cc_status(cc: dict) -> str:
+        if cc.get("has_mismatch"):
+            return "fail"
+        if cc.get("db_unverified") or cc.get("api_unverified"):
+            return "unverified"
+        return "pass"
+
+    # tc_id ("TS-001-TC-05") → ts_id ("TS-001") 도출. upsert_tc_result 는
+    # ts_id 빈 값 시 skip — 격차: cross_check kind tc_results 가 DB 에 0건 저장됐던 원인.
+    # e2e trace `40fce3fa` 확인 (cross_check row 0건). ui/api/db kind 는 _mirror 에서
+    # ts_id 명시 전달이라 정상이지만, cross_check 는 별도 노드라 본 도출 필요.
+    def _derive_ts_id(tc_id_str: str) -> str:
+        parts = (tc_id_str or "").split("-TC-")
+        return parts[0] if len(parts) >= 2 else ""
+
     for cc in cross_check_results:
+        tc_id_str = cc.get("tc_id", "")
         upsert_tc_result(
             run_id=trace_id,
-            ts_id="",
-            tc_id=cc.get("tc_id", ""),
+            ts_id=_derive_ts_id(tc_id_str),
+            tc_id=tc_id_str,
             kind="cross_check",
             payload=cc,
-            status="fail" if cc.get("has_mismatch") else "pass",
-        )    
+            status=_derive_cc_status(cc),
+        )
         
 
     return {
@@ -2347,7 +2389,13 @@ async def _root_cause(state: PipelineState) -> dict:
             output = await agent.run(
                 AgentInput(
                     trace_id=trace_id,
-                    context={},
+                    context={
+                        # SaaS 흐름에서 RootCauseAgent 가 codebase-index 로드하려면
+                        # state.qapilot_dir 가 필요. cfg.project.repo_path 는 None →
+                        # fallback Path(".") = qapilot 디렉토리에서 .qapilot/codebase-index
+                        # 찾기 실패 → `codebase_index_empty` warning. 본 fix.
+                        "qapilot_dir": state.get("qapilot_dir"),
+                    },
                     params={
                         "tc_id": tc_id,
                         "error_code": cc.get("error_code") or "",

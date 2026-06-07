@@ -7,8 +7,10 @@ Created: 2026-05-07
 # .env 를 다른 module import 전에 강제 로드 (#232) — db_test_tool.py:20 의
 # module-level `MODULE_URL = os.getenv("QAPILOT_SUT_DB_URL", "")` 같은 eager
 # capture 가 빈 값으로 잡혀 DBTestTool 이 "환경변수 미설정" 에러 내던 격차.
+# override=True: shell 의 stale env (빈 값 export 등) 가 .env 값을 덮어쓰는
+# 격차를 차단. e2e trace `40fce3fa` 6 TC 모두 DBTestTool fail 의 직접 원인이었음.
 from dotenv import load_dotenv
-load_dotenv()
+load_dotenv(override=True)
 
 import asyncio
 import time

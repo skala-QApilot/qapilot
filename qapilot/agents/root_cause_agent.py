@@ -117,8 +117,13 @@ class RootCauseAgent(BaseAgent):
             error_code, summary, mismatches, runtime_str,
         )
 
-        # codebase-index에서 항상 관련 항목 선별 (코드 컨텍스트의 유일한 소스)
-        code_context_raw = self._load_from_codebase_index(clues, error_code)
+        # codebase-index에서 항상 관련 항목 선별 (코드 컨텍스트의 유일한 소스).
+        # SaaS 흐름은 cfg.project.repo_path 가 None → fallback Path(".") = CWD (qapilot 디렉토리)
+        # 에서 .qapilot/codebase-index 찾기 시도 → 없음 → `codebase_index_empty` warning.
+        # state.qapilot_dir (SaaS temp 또는 CLI 명시) 를 context 로 받아 우선 사용.
+        # e2e trace `40fce3fa` 격차.
+        qapilot_dir = context.get("qapilot_dir") if context else None
+        code_context_raw = self._load_from_codebase_index(clues, error_code, qapilot_dir=qapilot_dir)
 
         # runtime_context 가용성 경고 (tc_id가 지정됐는데 없을 때)
         runtime_missing = tc_id and not runtime_context_raw
@@ -364,13 +369,34 @@ class RootCauseAgent(BaseAgent):
 
     # ── codebase-index 연동 ────────────────────────────────────────────────────
 
-    def _load_from_codebase_index(self, clues: dict[str, Any], error_code: str = "") -> str:
+    def _load_from_codebase_index(
+        self,
+        clues: dict[str, Any],
+        error_code: str = "",
+        qapilot_dir: str | None = None,
+    ) -> str:
         """codebase-index 메타데이터를 로드하고 관련 항목을 선별하여 반환한다.
 
         인덱스가 없거나 모든 파일이 비어 있으면 warning을 남기고 빈 문자열을 반환한다.
+
+        SaaS 흐름에서는 qapilot_dir 가 temp 디렉토리 (pipeline state.qapilot_dir).
+        CodebaseContextLoader 는 base_dir 가 그 root 이면 그 하위의 `.qapilot/codebase-index`
+        를 찾음. SaaS 의 qapilot_dir 는 이미 그 안에 `codebase-index/` 가 직접 들어있어
+        한 단계 깊은 구조 — `base_dir = qapilot_dir.parent` 또는 loader 가 직접 디렉토리
+        명을 받도록 우회. CodebaseContextLoader 의 _INDEX_SUBDIR = ".qapilot/codebase-index"
+        기준이라 qapilot_dir 의 parent 가 root 처럼 동작.
         """
-        repo_path = self._config.project.repo_path
-        base_dir = Path(repo_path) if repo_path else Path(".")
+        if qapilot_dir:
+            qd = Path(qapilot_dir).resolve()
+            # qapilot_dir 명이 ".qapilot" 이면 parent 가 root (CLI 흐름)
+            # qapilot_dir 명이 임의 (SaaS temp) 이면 qapilot_dir 자체가 root 처럼 + .qapilot 가상
+            # 가장 간단: qapilot_dir 의 parent 를 base_dir 로 — 단 qapilot_dir 명이 .qapilot 이거나
+            # 아니거나 모두 동일하게 작동하려면 별도 helper.
+            # 본인은 직접 codebase-index/ 경로를 알므로 loader 우회 + 동등 로직 inline.
+            base_dir = qd if (qd / "codebase-index").is_dir() else qd.parent
+        else:
+            repo_path = self._config.project.repo_path
+            base_dir = Path(repo_path) if repo_path else Path(".")
 
         index = CodebaseContextLoader.load(base_dir=base_dir)
 
