@@ -1047,7 +1047,7 @@ class UITestTool(BaseTool):
 
         if action == "fill":
             await locator.fill(value or "", **kw)
-            # PR #244 native setter — Vue 3 v-model / React controlled input 호환성 (#246).
+            # PR #244 native setter — Vue 3 v-model / React controlled input 호환성.
             try:
                 await locator.evaluate(
                     """(el, v) => {
@@ -1066,12 +1066,26 @@ class UITestTool(BaseTool):
                 await locator.blur(timeout=500)
             except Exception as e:
                 self.logger.warning("ui_fill_setter_failed", error=str(e)[:80])
-            # #248 추가: fill verify — actual input.value 가 expected 와 동일한지 검증.
-            # e2e trace `e48e9028` 후속 진단: 본인 reproduce 정상 (POST 발생) vs e2e
-            # 0건 잔존. 진짜 차이는 fill 의 actual 효과. native setter 가 silent fail
-            # 또는 reactive proxy 가 setter 이후 reset 한다면 input.value 빈 채 → form
-            # submit 시 validation fail. 본 verify 로 actual=expected 보장 + 차이 시
-            # warning + 한 번 더 강제 setter (retry). trace 에 ui_fill_mismatch 로 노출.
+            # #250 본질 fix — Vue/React reactive batched update race 방지.
+            # e2e trace `c430003e` 진단: 본인 reproduce 정상 (POST 201) vs e2e POST
+            # 0건. ui_fill_mismatch warning 등장 안 함 (input.value 채워짐) + ui_
+            # click_submit_attempted 정상 (BUTTON/submit 확정) + spa_mounted=True.
+            # 모든 단순 진단 통과했음에도 form submit 미발생. 본질: Vue 의 v-model
+            # 은 input event 후 next tick (microtask) 에서 reactive update. e2e 의
+            # 6 TC sequential + APITraceTool listener + DBTool 호출 등 추가 부담으로
+            # 후속 click 가 reactive update 완료 전 발생 → form submit 시 reactive
+            # form.email/password 등 빈 채 → required validation fail → POST 0건.
+            # 본 fix: 2 RAF (requestAnimationFrame) 대기로 reactive batched update
+            # commit 보장. 본인 reproduce 와 e2e timing 차이 정합.
+            try:
+                page = locator.page
+                await page.evaluate(
+                    "() => new Promise(r => requestAnimationFrame("
+                    "() => requestAnimationFrame(r)))"
+                )
+            except Exception:
+                pass
+            # fill verify — actual input.value 가 expected 와 동일한지 검증.
             try:
                 actual = await locator.input_value(timeout=500)
                 if (value or "") and actual != (value or ""):
@@ -1088,23 +1102,38 @@ class UITestTool(BaseTool):
             await locator.clear(**kw)
             return
         if action == "click":
-            await locator.click(**kw)
-            # #248 추가: button[type=submit] click 시 form submit event 발동 여부 verify.
-            # 본인 reproduce 정상 (POST 발생) vs e2e POST 0건 잔존. 본 verify 로 actual
-            # form submit event 가 발동했는지 trace 에 노출. ui_click_submit_no_event
-            # warning 가 e2e 에 등장하면 click 이 form chain 정상 trigger 안 함 확정.
+            # #250: click 전 button[type=submit] 인 경우 form 의 reactive state
+            # 가 채워졌는지 사전 검증. fill 의 reactive update race 추가 노출.
             try:
                 tag_type = await locator.evaluate(
                     """el => el ? `${el.tagName}/${el.type || ''}` : ''"""
                 )
                 if isinstance(tag_type, str) and tag_type.startswith("BUTTON/submit"):
+                    # form 안 모든 input.value 검증 — 빈 채면 form submit fail
+                    form_state = await locator.evaluate(
+                        """el => {
+                            const form = el.closest('form');
+                            if (!form) return {form_present: false};
+                            const inputs = Array.from(form.querySelectorAll('input, textarea, select'));
+                            const empty_required = inputs
+                                .filter(i => i.required && !i.value)
+                                .map(i => i.name || i.id || i.getAttribute('data-testid') || 'unnamed');
+                            return {
+                                form_present: true,
+                                total_inputs: inputs.length,
+                                empty_required: empty_required,
+                            };
+                        }"""
+                    )
                     self.logger.info(
                         "ui_click_submit_attempted",
                         selector=step.get("selector"),
                         tag_type=tag_type,
+                        form_state=form_state,
                     )
             except Exception:
                 pass
+            await locator.click(**kw)
             return
         if action == "dblclick":
             await locator.dblclick(**kw)
