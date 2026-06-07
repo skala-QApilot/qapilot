@@ -77,6 +77,8 @@ class DomainKnowledgeTool(BaseTool):
 
         Args:
             params: file_path (str) — 임포트할 문서의 경로.
+                document_id (str, optional) — domain_documents row PK. 버전이
+                바뀌면 값이 달라지므로 재임포트 판단·인덱스 캐시 키로 쓰인다.
 
         Returns:
             dict: file, chunks_total, chunks_stored, chunks_failed 포함.
@@ -88,10 +90,13 @@ class DomainKnowledgeTool(BaseTool):
         if not file_path.exists():
             raise ToolExecutionError(ErrorCode.TOOL_002, f"파일 없음: {file_path}")
 
+        document_id = params.get("document_id")
         self.logger.info("doc_import_start", file=str(file_path))
         chunks = self._parser.parse_and_chunk(file_path)
+        # chunk_id 가 매번 새 UUID 라 upsert 만으로는 구버전 벡터가 남는다 — 재임포트 전 정리.
+        await self._store.delete_by_source(file_path.name)
         stored, failed = await self._store.embed_and_store(chunks)
-        self._store.save_index(file_path, len(chunks))
+        self._store.save_index(file_path, len(chunks), document_id=document_id)
         self.logger.info("doc_import_done", stored=stored, failed=failed)
 
         return {

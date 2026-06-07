@@ -225,6 +225,27 @@ async def test_save_codes_persists_action_mappings(tmp_path: Path, monkeypatch):
     assert result["status"] == "completed"
 
 
+@pytest.mark.asyncio
+async def test_save_codes_incremental_removes_deleted_tc_artifacts(tmp_path: Path):
+    qapilot_dir = tmp_path / ".qapilot"
+    code_dir = qapilot_dir / "generated-code"
+    am_dir = qapilot_dir / "action-mappings"
+    code_dir.mkdir(parents=True, exist_ok=True)
+    am_dir.mkdir(parents=True, exist_ok=True)
+    (code_dir / "TS-001-TC-01.js").write_text("// old", encoding="utf-8")
+    _write_json(am_dir / "TS-001-TC-01.json", {"tc_id": "TS-001-TC-01"})
+
+    result = await P._save_codes(_state(
+        run_options={"deleted_tc_ids": ["TS-001-TC-01"], "incremental": True},
+        trace_id="trace-delete-tc",
+        qapilot_dir=qapilot_dir,
+    ))
+
+    assert result["status"] == "completed"
+    assert not (code_dir / "TS-001-TC-01.js").exists()
+    assert not (am_dir / "TS-001-TC-01.json").exists()
+
+
 def test_action_mapping_from_generated_code_parses_basic_playwright_script():
     code_obj = {
         "tc_id": "TS-001-TC-01",

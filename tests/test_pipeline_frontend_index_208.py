@@ -112,3 +112,19 @@ async def test_load_scenarios_for_codegen_restores_frontend_dom(tmp_path: Path):
 
     assert len(result["frontend_dom"]) == 1
     assert result["frontend_dom"][0]["testid"] == "email"
+
+
+@pytest.mark.asyncio
+async def test_load_scenarios_for_codegen_incremental_empty_ids_does_not_load_all(tmp_path: Path):
+    state = _make_state(tmp_path)
+    state["run_options"] = {"scenario_ids": [], "incremental": True}
+    scenarios_dir = Path(state["qapilot_dir"]) / "scenarios"
+    scenarios_dir.mkdir(parents=True, exist_ok=True)
+    (scenarios_dir / "TS-001.json").write_text(
+        json.dumps({"ts_id": "TS-001", "test_cases": []}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    result = await _load_scenarios_for_codegen(state)  # type: ignore[arg-type]
+
+    assert result["scenarios"] == []

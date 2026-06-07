@@ -1350,6 +1350,18 @@ class ScenarioGeneratorAgent(BaseAgent):
             path = Path(qapilot_dir) / "scenarios" / f"{ts_id}.json"
             if path.exists():
                 return json.loads(path.read_text(encoding="utf-8"))
+            # 디스크 없음 → DB 폴백
+            try:
+                from qapilot.shared.trace_store import load_trace
+                from qapilot.db.scenario_reader import load_latest_scenarios
+                trace = load_trace(self.trace_id) or {}
+                service_id = trace.get("service_id")
+                if service_id:
+                    all_ts = load_latest_scenarios(service_id, scenario_ids=[ts_id])
+                    if all_ts:
+                        return all_ts[0]
+            except Exception:
+                pass
             return None
         return load_scenario(ts_id)
 
@@ -1636,10 +1648,68 @@ class ScenarioGeneratorAgent(BaseAgent):
         filtered = {f: eps for f, eps in router_map.items() if is_meaningful(eps)}
 
         if affected_files:
-            in_scope = {f: eps for f, eps in filtered.items() if f in affected_files}
-            return in_scope or filtered
+            scoped_files = self._resolve_affected_router_files(affected_files, filtered)
+            in_scope = {f: eps for f, eps in filtered.items() if f in scoped_files}
+            return in_scope
 
         return filtered
+
+    def _resolve_affected_router_files(
+        self,
+        affected_files: list[str],
+        router_map: dict[str, list[dict]],
+    ) -> set[str]:
+        """Git diff 파일에서 실제 영향을 받는 라우터 파일 집합을 계산한다.
+
+        직접 라우터 파일이 바뀐 경우만 포함하면 main.py 의 include_router 변경,
+        service/config/helper 변경처럼 라우터가 참조하는 파일 변경을 놓친다. 반대로
+        매칭 실패 시 전체 라우터로 확장하면 변경 범위를 벗어난 시나리오까지 수정된다.
+        따라서 import/call index 로 연결된 라우터만 보수적으로 포함한다.
+        """
+        affected_set = set(affected_files)
+        router_files = set(router_map.keys())
+        scoped = affected_set & router_files
+
+        callgraph: dict[str, list[str]] = self._read_index_json("callgraph.json")  # type: ignore[assignment]
+        functions: list[dict] = self._read_index_json("functions.json")  # type: ignore[assignment]
+
+        affected_stems = {Path(f).stem for f in affected_set}
+        router_stems = {Path(f).stem: f for f in router_files}
+
+        def imports_module(imports: list[str], stem: str) -> bool:
+            pattern = re.compile(rf"(^|\b|\.|/){re.escape(stem)}(\b|\.|/|$)")
+            return any(pattern.search(line) for line in imports or [])
+
+        # main/app 등 진입점 변경: 해당 파일이 import/include 하는 라우터만 포함.
+        for changed in affected_set:
+            imports = callgraph.get(changed, [])
+            for stem, router_file in router_stems.items():
+                if imports_module(imports, stem):
+                    scoped.add(router_file)
+
+        # 라우터가 변경 파일의 모듈을 import 하면 해당 라우터를 포함.
+        for router_file in router_files:
+            imports = callgraph.get(router_file, [])
+            if any(imports_module(imports, stem) for stem in affected_stems):
+                scoped.add(router_file)
+
+        # 라우터 핸들러가 변경 파일에 정의된 helper 함수를 호출하면 해당 라우터를 포함.
+        changed_function_names = {
+            fn.get("name")
+            for fn in functions
+            if fn.get("file") in affected_set and fn.get("name")
+        }
+        if changed_function_names:
+            for router_file in router_files:
+                for fn in functions:
+                    if fn.get("file") != router_file:
+                        continue
+                    calls = set(fn.get("calls") or [])
+                    if calls & changed_function_names:
+                        scoped.add(router_file)
+                        break
+
+        return scoped
 
     def _sort_router_map(self, router_map: dict[str, list[dict]]) -> dict[str, list[dict]]:
         """_ROUTER_PRIORITY 순서로 라우터맵을 정렬한다. 목록에 없는 라우터는 뒤에 붙는다."""

@@ -201,6 +201,8 @@ async def code_generation(request: Request, body: CodeGenerationRequestBody) -> 
         "trigger": None,
         "user_input": None,
         "scenario_ids": _optional_list(body_dict, "scenario_ids"),
+        "deleted_tc_ids": _optional_list(body_dict, "deleted_tc_ids"),
+        "incremental": bool(body_dict.get("incremental")),
         "filter": None,
         "tags": None,
     }
@@ -388,6 +390,47 @@ async def reindex_scenarios(request: Request) -> Any:
     except Exception as e:
         logger.warning("scenario_reindex_failed", error=str(e))
         return fail("AGENT_API_500", f"reindex 실패: {e}")
+
+
+@router.post("/scenarios/restore-code")
+async def restore_code_snapshot(request: Request) -> Any:
+    """버전 복원 시 스냅샷 시점의 generated_code 를 디스크에 복구한다.
+
+    Body: { "service_id": "...", "snapshot_time": "2026-06-05T10:30:00Z", "qapilot_dir": "..." }
+
+    generated_code 테이블에서 snapshot_time 이전 최신 코드를 TC별로 찾아
+    .qapilot/generated-code/{tc_id}.js 로 덮어씀.
+    S3 disabled 또는 코드 없으면 해당 TC 는 skip (graceful).
+    """
+    body = await request.json()
+    service_id = body.get("service_id", "")
+    snapshot_time = body.get("snapshot_time", "")
+    qapilot_dir = body.get("qapilot_dir", "")
+
+    if not service_id or not snapshot_time:
+        return fail("AGENT_API_003", "service_id 와 snapshot_time 이 필요합니다.")
+
+    try:
+        from pathlib import Path
+        from qapilot.db.code_reader import load_code_at_snapshot
+
+        codes = load_code_at_snapshot(service_id=service_id, snapshot_time=snapshot_time)
+        restored = 0
+        if qapilot_dir:
+            code_dir = Path(qapilot_dir) / "generated-code"
+            code_dir.mkdir(parents=True, exist_ok=True)
+            for item in codes:
+                tc_id = item.get("tc_id")
+                code_text = item.get("code", "")
+                if tc_id and code_text:
+                    (code_dir / f"{tc_id}.js").write_text(code_text, encoding="utf-8")
+                    restored += 1
+
+        logger.info("code_snapshot_restored", service_id=service_id, restored=restored, snapshot_time=snapshot_time)
+        return ok({"restored": restored, "total": len(codes)})
+    except Exception as e:
+        logger.warning("code_snapshot_restore_failed", error=str(e))
+        return fail("AGENT_API_500", f"코드 복원 실패: {e}")
 
 
 @router.post("/runs/{trace_id}/stop")
