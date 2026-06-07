@@ -282,26 +282,268 @@ def test_normalize_assert_selector_falls_back_to_label_when_no_testid(mock_llm_c
     assert result is None  # text 정확 매치이므로 원본 유지
 
 
-def test_normalize_assert_selector_called_only_for_assert_actions(mock_llm_client):
-    """_normalize_selector_fields 는 assert action 에서만 인덱스 정규화 호출."""
+def test_normalize_selector_fields_preserves_raw_intent_before_frontend_resolution(mock_llm_client):
+    """raw selector 는 유지하고, 실제 보정은 후단 frontend resolver 가 담당한다."""
     agent = _make_agent(mock_llm_client)
     agent._frontend_dom_index = [
         {"tag": "button", "text": "환영합니다", "testid": "welcome-banner",
-         "placeholder": "", "label": "", "name": "", "id": "", "file": "x.vue"}
+         "placeholder": "", "label": "", "name": "", "id": "", "file": "x.vue"},
+        {"tag": "input", "text": "", "testid": "email", "placeholder": "example@email.com",
+         "label": "이메일", "name": "", "id": "email", "file": "Signup.vue"},
     ]
-    # fill action — 정규화 적용 안 됨
-    sel, st = agent._normalize_selector_fields(
-        "fill", "환영", "text", {"value": "x"}, "TC-1", 1
-    )
-    assert sel == "환영"
-    assert st == "text"
 
-    # assert action — 정규화 적용
+    # fill action — selector raw intent 는 유지
+    sel, st = agent._normalize_selector_fields(
+        "fill", "이메일을 입력하세요", "placeholder", {"value": "x"}, "TC-1", 1
+    )
+    assert sel == "이메일을 입력하세요"
+    assert st == "placeholder"
+
+    # assert action — raw intent 유지
     sel2, st2 = agent._normalize_selector_fields(
         "assert", "환영", "text", {"expected": "x"}, "TC-1", 2
     )
-    assert sel2 == "welcome-banner"
-    assert st2 == "testid"
+    assert sel2 == "환영"
+    assert st2 == "text"
+
+
+def test_normalize_click_selector_fuzzy_match_to_testid(mock_llm_client):
+    """click step 도 환각 text selector 를 testid 로 정규화한다."""
+    agent = _make_agent(mock_llm_client)
+    agent._frontend_dom_index = [
+        {"tag": "button", "text": "가입하기", "placeholder": "", "label": "",
+         "testid": "signup-submit", "name": "", "id": "", "file": "Signup.vue"}
+    ]
+
+    result = agent._normalize_selector_via_index("click", "회원가입", "text", "TC-1", 1)
+    assert result == ("signup-submit", "testid")
+
+
+def test_resolve_mapping_with_frontend_blocks_value_leak_and_maps_by_tc_values(mock_llm_client):
+    """selector/value 누수는 버리고 tc.values + frontend index 로만 resolve 한다."""
+    agent = _make_agent(mock_llm_client)
+    frontend_dom = [
+        {
+            "tag": "input",
+            "text": "",
+            "placeholder": "example@email.com",
+            "label": "이메일",
+            "testid": "email",
+            "name": "",
+            "id": "email",
+            "file": "Signup.vue",
+            "page": "Signup",
+            "route": "/signup",
+            "actionable": True,
+            "control_type": "form_input",
+        },
+        {
+            "tag": "input",
+            "text": "",
+            "placeholder": "8자 이상",
+            "label": "비밀번호",
+            "testid": "password",
+            "name": "",
+            "id": "password",
+            "file": "Signup.vue",
+            "page": "Signup",
+            "route": "/signup",
+            "actionable": True,
+            "control_type": "form_input",
+        },
+        {
+            "tag": "button",
+            "text": "가입하기",
+            "placeholder": "",
+            "label": "",
+            "testid": "signup-submit",
+            "name": "",
+            "id": "",
+            "file": "Signup.vue",
+            "page": "Signup",
+            "route": "/signup",
+            "actionable": True,
+            "control_type": "submit",
+        },
+    ]
+    tc = {
+        "tc_id": "TS-001-TC-01",
+        "name": "정상 회원가입",
+        "given": "사용자가 유효한 이메일, 비밀번호를 제공하고",
+        "when": "회원가입 요청을 하면",
+        "then": "회원가입이 성공적으로 완료된다",
+        "values": [
+            {"field": "email", "value": "newuser@example.com"},
+            {"field": "password", "value": "SecurePass123!"},
+        ],
+    }
+    mapping = {
+        "tc_id": "TS-001-TC-01",
+        "steps": [
+            {"step_no": 1, "action": "fill", "selector": "newuser@example.com", "selector_type": "text", "value": "newuser@example.com", "expected": None, "api_endpoint": None},
+            {"step_no": 2, "action": "fill", "selector": "SecurePass123!", "selector_type": "text", "value": "SecurePass123!", "expected": None, "api_endpoint": None},
+            {"step_no": 3, "action": "click", "selector": "click", "selector_type": "text", "value": None, "expected": None, "api_endpoint": None},
+        ],
+        "selector_confidence": 0.8,
+    }
+
+    resolved = agent._resolve_mapping_with_frontend(mapping, tc, frontend_dom)
+    assert resolved["steps"][0]["action"] == "navigate"
+    assert resolved["steps"][0]["value"] == "/signup"
+    assert resolved["steps"][1]["selector_type"] == "testid"
+    assert resolved["steps"][1]["selector"] == "email"
+    assert resolved["steps"][1]["target_name"] == "email"
+    assert resolved["steps"][2]["selector_type"] == "testid"
+    assert resolved["steps"][2]["selector"] == "password"
+    assert resolved["steps"][3]["selector_type"] == "testid"
+    assert resolved["steps"][3]["selector"] == "signup-submit"
+
+
+def test_resolve_mapping_with_frontend_prefers_success_feedback_for_assert(mock_llm_client):
+    agent = _make_agent(mock_llm_client)
+    frontend_dom = [
+        {
+            "tag": "label",
+            "text": "법정대리인의 동의를 받았습니다. (만 19세 미만 가입 시 필수 — 이용약관 제5조 4항)",
+            "placeholder": "",
+            "label": "",
+            "testid": "",
+            "name": "",
+            "id": "",
+            "file": "Signup.vue",
+            "page": "Signup",
+            "route": "/signup",
+            "actionable": False,
+            "control_type": "label",
+        },
+        {
+            "tag": "div",
+            "text": "가입이 완료되었습니다! 로그인 페이지로 이동합니다.",
+            "placeholder": "",
+            "label": "",
+            "testid": "signup-success-toast",
+            "name": "",
+            "id": "",
+            "file": "Signup.vue",
+            "page": "Signup",
+            "route": "/signup",
+            "actionable": False,
+            "control_type": "feedback_success",
+        },
+    ]
+    tc = {
+        "tc_id": "TS-001-TC-01",
+        "name": "정상 회원가입",
+        "given": "유효한 이메일, 비밀번호, 이름, 생년월일을 제공하고",
+        "when": "회원가입 요청을 하면",
+        "then": "회원가입이 성공적으로 완료된다",
+        "values": [],
+    }
+    mapping = {
+        "tc_id": "TS-001-TC-01",
+        "steps": [
+            {"step_no": 1, "action": "assert", "selector": None, "selector_type": None, "value": None, "expected": "회원가입이 성공적으로 완료된다", "api_endpoint": None}
+        ],
+        "selector_confidence": 0.8,
+    }
+
+    resolved = agent._resolve_mapping_with_frontend(mapping, tc, frontend_dom)
+    assert resolved["steps"][0]["action"] == "navigate"
+    assert resolved["steps"][0]["value"] == "/signup"
+    assert resolved["steps"][1]["selector_type"] == "testid"
+    assert resolved["steps"][1]["selector"] == "signup-success-toast"
+
+
+def test_resolve_mapping_with_frontend_prepends_navigate_from_route_hint(mock_llm_client):
+    agent = _make_agent(mock_llm_client)
+    frontend_dom = [
+        {
+            "tag": "input",
+            "text": "",
+            "placeholder": "example@email.com",
+            "label": "이메일",
+            "testid": "email",
+            "name": "",
+            "id": "email",
+            "file": "Signup.vue",
+            "page": "Signup",
+            "route": "/signup",
+            "actionable": True,
+            "control_type": "form_input",
+        },
+        {
+            "tag": "button",
+            "text": "가입하기",
+            "placeholder": "",
+            "label": "",
+            "testid": "signup-submit",
+            "name": "",
+            "id": "",
+            "file": "Signup.vue",
+            "page": "Signup",
+            "route": "/signup",
+            "actionable": True,
+            "control_type": "submit",
+        },
+    ]
+    tc = {
+        "tc_id": "TS-001-TC-01",
+        "name": "정상 회원가입",
+        "given": "유효한 이메일, 비밀번호, 이름, 생년월일을 제공하고",
+        "when": "회원가입 요청을 하면",
+        "then": "회원가입이 성공적으로 완료된다",
+        "values": [
+            {"field": "email", "value": "newuser@example.com"},
+        ],
+    }
+    mapping = {
+        "tc_id": "TS-001-TC-01",
+        "steps": [
+            {
+                "step_no": 1,
+                "action": "fill",
+                "selector": None,
+                "selector_type": None,
+                "value": "newuser@example.com",
+                "expected": None,
+                "api_endpoint": None,
+                "target_name": "이메일",
+                "target_kind": "field",
+            },
+            {
+                "step_no": 2,
+                "action": "click",
+                "selector": None,
+                "selector_type": None,
+                "value": None,
+                "expected": None,
+                "api_endpoint": "POST /api/auth/signup",
+                "target_kind": "submit",
+            },
+        ],
+        "selector_confidence": 0.8,
+    }
+
+    resolved = agent._resolve_mapping_with_frontend(mapping, tc, frontend_dom)
+    assert resolved["steps"][0]["action"] == "navigate"
+    assert resolved["steps"][0]["value"] == "/signup"
+    assert resolved["steps"][1]["action"] == "fill"
+    assert resolved["steps"][1]["step_no"] == 2
+    assert resolved["steps"][2]["action"] == "click"
+    assert resolved["steps"][2]["step_no"] == 3
+
+
+def test_normalize_click_selector_button_semantics_to_submit_testid(mock_llm_client):
+    """버튼 의미 + control_type 보너스로 '회원가입 버튼' -> submit testid 정규화."""
+    agent = _make_agent(mock_llm_client)
+    agent._frontend_dom_index = [
+        {"tag": "button", "text": "", "placeholder": "", "label": "",
+         "testid": "signup-submit", "name": "", "id": "", "file": "Signup.vue",
+         "page": "Signup", "route": "/signup", "control_type": "submit"},
+    ]
+
+    result = agent._normalize_selector_via_index("click", "회원가입 버튼", "text", "TC-1", 1)
+    assert result == ("signup-submit", "testid")
 
 
 def test_normalize_assert_selector_substring_bonus_breaks_threshold(mock_llm_client):

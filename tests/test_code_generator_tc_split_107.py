@@ -26,7 +26,7 @@ def _make_agent(mock_llm_client: MagicMock) -> CodeGeneratorAgent:
     agent.llm = mock_llm_client
     agent.prompts = MagicMock()
     agent.prompts.system = MagicMock(return_value="SYSTEM")
-    agent.prompts.render = MagicMock(side_effect=lambda **kw: f"USER<{kw.get('action_mappings','')}>")
+    agent.prompts.render = MagicMock(side_effect=lambda **kw: f"USER<{kw.get('action_mappings','')}|frontend={kw.get('frontend_dom','')[:80]}>")
     agent.logger = MagicMock()
     agent.with_correction_hint = MagicMock(side_effect=lambda p, e: p)
 
@@ -76,6 +76,301 @@ def test_tc_index_slices_single_tc_per_entry():
 
 def test_tc_index_empty_when_no_scenarios():
     assert _build_tc_to_scenario_index([]) == {}
+
+
+def test_normalize_mapping_with_frontend_index_prefers_testid_and_label(mock_llm_client):
+    agent = _make_agent(mock_llm_client)
+    frontend_dom = [
+        {
+            "tag": "input",
+            "text": "",
+            "placeholder": "example@email.com",
+            "label": "이메일",
+            "testid": "email",
+            "id": "email",
+            "name": "",
+            "file": "Signup.vue",
+        },
+        {
+            "tag": "button",
+            "text": "가입하기",
+            "placeholder": "",
+            "label": "",
+            "testid": "signup-submit",
+            "id": "",
+            "name": "",
+            "file": "Signup.vue",
+        },
+    ]
+    mapping = {
+        "tc_id": "TS-001-TC-01",
+        "steps": [
+            {"step_no": 1, "action": "fill", "selector": "이메일", "selector_type": "text", "value": "a", "expected": None},
+            {"step_no": 2, "action": "click", "selector": "가입하기", "selector_type": "text", "value": None, "expected": None},
+        ],
+    }
+
+    normalized = agent._normalize_mapping_with_frontend_index(mapping, frontend_dom)
+    assert normalized["steps"][0]["selector_type"] == "testid"
+    assert normalized["steps"][0]["selector"] == "email"
+    assert normalized["steps"][1]["selector_type"] == "text"
+    assert normalized["steps"][1]["selector"] == "가입하기"
+
+
+def test_render_generated_code_uses_normalized_selectors(mock_llm_client):
+    agent = _make_agent(mock_llm_client)
+    mapping = {
+        "tc_id": "TS-001-TC-01",
+        "steps": [
+            {"step_no": 1, "action": "navigate", "selector": None, "selector_type": None, "value": "/signup", "expected": None},
+            {"step_no": 2, "action": "fill", "selector": "email", "selector_type": "testid", "value": "newuser@example.com", "expected": None},
+            {"step_no": 3, "action": "fill", "selector": "password", "selector_type": "testid", "value": "plaintext", "expected": None},
+            {"step_no": 4, "action": "fill", "selector": "이름", "selector_type": "label", "value": "John Doe", "expected": None},
+            {"step_no": 5, "action": "click", "selector": "signup-submit", "selector_type": "testid", "value": None, "expected": None},
+            {"step_no": 6, "action": "assert", "selector": "가입이 완료되었습니다! 로그인 페이지로 이동합니다.", "selector_type": "text", "value": None, "expected": None},
+        ],
+    }
+    scenario = {
+        "ts_id": "TS-001",
+        "test_cases": [{
+            "tc_id": "TS-001-TC-01",
+            "name": "정상 회원가입",
+            "given": "유효한 이메일, 비밀번호, 이름, 생년월일을 제공한 상태에서",
+            "when": "회원가입 요청을 하면",
+            "then": "회원가입이 성공적으로 완료된다",
+        }],
+    }
+
+    code = agent._render_generated_code(mapping, scenario)
+    assert code is not None
+    assert "page.getByTestId(\"email\").fill(\"newuser@example.com\")" in code
+    assert "page.getByTestId(\"password\").fill(process.env.E2E_USER_PASSWORD)" in code
+    assert "page.getByLabel(\"이름\").fill(\"John Doe\")" in code
+    assert "page.getByTestId(\"signup-submit\").click()" in code
+    assert "page.getByPlaceholder(\"이메일을 입력하세요\")" not in code
+    assert "page.getByText(\"회원가입\").click()" not in code
+
+
+def test_normalize_mapping_with_target_hints_without_selector(mock_llm_client):
+    agent = _make_agent(mock_llm_client)
+    frontend_dom = [
+        {
+            "tag": "input",
+            "text": "",
+            "placeholder": "example@email.com",
+            "label": "이메일",
+            "testid": "email",
+            "id": "email",
+            "name": "",
+            "file": "Signup.vue",
+            "page": "Signup",
+            "route": "/signup",
+            "control_type": "form_input",
+        },
+        {
+            "tag": "button",
+            "text": "가입하기",
+            "placeholder": "",
+            "label": "",
+            "testid": "signup-submit",
+            "id": "",
+            "name": "",
+            "file": "Signup.vue",
+            "page": "Signup",
+            "route": "/signup",
+            "control_type": "submit",
+        },
+    ]
+    mapping = {
+        "tc_id": "TS-001-TC-01",
+        "steps": [
+            {
+                "step_no": 1,
+                "action": "navigate",
+                "selector": None,
+                "selector_type": None,
+                "value": "/signup",
+                "expected": None,
+            },
+            {
+                "step_no": 2,
+                "action": "fill",
+                "selector": None,
+                "selector_type": None,
+                "target_name": "email",
+                "target_kind": "field",
+                "value": "newuser@example.com",
+                "expected": None,
+            },
+            {
+                "step_no": 3,
+                "action": "click",
+                "selector": None,
+                "selector_type": None,
+                "target_kind": "submit",
+                "value": None,
+                "expected": None,
+            },
+        ],
+    }
+
+    normalized = agent._normalize_mapping_with_frontend_index(mapping, frontend_dom)
+    assert normalized["steps"][1]["selector_type"] == "testid"
+    assert normalized["steps"][1]["selector"] == "email"
+    assert normalized["steps"][2]["selector_type"] == "testid"
+    assert normalized["steps"][2]["selector"] == "signup-submit"
+
+
+def test_normalize_mapping_preserves_existing_valid_selector(mock_llm_client):
+    agent = _make_agent(mock_llm_client)
+    frontend_dom = [
+        {
+            "tag": "button",
+            "text": "로그인",
+            "placeholder": "",
+            "label": "",
+            "testid": "login-submit",
+            "id": "",
+            "name": "",
+            "file": "Login.vue",
+            "page": "Login",
+            "route": "/login",
+            "control_type": "submit",
+        },
+        {
+            "tag": "button",
+            "text": "가입하기",
+            "placeholder": "",
+            "label": "",
+            "testid": "signup-submit",
+            "id": "",
+            "name": "",
+            "file": "Signup.vue",
+            "page": "Signup",
+            "route": "/signup",
+            "control_type": "submit",
+        },
+    ]
+    mapping = {
+        "tc_id": "TS-001-TC-01",
+        "steps": [
+            {
+                "step_no": 1,
+                "action": "navigate",
+                "selector": None,
+                "selector_type": None,
+                "value": "/signup",
+                "expected": None,
+            },
+            {
+                "step_no": 2,
+                "action": "click",
+                "selector": "signup-submit",
+                "selector_type": "testid",
+                "target_kind": "submit",
+                "value": None,
+                "expected": None,
+            },
+        ],
+    }
+
+    normalized = agent._normalize_mapping_with_frontend_index(mapping, frontend_dom)
+    assert normalized["steps"][1]["selector_type"] == "testid"
+    assert normalized["steps"][1]["selector"] == "signup-submit"
+
+
+def test_normalize_mapping_with_route_and_button_semantics_prefers_signup_submit(mock_llm_client):
+    agent = _make_agent(mock_llm_client)
+    frontend_dom = [
+        {
+            "tag": "input",
+            "text": "",
+            "placeholder": "example@email.com",
+            "label": "이메일",
+            "testid": "email",
+            "id": "email",
+            "name": "",
+            "file": "system-under-test/frontend/src/pages/Login.vue",
+            "page": "Login",
+            "route": "/login",
+            "control_type": "form_input",
+        },
+        {
+            "tag": "button",
+            "text": "가입하기",
+            "placeholder": "",
+            "label": "",
+            "testid": "signup-submit",
+            "id": "",
+            "name": "",
+            "file": "system-under-test/frontend/src/pages/Signup.vue",
+            "page": "Signup",
+            "route": "/signup",
+            "control_type": "submit",
+        },
+    ]
+    mapping = {
+        "tc_id": "TS-001-TC-01",
+        "steps": [
+            {"step_no": 1, "action": "navigate", "selector": None, "selector_type": None, "value": "/signup", "expected": None},
+            {"step_no": 2, "action": "click", "selector": "회원가입 버튼", "selector_type": "text", "value": None, "expected": None},
+        ],
+    }
+
+    normalized = agent._normalize_mapping_with_frontend_index(mapping, frontend_dom)
+    assert normalized["steps"][1]["selector_type"] == "testid"
+    assert normalized["steps"][1]["selector"] == "signup-submit"
+
+
+@pytest.mark.asyncio
+async def test_execute_prefers_deterministic_render_for_mapped_steps(mock_llm_client):
+    agent = _make_agent(mock_llm_client)
+    agent.llm.chat = AsyncMock(side_effect=AssertionError("LLM should not be called for mapped steps"))
+    mapping = {
+        "tc_id": "TS-001-TC-01",
+        "steps": [
+            {"step_no": 1, "action": "navigate", "selector": None, "selector_type": None, "value": "/signup", "expected": None},
+            {"step_no": 2, "action": "fill", "selector": "email", "selector_type": "testid", "value": "newuser@example.com", "expected": None},
+            {"step_no": 3, "action": "click", "selector": "signup-submit", "selector_type": "testid", "value": None, "expected": None},
+        ],
+    }
+    scenarios = [{
+        "ts_id": "TS-001",
+        "test_cases": [{"tc_id": "TS-001-TC-01", "name": "정상 회원가입"}],
+    }]
+
+    result = await agent._execute({"action_mappings": [mapping], "scenarios": scenarios}, {})
+    code = result.result["generated_codes"][0]["code"]
+    assert "page.getByTestId(\"email\").fill(\"newuser@example.com\")" in code
+    assert "page.getByTestId(\"signup-submit\").click()" in code
+
+
+@pytest.mark.asyncio
+async def test_execute_does_not_reload_or_remap_frontend_index(mock_llm_client):
+    agent = _make_agent(mock_llm_client)
+    agent.llm.chat = AsyncMock(side_effect=AssertionError("LLM should not be called for mapped steps"))
+    mapping = {
+        "tc_id": "TS-001-TC-01",
+        "steps": [
+            {"step_no": 1, "action": "navigate", "selector": None, "selector_type": None, "value": "/signup", "expected": None},
+            {"step_no": 2, "action": "click", "selector": "signup-submit", "selector_type": "testid", "value": None, "expected": None, "target_kind": "submit"},
+        ],
+    }
+    scenarios = [{
+        "ts_id": "TS-001",
+        "test_cases": [{"tc_id": "TS-001-TC-01", "name": "정상 회원가입"}],
+    }]
+
+    with patch.object(agent, "_load_frontend_dom", side_effect=AssertionError("frontend_dom should not be loaded")), \
+         patch.object(agent, "_normalize_mapping_with_frontend_index", side_effect=AssertionError("mapping should not be remapped")):
+        result = await agent._execute(
+            {"action_mappings": [mapping], "scenarios": scenarios, "frontend_dom": [{"testid": "login-submit"}]},
+            {},
+        )
+
+    code = result.result["generated_codes"][0]["code"]
+    assert "page.goto(\"/signup\")" in code
+    assert "page.getByTestId(\"signup-submit\").click()" in code
 
 
 # ── _execute graceful 동작 ─────────────────────────────────────────────────
@@ -233,6 +528,7 @@ async def test_execute_passes_scenario_slice_to_prompt(mock_llm_client):
     # 호출별 TC id 매칭
     tc_ids_in_calls = [s[0]["test_cases"][0]["tc_id"] for s in rendered_scenarios]
     assert sorted(tc_ids_in_calls) == ["TC-A", "TC-B"]
+    assert all("frontend_dom" in c.kwargs for c in calls)
 
 
 # ── 이슈 #140: per-TC LLMClient 분리 검증 ─────────────────────────────────

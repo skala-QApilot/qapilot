@@ -74,6 +74,23 @@ def test_load_frontend_dom_returns_empty_when_no_source(mock_llm_client, tmp_pat
     assert result == []
 
 
+def test_load_frontend_dom_from_qapilot_dir_runtime_cache(mock_llm_client, tmp_path: Path):
+    """context.qapilot_dir 우선 fallback — 서비스별 runtime cache 경로 사용."""
+    qapilot_dir = tmp_path / ".qapilot" / "svc-a"
+    (qapilot_dir / "codebase-index").mkdir(parents=True)
+    (qapilot_dir / "codebase-index" / "frontend.json").write_text(
+        json.dumps({"version": 1, "element_count": 1, "elements": [
+            {"tag": "button", "text": "가입하기", "testid": "signup-submit", "file": "Signup.vue"}
+        ]}),
+        encoding="utf-8",
+    )
+
+    agent = _make_agent(mock_llm_client)
+    result = agent._load_frontend_dom({"qapilot_dir": str(qapilot_dir)})
+    assert len(result) == 1
+    assert result[0]["testid"] == "signup-submit"
+
+
 # ── _format_frontend_dom ────────────────────────────────────────────────────
 
 
@@ -136,6 +153,52 @@ def test_format_frontend_dom_skips_empty_element(mock_llm_client):
     # 핵심: text="확인" 만 검증
 
 
+def test_select_frontend_candidates_prefers_signup_page_for_signup_scenario(mock_llm_client):
+    agent = _make_agent(mock_llm_client)
+    batch = [{
+        "ts_id": "TS-001",
+        "test_cases": [{
+            "tc_id": "TS-001-TC-01",
+            "name": "정상 회원가입",
+            "given": "유효한 이메일, 비밀번호, 이름, 생년월일을 제공하고",
+            "when": "회원가입 요청을 하면",
+            "then": "회원가입이 성공적으로 완료된다",
+        }],
+    }]
+    frontend_dom = [
+        {
+            "tag": "input",
+            "text": "",
+            "placeholder": "example@email.com",
+            "label": "이메일",
+            "testid": "email",
+            "name": "",
+            "id": "email",
+            "file": "system-under-test/frontend/src/pages/Login.vue",
+            "page": "Login",
+            "route": "/login",
+            "control_type": "form_input",
+        },
+        {
+            "tag": "button",
+            "text": "가입하기",
+            "placeholder": "",
+            "label": "",
+            "testid": "signup-submit",
+            "name": "",
+            "id": "",
+            "file": "system-under-test/frontend/src/pages/Signup.vue",
+            "page": "Signup",
+            "route": "/signup",
+            "control_type": "submit",
+        },
+    ]
+
+    candidates = agent._select_frontend_candidates(batch, frontend_dom)
+    assert any(el.get("testid") == "signup-submit" for el in candidates)
+    assert all("Signup.vue" in str(el.get("file") or "") for el in candidates)
+
+
 # ── _call_batch frontend_dom 전달 ──────────────────────────────────────────
 
 
@@ -146,7 +209,8 @@ async def test_call_batch_passes_frontend_dom_to_prompt_render(mock_llm_client):
     batch = [{"ts_id": "TS-1", "test_cases": []}]
     endpoints = [{"method": "POST", "path": "/login"}]
     frontend_dom = [{"tag": "input", "placeholder": "이메일", "file": "Login.vue",
-                     "text": "", "label": "", "testid": "", "name": "", "id": ""}]
+                     "text": "", "label": "", "testid": "", "name": "", "id": "",
+                     "page": "Login", "route": "/login", "control_type": "form_input"}]
 
     await agent._call_batch(batch, endpoints, frontend_dom, None)
 
@@ -172,7 +236,8 @@ async def test_execute_loads_frontend_dom_from_context(mock_llm_client, tmp_path
         "scenarios": scenarios,
         "scan_result": None,
         "frontend_dom": [{"tag": "label", "text": "이메일", "file": "Login.vue",
-                          "placeholder": "", "testid": "", "label": "", "name": "", "id": ""}],
+                          "placeholder": "", "testid": "", "label": "", "name": "", "id": "",
+                          "page": "Login", "route": "/login", "control_type": "label"}],
     }
 
     await agent._execute(context, {}, None)

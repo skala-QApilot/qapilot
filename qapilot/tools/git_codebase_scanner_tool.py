@@ -29,6 +29,7 @@ from tree_sitter import Language, Node, Parser
 from qapilot.shared.errors import ErrorCode, ToolExecutionError
 from qapilot.shared.schemas import FileInfo, GitDiff, ScanResult
 from qapilot.tools.base_tool import BaseTool
+from qapilot.tools.frontend_dom_scanner import scan_frontend_files
 
 # ── 상수 ──────────────────────────────────────────────────────────────────────
 
@@ -51,6 +52,7 @@ _CONFIG_FILES = frozenset({
 _SENSITIVE_KEYS = frozenset({"password", "secret", "key", "token", "credential"})
 _LANG_MAP: dict[str, str] = {
     ".py": "python",
+    ".vue": "vue",
     ".ts": "typescript", ".tsx": "typescript",
     ".js": "javascript", ".jsx": "javascript",
     ".java": "java",
@@ -422,6 +424,7 @@ class GitCodebaseScannerTool(BaseTool):
         )
 
         file_infos_all: list[FileInfo] = []
+        frontend_elements_all: list[dict] = []
         git_diffs: list[GitDiff] = []
         languages: list[str] = []
         frameworks: list[str] = []
@@ -440,6 +443,7 @@ class GitCodebaseScannerTool(BaseTool):
                 skipped_count += 1
                 continue
             file_infos_all.extend(result["file_infos"])
+            frontend_elements_all.extend(result.get("frontend_elements") or [])
             if result["git_diff"]:
                 git_diffs.append(result["git_diff"])
             languages.append(f"{repo['role']}:{result['language']}")
@@ -458,6 +462,7 @@ class GitCodebaseScannerTool(BaseTool):
             "language": ",".join(languages),
             "endpoint_count": sum(len(fi["endpoints"]) for fi in file_infos_all),
         }
+        scan_result["frontend_elements"] = frontend_elements_all
         scan_status = (
             "incremental"
             if trigger in ("code_change", "natural_lang") and last_commit_hash
@@ -548,6 +553,8 @@ class GitCodebaseScannerTool(BaseTool):
         )
 
         file_infos: list[FileInfo] = []
+        frontend_sources: list[tuple[str, str]] = []
+        frontend_source_count = 0
         for file_path in files_to_scan:
             try:
                 content = await adapter.get_file_content(file_path, branch)
@@ -556,6 +563,9 @@ class GitCodebaseScannerTool(BaseTool):
                 continue
             file_lang = _LANG_MAP.get(PurePosixPath(file_path).suffix.lower(), "unknown")
             prefixed_path = f"{role}/{file_path}"
+            if PurePosixPath(file_path).suffix.lower() in {".vue", ".tsx", ".jsx"}:
+                frontend_source_count += 1
+            frontend_sources.append((prefixed_path, content.decode("utf-8", errors="replace")))
             fi = self._parse_file_from_content(prefixed_path, file_lang, content)
             file_infos.append(fi)
 
@@ -573,11 +583,20 @@ class GitCodebaseScannerTool(BaseTool):
             language=language,
             framework=framework,
         )
+        frontend_elements = scan_frontend_files(frontend_sources)
+        if frontend_source_count > 0 and not frontend_elements:
+            self.logger.warning(
+                "frontend_elements_empty_after_git_scan",
+                role=role,
+                frontend_source_count=frontend_source_count,
+                scanned_file_count=len(file_infos),
+            )
         return {
             "file_infos": file_infos,
             "git_diff": git_diff,
             "language": language,
             "framework": framework,
+            "frontend_elements": frontend_elements,
         }
 
     @staticmethod

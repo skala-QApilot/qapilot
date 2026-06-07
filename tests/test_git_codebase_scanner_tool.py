@@ -300,6 +300,66 @@ async def test_scan_single_repo_file_fetch_failure_skipped(tool):
     assert result["file_infos"][0]["path"] == "svc/ok.py"
 
 
+async def test_scan_single_repo_collects_frontend_elements(tool):
+    adapter = _make_adapter(file_list=[
+        {"path": "frontend/src/pages/Signup.vue", "type": "blob"},
+        {"path": "package.json", "type": "blob"},
+    ])
+    adapter.get_file_content.side_effect = [
+        """
+        <template>
+          <label for="email">이메일</label>
+          <input id="email" data-testid="email" placeholder="example@email.com" />
+          <button data-testid="signup-submit">가입하기</button>
+        </template>
+        """.encode("utf-8"),
+        b'{"dependencies":{"vue":"^3.0.0"}}',
+    ]
+    with patch("qapilot.tools.git_codebase_scanner_tool._resolve_adapter", return_value=adapter), \
+         patch.object(tool, "_detect_language_framework", new=AsyncMock(return_value=("typescript", "vue"))), \
+         patch.object(tool, "_collect_files", new=AsyncMock(return_value=["frontend/src/pages/Signup.vue", "package.json"])), \
+         patch.object(tool, "_extract_git_diff", new=AsyncMock(return_value=None)):
+
+        result = await tool._scan_single_repo(
+            {"repo_url": "https://github.com/org/repo", "token": "tok", "branch": "main", "role": "frontend"},
+            "init",
+            None,
+        )
+
+    assert any(e.get("testid") == "email" for e in result["frontend_elements"])
+    assert any(e.get("testid") == "signup-submit" for e in result["frontend_elements"])
+
+
+async def test_scan_single_repo_warns_when_frontend_sources_have_no_elements(tool):
+    adapter = _make_adapter(file_list=[
+        {"path": "frontend/src/pages/Empty.vue", "type": "blob"},
+    ])
+    adapter.get_file_content.return_value = """
+    <template>
+      <div class="wrapper"></div>
+    </template>
+    """.encode("utf-8")
+    with patch("qapilot.tools.git_codebase_scanner_tool._resolve_adapter", return_value=adapter), \
+         patch.object(tool, "_detect_language_framework", new=AsyncMock(return_value=("typescript", "vue"))), \
+         patch.object(tool, "_collect_files", new=AsyncMock(return_value=["frontend/src/pages/Empty.vue"])), \
+         patch.object(tool, "_extract_git_diff", new=AsyncMock(return_value=None)), \
+         patch.object(tool.logger, "warning") as warning_mock:
+
+        result = await tool._scan_single_repo(
+            {"repo_url": "https://github.com/org/repo", "token": "tok", "branch": "main", "role": "frontend"},
+            "init",
+            None,
+        )
+
+    assert result["frontend_elements"] == []
+    warning_mock.assert_any_call(
+        "frontend_elements_empty_after_git_scan",
+        role="frontend",
+        frontend_source_count=1,
+        scanned_file_count=1,
+    )
+
+
 # ── _merge_git_diffs ──────────────────────────────────────────────────────────
 
 def test_merge_git_diffs_sums_lines():
@@ -375,6 +435,10 @@ def test_should_scan_path_python(tool):
 
 def test_should_scan_path_typescript(tool):
     assert tool._should_scan_path("src/app.ts") is True
+
+
+def test_should_scan_path_vue(tool):
+    assert tool._should_scan_path("frontend/src/pages/Signup.vue") is True
 
 
 def test_should_scan_path_config_file(tool):

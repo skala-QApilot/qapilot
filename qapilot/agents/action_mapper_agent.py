@@ -34,6 +34,30 @@ _MAX_CONCURRENT_LLM_CALLS = 5
 # 와 동일 알고리즘 — Agent 단 정규화 + Tool 런타임 보정 의 일관성.
 _FUZZY_MATCH_THRESHOLD = 0.6
 _FUZZY_MATCH_SUBSTRING_BONUS = 0.2
+_FUZZY_MATCH_SHARED_SUBSTRING_BONUS = 0.15
+_FRONTEND_CANDIDATE_FILE_LIMIT = 4
+_FRONTEND_CANDIDATE_ELEMENT_LIMIT = 40
+_SEMANTIC_ALIASES: dict[str, tuple[str, ...]] = {
+    "회원가입": ("signup", "가입", "create account"),
+    "가입": ("signup", "회원가입"),
+    "로그인": ("login", "signin"),
+    "이메일": ("email", "mail"),
+    "비밀번호": ("password", "pwd", "pass"),
+    "이름": ("name", "user name", "username"),
+    "생년월일": ("birth", "birth date", "birth_date"),
+    "버튼": ("button", "submit"),
+}
+_ACTION_TOKEN_SET = frozenset({
+    "click", "fill", "submit", "press", "upload", "check", "uncheck",
+    "select", "hover", "dblclick", "assert",
+})
+_FIELD_ALIASES: dict[str, tuple[str, ...]] = {
+    "email": ("email", "이메일", "mail"),
+    "password": ("password", "비밀번호", "pwd", "pass"),
+    "name": ("name", "이름", "user name", "username", "사용자 이름"),
+    "birth_date": ("birth_date", "birth date", "birth", "생년월일"),
+    "guardian_consent": ("guardian_consent", "guardian consent", "법정대리인 동의"),
+}
 
 # assert 계열 action — Step B 의 frontend.json 매칭 적용 대상.
 _ASSERT_ACTIONS = {
@@ -257,10 +281,11 @@ class ActionMapperAgent(BaseAgent):
         주: 이슈 #129 Step A 이후 `_execute` 는 TC-별 분할 (`_call_single_tc`) 을 사용.
         본 메서드는 하위 호환·외부 caller 가능성·테스트 참조용으로 유지.
         """
+        frontend_candidates = self._select_frontend_candidates(batch, frontend_dom)
         user_prompt = self.prompts.render(
             scenarios=self._format_scenarios(batch),
             endpoints=self._format_endpoints(endpoints),
-            frontend_dom=self._format_frontend_dom(frontend_dom),
+            frontend_dom=self._format_frontend_dom(frontend_candidates),
         )
         user_prompt = self.with_correction_hint(user_prompt, last_error)
         response = await self.llm.chat(
@@ -309,6 +334,7 @@ class ActionMapperAgent(BaseAgent):
         sliced_ts = dict(ts)
         sliced_ts["test_cases"] = [tc]
         batch = [sliced_ts]
+        frontend_candidates = self._select_frontend_candidates(batch, frontend_dom)
 
         # 이슈 #140: TC 마다 새 LLMClient — 누적 정책 충돌 해결
         tc_llm = self._create_tc_llm()
@@ -317,7 +343,7 @@ class ActionMapperAgent(BaseAgent):
             user_prompt = self.prompts.render(
                 scenarios=self._format_scenarios(batch),
                 endpoints=self._format_endpoints(endpoints),
-                frontend_dom=self._format_frontend_dom(frontend_dom),
+                frontend_dom=self._format_frontend_dom(frontend_candidates),
             )
             user_prompt = self.with_correction_hint(user_prompt, last_error)
             response = await tc_llm.chat(
@@ -334,23 +360,64 @@ class ActionMapperAgent(BaseAgent):
         if not mappings:
             return None
         # 단일 TC 입력 — 응답도 단일 mapping. 다중 시 첫 항목.
-        return mappings[0]
+        return self._resolve_mapping_with_frontend(mappings[0], tc, frontend_candidates)
 
     def _load_frontend_dom(self, context: dict[str, Any]) -> list[dict]:
-        """frontend DOM 인덱스 로드 — context 우선, 없으면 디스크 (.qapilot/codebase-index/frontend.json).
+        """frontend DOM 인덱스 로드 — context 우선, 없으면 qapilot_dir/DB/S3 순 fallback.
 
-        이슈 #127: `qapilot init` / `qapilot rescan` 시점에 디스크 저장된 frontend.json
-        을 LLM 호출 시점에 로드. context 에 직접 주입된 경우 (테스트/외부 caller) 도 지원.
+        우선순위:
+        1) context["frontend_dom"] 직접 주입
+        2) context["frontend_index_path"]
+        3) context["qapilot_dir"]/codebase-index/frontend.json
+        4) DB 메타 + S3 mirror (service_id / commit_hash 제공 시)
+        5) 레거시 CWD `.qapilot/codebase-index/frontend.json`
         """
         from pathlib import Path
+
+        from qapilot.db.code_reader import load_codebase_index
+        from qapilot.tools.frontend_dom_scanner import load_frontend_index
 
         # 1) context 우선 (테스트/외부 caller 가 직접 전달 가능)
         ctx_dom = context.get("frontend_dom")
         if isinstance(ctx_dom, list):
             return ctx_dom
 
-        # 2) 디스크 fallback
-        from qapilot.tools.frontend_dom_scanner import load_frontend_index
+        # 2) 명시 경로
+        index_path = context.get("frontend_index_path")
+        if index_path:
+            elements = load_frontend_index(Path(str(index_path)))
+            if elements:
+                return elements
+
+        # 3) qapilot_dir 기준 디스크 fallback
+        qapilot_dir = context.get("qapilot_dir")
+        if qapilot_dir:
+            elements = load_frontend_index(
+                Path(str(qapilot_dir)) / "codebase-index" / "frontend.json"
+            )
+            if elements:
+                self.logger.info("frontend_dom_index_loaded", element_count=len(elements))
+                return elements
+
+        # 4) DB+S3 mirror fallback
+        service_id = context.get("service_id")
+        if service_id:
+            payload = load_codebase_index(
+                str(service_id),
+                "frontend",
+                commit_hash=context.get("commit_hash"),
+            )
+            if isinstance(payload, dict):
+                elements = list(payload.get("elements") or [])
+                if elements:
+                    self.logger.info(
+                        "frontend_dom_index_loaded_from_mirror",
+                        element_count=len(elements),
+                        service_id=service_id,
+                    )
+                    return elements
+
+        # 5) 레거시 CWD fallback
         elements = load_frontend_index(Path(".qapilot") / "codebase-index" / "frontend.json")
         if elements:
             self.logger.info(
@@ -389,6 +456,107 @@ class ActionMapperAgent(BaseAgent):
             if parts:
                 lines.append("- " + " ".join(parts))
         return "\n".join(lines) if lines else "인덱스 없음"
+
+    def _select_frontend_candidates(self, batch: list[dict], frontend_dom: list[dict]) -> list[dict]:
+        """시나리오와 관련된 frontend 후보만 추려 LLM 컨텍스트를 줄인다."""
+        if not frontend_dom:
+            return []
+
+        scenario_text = self._scenario_text_for_candidates(batch)
+        if not scenario_text.strip():
+            return frontend_dom[:_FRONTEND_CANDIDATE_ELEMENT_LIMIT]
+
+        scored: list[tuple[float, dict]] = []
+        for el in frontend_dom:
+            score = self._frontend_candidate_score(scenario_text, el)
+            if score > 0:
+                scored.append((score, el))
+
+        if not scored:
+            return frontend_dom[:_FRONTEND_CANDIDATE_ELEMENT_LIMIT]
+
+        file_counts: dict[str, int] = {}
+        file_best: dict[str, float] = {}
+        for score, el in scored:
+            file_key = str(el.get("file") or "")
+            file_counts[file_key] = file_counts.get(file_key, 0) + 1
+            file_best[file_key] = max(file_best.get(file_key, 0.0), score)
+
+        max_file_score = max(file_best.values()) if file_best else 0.0
+        score_cutoff = max(1.0, max_file_score * 0.7)
+        top_files = {
+            file_key
+            for file_key, _ in sorted(
+                (
+                    item for item in file_best.items()
+                    if item[1] >= score_cutoff
+                ),
+                key=lambda item: (item[1], file_counts.get(item[0], 0)),
+                reverse=True,
+            )[:_FRONTEND_CANDIDATE_FILE_LIMIT]
+        }
+
+        picked = [
+            el
+            for _, el in sorted(scored, key=lambda item: item[0], reverse=True)
+            if str(el.get("file") or "") in top_files
+        ]
+        return picked[:_FRONTEND_CANDIDATE_ELEMENT_LIMIT]
+
+    def _scenario_text_for_candidates(self, batch: list[dict]) -> str:
+        parts: list[str] = []
+        for ts in batch:
+            parts.extend([
+                str(ts.get("ts_id") or ""),
+                str(ts.get("title") or ts.get("name") or ""),
+            ])
+            for tc in ts.get("test_cases") or []:
+                parts.extend([
+                    str(tc.get("tc_id") or ""),
+                    str(tc.get("name") or ""),
+                    str(tc.get("given") or ""),
+                    str(tc.get("when") or ""),
+                    str(tc.get("then") or ""),
+                ])
+        return " ".join(part for part in parts if part).lower()
+
+    def _frontend_candidate_score(self, scenario_text: str, el: dict) -> float:
+        score = 0.0
+        file_path = str(el.get("file") or "").lower()
+        page = str(el.get("page") or "").lower()
+        route = str(el.get("route") or "").lower()
+        control_type = str(el.get("control_type") or "").lower()
+
+        for token, aliases in _SEMANTIC_ALIASES.items():
+            if token in scenario_text:
+                if any(alias in file_path or alias in page or alias in route for alias in aliases):
+                    score += 1.0
+                if any(alias in control_type for alias in aliases):
+                    score += 0.3
+
+        if any(term in scenario_text for term in ("회원가입", "가입")):
+            if "signup" in file_path or route == "/signup" or page == "signup":
+                score += 2.0
+        if any(term in scenario_text for term in ("로그인",)):
+            if "login" in file_path or route == "/login" or page == "login":
+                score += 2.0
+
+        for key in ("text", "placeholder", "label", "testid", "id", "name"):
+            value = str(el.get(key) or "").lower()
+            if not value:
+                continue
+            for token in self._extract_meaningful_tokens(scenario_text):
+                if token and token in value:
+                    score += 0.6
+
+        if control_type in {"submit", "button"} and "버튼" in scenario_text:
+            score += 0.5
+        if control_type == "form_input" and any(tok in scenario_text for tok in ("이메일", "비밀번호", "이름", "생년월일")):
+            score += 0.2
+        return score
+
+    def _extract_meaningful_tokens(self, text: str) -> list[str]:
+        return [tok for tok in re.split(r"[^0-9a-zA-Z가-힣_/-]+", text) if len(tok) >= 2]
 
     def _format_scenarios(self, batch: list[dict]) -> str:
         """시나리오 배치를 JSON 문자열로 직렬화한다."""
@@ -455,7 +623,7 @@ class ActionMapperAgent(BaseAgent):
         )
         value = self._normalize_value(action, item, selector, tc_id, step_no)
         expected = self._normalize_expected(action, item, selector, value, tc_id, step_no)
-        return {
+        step: ActionStep = {
             "step_no": step_no,
             "action": action,
             "selector": selector,
@@ -464,6 +632,11 @@ class ActionMapperAgent(BaseAgent):
             "expected": expected,
             "api_endpoint": item.get("api_endpoint"),
         }
+        if item.get("target_name") is not None:
+            step["target_name"] = str(item.get("target_name") or "").strip() or None
+        if item.get("target_kind") is not None:
+            step["target_kind"] = str(item.get("target_kind") or "").strip() or None
+        return step
 
     def _normalize_action(self, item: dict, tc_id: str, step_no: int) -> str:
         """비표준 action을 표준 action vocabulary로 정규화한다."""
@@ -517,17 +690,408 @@ class ActionMapperAgent(BaseAgent):
         if action in _SELECTOR_OPTIONAL_ACTIONS:
             return None, None
         if selector and selector_type:
-            # 이슈 #129 Step B — assert 계열 + 인덱스 보유 시 정규화 적용
-            if action in _ASSERT_ACTIONS and self._frontend_dom_index:
-                normalized = self._normalize_assert_selector_via_index(
-                    str(selector), selector_type, tc_id, step_no
-                )
-                if normalized is not None:
-                    return normalized
             return str(selector), selector_type
-        fallback = item.get("expected") or item.get("value") or action
-        self._log_normalization(tc_id, step_no, "selector", selector, fallback)
-        return str(fallback), selector_type or "text"
+        return None, None
+
+    def _resolve_mapping_with_frontend(
+        self, action_mapping: ActionMapping, tc: dict[str, Any], frontend_dom: list[dict]
+    ) -> ActionMapping:
+        """LLM 이 만든 step intent 를 frontend index 원소로만 resolve 한다."""
+        mapping = dict(action_mapping)
+        scenario_text = " ".join(str(tc.get(key) or "") for key in ("name", "given", "when", "then"))
+        route_hint = self._route_hint_from_elements(frontend_dom) or self._route_hint_from_tc(tc)
+        steps: list[ActionStep] = []
+
+        for raw_step in mapping.get("steps") or []:
+            step = dict(raw_step)
+            action = str(step.get("action") or "")
+            if action in _SELECTOR_OPTIONAL_ACTIONS:
+                step["selector"] = None
+                step["selector_type"] = None
+                steps.append(step)
+                continue
+
+            intent = self._infer_step_intent(step, tc, scenario_text)
+            resolved = self._resolve_selector_from_intent(action, intent, frontend_dom, route_hint, scenario_text)
+            if resolved is None:
+                self.logger.warning(
+                    "action_mapping_selector_unresolved",
+                    tc_id=mapping.get("tc_id"),
+                    step_no=step.get("step_no"),
+                    action=action,
+                    intent=intent,
+                )
+                step["selector"] = None
+                step["selector_type"] = None
+            else:
+                step["selector"] = resolved["selector"]
+                step["selector_type"] = resolved["selector_type"]
+            if intent.get("target_name"):
+                step["target_name"] = intent["target_name"]
+            if intent.get("target_kind"):
+                step["target_kind"] = intent["target_kind"]
+            if action in {"assert", "assert_visible"}:
+                step["expected"] = None
+            steps.append(step)
+
+        steps = self._ensure_navigate_step(steps, route_hint)
+        mapping["steps"] = steps
+        return mapping
+
+    def _ensure_navigate_step(
+        self, steps: list[ActionStep], route_hint: str | None
+    ) -> list[ActionStep]:
+        """DOM action 시나리오에 route 힌트가 있으면 선행 navigate 를 보장한다."""
+        if not route_hint or not steps:
+            return steps
+        first_action = str(steps[0].get("action") or "")
+        if first_action == "navigate":
+            return steps
+        if first_action not in _SELECTOR_REQUIRED_ACTIONS:
+            return steps
+
+        navigate_step: ActionStep = {
+            "step_no": 1,
+            "action": "navigate",
+            "selector": None,
+            "selector_type": None,
+            "value": route_hint,
+            "expected": None,
+            "api_endpoint": None,
+        }
+        renumbered: list[ActionStep] = [navigate_step]
+        for index, step in enumerate(steps, start=2):
+            updated = dict(step)
+            updated["step_no"] = index
+            renumbered.append(updated)
+        return renumbered
+
+    def _infer_step_intent(
+        self, step: dict[str, Any], tc: dict[str, Any], scenario_text: str
+    ) -> dict[str, str | None]:
+        action = str(step.get("action") or "")
+        selector = str(step.get("selector") or "").strip()
+        value = step.get("value")
+        expected = str(step.get("expected") or "").strip()
+        explicit_target_name = str(step.get("target_name") or "").strip()
+        explicit_target_kind = str(step.get("target_kind") or "").strip()
+
+        if explicit_target_name or explicit_target_kind:
+            return {
+                "target_name": explicit_target_name or None,
+                "target_kind": explicit_target_kind or None,
+                "target_text": expected or selector or None,
+            }
+
+        if action in {"fill", "clear", "select", "press", "upload"}:
+            return {
+                "target_name": (
+                    self._field_from_tc_value(tc, value)
+                    or self._field_from_hint(selector)
+                    or self._field_from_hint(scenario_text)
+                ),
+                "target_kind": "field",
+                "target_text": selector if self._is_meaningful_selector_hint(selector, value) else None,
+            }
+
+        if action in {"click", "dblclick", "hover", "check", "uncheck"}:
+            target_text = selector if self._is_meaningful_selector_hint(selector, value) else scenario_text
+            target_kind = "submit" if any(tok in scenario_text.lower() for tok in ("회원가입", "signup", "가입")) else "actionable"
+            return {
+                "target_name": self._field_from_hint(selector),
+                "target_kind": target_kind,
+                "target_text": target_text or None,
+            }
+
+        if action in _ASSERT_ACTIONS:
+            return {
+                "target_name": None,
+                "target_kind": "assertion",
+                "target_text": expected or selector or str(tc.get("then") or "") or None,
+            }
+
+        return {"target_name": None, "target_kind": None, "target_text": selector or None}
+
+    def _resolve_selector_from_intent(
+        self,
+        action: str,
+        intent: dict[str, str | None],
+        frontend_dom: list[dict],
+        route_hint: str | None,
+        scenario_text: str,
+    ) -> dict[str, str] | None:
+        candidates = self._frontend_candidates_for_action(action, frontend_dom, route_hint)
+        if not candidates:
+            return None
+
+        if len(candidates) == 1 and action in {"click", "dblclick", "hover"}:
+            selector, selector_type = self._preferred_selector_for_action(action, candidates[0])
+            if selector and selector_type:
+                return {"selector": selector, "selector_type": selector_type}
+
+        best_el: dict[str, Any] | None = None
+        best_score = 0.0
+        for el in candidates:
+            score = self._intent_match_score(action, intent, el, scenario_text, route_hint)
+            if score > best_score:
+                best_score = score
+                best_el = el
+
+        if best_el is None:
+            return None
+
+        threshold = 0.8 if action in _ASSERT_ACTIONS else 0.7
+        if best_score < threshold:
+            return None
+
+        selector, selector_type = self._preferred_selector_for_action(action, best_el)
+        if not selector or not selector_type:
+            return None
+        return {"selector": selector, "selector_type": selector_type}
+
+    def _frontend_candidates_for_action(
+        self, action: str, frontend_dom: list[dict], route_hint: str | None
+    ) -> list[dict]:
+        result: list[dict] = []
+        for el in frontend_dom:
+            if route_hint and str(el.get("route") or "").strip() not in {"", route_hint}:
+                continue
+            actionable = bool(el.get("actionable"))
+            control_type = str(el.get("control_type") or "").lower()
+            tag = str(el.get("tag") or "").lower()
+            if action in {"fill", "clear", "select", "press", "upload"}:
+                if actionable and (control_type in {"form_input", "select", "textarea"} or tag in {"input", "textarea", "select"}):
+                    result.append(el)
+                continue
+            if action in {"click", "dblclick", "hover", "check", "uncheck"}:
+                if actionable and (control_type in {"button", "submit", "link", "checkbox", "radio"} or tag in {"button", "a", "input"}):
+                    result.append(el)
+                continue
+            if action in _ASSERT_ACTIONS:
+                if any(str(el.get(k) or "").strip() for k in ("text", "testid", "label", "placeholder")):
+                    result.append(el)
+                continue
+            result.append(el)
+        return result
+
+    def _intent_match_score(
+        self,
+        action: str,
+        intent: dict[str, str | None],
+        element: dict[str, Any],
+        scenario_text: str,
+        route_hint: str | None,
+    ) -> float:
+        score = 0.0
+        target_name = str(intent.get("target_name") or "").strip().lower()
+        target_kind = str(intent.get("target_kind") or "").strip().lower()
+        target_text = str(intent.get("target_text") or "").strip().lower()
+        control_type = str(element.get("control_type") or "").lower()
+        tag = str(element.get("tag") or "").lower()
+
+        if route_hint and str(element.get("route") or "").strip() == route_hint:
+            score += 0.4
+
+        if target_name:
+            score += self._field_match_score(target_name, element)
+
+        if target_text:
+            for key in ("text", "label", "placeholder", "testid", "id", "name"):
+                cand = str(element.get(key) or "").strip().lower()
+                if not cand:
+                    continue
+                pair_score = difflib.SequenceMatcher(
+                    None, self._expand_aliases(target_text), self._expand_aliases(cand)
+                ).ratio()
+                if target_text == cand:
+                    pair_score = 1.0
+                elif target_text in cand or cand in target_text:
+                    pair_score += _FUZZY_MATCH_SUBSTRING_BONUS
+                pair_score += self._semantic_bonus(target_text, cand)
+                score += pair_score
+
+        if action in {"fill", "clear", "select", "press", "upload"} and (
+            control_type in {"form_input", "select", "textarea"} or tag in {"input", "textarea", "select"}
+        ):
+            score += 0.5
+        if action in {"click", "dblclick", "hover", "check", "uncheck"} and (
+            control_type in {"button", "submit", "link", "checkbox", "radio"} or tag in {"button", "a", "input"}
+        ):
+            score += 0.5
+        if action in _ASSERT_ACTIONS:
+            if not bool(element.get("actionable")):
+                score += 0.2
+            if control_type.startswith("feedback"):
+                score += 1.2
+            if target_kind == "assertion" and any(token in str(element.get("testid") or "").lower() for token in ("success", "error", "toast", "message", "status")):
+                score += 0.7
+            if target_kind == "assertion" and any(token in str(element.get("text") or "").lower() for token in ("완료", "성공", "이동")):
+                score += 0.5
+
+        if target_kind == "submit":
+            if any(token in str(element.get("text") or "").lower() for token in ("가입", "signup")):
+                score += 0.7
+            if any(token in str(element.get("testid") or "").lower() for token in ("signup", "submit")):
+                score += 0.7
+
+        if any(term in scenario_text.lower() for term in ("회원가입", "가입", "signup")) and "signup" in str(element.get("page") or "").lower():
+            score += 0.4
+        return score
+
+    def _field_match_score(self, field_name: str, element: dict[str, Any]) -> float:
+        aliases = _FIELD_ALIASES.get(field_name, (field_name,))
+        score = 0.0
+        for key in ("testid", "id", "label", "placeholder", "text", "name"):
+            cand = str(element.get(key) or "").strip().lower()
+            if not cand:
+                continue
+            if any(alias == cand for alias in aliases):
+                score += 1.2
+            elif any(alias in cand for alias in aliases):
+                score += 0.9
+        return score
+
+    def _field_from_tc_value(self, tc: dict[str, Any], value: Any) -> str | None:
+        if value is None:
+            return None
+        target = str(value).strip()
+        if not target:
+            return None
+        for item in tc.get("values") or []:
+            if str(item.get("value") or "").strip() == target:
+                return self._canonical_field_name(str(item.get("field") or ""))
+        return None
+
+    def _field_from_hint(self, hint: str) -> str | None:
+        lowered = hint.strip().lower()
+        if not lowered:
+            return None
+        for canonical, aliases in _FIELD_ALIASES.items():
+            if any(alias.lower() in lowered for alias in aliases):
+                return canonical
+        return None
+
+    def _canonical_field_name(self, field: str) -> str | None:
+        lowered = field.strip().lower()
+        if lowered in _FIELD_ALIASES:
+            return lowered
+        for canonical, aliases in _FIELD_ALIASES.items():
+            if lowered == canonical or any(lowered == alias.lower() for alias in aliases):
+                return canonical
+        return None
+
+    def _is_meaningful_selector_hint(self, selector: str, value: Any) -> bool:
+        cleaned = selector.strip()
+        if not cleaned:
+            return False
+        lowered = cleaned.lower()
+        if lowered in _ACTION_TOKEN_SET:
+            return False
+        if value is not None and cleaned == str(value):
+            return False
+        if self._looks_like_literal_value(cleaned):
+            return False
+        return True
+
+    def _looks_like_literal_value(self, text: str) -> bool:
+        lowered = text.strip().lower()
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", lowered):
+            return True
+        if re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", lowered):
+            return True
+        if re.fullmatch(r"[A-Za-z][A-Za-z0-9!@#$%^&*()_+=-]{7,}", text):
+            return True
+        return False
+
+    def _route_hint_from_elements(self, elements: list[dict]) -> str | None:
+        routes = [str(el.get("route") or "").strip() for el in elements if str(el.get("route") or "").strip()]
+        if not routes:
+            return None
+        return max(set(routes), key=routes.count)
+
+    def _route_hint_from_tc(self, tc: dict[str, Any]) -> str | None:
+        text = " ".join(str(tc.get(key) or "") for key in ("name", "given", "when", "then")).lower()
+        if any(term in text for term in ("회원가입", "가입", "signup")):
+            return "/signup"
+        if "로그인" in text or "login" in text:
+            return "/login"
+        return None
+
+    def _normalize_selector_via_index(
+        self, action: str, selector: str, selector_type: str, tc_id: str, step_no: int
+    ) -> tuple[str, str] | None:
+        """selector 를 frontend index 의 실제 element 로 정규화한다.
+
+        assert 뿐 아니라 fill/click 류에도 적용해, 시나리오 자연어가 selector 로 새는
+        문제를 LLM 이후 단계에서 한 번 더 줄인다.
+        """
+        target = selector.strip().lower()
+        if not target or not self._frontend_dom_index:
+            return None
+
+        best_el: dict | None = None
+        best_score = 0.0
+        exact_match = False
+        for el in self._frontend_dom_index:
+            candidates = [
+                ("text", el.get("text", "")),
+                ("placeholder", el.get("placeholder", "")),
+                ("label", el.get("label", "")),
+                ("testid", el.get("testid", "")),
+                ("page", el.get("page", "")),
+                ("route", el.get("route", "")),
+            ]
+            for _, candidate in candidates:
+                cand = (candidate or "").strip().lower()
+                if not cand:
+                    continue
+                if cand == target:
+                    best_el = el
+                    best_score = 1.0
+                    exact_match = True
+                    break
+                score = difflib.SequenceMatcher(
+                    None, self._expand_aliases(target), self._expand_aliases(cand)
+                ).ratio()
+                if target in cand or cand in target:
+                    score += _FUZZY_MATCH_SUBSTRING_BONUS
+                elif self._has_meaningful_shared_substring(target, cand):
+                    score += _FUZZY_MATCH_SHARED_SUBSTRING_BONUS
+                score += self._semantic_bonus(target, cand)
+                score += self._action_bonus(action, el, target)
+                if score > best_score:
+                    best_score = score
+                    best_el = el
+            if exact_match:
+                break
+
+        if best_el is None:
+            return None
+        if not exact_match and best_score < _FUZZY_MATCH_THRESHOLD:
+            return None
+
+        new_selector, new_type = self._preferred_selector_for_action(action, best_el)
+        if not new_selector or not new_type:
+            return None
+        if new_selector == selector and new_type == selector_type:
+            return None
+
+        if exact_match and action in _ASSERT_ACTIONS:
+            # 기존 assert exact-match 동작은 유지한다.
+            return None
+
+        self.logger.info(
+            "selector_normalized_via_index",
+            tc_id=tc_id,
+            step_no=step_no,
+            action=action,
+            original=selector,
+            original_type=selector_type,
+            normalized=new_selector,
+            normalized_type=new_type,
+            score=round(best_score, 3),
+        )
+        return new_selector, new_type
 
     def _normalize_assert_selector_via_index(
         self, selector: str, selector_type: str, tc_id: str, step_no: int
@@ -548,67 +1112,57 @@ class ActionMapperAgent(BaseAgent):
         - Agent 정적 정규화 (본 메서드) + Tool 런타임 보정 (UITestTool `_fallback_dom_scan`)
         - 동일 difflib.SequenceMatcher + 동일 임계값 — 이중 방어
         """
-        target = selector.strip().lower()
-        if not target:
-            return None
+        return self._normalize_selector_via_index("assert", selector, selector_type, tc_id, step_no)
 
-        # 1) 정확 매치 — 인덱스에 이미 그 텍스트 존재 시 정규화 불필요
-        for el in self._frontend_dom_index:
-            for key in ("testid", "text", "label", "placeholder"):
-                val = (el.get(key) or "").strip()
-                if val and val.lower() == target:
-                    return None  # 원본 유지
-
-        # 2) Fuzzy match — UITestTool 옵션 B 와 동일 알고리즘
-        best_el: dict | None = None
-        best_score = 0.0
-        for el in self._frontend_dom_index:
-            candidates = [
-                el.get("text", ""), el.get("placeholder", ""), el.get("label", ""),
-                el.get("testid", ""), el.get("name", ""), el.get("id", ""),
-            ]
-            for candidate in candidates:
-                cand = (candidate or "").strip().lower()
-                if not cand:
-                    continue
-                score = difflib.SequenceMatcher(None, target, cand).ratio()
-                if target in cand or cand in target:
-                    score += _FUZZY_MATCH_SUBSTRING_BONUS
-                if score > best_score:
-                    best_score = score
-                    best_el = el
-
-        if not best_el or best_score < _FUZZY_MATCH_THRESHOLD:
-            # 매치 실패 — 원본 유지 (UITestTool 런타임 보정에 위임)
-            return None
-
-        # 3) 정규화 — testid > placeholder > label > text 우선순위
-        if best_el.get("testid"):
-            new_selector, new_type = best_el["testid"], "testid"
-        elif best_el.get("placeholder"):
-            new_selector, new_type = best_el["placeholder"], "placeholder"
-        elif best_el.get("label"):
-            new_selector, new_type = best_el["label"], "label"
-        elif best_el.get("text"):
-            new_selector, new_type = best_el["text"], "text"
+    def _preferred_selector_for_action(self, action: str, element: dict) -> tuple[str | None, str | None]:
+        """action 성격에 맞는 가장 안정적인 selector 필드를 선택한다."""
+        if action in {"fill", "clear", "select", "press", "upload"}:
+            priority = ("testid", "label", "placeholder", "text")
         else:
-            return None  # 식별자 모두 빈 element — 정규화 불가
+            priority = ("testid", "text", "label", "placeholder")
 
-        # 원본과 동일하면 그대로
-        if new_selector == selector and new_type == selector_type:
-            return None
+        for key in priority:
+            value = (element.get(key) or "").strip()
+            if value:
+                return value, key
+        return None, None
 
-        self.logger.info(
-            "assert_selector_normalized_via_index",
-            tc_id=tc_id,
-            step_no=step_no,
-            original=selector,
-            original_type=selector_type,
-            normalized=new_selector,
-            normalized_type=new_type,
-            score=round(best_score, 3),
+    def _has_meaningful_shared_substring(self, left: str, right: str) -> bool:
+        """한국어 UI 문구의 부분 겹침(예: '회원가입' vs '가입하기')을 약하게 보정한다."""
+        if not left or not right:
+            return False
+        match = difflib.SequenceMatcher(None, left, right).find_longest_match(
+            0, len(left), 0, len(right)
         )
-        return new_selector, new_type
+        min_len = min(len(left), len(right))
+        return match.size >= max(2, min_len // 2)
+
+    def _expand_aliases(self, text: str) -> str:
+        expanded = [text]
+        for token, aliases in _SEMANTIC_ALIASES.items():
+            if token in text:
+                expanded.extend(aliases)
+        return " ".join(expanded)
+
+    def _semantic_bonus(self, target: str, candidate: str) -> float:
+        bonus = 0.0
+        for token, aliases in _SEMANTIC_ALIASES.items():
+            if token in target and any(alias in candidate for alias in aliases):
+                bonus += 0.25
+            if any(alias in target for alias in aliases) and token in candidate:
+                bonus += 0.25
+        return bonus
+
+    def _action_bonus(self, action: str, element: dict, target: str) -> float:
+        control_type = str(element.get("control_type") or "").lower()
+        bonus = 0.0
+        if action in {"fill", "clear", "select", "press", "upload"} and control_type in {"form_input", "select", "textarea"}:
+            bonus += 0.35
+        if action in {"click", "dblclick", "hover", "check", "uncheck"} and control_type in {"button", "submit", "link", "checkbox", "radio"}:
+            bonus += 0.35
+        if "버튼" in target and control_type in {"button", "submit"}:
+            bonus += 0.2
+        return bonus
 
     def _normalize_value(
         self, action: str, item: dict, selector: str | None, tc_id: str, step_no: int

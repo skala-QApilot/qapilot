@@ -65,7 +65,7 @@ async def test_generate_code_valid_syntax(agent):
     assert len(codes) == 1
     assert codes[0]["tc_id"] == "TC-001"
     assert codes[0]["syntax_valid"] is True
-    assert result.confidence == 0.9
+    assert result.confidence == 1.0
 
 
 @pytest.mark.asyncio

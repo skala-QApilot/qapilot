@@ -159,6 +159,7 @@ class ScenarioGeneratorAgent(BaseAgent):
         affected_only: bool = bool(params.get("affected_only", False))
         # codebase-index read 경로 — pipeline 이 state.qapilot_dir 을 주입함. 없으면 CWD fallback.
         self._qapilot_dir_override: str | None = context.get("qapilot_dir")
+        self._service_id: str | None = context.get("service_id")
 
         if not scan_result:
             scan_result = await self._fetch_scan_result()
@@ -1268,11 +1269,17 @@ class ScenarioGeneratorAgent(BaseAgent):
     # ── update 액션 헬퍼 (#201) ────────────────────────────────────────────────
 
     def _load_scenario_file(self, ts_id: str) -> dict | None:
-        """qapilot_dir 기준으로 기존 시나리오 파일을 로드한다."""
+        """기존 시나리오를 DB 우선, 필요 시 qapilot_dir fallback 으로 로드한다."""
         import json
         from pathlib import Path
+        from qapilot.db.scenario_reader import load_latest_scenarios
         from qapilot.agents.scenario_generator.repository import load_scenario
 
+        service_id = getattr(self, "_service_id", None)
+        if service_id:
+            rows = load_latest_scenarios(str(service_id), [ts_id])
+            if rows:
+                return rows[0]
         qapilot_dir = getattr(self, "_qapilot_dir_override", None)
         if qapilot_dir:
             path = Path(qapilot_dir) / "scenarios" / f"{ts_id}.json"

@@ -14,6 +14,7 @@ from qapilot.tools.frontend_dom_scanner import (
     _build_label_map,
     _clean_inner_text,
     _extract_elements_from_text,
+    _extract_literal_text,
     _parse_attrs,
     load_frontend_index,
     scan_frontend_directory,
@@ -47,6 +48,10 @@ def test_clean_inner_text_strips_nested_html_tags():
     assert _clean_inner_text('<svg width="14"><path d="M0..."/></svg> 메뉴') == "메뉴"
     assert _clean_inner_text("<i class='icon'></i>로그아웃") == "로그아웃"
     assert _clean_inner_text("<br/>줄바꿈<br>다음") == "줄바꿈 다음"
+
+
+def test_extract_literal_text_from_vue_expression():
+    assert _extract_literal_text("{{ loading ? '처리 중...' : '가입하기' }}") == "가입하기"
 
 
 def test_build_label_map_extracts_for_attribute():
@@ -95,6 +100,9 @@ def test_extract_from_vue_login_template():
     assert email["testid"] == "email"
     assert email["label"] == "이메일"  # <label for="email"> 연결
     assert email["file"] == "frontend/pages/Login.vue"
+    assert email["page"] == "Login"
+    assert email["route"] == "/login"
+    assert email["control_type"] == "form_input"
 
     # input password
     pwd = next((e for e in elements if e.get("id") == "password"), None)
@@ -107,6 +115,38 @@ def test_extract_from_vue_login_template():
     assert btn is not None
     assert btn["tag"] == "button"
     assert btn["text"] == "로그인"
+    assert btn["control_type"] == "submit"
+
+
+def test_extract_button_text_from_vue_expression_literal():
+    text = """
+<template>
+  <button type="submit" data-testid="signup-submit">
+    {{ loading ? '처리 중...' : '가입하기' }}
+  </button>
+</template>
+"""
+    elements = _extract_elements_from_text(text, "frontend/src/pages/Signup.vue")
+    btn = next((e for e in elements if e.get("testid") == "signup-submit"), None)
+    assert btn is not None
+    assert btn["text"] == "가입하기"
+    assert btn["route"] == "/signup"
+
+
+def test_extract_feedback_success_container_from_vue_template():
+    text = """
+<template>
+  <div v-if="success" class="success-toast" data-testid="signup-success-toast">
+    가입이 완료되었습니다! 로그인 페이지로 이동합니다.
+  </div>
+</template>
+"""
+    elements = _extract_elements_from_text(text, "frontend/src/pages/Signup.vue")
+    toast = next((e for e in elements if e.get("testid") == "signup-success-toast"), None)
+    assert toast is not None
+    assert toast["text"] == "가입이 완료되었습니다! 로그인 페이지로 이동합니다."
+    assert toast["actionable"] is False
+    assert toast["control_type"] == "feedback_success"
 
 
 def test_extract_ignores_script_section_in_vue():
