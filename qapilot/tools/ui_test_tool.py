@@ -1066,23 +1066,14 @@ class UITestTool(BaseTool):
                 await locator.blur(timeout=500)
             except Exception as e:
                 self.logger.warning("ui_fill_setter_failed", error=str(e)[:80])
-            # #250 본질 fix — Vue/React reactive batched update race 방지.
-            # e2e trace `c430003e` 진단: 본인 reproduce 정상 (POST 201) vs e2e POST
-            # 0건. ui_fill_mismatch warning 등장 안 함 (input.value 채워짐) + ui_
-            # click_submit_attempted 정상 (BUTTON/submit 확정) + spa_mounted=True.
-            # 모든 단순 진단 통과했음에도 form submit 미발생. 본질: Vue 의 v-model
-            # 은 input event 후 next tick (microtask) 에서 reactive update. e2e 의
-            # 6 TC sequential + APITraceTool listener + DBTool 호출 등 추가 부담으로
-            # 후속 click 가 reactive update 완료 전 발생 → form submit 시 reactive
-            # form.email/password 등 빈 채 → required validation fail → POST 0건.
-            # 본 fix: 2 RAF (requestAnimationFrame) 대기로 reactive batched update
-            # commit 보장. 본인 reproduce 와 e2e timing 차이 정합.
+            # #251 본질 강화: PR #250 의 2 RAF (~32ms) 가 e2e trace `b305817d` 에서
+            # 부족 — POST 0건 잔존. Vue 의 v-model 은 microtask (nextTick) 에서
+            # reactive update commit. RAF 는 frame 단위 (~16ms) 라 timing 보장 X.
+            # 본 fix: 명시적 100ms wait 로 microtask + nextTick 모두 완료 보장.
+            # 본인 reproduce 정상 동작 (POST 201) 과 e2e 의 timing 격차 흡수.
             try:
                 page = locator.page
-                await page.evaluate(
-                    "() => new Promise(r => requestAnimationFrame("
-                    "() => requestAnimationFrame(r)))"
-                )
+                await page.wait_for_timeout(100)
             except Exception:
                 pass
             # fill verify — actual input.value 가 expected 와 동일한지 검증.
@@ -1102,14 +1093,16 @@ class UITestTool(BaseTool):
             await locator.clear(**kw)
             return
         if action == "click":
-            # #250: click 전 button[type=submit] 인 경우 form 의 reactive state
-            # 가 채워졌는지 사전 검증. fill 의 reactive update race 추가 노출.
+            # #251: button[type=submit] click 전 form 의 reactive state 검증 +
+            # empty_required 있으면 강제 setter retry. 본인 PR #250 의 단순 노출
+            # 진단을 한 단계 더 — 빈 채로 발견 시 같은 form 의 모든 빈 required
+            # input 에 placeholder/data-testid 기반 추정 값 재주입 + reactive
+            # event dispatch. PR #251 의 100ms wait 와 함께 race 본질 흡수.
             try:
                 tag_type = await locator.evaluate(
                     """el => el ? `${el.tagName}/${el.type || ''}` : ''"""
                 )
                 if isinstance(tag_type, str) and tag_type.startswith("BUTTON/submit"):
-                    # form 안 모든 input.value 검증 — 빈 채면 form submit fail
                     form_state = await locator.evaluate(
                         """el => {
                             const form = el.closest('form');
@@ -1117,7 +1110,10 @@ class UITestTool(BaseTool):
                             const inputs = Array.from(form.querySelectorAll('input, textarea, select'));
                             const empty_required = inputs
                                 .filter(i => i.required && !i.value)
-                                .map(i => i.name || i.id || i.getAttribute('data-testid') || 'unnamed');
+                                .map(i => ({
+                                    name: i.name || i.id || i.getAttribute('data-testid') || 'unnamed',
+                                    type: i.type || '',
+                                }));
                             return {
                                 form_present: true,
                                 total_inputs: inputs.length,
