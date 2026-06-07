@@ -669,7 +669,15 @@ class UITestTool(BaseTool):
                 url if url.startswith(("http://", "https://"))
                 else f"{target_url.rstrip('/')}{url}"
             )
-            await page.goto(full)
+            # #41 본질 (#244 후속): 기존 `page.goto(full)` 은 default `wait_until="load"` 사용
+            # → SPA (Vue/React) hydrate 전에 후속 fill/click step 진행 → v-model reactive
+            # 미반영 → form submit 시 빈 form → POST 호출 0건. e2e trace `7be2a2ab` 본질.
+            # `_ensure_page_loaded` (line 300) / `_try_auto_navigate` (line 534) 와 정합 —
+            # `networkidle` + 10s timeout cap (long-poll/SSE graceful) + 실패 시 fallback.
+            try:
+                await page.goto(full, wait_until="networkidle", timeout=10000)
+            except Exception:
+                await page.goto(full)
             return
 
         if action == "reload":
@@ -1059,26 +1067,13 @@ class UITestTool(BaseTool):
             return
         if action == "click":
             await locator.click(**kw)
-            # #41 후속 (#249): button[type=submit] click 시 form 의 submit event 가
-            # 일부 환경 (Vue 3 + Playwright headless chrome 조합) 에서 trigger 안 되는
-            # 격차 — trace `b59996fe` 의 회원가입 form HTML snapshot 변화 0. 본 fallback:
-            # button 의 closest form 을 찾아 requestSubmit() 호출. browser 의 native
-            # form submit chain (validation + submit event) 정상 발동. 일반 click 영향 X
-            # (button[type=submit] 만 선별 + Vue 의 @submit.prevent 가 cancel + handler
-            # 중복 호출 방지). 실패해도 graceful.
-            try:
-                await locator.evaluate(
-                    """el => {
-                        if (el && el.tagName === 'BUTTON' && el.type === 'submit') {
-                            const form = el.closest('form');
-                            if (form && typeof form.requestSubmit === 'function') {
-                                form.requestSubmit(el);
-                            }
-                        }
-                    }"""
-                )
-            except Exception:
-                pass
+            # PR #242 의 form.requestSubmit() fallback 제거 (#244 후속).
+            # 본인 reproduce (trace `7be2a2ab` 후속 진단): 정상 click 시 native button
+            # click → form submit event 자동 발동 + 본 fallback 의 requestSubmit() →
+            # 두번째 POST 호출 발생 → backend 500 (중복 회원가입) → frontend error toast
+            # → signup-success-toast 미표시 → assert_visible fail. 본질은 navigate 의
+            # SPA hydrate 미대기였으며 (line 672 fix), form.requestSubmit() fallback 자체
+            # 가 부작용. 본 코드 제거로 정상 single click → single POST 보장.
             return
         if action == "dblclick":
             await locator.dblclick(**kw)
