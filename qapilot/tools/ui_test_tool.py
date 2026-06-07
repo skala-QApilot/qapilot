@@ -767,6 +767,28 @@ class UITestTool(BaseTool):
         # chain 의미 없이 즉시 raise, locator timeout / assertion 만 graceful 흡수.
         # timeout_ms 는 chain 2차+ 와 동일한 _CHAIN_FALLBACK_TIMEOUT_MS — fallback 시도는
         # 모두 short timeout 으로 e2e 총 시간 폭증 회피.
+        #
+        # testid 류 selector 는 exact match 가 본질 — fuzzy fallback 차단.
+        # 격차: e2e trace `40fce3fa` 의 `signup-success-toast` (assert_visible) 가
+        # fuzzy match 로 `signup-submit` (회원가입 버튼) 에 0.6+ 매칭 → 버튼 visible
+        # 이라 가짜 PASS. testid 는 SUT 컨벤션상 정확 일치가 의미. 매칭 실패 시
+        # SUT 가 시나리오 의도대로 작동 안 함을 fail 로 보고하는 게 정답.
+        selector_type = (step.get("selector_type") or "").lower()
+        if selector_type in {"testid", "test_id", "data-testid", "data-test-id"}:
+            self.logger.warning(
+                "ui_fallback_dom_scan_skipped_testid",
+                action=action,
+                selector_type=step.get("selector_type"),
+                selector=step.get("selector"),
+                reason="testid 는 exact match 가 본질 — fuzzy fallback 차단 (false positive 방지)",
+            )
+            if last_error is not None:
+                raise last_error
+            raise ToolExecutionError(
+                ErrorCode.TOOL_UI_LOCATOR_NOT_FOUND,
+                f"testid {step.get('selector')!r} 미존재 — SUT 가 시나리오 의도대로 작동 안 함",
+            )
+
         fallback_locator = await self._fallback_dom_scan(page, step)
         if fallback_locator is not None:
             try:
@@ -797,6 +819,17 @@ class UITestTool(BaseTool):
         # 페이지 어디든 substring/fuzzy 매칭되면 graceful pass.
         # 호출 1회만 (chain attempt 마다 호출하면 evaluate × N 누적 → 120s timeout 위험).
         # evaluate timeout 5s 명시 — Playwright default (30s) 우회.
+        #
+        # testid 류 selector 는 page-wide fuzzy 도 차단 (위 _fallback_dom_scan 와 동일 이유).
+        # testid 가 page-wide text 에 매칭되는 건 의미 없음 (testid 는 hidden attribute).
+        if selector_type in {"testid", "test_id", "data-testid", "data-test-id"}:
+            if last_error is not None:
+                raise last_error
+            raise ToolExecutionError(
+                ErrorCode.TOOL_UI_LOCATOR_NOT_FOUND,
+                f"testid {step.get('selector')!r} 미존재 — page-wide fuzzy fallback 도 차단",
+            )
+
         if action in {"assert", "assert_visible", "assert_text"}:
             target_text = step.get("expected") if action == "assert_text" else step.get("selector")
             if not target_text:
