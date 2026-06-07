@@ -81,22 +81,10 @@ getByTestId > getByLabel > getByPlaceholder > getByText
      - 없다면 `assert_visible` 의 selector 를 입력 form 자체 (signup-submit 등) 로 유지
        (= 페이지에 머무름 검증)
 
-### 예시 (회원가입 시나리오)
-```
-시나리오 1 (Positive, tags=[normal], then="회원가입이 성공적으로 완료된다"):
-  assert step → selector="signup-success-toast", selector_type="testid"
-
-시나리오 2 (Negative, tags=[edge_case], then="409 Conflict 오류와 'Email already registered' 메시지가 반환된다"):
-  assert step → selector="signup-error", selector_type="testid"
-  (frontend DOM 인덱스에 signup-error 존재 시)
-
-시나리오 3 (Negative, tags=[edge_case], then="400 Bad Request 오류가 반환된다"):
-  assert step → selector="signup-error", selector_type="testid"
-```
-
 ### 절대 금지
-- 모든 TC 의 step 7 (assert) 을 동일 `signup-success-toast` 로 일괄 매핑 (이번 격차)
-- HTTP status code, JSON body 등을 selector/expected 에 그대로 박기
+- 시나리오의 outcome 분류 (positive/negative) 무시하고 모든 TC 의 assert step 을 동일 element 로 일괄 매핑
+- HTTP status code, JSON body, 응답 메시지 그대로 selector/expected 에 박기 (실제 화면 element 로 치환)
+- frontend DOM 인덱스에 없는 testid/text 를 새로 창작
 
 ## selector 없는 액션 규칙
 - navigate: selector=null, selector_type=null, value에 이동 URL을 넣는다
