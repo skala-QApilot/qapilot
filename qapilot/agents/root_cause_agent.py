@@ -415,23 +415,45 @@ class RootCauseAgent(BaseAgent):
         """
         index: dict[str, Any] | None = None
 
-        # (1) qapilot_dir 디스크
+        # PR #237 #245 후속 (#247): _dir_found=True 만으로 단정하지 않고 의미 있는 데이터
+        # 여부로 판단. 디스크 디렉토리는 존재하나 빈 경우 (e.g. CWD 의 stale `.qapilot/
+        # codebase-index/`) 가 있어 mirror fallback 까지 도달 못하던 격차 (trace `531ce56a`
+        # 의 `codebase_index_empty base_dir=.`). 본 fix 로 disk_index 가 empty 면 mirror 시도.
+        def _is_meaningful(idx: dict) -> bool:
+            return bool(
+                idx.get("endpoints") or idx.get("models")
+                or idx.get("callgraph") or idx.get("manifest")
+            )
+
+        # (1) qapilot_dir 디스크 — SaaS generate_code trace 의 잔존 dir
         if qapilot_dir:
             qd = Path(qapilot_dir).resolve()
             base_dir = qd if (qd / "codebase-index").is_dir() else qd.parent
             disk_index = CodebaseContextLoader.load(base_dir=base_dir)
-            if disk_index.get("_dir_found"):
+            if disk_index.get("_dir_found") and _is_meaningful(disk_index):
                 index = disk_index
 
-        # (2) DB+S3 mirror — SaaS test trace 격차 해결
+        # (2) DB+S3 mirror — SaaS test trace 격차 (#245). disk 가 빈 경우 항상 시도.
         if index is None and service_id:
+            self.logger.info(
+                "codebase_index_mirror_attempt",
+                service_id=service_id,
+                qapilot_dir=qapilot_dir,
+            )
             mirror_index = _load_codebase_index_from_db_mirror(service_id)
-            if mirror_index.get("_dir_found"):
+            if _is_meaningful(mirror_index):
                 index = mirror_index
                 self.logger.info(
                     "codebase_index_loaded_from_mirror",
                     service_id=service_id,
                     endpoints_count=len(mirror_index.get("endpoints") or []),
+                )
+            else:
+                self.logger.warning(
+                    "codebase_index_mirror_empty",
+                    service_id=service_id,
+                    hint="DB+S3 mirror 에 service_id 의 codebase-index 가 비어있음 — "
+                         "generate_code 가 한 번도 수행되지 않았거나 mirror 저장 실패",
                 )
 
         # (3) cfg.project.repo_path / (4) Path(".") fallback
