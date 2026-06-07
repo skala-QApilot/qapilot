@@ -233,6 +233,53 @@ async def test_affected_only_파라미터(mock_save):
     assert scenarios[0]["affected_files"] == ["src/auth.py"]
 
 
+def test_affected_router_map_변경파일_미매칭시_전체_fallback_금지():
+    """code_change는 diff에 잡힌 파일이 라우터와 매칭되지 않아도 전체 라우터로 확장하지 않는다."""
+    agent = ScenarioGeneratorAgent(trace_id="test-trace")
+    endpoints = [
+        {"file": "src/auth.py", "handler": "signup", "path": "/api/auth/signup"},
+        {"file": "src/orders.py", "handler": "create_order", "path": "/api/orders"},
+    ]
+
+    def read_index(filename):
+        if filename == "endpoints.json":
+            return endpoints
+        if filename == "callgraph.json":
+            return {}
+        if filename == "functions.json":
+            return []
+        return []
+
+    with patch.object(agent, "_read_index_json", side_effect=read_index):
+        assert agent._build_router_map(["src/unrelated_config.py"]) == {}
+
+
+def test_affected_router_map_main_import_라우터만_포함():
+    """main.py 변경은 include/import 한 라우터로만 좁혀 시나리오를 생성한다."""
+    agent = ScenarioGeneratorAgent(trace_id="test-trace")
+    endpoints = [
+        {"file": "backend/app/routers/auth.py", "handler": "login", "path": "/api/auth/login"},
+        {"file": "backend/app/routers/orders.py", "handler": "create_order", "path": "/api/orders"},
+    ]
+    callgraph = {
+        "backend/app/main.py": ["from app.routers import auth"],
+    }
+
+    def read_index(filename):
+        if filename == "endpoints.json":
+            return endpoints
+        if filename == "callgraph.json":
+            return callgraph
+        if filename == "functions.json":
+            return []
+        return []
+
+    with patch.object(agent, "_read_index_json", side_effect=read_index):
+        router_map = agent._build_router_map(["backend/app/main.py"])
+
+    assert set(router_map) == {"backend/app/routers/auth.py"}
+
+
 @patch("qapilot.agents.scenario_generator.agent.save_scenarios")
 async def test_TS_TC_ID_자동_부여(mock_save):
     """TS-001, TS-001-TC-01 형식의 ID가 순서대로 부여된다."""

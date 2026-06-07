@@ -93,6 +93,9 @@ class RunOptions(TypedDict):
     user_input: str | None
     # generate_code / test 공통 — 대상 시나리오 필터
     scenario_ids: list[str] | None
+    # generate_code 증분 모드 — 삭제된 TC 산출물 정리 및 explicit empty 필터 보존
+    deleted_tc_ids: NotRequired[list[str] | None]
+    incremental: NotRequired[bool]
     filter: Literal["all", "failed", "affected"] | None
     tags: list[str] | None
     # test 전용 — 이어서 실행: 지정된 이전 trace 의 results 디렉토리에 이미 ui_result.json

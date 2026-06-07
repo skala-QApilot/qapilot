@@ -57,7 +57,7 @@ class NaturalLanguageAgent(BaseAgent):
         if len(user_input.strip()) < 2:
             raise AgentExecutionError(
                 ErrorCode.AGENT_003,
-                "user_input이 너무 짧습니다. 2자 이상 입력해 주세요.",
+                "메시지가 너무 짧습니다. 2자 이상 입력해 주세요.",
             )
 
         scan_summary = self._build_scan_summary(context.get("scan_result"))

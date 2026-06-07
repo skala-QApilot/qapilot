@@ -1,6 +1,6 @@
 """이슈 #100 fix 검증.
 
-1) `_run_db_test_safe` 가 QAPILOT_MODULE_URL 미설정 시 Tool 호출 없이 즉시 skip 반환
+1) `_run_db_test_safe` 가 QAPILOT_SUT_DB_URL 미설정 시 Tool 호출 없이 즉시 skip 반환
 2) `_cross_check` 가 UI fail TC 를 has_mismatch=True 로 보강
 3) `is_chromium_installed_async` / `ensure_chromium_for_test_async` 가 RuntimeWarning 없이 동작
 """
@@ -67,8 +67,8 @@ def test_is_chromium_installed_sync_closes_coroutine_on_runtime_error():
 
 @pytest.mark.asyncio
 async def test_run_db_test_safe_skips_when_env_missing(monkeypatch):
-    """QAPILOT_MODULE_URL 미설정 → Tool 호출 자체 X, skip 결과 즉시 반환."""
-    monkeypatch.delenv("QAPILOT_MODULE_URL", raising=False)
+    """QAPILOT_SUT_DB_URL 미설정 → Tool 호출 자체 X, skip 결과 즉시 반환."""
+    monkeypatch.delenv("QAPILOT_SUT_DB_URL", raising=False)
 
     mock_tool_class = MagicMock()
     mock_input_class = MagicMock()
@@ -82,13 +82,13 @@ async def test_run_db_test_safe_skips_when_env_missing(monkeypatch):
 
     mock_tool_class.assert_not_called()  # Tool 생성 자체 안 함
     assert result["tc_id"] == "TC-1"
-    assert "QAPILOT_MODULE_URL 미설정" in result["summary"]
+    assert "QAPILOT_SUT_DB_URL 미설정" in result["summary"]
 
 
 @pytest.mark.asyncio
 async def test_run_db_test_safe_calls_tool_when_env_set(monkeypatch):
     """QAPILOT_MODULE_URL 설정 시 Tool 호출."""
-    monkeypatch.setenv("QAPILOT_MODULE_URL", "http://localhost:9999")
+    monkeypatch.setenv("QAPILOT_SUT_DB_URL", "http://localhost:9999")
 
     mock_tool = MagicMock(spec=BaseTool)
     mock_tool.run = AsyncMock(return_value=MagicMock(
