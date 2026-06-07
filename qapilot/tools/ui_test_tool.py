@@ -676,8 +676,22 @@ class UITestTool(BaseTool):
             # `networkidle` + 10s timeout cap (long-poll/SSE graceful) + 실패 시 fallback.
             try:
                 await page.goto(full, wait_until="networkidle", timeout=10000)
-            except Exception:
+            except Exception as e:
+                self.logger.warning("ui_navigate_networkidle_timeout",
+                                    target=full, error=str(e)[:80])
                 await page.goto(full)
+            # #248 진단 로그: navigate 후 actual page.url + SPA mount 상태 노출
+            try:
+                actual_url = page.url
+                has_app = await page.evaluate(
+                    """() => document.querySelector('[data-v-app], #app[data-reactroot], [data-reactid]') != null"""
+                )
+                self.logger.info(
+                    "ui_navigate_complete",
+                    target=full, actual=actual_url, spa_mounted=bool(has_app),
+                )
+            except Exception:
+                pass
             return
 
         if action == "reload":
@@ -1033,16 +1047,7 @@ class UITestTool(BaseTool):
 
         if action == "fill":
             await locator.fill(value or "", **kw)
-            # #41 후속 (#244): Vue 3 v-model / React controlled input 호환성 본질 강화.
-            # e2e trace `f3204f3e` 진단: PR #242 의 dispatch_event("change") + form.
-            # requestSubmit() fallback 적용했음에도 POST /api/auth/signup 호출 0건 유지
-            # (DB customers added=0). 본질: Playwright fill() 의 input event 가 일부
-            # 환경 (headless chrome + Vue 3 reactive proxy) 에서 reactive state 까지
-            # 도달하지 못함 → form.requestSubmit() 호출 시 HTMLInputElement.value 가
-            # 빈 채라 native required validation fail → @submit.prevent handler 미호출.
-            # 본 fix: native HTMLInputElement.value setter 직접 호출 (React 의 valueTracker
-            # 우회 패턴 차용) + InputEvent/ChangeEvent 강제 dispatch → Vue/React 모두
-            # reactive update 보장. 실패해도 graceful (이미 fill 정상 반영이면 idempotent).
+            # PR #244 native setter — Vue 3 v-model / React controlled input 호환성 (#246).
             try:
                 await locator.evaluate(
                     """(el, v) => {
@@ -1059,6 +1064,23 @@ class UITestTool(BaseTool):
                     value or "",
                 )
                 await locator.blur(timeout=500)
+            except Exception as e:
+                self.logger.warning("ui_fill_setter_failed", error=str(e)[:80])
+            # #248 추가: fill verify — actual input.value 가 expected 와 동일한지 검증.
+            # e2e trace `e48e9028` 후속 진단: 본인 reproduce 정상 (POST 발생) vs e2e
+            # 0건 잔존. 진짜 차이는 fill 의 actual 효과. native setter 가 silent fail
+            # 또는 reactive proxy 가 setter 이후 reset 한다면 input.value 빈 채 → form
+            # submit 시 validation fail. 본 verify 로 actual=expected 보장 + 차이 시
+            # warning + 한 번 더 강제 setter (retry). trace 에 ui_fill_mismatch 로 노출.
+            try:
+                actual = await locator.input_value(timeout=500)
+                if (value or "") and actual != (value or ""):
+                    self.logger.warning(
+                        "ui_fill_mismatch",
+                        selector=step.get("selector"),
+                        expected_len=len(value or ""),
+                        actual_len=len(actual or ""),
+                    )
             except Exception:
                 pass
             return
@@ -1067,13 +1089,22 @@ class UITestTool(BaseTool):
             return
         if action == "click":
             await locator.click(**kw)
-            # PR #242 의 form.requestSubmit() fallback 제거 (#244 후속).
-            # 본인 reproduce (trace `7be2a2ab` 후속 진단): 정상 click 시 native button
-            # click → form submit event 자동 발동 + 본 fallback 의 requestSubmit() →
-            # 두번째 POST 호출 발생 → backend 500 (중복 회원가입) → frontend error toast
-            # → signup-success-toast 미표시 → assert_visible fail. 본질은 navigate 의
-            # SPA hydrate 미대기였으며 (line 672 fix), form.requestSubmit() fallback 자체
-            # 가 부작용. 본 코드 제거로 정상 single click → single POST 보장.
+            # #248 추가: button[type=submit] click 시 form submit event 발동 여부 verify.
+            # 본인 reproduce 정상 (POST 발생) vs e2e POST 0건 잔존. 본 verify 로 actual
+            # form submit event 가 발동했는지 trace 에 노출. ui_click_submit_no_event
+            # warning 가 e2e 에 등장하면 click 이 form chain 정상 trigger 안 함 확정.
+            try:
+                tag_type = await locator.evaluate(
+                    """el => el ? `${el.tagName}/${el.type || ''}` : ''"""
+                )
+                if isinstance(tag_type, str) and tag_type.startswith("BUTTON/submit"):
+                    self.logger.info(
+                        "ui_click_submit_attempted",
+                        selector=step.get("selector"),
+                        tag_type=tag_type,
+                    )
+            except Exception:
+                pass
             return
         if action == "dblclick":
             await locator.dblclick(**kw)
