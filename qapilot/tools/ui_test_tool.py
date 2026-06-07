@@ -1056,6 +1056,17 @@ class UITestTool(BaseTool):
                 if not hasattr(self, "_fill_history"):
                     self._fill_history = {}
                 self._fill_history[sel] = value or ""
+                # #254 진단 — cache 저장 시점의 value content 노출. trace `b201373d`
+                # 진단: ui_fill_retry_check will_retry=true 인데 ui_fill_retry_input
+                # 0건 = `if not cached: continue` 으로 skip = cache value 빈 string.
+                # 본 log 로 fill 시 actually 빈 string 저장하는지 확정.
+                self.logger.info(
+                    "ui_fill_cached",
+                    selector=sel,
+                    value_type=type(value).__name__,
+                    value_len=len(value) if isinstance(value, str) else -1,
+                    value_repr=repr(value)[:60],
+                )
             # PR #244 native setter — Vue 3 v-model / React controlled input 호환성.
             try:
                 await locator.evaluate(
@@ -1161,6 +1172,14 @@ class UITestTool(BaseTool):
                                     if cs == name:
                                         cached = cv
                                         break
+                            # #254 진단: continue 직전에 cached 의 actual content 노출
+                            self.logger.info(
+                                "ui_fill_retry_cached_lookup",
+                                name=name,
+                                cached_type=type(cached).__name__,
+                                cached_len=len(cached) if isinstance(cached, str) else -1,
+                                will_continue=not bool(cached),
+                            )
                             if not cached:
                                 continue
                             try:
