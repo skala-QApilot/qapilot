@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from qapilot.agents.base_agent import BaseAgent
+from qapilot.shared.codebase_context_loader import CodebaseContextLoader
 from qapilot.shared.errors import AgentExecutionError, ErrorCode
 from qapilot.shared.schemas import ExecuteResult, FixResult, FixSuggestion
 
@@ -61,8 +62,19 @@ class FixRecommenderAgent(BaseAgent):
             fallback = self._build_fallback_fix_result(tc_id, [])
             return ExecuteResult(result={"fix_results": [fallback]}, confidence=0.3)
 
-        # tc_id 기준 코드 인덱스 로드
+        # tc_id 기준 코드 인덱스 로드.
+        # 우선순위: 1) params/context 직접 주입 → 2) candidates 의 evidence_code_location
+        # (root_cause Agent 가 채움) 에서 추출 → 3) state.qapilot_dir 의 codebase-index
+        # → 4) _load_dummy_context (tests fixture).
+        # 격차 (e2e trace `c8aadf83`): 기존엔 1 → 4 로 곧장 fallback → SaaS dev 에 fixture
+        # 없어 6 TC 모두 `code_context_not_found` warning + confidence=0.0. 본 fix 로
+        # candidates 의 code_location + qapilot_dir codebase-index 활용.
         code_context_raw = params.get("code_context") or context.get("code_context", "")
+        if not code_context_raw:
+            code_context_raw = self._extract_context_from_candidates(candidates)
+        if not code_context_raw:
+            qapilot_dir = context.get("qapilot_dir") if context else None
+            code_context_raw = self._load_from_codebase_index(qapilot_dir)
         if not code_context_raw and tc_id:
             code_context_raw = self._load_dummy_context(tc_id, "code_context")
 
@@ -183,6 +195,54 @@ class FixRecommenderAgent(BaseAgent):
         if path.exists():
             return path.read_text(encoding="utf-8")
         return ""
+
+    @staticmethod
+    def _extract_context_from_candidates(candidates: list) -> str:
+        """RootCauseCandidate 의 evidences (type='code_location') 에서 code 컨텍스트 추출.
+
+        root_cause Agent 가 candidates 의 evidence_code_location 필드에 file/line 정보
+        + (선택) snippet 을 채움. fix_recommender 는 이를 활용하여 추가 codebase-index
+        조회 없이 즉시 컨텍스트 구성.
+        """
+        if not candidates:
+            return ""
+        code_locations: list[str] = []
+        for c in candidates:
+            for ev in (c.get("evidences") or []):
+                if ev.get("type") == "code_location":
+                    content = ev.get("content") or ""
+                    if content and content not in code_locations:
+                        code_locations.append(str(content))
+        return "\n".join(code_locations) if code_locations else ""
+
+    @staticmethod
+    def _load_from_codebase_index(qapilot_dir: str | None) -> str:
+        """SaaS qapilot_dir 의 codebase-index 메타데이터를 요약하여 반환.
+
+        root_cause 의 _load_from_codebase_index 와 동형 — 단 fix_recommender 는 clue
+        없이 전체 endpoints 요약만 (root_cause 가 이미 cause 식별 후라 fix 단계는 일반
+        컨텍스트 충분). 인덱스 없으면 빈 문자열.
+        """
+        if not qapilot_dir:
+            return ""
+        qd = Path(qapilot_dir).resolve()
+        base_dir = qd if (qd / "codebase-index").is_dir() else qd.parent
+        try:
+            index = CodebaseContextLoader.load(base_dir=base_dir)
+        except Exception:
+            return ""
+        if not index.get("_dir_found"):
+            return ""
+        endpoints = (index.get("endpoints") or [])[:20]
+        models = (index.get("models") or [])[:10]
+        manifest = index.get("manifest") or {}
+        if not endpoints and not models and not manifest:
+            return ""
+        return json.dumps(
+            {"endpoints": endpoints, "models": models, "manifest": manifest},
+            ensure_ascii=False,
+            indent=2,
+        )
 
     @staticmethod
     def _stringify(val: Any) -> str:
