@@ -2579,8 +2579,10 @@ async def _report(state: PipelineState) -> dict:
     try:
         from qapilot.db.defect_writer import insert_defects
 
-        trace = load_trace(state["qapilot_dir"], trace_id) or {}
-        service_id = trace.get("service_id")
+        # PR #237 #243 후속 (#247): load_trace signature 정합 — 1 arg. 본인 PR #237 가
+        # line 908 만 fix 했고 본 위치 누락 → `defects_persist_failed` 잔존 (trace `531ce56a`).
+        trace = load_trace(trace_id) or {}
+        service_id = trace.get("service_id") or state.get("service_id")
         if service_id:
             inserted = insert_defects(
                 service_id=service_id,
