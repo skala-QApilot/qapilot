@@ -1025,13 +1025,31 @@ class UITestTool(BaseTool):
 
         if action == "fill":
             await locator.fill(value or "", **kw)
-            # #41 후속 (#249): Vue 3 v-model / React controlled input 호환성 강화.
-            # e2e trace `b59996fe` 진단: Playwright fill() 후 button click → form submit
-            # → POST /api/auth/signup 호출 0건 (HTML snapshot 변화 0). 일부 framework 의
-            # reactive state binding 이 input event 외 change/blur 도 listen 하는 경우
-            # 대비. 실패해도 graceful (이미 fill 정상이면 noop).
+            # #41 후속 (#244): Vue 3 v-model / React controlled input 호환성 본질 강화.
+            # e2e trace `f3204f3e` 진단: PR #242 의 dispatch_event("change") + form.
+            # requestSubmit() fallback 적용했음에도 POST /api/auth/signup 호출 0건 유지
+            # (DB customers added=0). 본질: Playwright fill() 의 input event 가 일부
+            # 환경 (headless chrome + Vue 3 reactive proxy) 에서 reactive state 까지
+            # 도달하지 못함 → form.requestSubmit() 호출 시 HTMLInputElement.value 가
+            # 빈 채라 native required validation fail → @submit.prevent handler 미호출.
+            # 본 fix: native HTMLInputElement.value setter 직접 호출 (React 의 valueTracker
+            # 우회 패턴 차용) + InputEvent/ChangeEvent 강제 dispatch → Vue/React 모두
+            # reactive update 보장. 실패해도 graceful (이미 fill 정상 반영이면 idempotent).
             try:
-                await locator.dispatch_event("change")
+                await locator.evaluate(
+                    """(el, v) => {
+                        if (!el) return;
+                        const proto = el instanceof HTMLTextAreaElement
+                            ? HTMLTextAreaElement.prototype
+                            : HTMLInputElement.prototype;
+                        const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+                        if (setter) setter.call(el, v);
+                        else el.value = v;
+                        el.dispatchEvent(new Event('input', {bubbles: true}));
+                        el.dispatchEvent(new Event('change', {bubbles: true}));
+                    }""",
+                    value or "",
+                )
                 await locator.blur(timeout=500)
             except Exception:
                 pass
