@@ -2507,10 +2507,32 @@ async def _cross_check(state: PipelineState) -> dict:
         )
     }
 
+    # #259 본질 fix — 시나리오 본문 (then/tags/name) 을 tc_id 별 인덱싱.
+    # cross_check 가 시나리오 의도 (positive/negative) 와 outcome 도달 여부를
+    # 정확히 판정하려면 시나리오 본문 필수. e2e trace `2cf12739` 진단: TC-02
+    # then="409 Conflict + Email already registered" actual 409 → 의도 도달
+    # = pass 가 정답인데 has_mismatch=True 로 잘못 fail. cross_check 가 본문 안
+    # 받음. 본 fix 로 scenarios state 에서 추출 + tc_intent 로 context 주입.
+    scenarios = state.get("scenarios") or []
+    tc_intent_map: dict[str, dict] = {}
+    for sc in scenarios:
+        for tc in (sc.get("test_cases") or []):
+            tid = tc.get("tc_id")
+            if not tid:
+                continue
+            tc_intent_map[str(tid)] = {
+                "name": tc.get("name") or "",
+                "tags": tc.get("tags") or [],
+                "given": tc.get("given") or "",
+                "when": tc.get("when") or "",
+                "then": tc.get("then") or "",
+            }
+
     for tc_id in ui_map.keys():
         ui_result = ui_map.get(tc_id, {})
         api_trace = api_map.get(tc_id, {})
         db_result = db_map.get(tc_id, {})
+        scenario_intent = tc_intent_map.get(str(tc_id)) or {}
 
         agent = CrossCheckAgent(trace_id=trace_id)
         try:
@@ -2521,6 +2543,9 @@ async def _cross_check(state: PipelineState) -> dict:
                         "ui_result": ui_result,
                         "api_trace": api_trace,
                         "db_result": db_result,
+                        # #259: 시나리오 의도 — cross_check agent 가 positive/negative
+                        # 구분하여 의도 도달 시 has_mismatch=false 판정에 활용.
+                        "scenario_intent": scenario_intent,
                     },
                     params={"tc_id": tc_id},
                 )
@@ -2532,10 +2557,21 @@ async def _cross_check(state: PipelineState) -> dict:
                     "tc_id": tc_id, "match_score": 0.0, "matched_fields": 0,
                     "mismatched_fields": 0, "mismatches": [], "has_mismatch": False,
                 }
-            # UI 단계 fail 인 TC 는 Layer 3 진입 위해 has_mismatch 강제 True
-            if tc_id in ui_failed_tc_ids:
+            # UI 단계 fail 인 TC 는 Layer 3 진입 위해 has_mismatch 강제 True.
+            # #259 본질 보강: 시나리오 의도 negative + outcome 도달 시 ui_failed 라도
+            # 강제 fail 처리하지 않음 (cross_check agent 의 판정 우선). 단순 ui_failed
+            # 강제 True 가 negative test 의 의도된 form prevent / 4xx 도 fail 로 만드는
+            # 격차. agent 가 시나리오 의도 도달 판정했으면 그 결과 보존.
+            agent_says_intended = (
+                output.result.get("intent_satisfied") is True
+            )
+            if tc_id in ui_failed_tc_ids and not agent_says_intended:
                 cc["has_mismatch"] = True
                 cc.setdefault("ui_failed", True)
+            elif tc_id in ui_failed_tc_ids:
+                # 의도 도달 — ui_failed 기록만 유지하고 has_mismatch 는 agent 판정 따름
+                cc.setdefault("ui_failed", True)
+                cc.setdefault("intent_satisfied", True)
             # DB / API 검증 부재 표시 — has_mismatch 변경 X (root_cause 호출 안 함)
             if tc_id in db_unverified_tc_ids:
                 cc["db_unverified"] = True

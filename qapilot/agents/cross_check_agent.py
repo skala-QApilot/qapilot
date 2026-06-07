@@ -164,6 +164,71 @@ class CrossCheckAgent(BaseAgent):
 
         return mismatches, match_score, matched_fields, error_code, summary
 
+    def _evaluate_scenario_intent(
+        self,
+        scenario_intent: dict[str, Any],
+        ui_result: dict,
+        api_trace: dict,
+    ) -> bool:
+        """#259: 시나리오 의도 (then/tags) 도달 여부 heuristic 판정.
+
+        Returns True 시 has_mismatch=False (pass) 처리. e2e trace `2cf12739` 본질.
+
+        분류:
+        - positive (tags=[normal] 또는 then 에 "성공"/"완료") + actual success → True
+        - negative error (tags=[edge_case] + then 에 4xx/오류/실패/거부) + actual 4xx → True
+        - negative validation (then 에 "빈"/"필수"/"입력"/"형식") + actual POST 0 또는 4xx → True
+        - 그 외 → False (기존 mismatch 로직 따름)
+        """
+        if not scenario_intent:
+            return False
+        then_text = (scenario_intent.get("then") or "").lower()
+        tags = [str(t).lower() for t in (scenario_intent.get("tags") or [])]
+        name = (scenario_intent.get("name") or "").lower()
+
+        is_negative = (
+            "edge_case" in tags or "negative" in tags or "error" in tags
+            or any(k in then_text for k in [
+                "4xx", "5xx", "400", "401", "403", "404", "409", "422", "500",
+                "오류", "실패", "에러", "거부", "불가", "차단", "잘못", "invalid", "error",
+                "conflict", "bad request",
+            ])
+            or any(k in name for k in ["오류", "실패", "edge"])
+        )
+        is_validation_negative = is_negative and any(k in then_text for k in [
+            "빈", "필수", "입력", "형식", "validation", "required",
+        ])
+
+        # actual outcome — API 4xx 응답 또는 UI form-level prevent
+        calls = api_trace.get("calls") or []
+        api_4xx_or_5xx = any(
+            (c.get("status_code") or 0) >= 400 for c in calls
+        )
+        # UI form prevent — submit 후 페이지 변화 0 + POST 0 (validation 막힘)
+        post_count = sum(
+            1 for c in calls
+            if (c.get("method") or "").upper() == "POST"
+        )
+        ui_steps = ui_result.get("steps") or []
+        ui_click_pass = any(
+            (s.get("action") in {"click", "click_submit"}) and s.get("status") == "pass"
+            for s in ui_steps
+        )
+        ui_form_prevent = ui_click_pass and post_count == 0
+
+        if is_validation_negative:
+            return ui_form_prevent or api_4xx_or_5xx
+        if is_negative:
+            return api_4xx_or_5xx
+        # positive — actual success (POST 2xx or UI success element)
+        api_2xx_post = any(
+            (c.get("method") or "").upper() == "POST"
+            and 200 <= (c.get("status_code") or 0) < 300
+            for c in calls
+        )
+        ui_all_pass = all(s.get("status") == "pass" for s in ui_steps) if ui_steps else False
+        return api_2xx_post or ui_all_pass
+
     async def _execute(
         self,
         context: dict[str, Any],
@@ -175,17 +240,26 @@ class CrossCheckAgent(BaseAgent):
         ui_result = context.get("ui_result", {})
         api_trace = context.get("api_trace", {})
         db_result = context.get("db_result", {})
+        # #259 본질 fix — 시나리오 의도 (then/tags) 기반 pass/fail 정확 판정.
+        # negative TC (tags=[edge_case] 또는 then 에 4xx/오류 키워드) 의 outcome
+        # 도달 (API 4xx 응답 또는 UI form prevent) 시 intent_satisfied=True.
+        # → has_mismatch=False (pass) 판정. e2e trace `2cf12739` 본질.
+        scenario_intent = context.get("scenario_intent") or {}
+        intent_satisfied = self._evaluate_scenario_intent(
+            scenario_intent, ui_result, api_trace
+        )
 
         # 경로 A: 에러 코드 있는 경우
         error_code = self._extract_error_code(ui_result, api_trace, db_result)
         if error_code:
+            has_mismatch = not intent_satisfied
             result = CrossCheckResult(
                 tc_id=tc_id,
-                match_score=0.0,
-                matched_fields=0,
+                match_score=1.0 if intent_satisfied else 0.0,
+                matched_fields=1 if intent_satisfied else 0,
                 mismatched_fields=0,
                 mismatches=[],
-                has_mismatch=True,
+                has_mismatch=has_mismatch,
             )
             # 경로 A summary는 LLM으로 생성
             _, _, _, _, summary = await self._analyze_with_llm(
@@ -195,6 +269,7 @@ class CrossCheckAgent(BaseAgent):
                 result={
                     "cross_check": result,
                     "error_code": error_code,
+                    "intent_satisfied": intent_satisfied,
                     "summary": summary,
                     "route": "A",
                 },
@@ -206,13 +281,19 @@ class CrossCheckAgent(BaseAgent):
             ui_result, api_trace, db_result, last_error
         )
 
+        # #259 본질 — Path B 에서도 intent_satisfied 가 mismatch 판정 우선
+        if intent_satisfied:
+            has_mismatch = False
+        else:
+            has_mismatch = len(mismatches) > 0
+
         result = CrossCheckResult(
             tc_id=tc_id,
-            match_score=match_score,
+            match_score=match_score if not intent_satisfied else max(match_score, 1.0),
             matched_fields=matched_fields,
             mismatched_fields=len(mismatches),
             mismatches=mismatches,
-            has_mismatch=len(mismatches) > 0,
+            has_mismatch=has_mismatch,
         )
 
         return ExecuteResult(
