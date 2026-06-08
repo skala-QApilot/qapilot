@@ -64,7 +64,8 @@ def _progress_node(name: str, fn):
     발행 실패/Redis 미설정은 progress 모듈이 알아서 흡수하므로 노드 실행에 영향 없다.
     """
     async def wrapped(state: PipelineState) -> dict:
-        progress.node(state.get("trace_id"), name)
+        trigger = state["run_options"].get("trigger")
+        progress.node(state.get("trace_id"), name, trigger)
         return await fn(state)
 
     return wrapped
@@ -1277,11 +1278,21 @@ async def _save_scenarios(state: PipelineState) -> dict:
             if service_id:
                 upsert_scenario_version(service_id, ts_id, ts)
                 await _upsert_scenario_index(service_id, ts)
+                # code_change/doc_update 로 (재)생성된 시나리오는 AI 변경 요청으로 등록해
+                # 목록에 "AI 생성" 표시(검토 대기) 가 뜨도록 한다 — natural_lang(chatbot) 과
+                # 동일한 검토 흐름을 code/file 트리거에도 적용 (이슈 #180 후속).
                 if trigger == "code_change":
                     upsert_change_request(
                         service_id=service_id,
                         scenario_id=ts_id,
                         trigger="code",
+                        reason=ts.get("name") or ts_id,
+                    )
+                elif trigger == "doc_update":
+                    upsert_change_request(
+                        service_id=service_id,
+                        scenario_id=ts_id,
+                        trigger="file",
                         reason=ts.get("name") or ts_id,
                     )
 

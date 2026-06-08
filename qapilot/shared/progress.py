@@ -36,17 +36,38 @@ _BANDS: dict[str, tuple[int, int]] = {
 }
 
 _LABELS: dict[str, str] = {
-    "doc_import": "문서를 임베딩하는 중...",
-    "codebase_scan": "코드베이스를 분석하는 중...",
-    "domain_knowledge": "도메인 지식을 불러오는 중...",
-    "requirement_extract": "요구사항을 추출하는 중...",
-    "scenario_generate": "시나리오를 생성하는 중...",
+    "doc_import": "기획/정책 문서를 읽는 중...",
+    "codebase_scan": "프로젝트 코드를 살펴보는 중...",
+    "domain_knowledge": "서비스 관련 지식을 정리하는 중...",
+    "requirement_extract": "요구사항을 정리하는 중...",
+    "scenario_generate": "테스트 시나리오를 만드는 중...",
     "save_scenarios": "시나리오를 저장하는 중...",
     "load_scenarios_for_codegen": "시나리오를 불러오는 중...",
-    "action_mapping": "액션 매핑을 작성하는 중...",
-    "code_generate": "테스트 코드를 생성하는 중...",
+    "action_mapping": "화면 요소와 테스트 동작을 연결하는 중...",
+    "code_generate": "테스트 코드를 작성하는 중...",
     "save_codes": "코드를 저장하는 중...",
 }
+
+# trigger 별로 실제 일어나는 작업이 _LABELS 의 기본 문구와 달라지는 노드의 대체 문구.
+# (trigger, node) 조합에 매칭되면 이 문구를 우선 사용한다 — 이슈 #180 의 trigger별
+# 노드 skip/축소 로직(doc_import/codebase_scan/requirement_extract)과 1:1로 맞춘다.
+_TRIGGER_LABEL_OVERRIDES: dict[tuple[str, str], str] = {
+    # doc_update: 코드 스캔이 불필요해 건너뛴다 — "코드를 살펴보는 중"이라는 오해를 막는다.
+    ("doc_update", "codebase_scan"): "문서 변경 내용을 정리하는 중...",
+    # code_change: 문서 재임포트가 불필요해 건너뛴다 — "문서를 읽는 중"이라는 오해를 막는다.
+    ("code_change", "doc_import"): "변경된 코드를 분석할 준비를 하는 중...",
+    # code_change: 요구사항을 재추출하지 않고 변경 영향 범위만 파악한다.
+    ("code_change", "requirement_extract"): "변경된 코드와 연관된 시나리오를 찾는 중...",
+}
+
+
+def _label(name: str, trigger: str | None) -> str:
+    """trigger별 대체 문구가 있으면 그것을, 없으면 기본 _LABELS 문구를 반환한다."""
+    if trigger:
+        override = _TRIGGER_LABEL_OVERRIDES.get((trigger, name))
+        if override:
+            return override
+    return _LABELS.get(name, "처리 중...")
 
 # 가드레일 상태 — trace_id → 마지막으로 발행한 정수 %. 단조 증가 보장.
 _last_pct: dict[str, int] = {}
@@ -63,21 +84,26 @@ def _emit(trace_id: str | None, node: str, pct: int, message: str) -> None:
     publish_run_event(trace_id, "progress", {"percent": pct, "node": node, "message": message})
 
 
-def node(trace_id: str | None, name: str) -> None:
-    """노드 진입 — 해당 노드 구간의 시작 % 로 진행률을 올린다."""
+def node(trace_id: str | None, name: str, trigger: str | None = None) -> None:
+    """노드 진입 — 해당 노드 구간의 시작 % 로 진행률을 올린다.
+
+    trigger 를 함께 넘기면 _TRIGGER_LABEL_OVERRIDES 에서 trigger별 실제 동작에 맞는
+    문구를 우선 사용한다 (예: code_change 의 doc_import 는 건너뛰므로 "문서를 읽는 중" 대신
+    "변경된 코드를 분석할 준비를 하는 중"으로 표시).
+    """
     band = _BANDS.get(name)
     if band:
-        _emit(trace_id, name, band[0], _LABELS.get(name, "처리 중..."))
+        _emit(trace_id, name, band[0], _label(name, trigger))
 
 
-def item(trace_id: str | None, name: str, done: int, total: int) -> None:
+def item(trace_id: str | None, name: str, done: int, total: int, trigger: str | None = None) -> None:
     """루프 항목 완료 — 노드 구간 내부를 done/total 로 보간한다."""
     band = _BANDS.get(name)
     if not band or total <= 0:
         return
     start, end = band
     pct = start + int((end - start) * done / total)
-    label = _LABELS.get(name, "처리 중...")
+    label = _label(name, trigger)
     _emit(trace_id, name, pct, f"{label} ({min(done, total)}/{total})")
 
 
