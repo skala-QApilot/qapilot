@@ -215,8 +215,9 @@ async def _execute(self, ...):
 docs/scan-enhancement/
 ├── README.md                       # 본 문서 (overview + before/after + 결정사항)
 ├── metadata-schema-spec.md         # 4 영역 schema 상세
-├── s3-path-spec.md                 # S3 path/SHA/TTL 규약
+├── s3-path-spec.md                 # S3 path/SHA/TTL 규약 + FAQ (RDB/그래프/depth 1)
 ├── poc2-vue-sfc-parser.md          # PoC 2 — Vue SFC AST 추출 (9/9, 100%)  ✅
+├── poc3-metadata-writer.md         # PoC 3 — DB+S3 mirror writer + cache skip  ✅
 └── migrations/
     └── 001_metadata_indices.sql    # DDL
 
@@ -233,9 +234,11 @@ qapilot/
 │   ├── package.json                # @vue/compiler-sfc 의존성
 │   ├── parse_vue_sfc.js            # SFC parser script
 │   └── .gitignore                  # node_modules 제외
+├── storage/
+│   └── s3_client.py                # head_object 추가  ✅ PoC 3
 └── db/
-    ├── metadata_writer.py          # metadata_indices upsert (PoC 3)
-    └── metadata_reader.py          # metadata_indices load + S3 mirror (PoC 4)
+    ├── metadata_writer.py          # ✅ PoC 3 신설 (upsert_metadata_index, upsert_source_file)
+    └── metadata_reader.py          # PoC 4 (load_metadata_index + load_source)
 ```
 
 PoC 1 = README + spec + Pydantic + DDL. PoC 2 = Vue SFC parser (frontend.selectors). PoC 3 부터 writer/reader.

@@ -4,6 +4,99 @@
 
 ---
 
+## 0. 궁금증 정리
+
+### Q1. 저장 방법 — RDB? 그래프 DB? NoSQL? 어떤 걸 쓰나?
+
+**A. 하이브리드 — 본문은 S3 (object storage), "어디에 무엇이 있나" 의 카탈로그는 PostgreSQL (RDB).**
+
+| Layer | 저장 위치 | 무엇을 저장 | 비유 |
+|---|---|---|---|
+| 본문 (blob) | **S3** (object storage) | `.py` `.vue` `.ts` 파일 텍스트 + 추출된 메타데이터 JSON | 책의 본문 |
+| 인덱스 (catalog) | **PostgreSQL `metadata_indices` 테이블** | `s3_key`, `service_id`, `commit_hash`, `kind/sub_kind`, `bytes`, `sha256`, `confidence`, `scanned_at` | 도서관 카드 카탈로그 |
+
+#### S3 만 쓰지 않는 이유
+"어떤 service 의 최신 frontend.selectors 가 어디 있나?" 를 알려면 매번 `list_objects` 해야 함 (느림 + 비쌈). RDB 에 카탈로그가 있으면:
+```sql
+SELECT s3_key FROM metadata_indices
+WHERE service_id=? AND kind='frontend' AND sub_kind='selectors'
+ORDER BY scanned_at DESC LIMIT 1
+```
+한 쿼리로 끝. + 본인 PR #240 의 `_load_codebase_index_from_db_mirror()` 패턴 그대로 재사용 (검증된 패턴).
+
+#### 그래프 DB 안 쓰는 이유
+본인 데이터는 "service × commit × 영역" 의 단순 다차원 lookup. joins 없음. 그래프 DB 는 callgraph 처럼 관계 탐색용 — 이미 `codebase_indices.callgraph` 가 JSON 으로 충분.
+
+#### NoSQL document store (Mongo 등) 안 쓰는 이유
+본인 인덱스는 schema 가 고정 (kind, sub_kind, s3_key, ...). RDB 의 `CHECK` constraint + `UNIQUE` 제약이 더 안전. 본인 기존 `codebase_indices` 와 정합.
+
+---
+
+### Q2. 다음 단계 (PoC 4+) 에서 어떻게 사용하나?
+
+유빈 agent 가 TC/TV 생성 시 본인 헬퍼 호출 → LLM context 주입:
+
+```text
+[유빈 TC generator]
+   │
+   │ ① load_metadata_index(service_id, "frontend", "selectors")
+   ▼
+[본인 헬퍼: scan_storage.load_metadata_index]
+   │ DB: SELECT s3_key FROM metadata_indices WHERE ... ORDER BY scanned_at DESC LIMIT 1
+   │ S3: GET s3_key
+   │ → dict (FrontendSelectorsIndex JSON)
+   │
+   │ ② load_source(service_id, sha, "backend/app/auth.py", line_start=10, line_end=50)
+   ▼
+[본인 헬퍼: scan_storage.load_source]
+   │ S3: GET services/{sid}/source/{sha}/backend/app/auth.py
+   │ → line range 만 잘라서 반환 (token 절감)
+   │
+   ▼
+[유빈 LLM prompt]
+   """
+   다음 selectors 카탈로그 사용해 TC 작성:
+   {selectors_json}
+   
+   관련 코드:
+   {auth_code_snippet}
+   
+   TS: {ts}
+   """
+```
+
+**핵심 효과 (격차 매핑)**:
+- **환각 selector 차단** — LLM 이 카탈로그 안의 testid (`name`, `email`, `signup-submit` ...) 만 사용
+- **격차 A-1 (오라클) 완화** — schemas (Pydantic field) 로 "이메일 검증 룰" 확인 가능
+- **격차 A-3 (런타임 상태)** — TV pool 도 같은 load_* 패턴 (PoC 6)
+
+본인 PoC 2 의 `FrontendSelectorsIndex` 가 바로 이 prompt context 의 입력.
+
+---
+
+### Q3. `git clone --depth 1` 의 `depth 1` 의미?
+
+**shallow clone — git history 1 commit (HEAD) 만 가져오기.**
+
+| | `git clone` (full) | `git clone --depth 1` |
+|---|---|---|
+| 가져오는 것 | 전체 history (모든 commit) | 마지막 commit (HEAD) 만 |
+| `.git` 크기 | service 누적 수백 MB ~ GB | ~수 MB |
+| 속도 | 느림 | 10~100배 빠름 |
+| 과거 commit | `git log` 전체 + `git checkout <old_sha>` 가능 | 못 봄 |
+| 사용처 | 개발 | CI / 1회 스캔 |
+
+#### 본인 PoC 에서 쓰는 이유
+- 본인은 **현재 코드만** 필요 — 과거 history 무관. commit 추적은 `metadata_indices.commit_hash` 컬럼만 있으면 충분.
+- 1회 clone → 스캔 → S3 PUT → 즉시 폐기 (workspace) → 디스크 자국 0.
+- 대용량 service repo 의 history 가 GB 일 때, depth 1 = 코드 자체 크기만 (예: 50MB).
+
+#### Trade-off
+- 단점: 과거 commit 접근 불가 — 단 본인은 service 등록 시점 HEAD 만 필요하므로 무관.
+- repeat scan = 새 SHA 마다 다시 `git clone --depth 1` (캐시는 S3 의 `head_object` skip 으로).
+
+---
+
 ## 1. S3 Bucket / Prefix 종합
 
 ```
