@@ -459,7 +459,7 @@ def _load_scan_result_from_disk(state: PipelineState) -> dict:
         return {"scan_result": None, "current_layer": "L1A"}
 
 
-async def _upsert_scenario_index(service_id: str, ts: dict) -> None:
+async def _upsert_scenario_index(service_id: str, ts: Any) -> None:
     """시나리오 저장 후 Qdrant scenario_index를 비동기로 업데이트한다. 실패는 silent."""
     try:
         from qapilot.tools.scenario_index import ScenarioVectorStore
@@ -559,7 +559,7 @@ async def _rough_match_scenarios(
 
             store = ScenarioVectorStore()
             hits = await store.search_ts(
-                service_id=service_id,
+                service_id=str(service_id),
                 query_vec=query_vec.tolist(),
                 top_n=top_n,
                 threshold=threshold,
@@ -579,12 +579,13 @@ async def _rough_match_scenarios(
     # ── 인메모리 폴백 ──────────────────────────────────────────────────────
     ts_texts = [ts.get("title") or ts.get("ts_id", "") for ts in existing_scenarios]
     ts_vecs = await _asyncio.to_thread(embedder.encode, ts_texts, normalize_embeddings=True)
+    ts_vecs = ts_vecs or []
 
     sims = [float(np.dot(query_vec, ts_vec)) for ts_vec in ts_vecs]
     candidates = [
         {**ts, "_similarity": round(sims[i], 4)}
         for i, ts in enumerate(existing_scenarios)
-        if sims[i] >= threshold
+        if sims and sims[i] >= threshold
     ]
     candidates.sort(key=lambda x: x["_similarity"], reverse=True)
     return candidates[:top_n]
@@ -642,9 +643,11 @@ async def _resolve_scenario_targets(
     async def _get_ts_vecs():
         nonlocal ts_vecs_cache
         if ts_vecs_cache is None:
-            ts_vecs_cache = await _asyncio.to_thread(
+            res = await _asyncio.to_thread(
                 embedder.encode, ts_texts, normalize_embeddings=True
             )
+            # Ensure we never return None to callers that iterate over ts_vecs
+            ts_vecs_cache = res if res is not None else []
         return ts_vecs_cache
 
     for i, req in enumerate(update_reqs):
@@ -666,7 +669,7 @@ async def _resolve_scenario_targets(
                 from qapilot.tools.scenario_index import ScenarioVectorStore
 
                 hits = await ScenarioVectorStore().search_ts(
-                    service_id=service_id,
+                    service_id=str(service_id),
                     query_vec=q_vec.tolist(),
                     top_n=1,
                     threshold=threshold,
@@ -683,7 +686,10 @@ async def _resolve_scenario_targets(
         if matched_ts_id is None:
             # 인메모리 폴백
             ts_vecs = await _get_ts_vecs()
-            ts_sims = [float(np.dot(q_vec, ts_vec)) for ts_vec in ts_vecs]
+            # _get_ts_vecs may return None or an empty value; guard before iteration.
+            if not ts_vecs:
+                continue
+            ts_sims = [float(np.dot(q_vec, tv)) for tv in ts_vecs]
             best_ts_idx = int(np.argmax(ts_sims))
             if ts_sims[best_ts_idx] < threshold:
                 continue
@@ -703,7 +709,7 @@ async def _resolve_scenario_targets(
                     from qapilot.tools.scenario_index import ScenarioVectorStore
 
                     tc_hits = await ScenarioVectorStore().search_tc(
-                        service_id=service_id,
+                        service_id=str(service_id),
                         ts_id=matched_ts_id,
                         query_vec=q_vec.tolist(),
                         threshold=threshold,
@@ -1028,7 +1034,7 @@ async def _classify_requirements_by_embedding(
                 from qapilot.tools.scenario_index import ScenarioVectorStore
 
                 hits = await ScenarioVectorStore().search_ts(
-                    service_id=service_id,
+                    service_id=str(service_id),
                     query_vec=q_vec.tolist(),
                     top_n=1,
                     threshold=update_threshold,
@@ -1042,6 +1048,11 @@ async def _classify_requirements_by_embedding(
 
         if best_ts is None:
             ts_vecs = await _get_ts_vecs()
+            if not ts_vecs:
+                # No TS vectors available -> treat as no match (created)
+                req["_diff_status"] = "created"
+                req.setdefault("action_type", "create")
+                continue
             ts_sims = [float(np.dot(q_vec, tv)) for tv in ts_vecs]
             best_idx = int(np.argmax(ts_sims))
             best_sim = ts_sims[best_idx]
@@ -1112,7 +1123,7 @@ def _classify_doc_update_requirements(
         elif (prev.get("content") or "") == (req.get("content") or ""):
             req["_diff_status"] = "unchanged"
         else:
-            target_ts_id = req_to_ts.get(req_id)
+            target_ts_id = req_to_ts.get(req_id) if req_id is not None else None
             if target_ts_id:
                 req["_diff_status"] = "updated"
                 req["action_type"] = "update"
@@ -1365,10 +1376,11 @@ async def _requirement_extract(state: PipelineState) -> dict:
         text_hash = hashlib.sha256(document_text.encode("utf-8")).hexdigest()
         if trigger == "doc_update":
             try:
-                prev_cached = json.loads(cache_path.read_text(encoding="utf-8"))
-                if prev_cached.get("hash") == text_hash and prev_cached.get("requirements"):
+                raw = cache_path.read_text(encoding="utf-8")
+                prev_cached = json.loads(raw) if raw else None
+                if isinstance(prev_cached, dict) and prev_cached.get("hash") == text_hash and prev_cached.get("requirements"):
                     get_logger("orchestrator").info("requirement_extract_skip_unchanged_prd")
-                    return {"requirements": prev_cached["requirements"]}
+                    return {"requirements": prev_cached.get("requirements", [])}
             except Exception:
                 prev_cached = None
 
@@ -1537,12 +1549,28 @@ async def _save_scenarios(state: PipelineState) -> dict:
     # requirements 가 비어있으면 RTM fallback 과 동일하게 TC.req_id 를 FR-{ts_id} 로 미리 채움.
     # 디스크/DB 저장이 fallback 보다 먼저 일어나는 순서 문제 회피 — _write_initial_rtm_version 의
     # 같은 블록은 멱등이라 그대로 둠.
-    def _backfill_req_id(ts_dict: dict, ts_id: str) -> None:
+    def _backfill_req_id(ts_dict: Any, ts_id: str) -> None:
         if requirements:
             return
-        for tc in ts_dict.get("test_cases") or []:
-            if not tc.get("req_id"):
-                tc["req_id"] = f"FR-{ts_id}"
+        # Support both dict-like scenarios and object-based (e.g. dataclass/Pydantic) TestScenario
+        if isinstance(ts_dict, dict):
+            tcs = ts_dict.get("test_cases") or []
+        else:
+            tcs = getattr(ts_dict, "test_cases", []) or []
+
+        for tc in tcs:
+            if isinstance(tc, dict):
+                if not tc.get("req_id"):
+                    tc["req_id"] = f"FR-{ts_id}"
+            else:
+                # try attribute access / assignment for object-like TC
+                if not getattr(tc, "req_id", None):
+                    try:
+                        setattr(tc, "req_id", f"FR-{ts_id}")
+                    except Exception:
+                        # last-resort: mutate __dict__ if available
+                        if hasattr(tc, "__dict__"):
+                            tc.__dict__["req_id"] = f"FR-{ts_id}"
 
     if trigger == "natural_lang":
         # natural_lang: delta(신규/수정 시나리오)만 저장, 기존 시나리오 파일 유지 (이슈 #180)
@@ -1562,8 +1590,10 @@ async def _save_scenarios(state: PipelineState) -> dict:
                         content={"delete_ts": True},
                     )
                 continue
-            change_type = ts.pop("_change_type", "ts_created")
-            change_target = ts.pop("_change_target", None)
+            raw_change_type = ts.pop("_change_type", "ts_created")
+            change_type = raw_change_type if isinstance(raw_change_type, str) else "ts_created"
+            _tmp_change_target = ts.pop("_change_target", None)
+            change_target = str(_tmp_change_target) if _tmp_change_target is not None else None
             change_tc_ids = ts.pop("_change_tc_ids", None)
             deleted_tc_ids = ts.pop("_deleted_tc_ids", None)
             # None이 아닌 경우(빈 리스트 포함)는 명시적으로 content에 기록한다.
@@ -1586,25 +1616,26 @@ async def _save_scenarios(state: PipelineState) -> dict:
             tc_count = len(ts.get("test_cases") or [])
             logger.info("scenario_save_debug", ts_id=ts_id, tc_count=tc_count, unchanged=is_unchanged)
             if service_id:
-                upsert_scenario_version(service_id, ts_id, ts)
-                await _upsert_scenario_index(service_id, ts)
+                payload = _ensure_payload_dict(ts)
+                upsert_scenario_version(service_id, ts_id, payload)
+                await _upsert_scenario_index(service_id, payload)
                 if not is_unchanged:
                     upsert_change_request(
                         service_id=service_id,
                         scenario_id=ts_id,
                         trigger="chatbot",
-                        reason=ts.get("name") or ts_id,
+                        reason=payload.get("name") or ts_id,
                         target_id=change_target,
                         content=change_content,
                     )
             if not is_unchanged:
-                _build_change_summary(change_summary, change_type, ts, ts_id, change_target)
-            logger.info(
-                "scenario_merged",
-                ts_id=ts_id,
-                action_type=ts.get("action_type", "create"),
-                unchanged=is_unchanged,
-            )
+                _build_change_summary(change_summary, change_type, _ensure_payload_dict(ts), ts_id, change_target)
+                logger.info(
+                    "scenario_merged",
+                    ts_id=ts_id,
+                    action_type=ts.get("action_type", "create"),
+                    unchanged=is_unchanged,
+                )
     else:
         for idx, ts in enumerate(scenarios, start=1):
             ts_id = ts.get("ts_id") or f"TS-{idx:03d}"
@@ -1613,7 +1644,8 @@ async def _save_scenarios(state: PipelineState) -> dict:
             # change_request 등록 시 강조 범위(target_id/content)로만 활용한다.
             is_unchanged = ts.pop("_unchanged", False)
             ts.pop("_change_type", None)
-            change_target = ts.pop("_change_target", None)
+            _tmp_change_target = ts.pop("_change_target", None)
+            change_target = str(_tmp_change_target) if _tmp_change_target is not None else None
             change_tc_ids = ts.pop("_change_tc_ids", None)
             deleted_tc_ids = ts.pop("_deleted_tc_ids", None)
             # changed_tc_ids와 deleted_tc_ids 모두 content에 포함 — UI가 각각 노란/빨간 스타일로 구분
@@ -1631,8 +1663,9 @@ async def _save_scenarios(state: PipelineState) -> dict:
             )
             saved_paths.append(str(path))
             if service_id:
-                upsert_scenario_version(service_id, ts_id, ts)
-                await _upsert_scenario_index(service_id, ts)
+                payload = _ensure_payload_dict(ts)
+                upsert_scenario_version(service_id, ts_id, payload)
+                await _upsert_scenario_index(service_id, payload)
                 # code_change/doc_update 로 (재)생성된 시나리오는 AI 변경 요청으로 등록해
                 # 목록에 "AI 생성" 표시(검토 대기) 가 뜨도록 한다 — natural_lang(chatbot) 과
                 # 동일한 검토 흐름을 code/file 트리거에도 적용 (이슈 #180 후속).
@@ -1645,7 +1678,7 @@ async def _save_scenarios(state: PipelineState) -> dict:
                         service_id=service_id,
                         scenario_id=ts_id,
                         trigger="code",
-                        reason=ts.get("name") or ts_id,
+                        reason=payload.get("name") or ts_id,
                         target_id=change_target,
                         content=change_content,
                     )
@@ -1654,7 +1687,7 @@ async def _save_scenarios(state: PipelineState) -> dict:
                         service_id=service_id,
                         scenario_id=ts_id,
                         trigger="file",
-                        reason=ts.get("name") or ts_id,
+                        reason=payload.get("name") or ts_id,
                         target_id=change_target,
                         content=change_content,
                     )
@@ -1713,8 +1746,13 @@ async def _save_scenarios(state: PipelineState) -> dict:
         try:
             from qapilot.db.scenario_version_writer import insert_initial_milestone
 
-            created = insert_initial_milestone(service_id, scenarios, label="v1.0",
-                                                description="초기 자동 생성")
+            # ensure each TestScenario-like object is normalized to a plain dict
+            created = insert_initial_milestone(
+                service_id,
+                [ _ensure_payload_dict(ts) for ts in scenarios ],
+                label="v1.0",
+                description="초기 자동 생성",
+            )
             logger.info("initial_milestone", created=created, label="v1.0")
         except Exception as e:
             logger.warning("initial_milestone_failed", error=str(e))
@@ -1753,7 +1791,29 @@ def _build_change_summary(
         summary.append(f"{ts_id} 시나리오 업데이트")
 
 
-def _write_initial_rtm_version(state: PipelineState, scenarios: list[dict] | None = None) -> None:
+def _ensure_payload_dict(obj: Any) -> dict:
+    """Normalize a TestScenario-like object to a plain dict for DB/API writers."""
+    if isinstance(obj, dict):
+        return obj
+    # pydantic v2 model_dump
+    if hasattr(obj, "model_dump") and callable(getattr(obj, "model_dump")):
+        try:
+            return obj.model_dump()
+        except Exception:
+            pass
+    # pydantic v1 dict()
+    if hasattr(obj, "dict") and callable(getattr(obj, "dict")):
+        try:
+            return obj.dict()
+        except Exception:
+            pass
+    try:
+        return dict(obj)
+    except Exception:
+        return {}
+
+
+def _write_initial_rtm_version(state: PipelineState, scenarios: list[Any] | None = None) -> None:
     """state.requirements 와 scenarios 의 TC 들을 매핑해 RTM 버전 JSON 을 디스크에 저장.
 
     label 은 기존 RTM 버전 수 +1 기준 vN.0 (예: v1.0, v2.0). status/카운트는 빈 채로
@@ -2083,9 +2143,11 @@ async def _save_codes(state: PipelineState) -> dict:
         if not tc_id:
             continue
         path = am_dir / f"{tc_id}.json"
-        path.write_text(json.dumps(am, ensure_ascii=False, indent=2), encoding="utf-8")
+        # normalize to plain dict (supports dict-like or pydantic/model objects)
+        payload = _ensure_payload_dict(am)
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         if service_id:
-            upsert_action_mapping(service_id, tc_id, am)
+            upsert_action_mapping(service_id, tc_id, payload)
 
     return {
         "saved_code_paths": saved_code_paths,
@@ -2364,7 +2426,9 @@ async def _test_execution(state: PipelineState) -> dict:
                 screenshots_dir = tc_dir / "screenshots"
                 tc_dir.mkdir(parents=True, exist_ok=True)
 
-                if generated_codes:
+                # item may be either a GeneratedCode dict or an ActionMapping dict.
+                # Only call the parser when this item looks like generated code (has "code").
+                if generated_codes and isinstance(item, dict) and item.get("code") is not None:
                     exec_mapping = _action_mapping_from_generated_code(item)
                     # api_endpoint 힌트는 기존 ActionMapping 의 값을 최대한 유지.
                     original = action_mapping_by_tc.get(str(tc_id)) or {}
@@ -2626,10 +2690,11 @@ _LOCATOR_EXPR_RE = re.compile(
 )
 
 
-def _action_mapping_from_generated_code(code_obj: dict[str, Any]) -> dict[str, Any]:
+def _action_mapping_from_generated_code(code_obj: Any) -> dict[str, Any]:
     """생성된 Playwright JS 코드의 표준 패턴을 ActionMapping 으로 복원한다."""
-    tc_id = str(code_obj.get("tc_id") or "unknown")
-    code = str(code_obj.get("code") or "")
+    payload = _ensure_payload_dict(code_obj)
+    tc_id = str(payload.get("tc_id") or "unknown")
+    code = str(payload.get("code") or "")
     locator_vars: dict[str, tuple[str, str]] = {}
     steps: list[dict[str, Any]] = []
 
@@ -3272,12 +3337,22 @@ async def _report(state: PipelineState) -> dict:
         trace = load_trace(trace_id) or {}
         service_id = trace.get("service_id") or state.get("service_id")
         if service_id:
+            # Ensure we pass plain dicts (not model instances) to insert_defects to satisfy type expectations.
+            cc_plain: list[dict] = []
+            for c in (cross_check_results or []):
+                cc_plain.append(_ensure_payload_dict(c))
+            rc_plain: list[dict] = []
+            for rc in (root_cause_results or []):
+                rc_plain.append(_ensure_payload_dict(rc))
+            fr_plain: list[dict] = []
+            for fr in (fix_results or []):
+                fr_plain.append(_ensure_payload_dict(fr))
             inserted = insert_defects(
                 service_id=service_id,
                 run_id=trace_id,
-                cross_check_results=cross_check_results,
-                root_cause_results=root_cause_results,
-                fix_results=fix_results,
+                cross_check_results=cc_plain,
+                root_cause_results=rc_plain,
+                fix_results=fr_plain,
             )
             get_logger(source="orchestrator", trace_id=trace_id).info(
                 "defects_persisted", count=inserted
