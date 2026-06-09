@@ -955,6 +955,28 @@ async def _codebase_scan(state: PipelineState) -> dict:
     # L2: spec §6.1 정합 디스크 캐시 (Tool 본체 무수정)
     _save_codebase_index_to_disk(scan, state)
 
+    # metadata-index (PoC 10): 4영역 AST 추출 → S3/DB
+    if scan:
+        _project_root = _resolve_project_root(state)
+        if _project_root is not None:
+            _trace = load_trace(state["trace_id"]) or {}
+            _service_id = _trace.get("service_id")
+            _commit_sha = (scan.get("git_diff") or {}).get("commit_hash") or ""
+            if _service_id and _commit_sha:
+                from qapilot.scan.orchestrator import scan_all_metadata
+                try:
+                    await scan_all_metadata(
+                        _service_id, _project_root, _commit_sha,
+                        skip_llm_classification=True,
+                    )
+                    logger.info(
+                        "metadata_index_done",
+                        service_id=_service_id,
+                        commit_sha=_commit_sha[:12],
+                    )
+                except Exception as _e:
+                    logger.warning("metadata_index_failed", error=str(_e))
+
     return {
         "trace_id": trace_id,
         "scan_result": scan,
