@@ -152,32 +152,38 @@ end-to-end: `get_db_snapshot_cached(sid, "customers") → TVValidator.validate(.
 
 ---
 
-## 2. 미흡 영역 종합 (본인이 객관적 인정)
+## 2. 미흡 영역 종합 — PoC 9 + 10 으로 해소 (✅ 완료)
 
-### 2.1 ⚠️ 부분 구현 (component 있음, caller 없음)
+### 2.1 ✅ A. GitHub repo → S3 source/ dump orchestrator — **PoC 9 해소**
 
-#### A. GitHub repo → S3 source/ dump orchestrator
-**현재**: `upsert_source_file(service_id, commit_hash, relative_path, content)` — **파일 1개씩** PUT 하는 저수준 함수.
-**없음**: `scan_source_to_s3(service_id, repo_url, commit_sha)` 같은 high-level — git clone (`--depth 1`) → file walk (whitelist `.py/.js/.ts/.vue/...`) → 각 파일 `upsert_source_file` 호출.
+**해소 모듈**: `qapilot/scan/source_dumper.py`
+- `clone_repo_shallow(repo_url, branch=None)` — `git clone --depth 1` + commit_sha 반환
+- `dump_source_to_s3(service_id, repo_root, commit_sha)` — walk + 각 파일 `upsert_source_file` 호출
+- whitelist `.py/.vue/.ts/.tsx/.jsx/.js/.html/.css/.json/.yaml/.md/.sql`
+- exclude `node_modules/.git/dist/build/venv/.qapilot/...` + 5MB 상한 + lock 파일 제외
+- PoC 3 head_object cache skip 그대로 활용
 
-→ 본인 PoC 9 (후속) 필요. 또는 caller (service register flow) 가 직접 git clone 후 본인 함수 반복 호출.
+### 2.2 ✅ B. Service register flow → 4영역 추출기 통합 caller — **PoC 10 해소**
 
-#### B. Service register flow → 4영역 추출기 통합 caller
-**현재**: 본인이 단위 components 만 만듦 (각 extractor 1개 호출 = 1 파일 추출).
-**없음**: service 등록 시 자동으로:
-1. git clone
-2. 모든 `.vue` 파일 → vue_sfc_parser → 합쳐서 `FrontendSelectorsIndex` → `upsert_metadata_index`
-3. `router/index.{js,ts}` → vue_router_parser → `FrontendRoutesIndex` → upsert
-4. `backend/**/*.py` (Pydantic/SQLAlchemy) → backend_schema_parser → `BackendSchemasIndex` → upsert
-5. `tests/**/test_*.py` → pytest_ast_parser → `SutTestsPatternsIndex` → upsert (+ LLM 보강)
+**해소 모듈**: `qapilot/scan/orchestrator.py`
+- `async scan_all_metadata(service_id, repo_root, commit_sha, *, llm_client=None, skip_*=False)`
+- 한 호출에:
+  1. dump_source_to_s3
+  2. 모든 .vue → vue_sfc_parser → FrontendSelectorsIndex → upsert
+  3. router/index.{js,ts} → vue_router_parser → FrontendRoutesIndex → upsert
+  4. backend/**/*.py (test_*.py 제외) → backend_schema_parser → BackendSchemasIndex → upsert
+  5. test_*.py/conftest.py → pytest_ast_parser → (LLM 보강) → SutTestsPatternsIndex → upsert
+- 영역별 실패 graceful — 한 영역 실패해도 다른 영역 계속
 
-→ 본인 PoC 10 (후속) 필요. 또는 ScanTool 의 entry point 가 본인 모듈 호출.
+실 환경 검증 (mini-bss-lite commit 3fc4330):
+- source 157/157 / selectors 125 / routes 16 / schemas 51 / patterns 129 / errors 0
 
-#### C. S3 Lifecycle policy 적용
+### 2.3 ⚠️ C. S3 Lifecycle policy 적용 — 운영 배포 시점
+
 **현재**: docs 에 정책만 명시 (`s3-path-spec.md` §4).
 **없음**: 실제 MinIO/AWS S3 bucket 에 lifecycle rule 설정 — `services/*/source/* 30일 후 삭제`.
 
-→ 운영 배포 시점에 필요 (현재 PoC 단계는 무관).
+→ 운영 배포 시점에 필요 (현재 PoC 단계는 무관). 본인 영역 outside.
 
 ### 2.2 🔵 본인 영역 외 (의도적 미구현)
 
@@ -206,7 +212,7 @@ end-to-end: `get_db_snapshot_cached(sid, "customers") → TVValidator.validate(.
 | 4.1 검증 helper | PoC 7 TVValidator | ✅ |
 | 4.2 DB 스캔 → value | PoC 8 db_state | ✅ |
 | 4.3.a github → S3 (함수) | PoC 3 upsert_source_file | ✅ |
-| 4.3.a github → S3 (orchestrator) | — | ⚠️ caller 없음 |
+| 4.3.a github → S3 (orchestrator) | PoC 9 source_dumper | ✅ |
 | 4.3.b codebase-index → S3 | 🔵 C 영역 (기존) | ✅ |
 | 4.3.c SUT 테스트 스캔 | PoC 5 + 5.1 | ✅ |
 | 4.3.d 프론트 셀렉터 | PoC 2 | ✅ |
@@ -214,18 +220,25 @@ end-to-end: `get_db_snapshot_cached(sid, "customers") → TVValidator.validate(.
 | 4.3.d 백엔드 스키마 | PoC 6.A | ✅ |
 | 4.3.e namespace 분리 | PoC 1+3 metadata_indices | ✅ |
 | 4.3.f 검색 → TC/TV | PoC 4 load_metadata_index/source | ✅ |
-| 5. 흐름 통합 | 🔵 유빈 + ⚠️ wiring | 부분 |
+| 5. 흐름 통합 | PoC 10 orchestrator + 🔵 유빈 호출만 | ✅ wiring |
 | 6. DB 스캔 → 비교 | PoC 7 + 8 | ✅ |
 
-**13 완전 구현 / 2 부분 (caller 없음) / 6 본인 영역 외**.
+**15 완전 구현 / 0 부분 / 6 본인 영역 외**.
 
 ---
 
-## 4. 검증 결론
+## 4. 검증 결론 (갱신)
 
-본인 데이터 layer (추출/저장/조회/검증/cache) 5 components 는 **모두 단독 동작 + 단위 테스트 + 실 환경 검증 통과**. 단 **service register flow 와의 통합 caller 가 없어, 본인 모듈을 사용하려면 caller (유빈 agent 또는 ScanTool entry point) 가 직접 호출 체인 구성 필요**.
+본인 영역 데이터 layer 의 **추출 / 저장 / 조회 / 검증 / cache / source dump / orchestration 7 components 모두 완성** — 단독 동작 + 단위 테스트 + 실 환경 검증 통과.
 
-→ 다음 본인 작업 우선순위:
-1. **PoC 9**: `scan_source_to_s3` orchestrator (git clone → walk → upsert_source_file)
-2. **PoC 10**: service register entry point — 4영역 추출기 통합 caller
-3. (선택) PoC 11+: framework 확장 (React/Playwright 등)
+caller (유빈 agent / service register flow / CLI) 는 본인 5 public API 만 호출:
+
+| # | API | 모듈 | 역할 |
+|---|---|---|---|
+| 1 | `scan_all_metadata(sid, repo_root, sha)` | PoC 10 orchestrator | 한 호출에 본인 4영역 + source 모두 |
+| 2 | `load_metadata_index(sid, kind, sub_kind)` | PoC 4 scan_storage | 4영역 조회 + LRU |
+| 3 | `load_source(sid, sha, path, line_start, line_end)` | PoC 4 scan_storage | 본문 조회 + line range slicing |
+| 4 | `get_db_snapshot_cached(sid, table)` | PoC 8 db_state | DB 스냅샷 + TTL cache |
+| 5 | `TVValidator().validate(tv_field, intent, snap, schemas, schema_name)` | PoC 7 tv_validator | schema/format/DB 검증 |
+
+→ 본인 작업 완전 완성. 다음은 framework 확장 (선택) 또는 유빈 agent 합류 대기.

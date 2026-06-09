@@ -34,8 +34,7 @@ function main() {
     process.stdout.write(JSON.stringify({
       ok: false,
       error: 'Usage: node parse_vue_sfc.js <vue_file_path>',
-    }));
-    process.exit(2);
+    }), () => process.exit(2));
   }
 
   const filePath = args[0];
@@ -43,8 +42,7 @@ function main() {
     process.stdout.write(JSON.stringify({
       ok: false,
       error: `File not found: ${filePath}`,
-    }));
-    process.exit(2);
+    }), () => process.exit(2));
   }
 
   let parseFn;
@@ -54,8 +52,7 @@ function main() {
     process.stdout.write(JSON.stringify({
       ok: false,
       error: `Cannot load @vue/compiler-sfc — run 'npm install' inside node-bridge/. ${e.message}`,
-    }));
-    process.exit(3);
+    }), () => process.exit(3));
   }
 
   let content;
@@ -65,8 +62,7 @@ function main() {
     process.stdout.write(JSON.stringify({
       ok: false,
       error: `Cannot read file: ${e.message}`,
-    }));
-    process.exit(2);
+    }), () => process.exit(2));
   }
 
   let result;
@@ -77,8 +73,7 @@ function main() {
       ok: false,
       error: `Vue SFC parse failed: ${e.message}`,
       stack: e.stack,
-    }));
-    process.exit(4);
+    }), () => process.exit(4));
   }
 
   const desc = result.descriptor;
@@ -118,8 +113,9 @@ function main() {
     };
   }
 
-  process.stdout.write(JSON.stringify(out));
-  process.exit(0);
+  // stdout flush 보장 — 큰 출력 (수십 KB+) 시 Node 가 write callback 전에
+  // exit 하면 데이터 잘림. callback 안에서 명시적 exit.
+  process.stdout.write(JSON.stringify(out), () => process.exit(0));
 }
 
 main();

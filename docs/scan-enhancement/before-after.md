@@ -267,12 +267,12 @@ mini-bss 한 service 등록 시:
 
 | 측면 | Before | After |
 |---|---|---|
-| 본인 영역 새 모듈 수 | 0 | 14 (extractor 5 + writer/reader 2 + shared 4 + node-bridge 3) |
+| 본인 영역 새 모듈 수 | 0 | 16 (extractor 5 + writer/reader 2 + shared 4 + node-bridge 3 + scan orchestrator 2) |
 | 새 DB 테이블 | 0 | 1 (`metadata_indices`) |
 | 새 S3 prefix | 0 | 2 (`metadata-index/`, `source/`) |
-| 단위 테스트 | (기존) | +204 (전부 PASS) |
+| 단위 테스트 | (기존) | +231 (전부 PASS) |
 | docs 페이지 | 0 (본인 영역) | 10 (`docs/scan-enhancement/`) |
 | 기존 코드 수정 | — | 1 파일 1 함수 (`s3_client.head_object`) |
 | 격차 직접 해결 | — | A-1 (간접) / A-2 (직접) / B-3 (직접) / B-4 (직접) |
 | 격차 부분 기여 | — | A-3 (TV pool 데이터 layer 제공) |
-| 미흡 영역 | — | git clone orchestrator + service register caller (PoC 9/10 후속) |
+| 미흡 영역 | — | 0 (PoC 9/10 으로 해소). 운영 lifecycle policy 만 운영 시점 적용 (본인 영역 외) |

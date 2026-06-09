@@ -18,6 +18,10 @@
 | `poc5-pytest-ast-parser.md` | pytest AST 추출 (sut_tests.patterns) | 5 + 5.1 |
 | `poc6-backend-schemas-and-vue-routes.md` | Pydantic/SQLAlchemy + Vue Router 추출 | 6.A + 6.B |
 | `poc7-8-validator-and-db-cache.md` | TVValidator + DBTool TTL cache | 7 + 8 |
+| `poc9-10-orchestrator.md` | source dumper + 4영역 통합 orchestrator | 9 + 10 |
+| `file-inventory.md` | 본 인벤토리 (이 문서) | 종합 |
+| `verification.md` | 회의 결론 ↔ 본인 구현 역추적 | 종합 |
+| `before-after.md` | Before/After 3 측면 | 종합 |
 
 ---
 
@@ -30,6 +34,13 @@
 | `backend_schema_parser.py` | `backend.schemas` | Pydantic + SQLAlchemy | tree-sitter-python | 6.A |
 | `pytest_ast_parser.py` | `sut_tests.patterns` | pytest | tree-sitter-python | 5 |
 | `llm_pattern_classifier.py` | (pytest 출력 보강) | LLM | LLMClient (LangChain ChatOpenAI) | 5.1 |
+
+## 2.1 Scan layer (`qapilot/scan/`) — 추가 2 모듈
+
+| 파일 | 함수 | PoC |
+|---|---|---|
+| `source_dumper.py` | `clone_repo_shallow`, `dump_source_to_s3`, `iter_source_files`, `_mask_url` | 9 |
+| `orchestrator.py` | `scan_all_metadata`, `_build_frontend_selectors`, `_build_frontend_routes`, `_build_backend_schemas`, `_build_sut_tests_patterns`, `_infer_route_from_path` | 10 |
 
 `__init__.py` 2개 (`qapilot/scan/__init__.py` + `qapilot/scan/extractors/__init__.py`).
 
@@ -92,7 +103,9 @@
 | `test_vue_router_parser.py` | 25 | PoC 6.B |
 | `test_tv_validator.py` | 50 | PoC 7 |
 | `test_db_state.py` | 18 | PoC 8 |
-| **합계** | **204 PASS** | |
+| `test_source_dumper.py` | 12 | PoC 9 |
+| `test_scan_orchestrator.py` | 15 | PoC 10 |
+| **합계** | **231 PASS** | |
 
 ### 7.2 fixture 디렉토리 (4 파일)
 
@@ -133,3 +146,4 @@ Node 의존성 1개 추가: **`@vue/compiler-sfc`** (`qapilot/node-bridge/packag
 | 6 | `e6d6970` | extractor 2 + test 2 + fixture 2 + docs 1 + README = 8 |
 | 7 | `5697ef0` | shared 1 + test 1 + README = 3 |
 | 8 | `301f04f` | shared 1 + test 1 + docs 1 (PoC 7+8 통합) + README = 4 |
+| 9+10 | (다음 commit) | scan 2 + test 2 + docs 1 (PoC 9+10 통합) + README + verification + before-after + file-inventory + node-bridge fix = 9 |

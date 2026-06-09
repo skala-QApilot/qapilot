@@ -222,7 +222,8 @@ docs/scan-enhancement/
 ├── poc5-pytest-ast-parser.md       # PoC 5 — pytest AST 추출 (sut_tests.patterns)  ✅
 ├── poc6-backend-schemas-and-vue-routes.md  # PoC 6 — backend.schemas + frontend.routes  ✅
 ├── poc7-8-validator-and-db-cache.md  # PoC 7+8 — TVValidator + DBTool TTL cache  ✅
-├── file-inventory.md               # 본인이 만든 40 files 분류 (extractor/writer/reader/shared/...)
+├── poc9-10-orchestrator.md         # PoC 9+10 — source dumper + 4영역 통합 orchestrator  ✅
+├── file-inventory.md               # 본인이 만든 모든 files 분류 (extractor/writer/reader/shared/...)
 ├── verification.md                 # 회의 결론 ↔ 본인 구현 역추적 검증 + 미흡 영역 명시
 ├── before-after.md                 # Before/After (툴/아키텍처/퀄리티 3 측면)
 └── migrations/
@@ -235,6 +236,8 @@ qapilot/
 │   ├── tv_validator.py             # ✅ PoC 7 신설 (schema/format/DB 검증)
 │   └── db_state.py                 # ✅ PoC 8 신설 (DBTool snapshot + TTL cache)
 ├── scan/                           # ✅ PoC 2 신설
+│   ├── source_dumper.py            # ✅ PoC 9   — git clone + S3 source/ dump helper
+│   ├── orchestrator.py             # ✅ PoC 10  — scan_all_metadata (4영역 통합 한 호출)
 │   └── extractors/
 │       ├── vue_sfc_parser.py       # ✅ PoC 2   — Vue SFC → frontend.selectors (Input/Button/...)
 │       ├── vue_router_parser.py    # ✅ PoC 6.B — Vue Router → frontend.routes
@@ -286,6 +289,8 @@ PoC 1 = README + spec + Pydantic + DDL. PoC 2 = Vue SFC parser (frontend.selecto
 | **PoC 6.B** | `frontend.routes` 추출 (Vue Router createRouter routes) | ✅ |
 | **PoC 7** | TVValidator helper (schema/format/DB 존재성 검증) | ✅ |
 | **PoC 8** | DBTool snapshot + TTL cache (TVValidator 의 DB 입력 helper) | ✅ |
+| **PoC 9** | git clone --depth 1 + source/ S3 dump helper | ✅ |
+| **PoC 10** | scan_all_metadata 4영역 통합 orchestrator | ✅ |
 
 #### 본인 4영역 완성
 
