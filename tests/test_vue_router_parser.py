@@ -1,4 +1,4 @@
-"""vue_router_parser 단위 테스트 — PoC 6.B (본인 영역)."""
+"""vue_router_parser 단위 테스트 — PoC 6.B (데이터 layer)."""
 
 from __future__ import annotations
 

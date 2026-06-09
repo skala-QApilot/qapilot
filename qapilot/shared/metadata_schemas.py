@@ -8,7 +8,7 @@
 본 모듈은 schema 정의만 제공 — 추출 (AST/LLM) 은 PoC 2+, S3 writer 는 PoC 3,
 조회는 PoC 4 에서 별도 모듈로 구현.
 
-본인 영역 (주환).
+Author: 주환 (kimjuhwan).
 Created: 2026-06-09
 """
 

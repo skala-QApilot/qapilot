@@ -1,4 +1,4 @@
-"""source_dumper 단위 테스트 — PoC 9 (본인 영역).
+"""source_dumper 단위 테스트 — PoC 9 (데이터 layer).
 
 mock s3_client + 실제 file walk (tmp 디렉토리) 으로 검증.
 git clone 자체는 subprocess 의존 — manual integration test 으로 별도.

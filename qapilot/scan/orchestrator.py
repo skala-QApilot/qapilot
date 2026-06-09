@@ -1,6 +1,6 @@
-"""4영역 통합 스캔 orchestrator — PoC 10 (본인 영역).
+"""4영역 통합 스캔 orchestrator — PoC 10 (데이터 layer).
 
-`scan_all_metadata(service_id, repo_root, commit_sha)` — 한 호출에 본인 4영역 모두:
+`scan_all_metadata(service_id, repo_root, commit_sha)` — 한 호출에 4영역 모두:
 1. dump_source_to_s3            (source/ 본문)
 2. frontend.selectors            (Vue SFC AST)
 3. frontend.routes               (Vue Router AST)
@@ -9,7 +9,7 @@
 
 caller: 유빈 agent register flow, CLI `qapilot scan <service>`, service register webhook 등.
 
-본인 영역 (주환).
+Author: 주환 (kimjuhwan).
 Created: 2026-06-09
 """
 
@@ -93,7 +93,7 @@ async def scan_all_metadata(
     llm_client: Any = None,
     exclude_dirs: frozenset[str] = DEFAULT_EXCLUDE_DIRS,
 ) -> ScanAllResult:
-    """본인 4영역 + source 모두 추출 + S3/DB 저장.
+    """4영역 + source 모두 추출 + S3/DB 저장.
 
     Args:
         service_id, commit_sha: S3 path 구성 + DB 매칭.

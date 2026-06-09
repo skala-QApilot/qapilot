@@ -1,4 +1,4 @@
-"""scan_all_metadata orchestrator 단위 테스트 — PoC 10 (본인 영역).
+"""scan_all_metadata orchestrator 단위 테스트 — PoC 10 (데이터 layer).
 
 mock extractor + mock upsert 으로 fan-out 호출 + 결과 집계 검증.
 실 환경 통합 검증은 manual integration test 으로 별도.

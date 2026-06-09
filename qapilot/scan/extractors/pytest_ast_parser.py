@@ -1,4 +1,4 @@
-"""pytest AST 추출기 — sut_tests.patterns (PoC 5, 본인 영역).
+"""pytest AST 추출기 — sut_tests.patterns (PoC 5, 데이터 layer).
 
 추출 대상 (framework 일반, 도메인 무관):
 - `def test_*` (또는 `async def test_*`) 함수 → TestPatternRecord
@@ -19,7 +19,7 @@ framework 결정:
 본 모듈은 단일 .py 파일 단위. service 전체 walk + SutTestsPatternsIndex 생성은
 PoC 6+ caller 가 담당.
 
-본인 영역 (주환).
+Author: 주환 (kimjuhwan).
 Created: 2026-06-09
 """
 
@@ -167,7 +167,7 @@ def _iter_function_nodes(root: Node) -> list[tuple[Node, bool]]:
     """(function_node, is_decorated_fixture) 튜플 list 반환.
 
     `function_definition` 또는 `decorated_definition` 의 child function_definition
-    을 모두 수집. 본인은 모듈 top-level + class 안 둘 다 수집.
+    을 모두 수집. 모듈 top-level + class 안 둘 다 수집.
     """
     out: list[tuple[Node, bool]] = []
 
@@ -185,7 +185,7 @@ def _iter_function_nodes(root: Node) -> list[tuple[Node, bool]]:
             walk(child, False, False)
 
     def _has_pytest_fixture_decorator_inner(decorated_node: Node) -> bool:
-        # source 가 본인 walker context 에 없어서 outer 클로저 사용
+        # source 가  walker context 에 없어서 outer 클로저 사용
         return False  # placeholder — _iter_function_nodes 의 caller 에서 별도 처리
 
     walk(root, False, False)
@@ -206,7 +206,7 @@ def _iter_functions_with_decorator_info(root: Node, source: bytes) -> list[tuple
             for child in node.children:
                 if child.type == "function_definition":
                     results.append((child, is_fixture))
-                    # decorator 안의 nested 는 별개 — 본인은 더 안 들어감
+                    # decorator 안의 nested 는 별개 — 더 안 들어감
             return
         if node.type == "function_definition":
             results.append((node, False))

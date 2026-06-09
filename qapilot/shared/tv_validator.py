@@ -1,6 +1,6 @@
-"""TVValidator — TV (test value) 검증 helper, PoC 7 (본인 영역).
+"""TVValidator — TV (test value) 검증 helper, PoC 7 (데이터 layer).
 
-본인 utility (호출자 = 유빈 agent). TC/TV 생성 후 LLM 출력을 ground truth 와
+ utility (호출자 = 유빈 agent). TC/TV 생성 후 LLM 출력을 ground truth 와
 대조해 valid/invalid 판정. 호출자가 결과 보고 재시도 결정.
 
 검증 종류 (도메인 무관 일반화):
@@ -11,7 +11,7 @@
 ValidationResult 의 reasons 는 사람이 읽기 쉬운 한국어 — agent 가 LLM 에 그대로
 피드백 가능 (재시도 시 컨텍스트).
 
-본인 영역 (주환).
+Author: 주환 (kimjuhwan).
 Created: 2026-06-09
 """
 

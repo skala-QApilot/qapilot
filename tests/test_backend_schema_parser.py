@@ -1,4 +1,4 @@
-"""backend_schema_parser 단위 테스트 — PoC 6.A (본인 영역)."""
+"""backend_schema_parser 단위 테스트 — PoC 6.A (데이터 layer)."""
 
 from __future__ import annotations
 

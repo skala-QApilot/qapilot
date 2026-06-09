@@ -1,4 +1,4 @@
-"""metadata_writer 단위 테스트 — PoC 3 (본인 영역).
+"""metadata_writer 단위 테스트 — PoC 3 (데이터 layer).
 
 실 환경 (PostgreSQL + MinIO) end-to-end 검증은 manual_test_metadata_writer.py 로 분리.
 본 단위 테스트는 mock 으로 cache skip / Pydantic kind 추출 / force / 결정성 확인.

@@ -1,4 +1,4 @@
-"""metadata_indices DB + S3 mirror writer — PoC 3 (본인 영역).
+"""metadata_indices DB + S3 mirror writer — PoC 3 (데이터 layer).
 
 기존 `code_writer.upsert_codebase_index()` 패턴 (#240) 그대로 차용. 차이:
 - UNIQUE (service_id, commit_hash, kind, sub_kind) → ON CONFLICT DO UPDATE
@@ -12,7 +12,7 @@ cache skip 정책:
 
 본 모듈은 writer 만. reader 는 metadata_reader.py.
 
-본인 영역 (주환).
+Author: 주환 (kimjuhwan).
 Created: 2026-06-09
 """
 
@@ -183,7 +183,7 @@ def _extract_kind_sub_kind(index: BaseModel | dict[str, Any]) -> tuple[str, str]
 def _to_json_bytes(index: BaseModel | dict[str, Any]) -> bytes:
     """Pydantic model 또는 dict → 안정적 JSON bytes (sha256 결정성 보장)."""
     if isinstance(index, BaseModel):
-        # Pydantic v2 — model_dump_json 은 indent X. 본인은 indent=2 로
+        # Pydantic v2 — model_dump_json 은 indent X. indent=2 로
         # human-readable + sha 결정성 유지 (같은 model → 같은 bytes).
         payload = index.model_dump(mode="json")
     else:

@@ -1,4 +1,4 @@
-"""vue_sfc_parser 단위 테스트 — PoC 2 (본인 영역).
+"""vue_sfc_parser 단위 테스트 — PoC 2 (데이터 layer).
 
 fixture: tests/fixtures/vue/signup_minimal.vue (6 testid + dynamic + disabled_when).
 

@@ -1,4 +1,4 @@
-"""pytest_ast_parser 단위 테스트 — PoC 5 (본인 영역).
+"""pytest_ast_parser 단위 테스트 — PoC 5 (데이터 layer).
 
 fixture: tests/fixtures/pytest/sample_auth_test.py — 일반 패턴 (도메인 무관).
 """
@@ -136,7 +136,7 @@ def test_line_range(extracted):
     for r in extracted:
         assert r.line_start >= 1
         assert r.line_end >= r.line_start
-        # extracted_from 과 record 본인 필드 동일
+        # extracted_from 과 record  필드 동일
         assert r.extracted_from.line_start == r.line_start
         assert r.extracted_from.line_end == r.line_end
 

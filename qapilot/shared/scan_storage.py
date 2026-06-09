@@ -1,6 +1,6 @@
-"""유빈 agent (TC/TV generator) 가 사용할 통합 조회 API — PoC 4 (본인 영역).
+"""유빈 agent (TC/TV generator) 가 사용할 통합 조회 API — PoC 4 (데이터 layer).
 
-본인 데이터 layer 의 single entry point:
+ 데이터 layer 의 single entry point:
 - `load_metadata_index(service_id, kind, sub_kind)` — 메타데이터 카탈로그 JSON
 - `load_source(service_id, sha, path, line_start?, line_end?)` — 코드베이스 본문
 
@@ -9,7 +9,7 @@
 - S3 source/ GET + line range 슬라이싱 (source/)
 - process-local LRU 캐시 (token 절감 / 같은 trace 중 반복 호출 최적화)
 
-본인 영역 (주환).
+Author: 주환 (kimjuhwan).
 Created: 2026-06-09
 """
 

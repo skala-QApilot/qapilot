@@ -226,6 +226,7 @@ docs/scan-enhancement/
 ├── file-inventory.md               # 구현한 모든 files 분류 (extractor/writer/reader/shared/...)
 ├── verification.md                 # 회의 결론 ↔ 구현 역추적 검증 + 미흡 영역 명시
 ├── before-after.md                 # Before/After (툴/아키텍처/퀄리티 3 측면)
+├── deep-verification.md            # 심층 의미적 역검증 (외부 reviewer 시각)
 └── migrations/
     └── 001_metadata_indices.sql    # DDL
 

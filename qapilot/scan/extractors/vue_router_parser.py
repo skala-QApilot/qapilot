@@ -1,4 +1,4 @@
-"""Vue Router 추출기 — frontend.routes (PoC 6.B, 본인 영역).
+"""Vue Router 추출기 — frontend.routes (PoC 6.B, 데이터 layer).
 
 추출 대상: Vue Router 의 routes 배열.
 지원 패턴 (Vue Router 3/4 공통):
@@ -20,7 +20,7 @@
 
 본 추출기는 단일 .js/.ts 파일 단위. caller 는 FrontendRoutesIndex 구성.
 
-본인 영역 (주환).
+Author: 주환 (kimjuhwan).
 Created: 2026-06-09
 """
 

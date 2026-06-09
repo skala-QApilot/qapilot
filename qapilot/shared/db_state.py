@@ -1,7 +1,7 @@
-"""DB snapshot + tables 의 TTL cache helper — PoC 8 (본인 영역).
+"""DB snapshot + tables 의 TTL cache helper — PoC 8 (데이터 layer).
 
 기존 DBTestTool (qapilot/tools/db_test_tool.py) 의 _get_tables / _get_snapshot 을
-wrap + per-process TTL cache. 본인 PoC 4 의 LRU 패턴 + TTL.
+wrap + per-process TTL cache. PoC 4 의 LRU 패턴 + TTL.
 
 호출자 (유빈 TC/TV agent):
     from qapilot.shared.db_state import get_db_snapshot_cached, list_db_tables_cached
@@ -21,10 +21,10 @@ graceful:
 
 cache key 에 service_id 가 있는 이유:
 - 현재 DBTestTool 은 단일 QAPILOT_SUT_DB_URL 가정 (multi-service X)
-- 향후 multi-service 시점에 본인이 DBTestTool 의 _module_url() 을 service 별로 분리하면
+- 향후 multi-service 시점에 DBTestTool 의 _module_url() 을 service 별로 분리하면
   본 cache 의 key (service_id, table) 가 그대로 격리 보장
 
-본인 영역 (주환).
+Author: 주환 (kimjuhwan).
 Created: 2026-06-09
 """
 
@@ -120,7 +120,7 @@ async def list_db_tables_cached(
 
     tool = db_tool or _default_db_tool()
     try:
-        tables = await tool._get_tables()  # noqa: SLF001 — 본인이 wrap
+        tables = await tool._get_tables()  # noqa: SLF001 — wrap
     except Exception as e:
         _logger.warning("db_tables_fetch_failed", service_id=service_id, error=str(e))
         return None
@@ -190,7 +190,7 @@ def cache_stats() -> dict[str, dict[str, int]]:
 # ────────────────────────────────────────────────────────────────────────
 
 def _default_db_tool() -> Any:
-    """기본 DBTestTool instance — 본인이 lazy import 으로 의존성 격리.
+    """기본 DBTestTool instance — lazy import 으로 의존성 격리.
 
     test 시 db_tool 인자로 mock 주입하면 본 함수 호출 안 됨.
     """

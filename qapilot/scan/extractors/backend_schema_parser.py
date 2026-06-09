@@ -1,4 +1,4 @@
-"""backend.schemas 추출기 — Pydantic + SQLAlchemy (PoC 6.A, 본인 영역).
+"""backend.schemas 추출기 — Pydantic + SQLAlchemy (PoC 6.A, 데이터 layer).
 
 추출 대상 (framework 일반, 도메인 무관):
 - Pydantic v1/v2 `class XxxRequest(BaseModel):` / `class XxxResponse(BaseModel):`
@@ -13,7 +13,7 @@ framework 분기:
 본 추출기는 단일 .py 파일 단위. service 전체 walk + BackendSchemasIndex 생성은
 PoC 6+ caller 가 담당.
 
-본인 영역 (주환).
+Author: 주환 (kimjuhwan).
 Created: 2026-06-09
 """
 
@@ -176,7 +176,7 @@ def _extract_pydantic_fields(
                 # tree-sitter 가 type 으로만 표기하는 경우 (rare)
                 continue
             # `name: type` 인 경우 — expression_statement -> assignment 가 아닌 형태
-            # tree-sitter-python 에서는 sub-pattern 으로 표현됨, 본인이 우선 assignment 만 처리
+            # tree-sitter-python 에서는 sub-pattern 으로 표현됨, 우선 assignment 만 처리
             continue
 
         name_node = target_node.child_by_field_name("left")

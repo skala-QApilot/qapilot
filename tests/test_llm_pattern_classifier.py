@@ -1,4 +1,4 @@
-"""llm_pattern_classifier 단위 테스트 — PoC 5.1 (본인 영역).
+"""llm_pattern_classifier 단위 테스트 — PoC 5.1 (데이터 layer).
 
 mock LLMClient 으로 cost 0 검증. 실 LLM 통합은 manual integration test 로 별도.
 """

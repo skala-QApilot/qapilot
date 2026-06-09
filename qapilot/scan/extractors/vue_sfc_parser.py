@@ -1,4 +1,4 @@
-"""Vue SFC parser — frontend.selectors 추출 (PoC 2, 본인 영역).
+"""Vue SFC parser — frontend.selectors 추출 (PoC 2, 데이터 layer).
 
 Node.js subprocess (qapilot/node-bridge/parse_vue_sfc.js) 으로 @vue/compiler-sfc
 AST 를 받아, data-testid 가 있는 element 를 Pydantic model 로 변환.

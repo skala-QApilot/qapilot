@@ -1,4 +1,4 @@
-"""TestPatternRecord 의 LLM 의미 분류 — PoC 5.1 (본인 영역).
+"""TestPatternRecord 의 LLM 의미 분류 — PoC 5.1 (데이터 layer).
 
 AST 단계 (pytest_ast_parser) 에서 'unknown' 으로 남은 record 를 LLM 으로 분류.
 회의 결정 2 (2026-06-09): confidence=0.85 (LLM 의미라벨), extraction_method="hybrid".
@@ -20,13 +20,13 @@ batch 정책:
 결정성:
 - temperature=0.0 (LLMClient 기본값)
 - model 고정 (config.default_model)
-- seed 는 LangChain ChatOpenAI 가 지원하면 자동 (본인 LLMClient 의 책임)
+- seed 는 LangChain ChatOpenAI 가 지원하면 자동 ( LLMClient 의 책임)
 
 graceful:
 - LLMClient = None → records 그대로 반환 (분류 안 됨, 호출자 자유)
 - LLM 호출 실패 → 해당 batch 의 records 그대로 (unknown 유지, 로그)
 
-본인 영역 (주환).
+Author: 주환 (kimjuhwan).
 Created: 2026-06-09
 """
 

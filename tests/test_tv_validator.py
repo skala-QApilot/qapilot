@@ -1,4 +1,4 @@
-"""TVValidator 단위 테스트 — PoC 7 (본인 영역)."""
+"""TVValidator 단위 테스트 — PoC 7 (데이터 layer)."""
 
 from __future__ import annotations
 

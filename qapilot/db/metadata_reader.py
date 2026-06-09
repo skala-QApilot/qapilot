@@ -1,11 +1,11 @@
-"""metadata_indices DB+S3 read helper — PoC 4 (본인 영역).
+"""metadata_indices DB+S3 read helper — PoC 4 (데이터 layer).
 
 기존 `code_reader.load_codebase_index()` 패턴 그대로. kind/sub_kind 2축 + S3 mirror fallback.
 
 본 모듈은 DB+S3 의 raw read 만. 메모리 LRU 캐시 + token 절감 헬퍼는
 `qapilot.shared.scan_storage` 에서 wrap.
 
-본인 영역 (주환).
+Author: 주환 (kimjuhwan).
 Created: 2026-06-09
 """
 

@@ -1,4 +1,4 @@
-"""코드베이스 원본 → S3 source/ dump — PoC 9 (본인 영역).
+"""코드베이스 원본 → S3 source/ dump — PoC 9 (데이터 layer).
 
 회의 결정 3 (2026-06-09): "PoC full S3 dump + TTL 30일".
 회의 verbatim: "깃허브 → 스캔 → S3에 전부 저장 (비용 따져)".
@@ -9,7 +9,7 @@
 
 caller (PoC 10 orchestrator / service register flow) 가 두 함수 조합 호출.
 
-본인 영역 (주환).
+Author: 주환 (kimjuhwan).
 Created: 2026-06-09
 """
 

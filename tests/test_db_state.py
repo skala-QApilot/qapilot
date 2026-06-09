@@ -1,4 +1,4 @@
-"""db_state TTL cache 단위 테스트 — PoC 8 (본인 영역).
+"""db_state TTL cache 단위 테스트 — PoC 8 (데이터 layer).
 
 mock DBTool 으로 격리 — 실 DB 의존 없이 cache 동작 검증.
 """

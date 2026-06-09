@@ -1,4 +1,4 @@
-"""scan_storage 단위 테스트 — PoC 4 (본인 영역).
+"""scan_storage 단위 테스트 — PoC 4 (데이터 layer).
 
 mock 으로 DB/S3 격리. cache hit/miss + line range + graceful None + traversal 방어.
 """
