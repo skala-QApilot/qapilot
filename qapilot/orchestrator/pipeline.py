@@ -64,7 +64,8 @@ def _progress_node(name: str, fn):
     발행 실패/Redis 미설정은 progress 모듈이 알아서 흡수하므로 노드 실행에 영향 없다.
     """
     async def wrapped(state: PipelineState) -> dict:
-        progress.node(state.get("trace_id"), name)
+        trigger = state["run_options"].get("trigger")
+        progress.node(state.get("trace_id"), name, trigger)
         return await fn(state)
 
     return wrapped
@@ -458,7 +459,7 @@ def _load_scan_result_from_disk(state: PipelineState) -> dict:
         return {"scan_result": None, "current_layer": "L1A"}
 
 
-async def _upsert_scenario_index(service_id: str, ts: dict) -> None:
+async def _upsert_scenario_index(service_id: str, ts: Any) -> None:
     """시나리오 저장 후 Qdrant scenario_index를 비동기로 업데이트한다. 실패는 silent."""
     try:
         from qapilot.tools.scenario_index import ScenarioVectorStore
@@ -467,14 +468,43 @@ async def _upsert_scenario_index(service_id: str, ts: dict) -> None:
         get_logger(source="orchestrator").warning("scenario_index_upsert_error", error=str(e))
 
 
+def _load_existing_scenarios_full(state: PipelineState) -> list[dict]:
+    """기존 시나리오 전체(JSON)를 디스크 우선, 없으면 DB 폴백으로 로드한다.
+
+    test_cases[].req_id 까지 포함한 원본 그대로 반환 — doc_update 증분 재생성의
+    requirement↔scenario 매핑(이슈 #261)과 _build_existing_scenarios_summary 의
+    공통 로딩 경로로 쓰인다. SaaS 서비스처럼 디스크 미사용 환경에서는 DB 폴백.
+    """
+    try:
+        scenarios = _load_json_files(_qapilot_path(state, "scenarios"))
+        if scenarios:
+            return scenarios
+    except Exception:
+        pass
+
+    try:
+        from qapilot.db.scenario_reader import load_latest_scenarios
+        trace = load_trace(state["trace_id"]) or {}
+        service_id = trace.get("service_id")
+        if service_id:
+            db_scenarios = load_latest_scenarios(service_id)
+            if db_scenarios:
+                get_logger(source="orchestrator").debug(
+                    "existing_scenarios_from_db", count=len(db_scenarios)
+                )
+                return db_scenarios
+    except Exception:
+        pass
+
+    return []
+
+
 def _build_existing_scenarios_summary(state: PipelineState) -> list[dict]:
     """기존 시나리오를 TS+TC 요약으로 반환한다.
 
     NaturalLanguageAgent가 target_ts_id / target_tc_id를 정확히 특정할 수 있도록
     ts_id, title, test_cases(tc_id + title)만 추출해 전달한다.
     전체 시나리오 JSON을 넘기면 프롬프트가 비대해지므로 요약본만 사용한다.
-
-    디스크 파일이 없으면 DB에서 폴백 — SaaS 서비스처럼 디스크 미사용 환경 대응.
     """
     def _to_summary(scenarios: list[dict]) -> list[dict]:
         result = []
@@ -491,29 +521,7 @@ def _build_existing_scenarios_summary(state: PipelineState) -> list[dict]:
             })
         return result
 
-    try:
-        scenarios = _load_json_files(_qapilot_path(state, "scenarios"))
-        if scenarios:
-            return _to_summary(scenarios)
-    except Exception:
-        pass
-
-    # 디스크 파일 없음 → DB 폴백
-    try:
-        from qapilot.db.scenario_reader import load_latest_scenarios
-        trace = load_trace(state["trace_id"]) or {}
-        service_id = trace.get("service_id")
-        if service_id:
-            db_scenarios = load_latest_scenarios(service_id)
-            if db_scenarios:
-                get_logger(source="orchestrator").debug(
-                    "existing_scenarios_from_db", count=len(db_scenarios)
-                )
-                return _to_summary(db_scenarios)
-    except Exception:
-        pass
-
-    return []
+    return _to_summary(_load_existing_scenarios_full(state))
 
 
 async def _rough_match_scenarios(
@@ -551,7 +559,7 @@ async def _rough_match_scenarios(
 
             store = ScenarioVectorStore()
             hits = await store.search_ts(
-                service_id=service_id,
+                service_id=str(service_id),
                 query_vec=query_vec.tolist(),
                 top_n=top_n,
                 threshold=threshold,
@@ -571,12 +579,13 @@ async def _rough_match_scenarios(
     # ── 인메모리 폴백 ──────────────────────────────────────────────────────
     ts_texts = [ts.get("title") or ts.get("ts_id", "") for ts in existing_scenarios]
     ts_vecs = await _asyncio.to_thread(embedder.encode, ts_texts, normalize_embeddings=True)
+    ts_vecs = ts_vecs or []
 
     sims = [float(np.dot(query_vec, ts_vec)) for ts_vec in ts_vecs]
     candidates = [
         {**ts, "_similarity": round(sims[i], 4)}
         for i, ts in enumerate(existing_scenarios)
-        if sims[i] >= threshold
+        if sims and sims[i] >= threshold
     ]
     candidates.sort(key=lambda x: x["_similarity"], reverse=True)
     return candidates[:top_n]
@@ -607,10 +616,10 @@ async def _resolve_scenario_targets(
 
     from qapilot.tools.domain_knowledge._embedder import get_embedder
 
-    # update + create(tc/tv) 모두 처리: create+ts는 target_ts_id 불필요
+    # update/delete + create(tc/tv) 모두 처리: create+ts는 target_ts_id 불필요
     update_reqs = [
         r for r in requirements
-        if r.get("action_type") == "update"
+        if r.get("action_type") in ("update", "delete")
         or (r.get("action_type") == "create" and r.get("target_level") in ("tc", "tv"))
     ]
     if not update_reqs or not existing_scenarios:
@@ -634,9 +643,11 @@ async def _resolve_scenario_targets(
     async def _get_ts_vecs():
         nonlocal ts_vecs_cache
         if ts_vecs_cache is None:
-            ts_vecs_cache = await _asyncio.to_thread(
+            res = await _asyncio.to_thread(
                 embedder.encode, ts_texts, normalize_embeddings=True
             )
+            # Ensure we never return None to callers that iterate over ts_vecs
+            ts_vecs_cache = res if res is not None else []
         return ts_vecs_cache
 
     for i, req in enumerate(update_reqs):
@@ -658,7 +669,7 @@ async def _resolve_scenario_targets(
                 from qapilot.tools.scenario_index import ScenarioVectorStore
 
                 hits = await ScenarioVectorStore().search_ts(
-                    service_id=service_id,
+                    service_id=str(service_id),
                     query_vec=q_vec.tolist(),
                     top_n=1,
                     threshold=threshold,
@@ -675,7 +686,10 @@ async def _resolve_scenario_targets(
         if matched_ts_id is None:
             # 인메모리 폴백
             ts_vecs = await _get_ts_vecs()
-            ts_sims = [float(np.dot(q_vec, ts_vec)) for ts_vec in ts_vecs]
+            # _get_ts_vecs may return None or an empty value; guard before iteration.
+            if not ts_vecs:
+                continue
+            ts_sims = [float(np.dot(q_vec, tv)) for tv in ts_vecs]
             best_ts_idx = int(np.argmax(ts_sims))
             if ts_sims[best_ts_idx] < threshold:
                 continue
@@ -695,7 +709,7 @@ async def _resolve_scenario_targets(
                     from qapilot.tools.scenario_index import ScenarioVectorStore
 
                     tc_hits = await ScenarioVectorStore().search_tc(
-                        service_id=service_id,
+                        service_id=str(service_id),
                         ts_id=matched_ts_id,
                         query_vec=q_vec.tolist(),
                         threshold=threshold,
@@ -737,9 +751,11 @@ async def _resolve_scenario_targets(
             if target_level == "tv" and tc_sims[best_tc_idx] >= threshold:
                 req["target_tc_id"] = tcs[best_tc_idx].get("tc_id")
             elif target_level == "tc" and tc_sims[best_tc_idx] >= 0.75:
-                # create 또는 update+target_tc_id 미설정: 유사 TC 발견 시 사용자에게 확인 요청
-                # target_tc_id가 명시된 update는 의도적 수정이므로 감지 불필요
-                if action_type == "create" or not req.get("target_tc_id"):
+                if action_type in ("update", "delete"):
+                    # update/delete 경로: 대상 TC를 확정해 ScenarioGeneratorAgent에 전달
+                    req["target_tc_id"] = tcs[best_tc_idx].get("tc_id")
+                else:
+                    # create 경로: 유사 TC 발견 → 사용자 확인 요청 (새로 추가 / 수정 / 삭제 선택)
                     similar_tc = tcs[best_tc_idx]
                     req["_similar_tc"] = {
                         "tc_id": similar_tc.get("tc_id"),
@@ -950,6 +966,181 @@ def _read_latest_prd_text(state: PipelineState | None = None) -> str:
     return "\n\n".join(texts)
 
 
+async def _classify_requirements_by_embedding(
+    new_requirements: list[dict],
+    existing_scenarios: list[dict],
+    service_id: str | None = None,
+    update_threshold: float = 0.50,
+    unchanged_threshold: float = 0.85,
+) -> tuple[list[dict], list[str]]:
+    """임베딩 유사도로 요구사항을 unchanged/updated/created로 분류한다.
+
+    req_id 기반 분류(`_classify_doc_update_requirements`)를 대체하며 PRD 외
+    문서 업로드에도 동작한다.
+
+    분류 기준:
+      - 유사도 >= unchanged_threshold : unchanged  → ScenarioGeneratorAgent 전달 안 함
+      - update_threshold <= 유사도 < unchanged_threshold : updated  → delta 수정
+      - 유사도 < update_threshold : created  → 신규 생성
+
+    Returns:
+        (분류 태그가 주입된 requirements, 고아 ts_id 목록)
+    """
+    import asyncio as _asyncio
+
+    import numpy as np
+
+    from qapilot.tools.domain_knowledge._embedder import get_embedder
+
+    if not existing_scenarios:
+        for req in new_requirements:
+            req.setdefault("_diff_status", "created")
+            req.setdefault("action_type", "create")
+        return new_requirements, []
+
+    embedder = get_embedder()
+
+    query_texts = [
+        f"{r.get('domain_area', '')} {r.get('content', '')}"
+        for r in new_requirements
+    ]
+    query_vecs = await _asyncio.to_thread(
+        embedder.encode, query_texts, normalize_embeddings=True
+    )
+
+    ts_texts = [ts.get("title") or ts.get("name") or ts.get("ts_id", "") for ts in existing_scenarios]
+
+    # Qdrant 우선, 실패 시 인메모리 폴백
+    use_qdrant = bool(service_id)
+    ts_vecs_cache: list | None = None
+
+    async def _get_ts_vecs():
+        nonlocal ts_vecs_cache
+        if ts_vecs_cache is None:
+            ts_vecs_cache = await _asyncio.to_thread(
+                embedder.encode, ts_texts, normalize_embeddings=True
+            )
+        return ts_vecs_cache
+
+    covered_ts_ids: set[str] = set()
+
+    for i, req in enumerate(new_requirements):
+        q_vec = query_vecs[i]
+        best_sim: float = 0.0
+        best_ts: dict | None = None
+
+        if use_qdrant:
+            try:
+                from qapilot.tools.scenario_index import ScenarioVectorStore
+
+                hits = await ScenarioVectorStore().search_ts(
+                    service_id=str(service_id),
+                    query_vec=q_vec.tolist(),
+                    top_n=1,
+                    threshold=update_threshold,
+                )
+                if hits:
+                    ts_by_id = {ts.get("ts_id"): ts for ts in existing_scenarios}
+                    best_ts = ts_by_id.get(hits[0]["ts_id"])
+                    best_sim = hits[0].get("_similarity", 0.0)
+            except Exception:
+                use_qdrant = False  # 이후 요건은 인메모리로 처리
+
+        if best_ts is None:
+            ts_vecs = await _get_ts_vecs()
+            if not ts_vecs:
+                # No TS vectors available -> treat as no match (created)
+                req["_diff_status"] = "created"
+                req.setdefault("action_type", "create")
+                continue
+            ts_sims = [float(np.dot(q_vec, tv)) for tv in ts_vecs]
+            best_idx = int(np.argmax(ts_sims))
+            best_sim = ts_sims[best_idx]
+            if best_sim >= update_threshold:
+                best_ts = existing_scenarios[best_idx]
+
+        if best_ts is None or best_sim < update_threshold:
+            req["_diff_status"] = "created"
+            req.setdefault("action_type", "create")
+        elif best_sim >= unchanged_threshold:
+            req["_diff_status"] = "unchanged"
+            covered_ts_ids.add(best_ts.get("ts_id", ""))
+        else:
+            req["_diff_status"] = "updated"
+            req["action_type"] = "update"
+            req["target_level"] = "ts"
+            req["target_ts_id"] = best_ts.get("ts_id")
+            covered_ts_ids.add(best_ts.get("ts_id", ""))
+
+    # 어떤 요구사항과도 매칭되지 않은 기존 TS → 고아
+    all_ts_ids = {ts.get("ts_id", "") for ts in existing_scenarios}
+    orphaned_ts_ids = sorted(all_ts_ids - covered_ts_ids - {""})
+
+    return new_requirements, orphaned_ts_ids
+
+
+def _classify_doc_update_requirements(
+    new_requirements: list[dict],
+    prev_requirements: list[dict],
+    existing_scenarios: list[dict],
+) -> tuple[list[dict], list[str]]:
+    """이전 PRD 요구사항과 비교해 각 요구사항을 unchanged/update/create로 분류한다 (이슈 #261).
+
+    PRD의 `#### FR-XXX-NN` heading에서 부여되는 req_id는 문서가 바뀌어도 안정적으로
+    유지되므로 (RequirementExtractorAgent._ensure_all_document_frs), 임베딩 매칭 없이
+    req_id 동일성 + content 비교만으로 정확한 diff가 가능하다.
+
+    분류 결과는 각 requirement dict에 in-place로 태깅한다:
+      - unchanged : req_id/content 모두 동일 → _diff_status="unchanged" (재생성 skip)
+      - update    : req_id 동일, content만 변경 → action_type="update" + target_ts_id
+                    (TC.req_id 매핑으로 대상 TS 특정 — natural_lang의 임베딩 매칭과 달리
+                    req_id가 정확한 키이므로 더 신뢰도 높은 매칭이 가능하다)
+      - create    : 새 req_id, 또는 매핑 대상 TS를 못 찾은 update → action_type="create"
+
+    Returns:
+        (분류 태그가 주입된 requirements, 고아가 된 기존 시나리오의 ts_id 목록)
+        고아 = 이전 PRD에는 있었으나 새 PRD에서 사라진 req_id가 매핑되어 있던 TS.
+    """
+    prev_by_id = {r.get("req_id"): r for r in prev_requirements if r.get("req_id")}
+
+    # req_id → ts_id 매핑 — TC.req_id 기준 (RTM 매핑(_write_initial_rtm_version)과 동일 키)
+    req_to_ts: dict[str, str] = {}
+    for ts in existing_scenarios:
+        ts_id = ts.get("ts_id")
+        if not ts_id:
+            continue
+        for tc in ts.get("test_cases") or []:
+            req_id = tc.get("req_id")
+            if req_id and req_id not in req_to_ts:
+                req_to_ts[req_id] = ts_id
+
+    for req in new_requirements:
+        req_id = req.get("req_id")
+        prev = prev_by_id.get(req_id) if req_id else None
+        if prev is None:
+            req["_diff_status"] = "created"
+            req["action_type"] = "create"
+        elif (prev.get("content") or "") == (req.get("content") or ""):
+            req["_diff_status"] = "unchanged"
+        else:
+            target_ts_id = req_to_ts.get(req_id) if req_id is not None else None
+            if target_ts_id:
+                req["_diff_status"] = "updated"
+                req["action_type"] = "update"
+                req["target_level"] = "ts"
+                req["target_ts_id"] = target_ts_id
+            else:
+                # 내용은 바뀌었지만 매핑된 기존 시나리오가 없음 → 새로 생성 (안전한 폴백)
+                req["_diff_status"] = "created"
+                req["action_type"] = "create"
+
+    new_ids = {r.get("req_id") for r in new_requirements if r.get("req_id")}
+    removed_ids = set(prev_by_id) - new_ids
+    orphaned_ts_ids = sorted({req_to_ts[rid] for rid in removed_ids if rid in req_to_ts})
+
+    return new_requirements, orphaned_ts_ids
+
+
 async def _requirement_extract(state: PipelineState) -> dict:
     """FR-024 trigger별 요구사항 추출.
 
@@ -967,25 +1158,52 @@ async def _requirement_extract(state: PipelineState) -> dict:
         from qapilot.shared.session_store import (
             get_last_exchange,
             pop_pending_requirements,
+            pop_pending_similar_tc,
             save_exchange,
             save_pending_requirements,
+            save_pending_similar_tc,
         )
 
         user_input = (state["run_options"].get("user_input") or "").strip()
         session_id = state["run_options"].get("session_id") or ""
         qapilot_dir = state.get("qapilot_dir") or ""
 
-        # ── 유사 TC 질문에 대한 "새로 추가" 응답 처리 ──────────────────────────
+        # ── 유사 TC 질문에 대한 "새로 추가" / "수정" / "삭제" 응답 처리 ──────────────────────
         # 직전 교환이 _similar_tc 감지로 인한 insufficient이고
-        # 현재 입력이 "새로 추가" 계열이면, 저장된 pending_requirements를 바로 사용한다.
+        # 현재 입력이 "새로 추가" 계열이면 pending_requirements를 그대로 재사용한다.
+        # "수정" 계열이면 pending_similar_tc에 저장된 tc 좌표를 꺼내 update 방향으로 주입한다.
+        # "삭제" 계열이면 pending_similar_tc의 tc 좌표를 꺼내 delete 방향으로 주입한다.
         _NEW_ADD_KEYWORDS = {"새로 추가", "새로추가", "추가", "add", "yes", "네", "응", "그냥 추가"}
-        if (
-            session_id
-            and qapilot_dir
-            and user_input in _NEW_ADD_KEYWORDS
-        ):
+        _MODIFY_KEYWORDS = {"수정", "변경", "고쳐", "수정할게", "수정해줘", "modify", "update"}
+        _DELETE_KEYWORDS = {"삭제", "삭제할래", "삭제해", "삭제해줘", "삭제할게", "지워", "지울래", "delete"}
+        if session_id and qapilot_dir and user_input in _NEW_ADD_KEYWORDS:
             pending_reqs = pop_pending_requirements(qapilot_dir, session_id)
+            pop_pending_similar_tc(qapilot_dir, session_id)  # 잔여 좌표 정리
             if pending_reqs:
+                save_exchange(qapilot_dir, session_id, user_input, "sufficient", None)
+                return {"requirements": pending_reqs}
+
+        if session_id and qapilot_dir and user_input in _MODIFY_KEYWORDS:
+            pending_reqs = pop_pending_requirements(qapilot_dir, session_id)
+            pending_tc = pop_pending_similar_tc(qapilot_dir, session_id)
+            if pending_reqs and pending_tc:
+                for req in pending_reqs:
+                    req["action_type"] = "update"
+                    req["target_level"] = "tc"
+                    req["target_ts_id"] = pending_tc.get("ts_id")
+                    req["target_tc_id"] = pending_tc.get("tc_id")
+                save_exchange(qapilot_dir, session_id, user_input, "sufficient", None)
+                return {"requirements": pending_reqs}
+
+        if session_id and qapilot_dir and user_input in _DELETE_KEYWORDS:
+            pending_reqs = pop_pending_requirements(qapilot_dir, session_id)
+            pending_tc = pop_pending_similar_tc(qapilot_dir, session_id)
+            if pending_reqs and pending_tc:
+                for req in pending_reqs:
+                    req["action_type"] = "delete"
+                    req["target_level"] = "tc"
+                    req["target_ts_id"] = pending_tc.get("ts_id")
+                    req["target_tc_id"] = pending_tc.get("tc_id")
                 save_exchange(qapilot_dir, session_id, user_input, "sufficient", None)
                 return {"requirements": pending_reqs}
 
@@ -1048,6 +1266,27 @@ async def _requirement_extract(state: PipelineState) -> dict:
 
         requirements = output.result.get("requirements", []) or []
 
+        # LLM 오분류 교정: "XXX 시나리오 삭제"처럼 TS/TC 관리 동작인데 create/update로 분류된 경우를 보정.
+        import re as _re
+        _input_is_tc_delete = bool(_re.search(
+            r"테스트\s*케이스\s+삭제|TC\s+삭제|tc\s+삭제", user_input.strip()
+        ))
+        _input_is_ts_delete = bool(_re.search(
+            r"시나리오\s+삭제\s*$|삭제\s*해\s*줘\s*$|삭제\s*해\s*주세요\s*$", user_input.strip()
+        ))
+        for req in requirements:
+            if req.get("action_type") in ("create", "update"):
+                domain = req.get("domain_area", "")
+                domain_is_delete = bool(_re.search(r"(시나리오\s*)?삭제\s*$", domain))
+                if _input_is_tc_delete:
+                    req["action_type"] = "delete"
+                    req["target_level"] = "tc"
+                    req["domain_area"] = _re.sub(r"\s*(테스트\s*케이스\s*)?삭제\s*$", "", domain).strip() or domain
+                elif domain_is_delete or _input_is_ts_delete:
+                    req["action_type"] = "delete"
+                    req["target_level"] = "ts"
+                    req["domain_area"] = _re.sub(r"\s*(시나리오\s*)?삭제\s*$", "", domain).strip() or domain
+
         # 3단계: top_candidates 안에서 target_ts_id / target_tc_id 확정 주입 (이슈 #186, #221)
         try:
             requirements = await _resolve_scenario_targets(
@@ -1055,6 +1294,31 @@ async def _requirement_extract(state: PipelineState) -> dict:
             )
         except Exception as e:
             get_logger("orchestrator").warning("scenario_target_resolve_failed", error=str(e))
+
+        # 3.5단계: delete 요청인데 target_ts_id 미확정(TS 삭제) 또는 target_tc_id 미확정(TC 삭제) → insufficient
+        unresolved_deletes = [
+            r for r in requirements
+            if r.get("action_type") == "delete" and (
+                not r.get("target_ts_id")
+                or (r.get("target_level") == "tc" and not r.get("target_tc_id"))
+            )
+        ]
+        if unresolved_deletes:
+            domain_areas = ", ".join(
+                f"'{r.get('domain_area', '')}'" for r in unresolved_deletes if r.get("domain_area")
+            ) or "해당 대상"
+            has_tc_delete = any(r.get("target_level") == "tc" for r in unresolved_deletes)
+            if has_tc_delete:
+                feedback = f"삭제할 테스트 케이스를 찾지 못했습니다: {domain_areas}. TC 이름이나 내용을 더 구체적으로 입력해 주세요."
+            else:
+                feedback = f"삭제할 시나리오를 찾지 못했습니다: {domain_areas}. 시나리오 이름을 더 구체적으로 입력해 주세요."
+            if session_id and qapilot_dir:
+                save_exchange(qapilot_dir, session_id, user_input, "insufficient", feedback)
+            return {
+                "requirements": [],
+                "query_status": "insufficient",
+                "query_feedback": feedback,
+            }
 
         # 4단계: 유사 TC 감지 → insufficient로 사용자 확인 요청
         for req in requirements:
@@ -1067,11 +1331,16 @@ async def _requirement_extract(state: PipelineState) -> dict:
                 tc_label = f"{tc_id} {tc_name}".strip() if tc_id else tc_name
                 feedback = (
                     f"유사한 TC '{tc_label}'가 {ts_id}에 이미 있습니다. "
-                    f"이 TC를 수정할까요, 아니면 새로 추가할까요?"
+                    f"이 TC를 수정할까요, 새로 추가할까요, 아니면 삭제할까요?"
                 )
                 if session_id and qapilot_dir:
-                    # 원본 요건을 저장 — 다음 턴 "새로 추가" 클릭 시 재사용
+                    # 원본 요건을 저장 — 다음 턴 "새로 추가"/"수정" 선택 시 재사용
                     save_pending_requirements(qapilot_dir, session_id, requirements)
+                    # tc 좌표 별도 보존 — "수정" 응답 시 target_tc_id 확정에 사용
+                    save_pending_similar_tc(qapilot_dir, session_id, {
+                        "tc_id": similar_tc.get("tc_id"),
+                        "ts_id": similar_tc.get("ts_id") or req.get("target_ts_id", ""),
+                    })
                     save_exchange(qapilot_dir, session_id, user_input, "insufficient", feedback)
                 return {
                     "requirements": [],
@@ -1100,18 +1369,20 @@ async def _requirement_extract(state: PipelineState) -> dict:
     # user_input(수동 텍스트)이 있는 경우는 PRD 캐시 대상이 아니므로 제외.
     cache_path = _qapilot_path(state, "domain", "_prd_requirements_cache.json")
     text_hash: str | None = None
+    prev_cached: dict | None = None
     if not user_input:
         import hashlib
 
         text_hash = hashlib.sha256(document_text.encode("utf-8")).hexdigest()
         if trigger == "doc_update":
             try:
-                cached = json.loads(cache_path.read_text(encoding="utf-8"))
-                if cached.get("hash") == text_hash and cached.get("requirements"):
+                raw = cache_path.read_text(encoding="utf-8")
+                prev_cached = json.loads(raw) if raw else None
+                if isinstance(prev_cached, dict) and prev_cached.get("hash") == text_hash and prev_cached.get("requirements"):
                     get_logger("orchestrator").info("requirement_extract_skip_unchanged_prd")
-                    return {"requirements": cached["requirements"]}
+                    return {"requirements": prev_cached.get("requirements", [])}
             except Exception:
-                pass
+                prev_cached = None
 
     agent = RequirementExtractorAgent(trace_id=state["trace_id"])
     output = await agent.run(
@@ -1126,6 +1397,8 @@ async def _requirement_extract(state: PipelineState) -> dict:
     agent_logs = state.get("agent_logs", []) + [output.metadata.model_dump()]
     requirements = output.result.get("requirements", []) or []
 
+    # 캐시는 분류 태깅(_diff_status/action_type/...) 이전의 순수 추출 결과로 저장한다 —
+    # 다음 실행에서 diff 기준선(prev_requirements)으로 그대로 재사용하기 위함.
     if text_hash is not None:
         try:
             cache_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1136,7 +1409,34 @@ async def _requirement_extract(state: PipelineState) -> dict:
         except Exception:
             pass
 
-    return {"requirements": requirements, "agent_logs": agent_logs}
+    result: dict = {"requirements": requirements, "agent_logs": agent_logs}
+
+    # ── doc_update 증분 재생성: 임베딩 유사도 기반 분류 ──────────────────────────
+    # req_id 기반 분류(_classify_doc_update_requirements)를 대체한다.
+    # PRD 문서뿐 아니라 API 명세·도메인 규칙 문서 등 비PRD 업로드에도 동작하며,
+    # 기존 시나리오가 없는 최초 생성(existing_scenarios 빈 목록) 시에도 안전하게 처리된다.
+    if trigger == "doc_update":
+        try:
+            existing_scenarios = _load_existing_scenarios_full(state)
+            _trace_doc = load_trace(state["trace_id"]) or {}
+            _service_id_doc = _trace_doc.get("service_id") or None
+            requirements, orphaned_ts_ids = await _classify_requirements_by_embedding(
+                requirements, existing_scenarios, service_id=_service_id_doc
+            )
+            result["requirements"] = requirements
+            if orphaned_ts_ids:
+                result["orphaned_ts_ids"] = orphaned_ts_ids
+            get_logger("orchestrator").info(
+                "doc_update_requirements_classified",
+                created=sum(1 for r in requirements if r.get("_diff_status") == "created"),
+                updated=sum(1 for r in requirements if r.get("_diff_status") == "updated"),
+                unchanged=sum(1 for r in requirements if r.get("_diff_status") == "unchanged"),
+                orphaned_ts_count=len(orphaned_ts_ids),
+            )
+        except Exception as e:
+            get_logger("orchestrator").warning("doc_update_requirement_diff_failed", error=str(e))
+
+    return result
 
 
 async def _scenario_generate(state: PipelineState) -> dict:
@@ -1157,10 +1457,31 @@ async def _scenario_generate(state: PipelineState) -> dict:
     if trigger == "natural_lang" and not (state.get("requirements") or []):
         return {"scenarios": []}
 
+    requirements_for_agent = state.get("requirements") or []
+    if trigger == "doc_update":
+        # 증분 재생성(이슈 #261): _requirement_extract가 _diff_status="unchanged"로
+        # 분류한 요구사항은 ScenarioGeneratorAgent에 전달하지 않는다 — 매핑된 기존
+        # 시나리오를 그대로 보존하기 위함. (state.requirements 자체는 RTM 전체 매핑
+        # 생성을 위해 원본 그대로 유지 — _write_initial_rtm_version에서 사용)
+        filtered = [r for r in requirements_for_agent if r.get("_diff_status") != "unchanged"]
+        if len(filtered) != len(requirements_for_agent):
+            get_logger("orchestrator").info(
+                "doc_update_unchanged_requirements_skipped",
+                skipped=len(requirements_for_agent) - len(filtered),
+                remaining=len(filtered),
+            )
+        requirements_for_agent = filtered
+        # 변경/신규 요구사항이 하나도 없으면 ScenarioGeneratorAgent를 호출하지 않는다 —
+        # requirements가 빈 리스트로 전달되면 _execute가 router 기반 fallback(전체 재생성)
+        # 으로 빠지므로, 명시적으로 early return해 기존 시나리오를 그대로 보존한다.
+        if not requirements_for_agent:
+            get_logger("orchestrator").info("doc_update_no_changed_requirements_skip_generation")
+            return {"scenarios": []}
+
     context: dict = {
         "scan_result": state.get("scan_result"),
         "domain_rules": state.get("domain_rules") or [],
-        "requirements": state.get("requirements") or [],
+        "requirements": requirements_for_agent,
         "service_id": (load_trace(state["trace_id"]) or {}).get("service_id"),
         # codebase-index 디렉토리를 state.qapilot_dir 기준으로 read 하도록 전달.
         # 미주입 시 agent 가 config.project.root → CWD fallback → qapilot 자체 dir 을 읽음 (회귀 원인).
@@ -1181,7 +1502,12 @@ async def _scenario_generate(state: PipelineState) -> dict:
     scenarios = output.result.get("scenarios", []) or []
     # agent_logs append — runner.run_pipeline 의 total_cost 집계 (#227).
     agent_logs = state.get("agent_logs", []) + [output.metadata.model_dump()]
-    return {"scenarios": scenarios, "agent_logs": agent_logs}
+    result: dict = {"scenarios": scenarios, "agent_logs": agent_logs}
+    # code_change router-based 에서 탐지된 orphaned TS id 목록 — _save_scenarios 로 전달
+    orphaned_ts_ids = output.result.get("orphaned_ts_ids")
+    if orphaned_ts_ids:
+        result["orphaned_ts_ids"] = orphaned_ts_ids
+    return result
 
 
 async def _save_scenarios(state: PipelineState) -> dict:
@@ -1223,12 +1549,28 @@ async def _save_scenarios(state: PipelineState) -> dict:
     # requirements 가 비어있으면 RTM fallback 과 동일하게 TC.req_id 를 FR-{ts_id} 로 미리 채움.
     # 디스크/DB 저장이 fallback 보다 먼저 일어나는 순서 문제 회피 — _write_initial_rtm_version 의
     # 같은 블록은 멱등이라 그대로 둠.
-    def _backfill_req_id(ts_dict: dict, ts_id: str) -> None:
+    def _backfill_req_id(ts_dict: Any, ts_id: str) -> None:
         if requirements:
             return
-        for tc in ts_dict.get("test_cases") or []:
-            if not tc.get("req_id"):
-                tc["req_id"] = f"FR-{ts_id}"
+        # Support both dict-like scenarios and object-based (e.g. dataclass/Pydantic) TestScenario
+        if isinstance(ts_dict, dict):
+            tcs = ts_dict.get("test_cases") or []
+        else:
+            tcs = getattr(ts_dict, "test_cases", []) or []
+
+        for tc in tcs:
+            if isinstance(tc, dict):
+                if not tc.get("req_id"):
+                    tc["req_id"] = f"FR-{ts_id}"
+            else:
+                # try attribute access / assignment for object-like TC
+                if not getattr(tc, "req_id", None):
+                    try:
+                        setattr(tc, "req_id", f"FR-{ts_id}")
+                    except Exception:
+                        # last-resort: mutate __dict__ if available
+                        if hasattr(tc, "__dict__"):
+                            tc.__dict__["req_id"] = f"FR-{ts_id}"
 
     if trigger == "natural_lang":
         # natural_lang: delta(신규/수정 시나리오)만 저장, 기존 시나리오 파일 유지 (이슈 #180)
@@ -1237,8 +1579,34 @@ async def _save_scenarios(state: PipelineState) -> dict:
         for idx, ts in enumerate(scenarios, start=1):
             ts_id = ts.get("ts_id") or f"TS-{idx:03d}"
             _backfill_req_id(ts, ts_id)
-            change_type = ts.pop("_change_type", "ts_created")
-            change_target = ts.pop("_change_target", None)
+            ts_delete_requested = ts.pop("_ts_delete_requested", False)
+            if ts_delete_requested:
+                if service_id:
+                    upsert_change_request(
+                        service_id=service_id,
+                        scenario_id=ts_id,
+                        trigger="chatbot",
+                        reason=f"시나리오 삭제 요청: {ts.get('name') or ts_id}",
+                        content={"delete_ts": True},
+                    )
+                continue
+            raw_change_type = ts.pop("_change_type", "ts_created")
+            change_type = raw_change_type if isinstance(raw_change_type, str) else "ts_created"
+            _tmp_change_target = ts.pop("_change_target", None)
+            change_target = str(_tmp_change_target) if _tmp_change_target is not None else None
+            change_tc_ids = ts.pop("_change_tc_ids", None)
+            deleted_tc_ids = ts.pop("_deleted_tc_ids", None)
+            # None이 아닌 경우(빈 리스트 포함)는 명시적으로 content에 기록한다.
+            # `if change_tc_ids`는 []를 None과 동일하게 취급해 content가 NULL로 저장되고,
+            # 프론트엔드가 "데이터 없음"으로 간주해 TS 전체 TC를 강조하는 문제가 생긴다.
+            if change_tc_ids is not None or deleted_tc_ids is not None:
+                change_content: dict | None = {}
+                if change_tc_ids is not None:
+                    change_content["changed_tc_ids"] = change_tc_ids
+                if deleted_tc_ids is not None:
+                    change_content["deleted_tc_ids"] = deleted_tc_ids
+            else:
+                change_content = None
             path = scenarios_dir / f"{ts_id}.json"
             path.write_text(
                 json.dumps(ts, ensure_ascii=False, indent=2), encoding="utf-8"
@@ -1248,51 +1616,129 @@ async def _save_scenarios(state: PipelineState) -> dict:
             tc_count = len(ts.get("test_cases") or [])
             logger.info("scenario_save_debug", ts_id=ts_id, tc_count=tc_count, unchanged=is_unchanged)
             if service_id:
-                upsert_scenario_version(service_id, ts_id, ts)
-                await _upsert_scenario_index(service_id, ts)
+                payload = _ensure_payload_dict(ts)
+                upsert_scenario_version(service_id, ts_id, payload)
+                await _upsert_scenario_index(service_id, payload)
                 if not is_unchanged:
                     upsert_change_request(
                         service_id=service_id,
                         scenario_id=ts_id,
                         trigger="chatbot",
-                        reason=ts.get("name") or ts_id,
+                        reason=payload.get("name") or ts_id,
+                        target_id=change_target,
+                        content=change_content,
                     )
             if not is_unchanged:
-                _build_change_summary(change_summary, change_type, ts, ts_id, change_target)
-            logger.info(
-                "scenario_merged",
-                ts_id=ts_id,
-                action_type=ts.get("action_type", "create"),
-                unchanged=is_unchanged,
-            )
+                _build_change_summary(change_summary, change_type, _ensure_payload_dict(ts), ts_id, change_target)
+                logger.info(
+                    "scenario_merged",
+                    ts_id=ts_id,
+                    action_type=ts.get("action_type", "create"),
+                    unchanged=is_unchanged,
+                )
     else:
         for idx, ts in enumerate(scenarios, start=1):
             ts_id = ts.get("ts_id") or f"TS-{idx:03d}"
             _backfill_req_id(ts, ts_id)
+            # update 분기에서 마킹한 내부 마커 — 저장 파일에는 남기지 않고
+            # change_request 등록 시 강조 범위(target_id/content)로만 활용한다.
+            is_unchanged = ts.pop("_unchanged", False)
+            ts.pop("_change_type", None)
+            _tmp_change_target = ts.pop("_change_target", None)
+            change_target = str(_tmp_change_target) if _tmp_change_target is not None else None
+            change_tc_ids = ts.pop("_change_tc_ids", None)
+            deleted_tc_ids = ts.pop("_deleted_tc_ids", None)
+            # changed_tc_ids와 deleted_tc_ids 모두 content에 포함 — UI가 각각 노란/빨간 스타일로 구분
+            if change_tc_ids is not None or deleted_tc_ids is not None:
+                change_content: dict | None = {}
+                if change_tc_ids is not None:
+                    change_content["changed_tc_ids"] = change_tc_ids
+                if deleted_tc_ids is not None:
+                    change_content["deleted_tc_ids"] = deleted_tc_ids
+            else:
+                change_content = None
             path = scenarios_dir / f"{ts_id}.json"
             path.write_text(
                 json.dumps(ts, ensure_ascii=False, indent=2), encoding="utf-8"
             )
             saved_paths.append(str(path))
             if service_id:
-                upsert_scenario_version(service_id, ts_id, ts)
-                await _upsert_scenario_index(service_id, ts)
-                if trigger == "code_change":
+                payload = _ensure_payload_dict(ts)
+                upsert_scenario_version(service_id, ts_id, payload)
+                await _upsert_scenario_index(service_id, payload)
+                # code_change/doc_update 로 (재)생성된 시나리오는 AI 변경 요청으로 등록해
+                # 목록에 "AI 생성" 표시(검토 대기) 가 뜨도록 한다 — natural_lang(chatbot) 과
+                # 동일한 검토 흐름을 code/file 트리거에도 적용 (이슈 #180 후속).
+                # 단, 재생성 결과가 기존과 실질적으로 동일하면(_unchanged) 표시하지 않는다
+                # — _diff_status="updated" 오분류로 인한 불필요한 검토 표시 방지 (이슈 #261 후속).
+                if is_unchanged:
+                    pass
+                elif trigger == "code_change":
                     upsert_change_request(
                         service_id=service_id,
                         scenario_id=ts_id,
                         trigger="code",
-                        reason=ts.get("name") or ts_id,
+                        reason=payload.get("name") or ts_id,
+                        target_id=change_target,
+                        content=change_content,
+                    )
+                elif trigger == "doc_update":
+                    upsert_change_request(
+                        service_id=service_id,
+                        scenario_id=ts_id,
+                        trigger="file",
+                        reason=payload.get("name") or ts_id,
+                        target_id=change_target,
+                        content=change_content,
                     )
 
     # RTM 버전 자동 생성 — natural_lang delta 저장 시에는 skip (전체 시나리오 기준이 아니므로)
     if trigger != "natural_lang":
         try:
-            _write_initial_rtm_version(state)
+            rtm_scenarios: list[dict] | None = None
+            if trigger == "doc_update":
+                # 증분 재생성(이슈 #261): state.scenarios 는 변경분(delta)만 담고 있으므로
+                # 보존된 기존 시나리오와 병합한 전체 목록을 RTM 매핑 기준으로 사용한다 —
+                # 그래야 미변경 시나리오의 req_id↔TC 매핑도 RTM 에 계속 반영된다.
+                merged_by_id: dict[str, Any] = {}
+                for existing_ts in _load_existing_scenarios_full(state):
+                    ts_id = existing_ts.get("ts_id")
+                    if ts_id:
+                        merged_by_id[ts_id] = existing_ts
+                for ts in scenarios:
+                    ts_id = ts.get("ts_id")
+                    if ts_id:
+                        merged_by_id[ts_id] = ts
+                rtm_scenarios = list(merged_by_id.values())
+            _write_initial_rtm_version(state, scenarios=rtm_scenarios)
         except Exception as e:
             # RTM 생성 실패는 본 시나리오 생성 흐름을 막지 않도록 silent.
             logger = get_logger(source="orchestrator", trace_id=state.get("trace_id"))
             logger.warning("rtm_version_write_failed", error=str(e))
+
+    # 고아 시나리오(이슈 #261) — 새 PRD 에서 매핑 요구사항이 사라진 기존 시나리오를
+    # "검토 대상"으로 표시한다. trigger="orphaned" 로 등록해 "AI 생성"(검토 대기)과
+    # 구분되는 별도 스타일(빨간색 + AlertTriangle)로 렌더링되도록 한다.
+    orphaned_ts_ids = state.get("orphaned_ts_ids") or []
+    if trigger == "doc_update" and service_id and orphaned_ts_ids:
+        for ts_id in orphaned_ts_ids:
+            upsert_change_request(
+                service_id=service_id,
+                scenario_id=ts_id,
+                trigger="orphaned",
+                reason="PRD에서 관련 요구사항이 제거되어 검토가 필요합니다",
+            )
+        logger.info("doc_update_orphaned_scenarios_flagged", ts_ids=orphaned_ts_ids)
+
+    if trigger == "code_change" and service_id and orphaned_ts_ids:
+        for ts_id in orphaned_ts_ids:
+            upsert_change_request(
+                service_id=service_id,
+                scenario_id=ts_id,
+                trigger="orphaned",
+                reason="연결된 라우터 파일이 삭제되어 검토가 필요합니다",
+            )
+        logger.info("code_change_orphaned_scenarios_flagged", ts_ids=orphaned_ts_ids)
 
     # 첫 마일스톤 v1.0 자동 박제 — init 트리거 + service 의 첫 시나리오 생성일 때.
     # UNIQUE(service_id, label) 제약 덕에 재실행해도 멱등 (이미 v1.0 있으면 skip).
@@ -1300,8 +1746,13 @@ async def _save_scenarios(state: PipelineState) -> dict:
         try:
             from qapilot.db.scenario_version_writer import insert_initial_milestone
 
-            created = insert_initial_milestone(service_id, scenarios, label="v1.0",
-                                                description="초기 자동 생성")
+            # ensure each TestScenario-like object is normalized to a plain dict
+            created = insert_initial_milestone(
+                service_id,
+                [ _ensure_payload_dict(ts) for ts in scenarios ],
+                label="v1.0",
+                description="초기 자동 생성",
+            )
             logger.info("initial_milestone", created=created, label="v1.0")
         except Exception as e:
             logger.warning("initial_milestone_failed", error=str(e))
@@ -1340,7 +1791,29 @@ def _build_change_summary(
         summary.append(f"{ts_id} 시나리오 업데이트")
 
 
-def _write_initial_rtm_version(state: PipelineState) -> None:
+def _ensure_payload_dict(obj: Any) -> dict:
+    """Normalize a TestScenario-like object to a plain dict for DB/API writers."""
+    if isinstance(obj, dict):
+        return obj
+    # pydantic v2 model_dump
+    if hasattr(obj, "model_dump") and callable(getattr(obj, "model_dump")):
+        try:
+            return obj.model_dump()
+        except Exception:
+            pass
+    # pydantic v1 dict()
+    if hasattr(obj, "dict") and callable(getattr(obj, "dict")):
+        try:
+            return obj.dict()
+        except Exception:
+            pass
+    try:
+        return dict(obj)
+    except Exception:
+        return {}
+
+
+def _write_initial_rtm_version(state: PipelineState, scenarios: list[Any] | None = None) -> None:
     """state.requirements 와 scenarios 의 TC 들을 매핑해 RTM 버전 JSON 을 디스크에 저장.
 
     label 은 기존 RTM 버전 수 +1 기준 vN.0 (예: v1.0, v2.0). status/카운트는 빈 채로
@@ -1348,13 +1821,19 @@ def _write_initial_rtm_version(state: PipelineState) -> None:
 
     state.requirements 가 비어있으면, scenarios 의 ts_id 별로 placeholder FR 을 만들어
     최소한 RTM 구조는 항상 생성한다 (UI 에 빈 RTM 페이지 보이지 않도록).
+
+    Args:
+        scenarios: RTM 매핑에 사용할 전체 시나리오 목록. 미지정 시 state.scenarios 사용.
+            doc_update 증분 재생성(이슈 #261)에서는 state.scenarios 가 변경분(delta)만
+            담고 있으므로, 호출부가 기존 시나리오와 병합한 전체 목록을 명시적으로 넘긴다 —
+            그래야 보존된(미변경) 시나리오의 req_id↔TC 매핑도 RTM 에 반영된다.
     """
     import uuid as _uuid
     from datetime import datetime, timezone
 
     logger = get_logger(source="orchestrator", trace_id=state.get("trace_id"))
     requirements = state.get("requirements") or []
-    scenarios = state.get("scenarios") or []
+    scenarios = scenarios if scenarios is not None else (state.get("scenarios") or [])
     logger.info(
         "rtm_write_invoked",
         requirements_count=len(requirements),
@@ -1664,9 +2143,11 @@ async def _save_codes(state: PipelineState) -> dict:
         if not tc_id:
             continue
         path = am_dir / f"{tc_id}.json"
-        path.write_text(json.dumps(am, ensure_ascii=False, indent=2), encoding="utf-8")
+        # normalize to plain dict (supports dict-like or pydantic/model objects)
+        payload = _ensure_payload_dict(am)
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         if service_id:
-            upsert_action_mapping(service_id, tc_id, am)
+            upsert_action_mapping(service_id, tc_id, payload)
 
     return {
         "saved_code_paths": saved_code_paths,
@@ -1945,7 +2426,9 @@ async def _test_execution(state: PipelineState) -> dict:
                 screenshots_dir = tc_dir / "screenshots"
                 tc_dir.mkdir(parents=True, exist_ok=True)
 
-                if generated_codes:
+                # item may be either a GeneratedCode dict or an ActionMapping dict.
+                # Only call the parser when this item looks like generated code (has "code").
+                if generated_codes and isinstance(item, dict) and item.get("code") is not None:
                     exec_mapping = _action_mapping_from_generated_code(item)
                     # api_endpoint 힌트는 기존 ActionMapping 의 값을 최대한 유지.
                     original = action_mapping_by_tc.get(str(tc_id)) or {}
@@ -2207,10 +2690,11 @@ _LOCATOR_EXPR_RE = re.compile(
 )
 
 
-def _action_mapping_from_generated_code(code_obj: dict[str, Any]) -> dict[str, Any]:
+def _action_mapping_from_generated_code(code_obj: Any) -> dict[str, Any]:
     """생성된 Playwright JS 코드의 표준 패턴을 ActionMapping 으로 복원한다."""
-    tc_id = str(code_obj.get("tc_id") or "unknown")
-    code = str(code_obj.get("code") or "")
+    payload = _ensure_payload_dict(code_obj)
+    tc_id = str(payload.get("tc_id") or "unknown")
+    code = str(payload.get("code") or "")
     locator_vars: dict[str, tuple[str, str]] = {}
     steps: list[dict[str, Any]] = []
 
@@ -2853,12 +3337,22 @@ async def _report(state: PipelineState) -> dict:
         trace = load_trace(trace_id) or {}
         service_id = trace.get("service_id") or state.get("service_id")
         if service_id:
+            # Ensure we pass plain dicts (not model instances) to insert_defects to satisfy type expectations.
+            cc_plain: list[dict] = []
+            for c in (cross_check_results or []):
+                cc_plain.append(_ensure_payload_dict(c))
+            rc_plain: list[dict] = []
+            for rc in (root_cause_results or []):
+                rc_plain.append(_ensure_payload_dict(rc))
+            fr_plain: list[dict] = []
+            for fr in (fix_results or []):
+                fr_plain.append(_ensure_payload_dict(fr))
             inserted = insert_defects(
                 service_id=service_id,
                 run_id=trace_id,
-                cross_check_results=cross_check_results,
-                root_cause_results=root_cause_results,
-                fix_results=fix_results,
+                cross_check_results=cc_plain,
+                root_cause_results=rc_plain,
+                fix_results=fr_plain,
             )
             get_logger(source="orchestrator", trace_id=trace_id).info(
                 "defects_persisted", count=inserted

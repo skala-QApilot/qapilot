@@ -76,6 +76,8 @@ def parse_response(
     trigger: str,
     affected_files: list[str],
     domain_rules: list,
+    *,
+    preserve_tc_ids: bool = False,
 ) -> tuple[list[TestScenario], float]:
     """LLM 응답 JSON을 파싱하고 TestScenario 목록을 반환한다.
 
@@ -86,6 +88,8 @@ def parse_response(
         trigger: 생성 트리거 (init/code_change 등).
         affected_files: Git diff 기반 변경 파일 목록.
         domain_rules: 도메인 규칙 목록 (rule_id 수집용).
+        preserve_tc_ids: True이면 LLM이 제공한 tc_id를 그대로 사용한다.
+            update/delta 모드에서 기존 tc_id를 유지해 병합 매칭에 활용.
 
     Returns:
         tuple[list[TestScenario], float]: (시나리오 목록, confidence).
@@ -136,9 +140,15 @@ def parse_response(
                 }
                 for v in tc.get("values", [])
             ]
+            raw_tc_id = tc.get("tc_id", "")
+            assigned_tc_id = (
+                raw_tc_id
+                if preserve_tc_ids and raw_tc_id
+                else f"{ts_id}-TC-{j + 1:02d}"
+            )
             unique_tcs.append(
                 {
-                    "tc_id": f"{ts_id}-TC-{j + 1:02d}",
+                    "tc_id": assigned_tc_id,
                     "name": tc.get("name", ""),
                     "given": tc.get("given", ""),
                     "when": tc.get("when", ""),

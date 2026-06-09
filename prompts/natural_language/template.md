@@ -22,7 +22,7 @@
 
 위 정보를 참조하여 사용자 입력을 분석하고 아래 중 하나로 응답하라.
 
-1. 시나리오 생성/수정이 가능하면 sufficient + requirements 배열 반환
+1. 시나리오 생성/수정/삭제가 가능하면 sufficient + requirements 배열 반환
 2. 정보가 부족하면 insufficient + query_feedback(보충 질문) 반환
 3. QA와 무관한 질의면 rejected + query_feedback(안내 메시지) 반환
 

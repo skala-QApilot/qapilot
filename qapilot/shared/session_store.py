@@ -105,6 +105,32 @@ def pop_pending_requirements(qapilot_dir: str | Path, session_id: str) -> list[d
     return reqs
 
 
+def save_pending_similar_tc(
+    qapilot_dir: str | Path,
+    session_id: str,
+    similar_tc: dict,
+) -> None:
+    """유사 TC 감지 시 tc_id·ts_id 좌표를 세션에 보존한다.
+
+    다음 턴에서 사용자가 '수정'을 선택하면 이 정보로 target_tc_id를 확정한다.
+    """
+    path = _session_path(qapilot_dir, session_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    session = load_session(qapilot_dir, session_id)
+    session["pending_similar_tc"] = similar_tc
+    path.write_text(json.dumps(session, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def pop_pending_similar_tc(qapilot_dir: str | Path, session_id: str) -> dict | None:
+    """저장된 pending_similar_tc를 꺼내고 세션에서 제거한다."""
+    path = _session_path(qapilot_dir, session_id)
+    session = load_session(qapilot_dir, session_id)
+    info = session.pop("pending_similar_tc", None)
+    if info is not None:
+        path.write_text(json.dumps(session, ensure_ascii=False, indent=2), encoding="utf-8")
+    return info
+
+
 def get_last_exchange(qapilot_dir: str | Path, session_id: str) -> dict | None:
     """직전 교환을 반환한다 (query_status 무관).
 
