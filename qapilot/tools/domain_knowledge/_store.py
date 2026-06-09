@@ -11,7 +11,9 @@ Created: 2026-05-07
 from __future__ import annotations
 
 import asyncio
+import json
 import os
+from pathlib import Path
 from typing import Any
 
 from qapilot.shared.schemas import DomainRule
@@ -20,6 +22,7 @@ from qapilot.tools.domain_knowledge._embedder import EMBED_DIM, embed_with_retry
 _QDRANT_COLLECTION = "domain_knowledge"
 _EMBED_BATCH = 20
 _TOP_K_DEFAULT = 5
+_DOMAIN_DIR = Path(".qapilot/domain")
 
 
 class VectorStore:
