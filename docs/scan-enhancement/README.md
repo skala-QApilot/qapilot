@@ -220,6 +220,7 @@ docs/scan-enhancement/
 ├── poc3-metadata-writer.md         # PoC 3 — DB+S3 mirror writer + cache skip  ✅
 ├── poc4-scan-storage.md            # PoC 4 — load_metadata_index + load_source + LRU  ✅
 ├── poc5-pytest-ast-parser.md       # PoC 5 — pytest AST 추출 (sut_tests.patterns)  ✅
+├── poc7-8-validator-and-db-cache.md  # PoC 7+8 — TVValidator + DBTool TTL cache  ✅
 └── migrations/
     └── 001_metadata_indices.sql    # DDL
 
@@ -227,12 +228,13 @@ qapilot/
 ├── shared/
 │   ├── metadata_schemas.py         # Pydantic model 4 영역  ✅ PoC 1
 │   ├── scan_storage.py             # ✅ PoC 4 신설 (load_metadata_index + load_source + LRU)
-│   ├── db_state.py                 # DB snapshot cache (PoC 7)
-│   └── tv_validator.py             # TV 검증 helper (PoC 6)
+│   ├── tv_validator.py             # ✅ PoC 7 신설 (schema/format/DB 검증)
+│   └── db_state.py                 # ✅ PoC 8 신설 (DBTool snapshot + TTL cache)
 ├── scan/                           # ✅ PoC 2 신설
 │   └── extractors/
 │       ├── vue_sfc_parser.py       # ✅ PoC 2 — Vue SFC → InputElement/ButtonElement/...
-│       └── pytest_ast_parser.py    # ✅ PoC 5 — pytest → TestPatternRecord (fixture/auth-setup/mock/unknown)
+│       ├── pytest_ast_parser.py    # ✅ PoC 5 — pytest → TestPatternRecord (fixture/auth-setup/mock/unknown)
+│       └── llm_pattern_classifier.py  # ✅ PoC 5.1 — unknown → db-seed/cleanup/... (confidence 0.85)
 ├── node-bridge/                    # ✅ PoC 2 신설 (Node.js subprocess)
 │   ├── package.json                # @vue/compiler-sfc 의존성
 │   ├── parse_vue_sfc.js            # SFC parser script
