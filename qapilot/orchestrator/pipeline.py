@@ -126,7 +126,22 @@ def build_pipeline() -> StateGraph:
     graph.add_edge("report", END)
 
     # ═══════════════════════════════════════════════════
-    # 진입점 분기 (3개 명령)
+    # prd_only_experiment — PRD-only TS + doc-search TC
+    # ═══════════════════════════════════════════════════
+    graph.add_node("doc_import_exp",            _doc_import)
+    graph.add_node("requirement_extract_exp",   _requirement_extract)
+    graph.add_node("ts_generate_prd_only",      _ts_generate_prd_only)
+    graph.add_node("tc_generate_doc_search",    _tc_generate_doc_search)
+    graph.add_node("save_experiment_scenarios", _save_experiment_scenarios)
+
+    graph.add_edge("doc_import_exp",            "requirement_extract_exp")
+    graph.add_edge("requirement_extract_exp",   "ts_generate_prd_only")
+    graph.add_edge("ts_generate_prd_only",      "tc_generate_doc_search")
+    graph.add_edge("tc_generate_doc_search",    "save_experiment_scenarios")
+    graph.add_edge("save_experiment_scenarios", END)
+
+    # ═══════════════════════════════════════════════════
+    # 진입점 분기 (4개 명령)
     # ═══════════════════════════════════════════════════
     graph.add_conditional_edges(
         START,
@@ -142,6 +157,7 @@ def _entry_point(command: str) -> str:
         "generate_scenarios": "doc_import",
         "generate_code": "load_scenarios_for_codegen",
         "test": "load_scenarios_for_test",
+        "prd_only_experiment": "doc_import_exp",
     }
     if command not in entry_map:
         raise ValueError(f"지원하지 않는 command: {command}")
@@ -325,13 +341,12 @@ async def _doc_import(state: PipelineState) -> dict:
     if not collection_alive:
         logger.warning("qdrant_collection_missing_reimport", name="domain_knowledge")
 
-    async def _import_path(doc_path: Path, document_id: str | None = None) -> bool:
+    async def _import_path(doc_path: Path, _service_id: str | None = None, document_id: str | None = None) -> bool:
         """문서를 Qdrant 에 임포트. 반환값은 '문서가 임베딩에 반영되어 있는지' (스킵 포함).
 
         document_id 가 있으면(DB+S3 경로) 캐시의 document_id 와 비교해 "동일 버전"
-        여부를 판단한다 — 새 버전이 업로드되면 row PK 가 바뀌므로 자동으로 캐시
-        미스가 나서 재임베딩되고, 버전이 그대로면 스킵해 불필요한 재계산을 줄인다.
-        document_id 가 없는 mirror/docs 경로는 기존 경로 문자열 비교로 폴백한다.
+        여부를 판단한다. document_id 가 없는 mirror/docs 경로는 기존 경로 문자열 비교로 폴백한다.
+        _service_id 가 있으면 Qdrant 청크 payload 에 service_id 를 태깅해 멀티테넌트 검색 필터링에 사용한다.
 
         실패 시에만 False — 이미 임포트되어 스킵한 경우도 반영된 상태이므로 True.
         """
@@ -349,12 +364,10 @@ async def _doc_import(state: PipelineState) -> dict:
             except Exception:
                 pass
         try:
-            await tool.run(
-                ToolInput(
-                    trace_id=trace_id,
-                    params={"action": "import", "file_path": str(doc_path), "document_id": document_id},
-                )
-            )
+            params: dict = {"action": "import", "file_path": str(doc_path), "document_id": document_id}
+            if _service_id:
+                params["service_id"] = _service_id
+            await tool.run(ToolInput(trace_id=trace_id, params=params))
             return True
         except Exception as e:
             logger.warning("doc_import_failed", file=str(doc_path), error=str(e))
@@ -384,7 +397,7 @@ async def _doc_import(state: PipelineState) -> dict:
             # 원본 파일명 유지를 위해 임시 디렉토리 안에 rename — index 도 stem 기준이라 일관성 확보.
             Path(tmp.name).rename(tmp_path)
             try:
-                imported = await _import_path(tmp_path, doc.get("id"))
+                imported = await _import_path(tmp_path, _service_id=service_id, document_id=doc.get("id"))
             finally:
                 tmp_path.unlink(missing_ok=True)
             # 임베딩에 반영된 문서는 UI 의 '미반영' 태그를 해소하도록 표시.
@@ -3363,6 +3376,217 @@ async def _report(state: PipelineState) -> dict:
         )
 
     return {
-        "report_path": str(report_path),
+        "scenarios": merged_scenarios,
+        "saved_scenario_paths": saved_paths,
+        "status": "completed",
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════
+# prd_only_experiment 노드 구현
+# ═══════════════════════════════════════════════════════════════════
+
+
+async def _ts_generate_prd_only(state: PipelineState) -> dict:
+    """PRD 요구사항만으로 TS 구조 생성 + S3 저장."""
+    import time
+    from datetime import datetime, timezone
+
+    from qapilot.agents.ts_prd_only_agent import TSFromPRDAgent
+    from qapilot.shared.schemas import AgentInput
+
+    trace_id = state["trace_id"]
+    requirements = state.get("requirements") or []
+
+    start = time.monotonic()
+    agent = TSFromPRDAgent(trace_id=trace_id)
+    output = await agent.run(AgentInput(
+        trace_id=trace_id,
+        context={"requirements": requirements},
+        params={},
+    ))
+    duration = round(time.monotonic() - start, 2)
+    ts_list = output.result.get("ts_list") or []
+
+    trace = load_trace(trace_id) or {}
+    service_id = trace.get("service_id")
+    if service_id:
+        payload = {
+            "trace_id": trace_id,
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "source": "prd_only",
+            "ts_list": ts_list,
+            "metrics": {
+                "model": output.metadata.model,
+                "cost_usd": output.metadata.cost_usd,
+                "duration_sec": duration,
+            },
+        }
+        key = f"services/{service_id}/experiments/{trace_id}/ts_generation.json"
+        s3_client.put_bytes(
+            key,
+            json.dumps(payload, ensure_ascii=False, indent=2).encode(),
+            "application/json",
+        )
+
+    agent_logs = list(state.get("agent_logs") or []) + [output.metadata.model_dump()]
+    return {"ts_list": ts_list, "agent_logs": agent_logs}
+
+
+async def _tc_generate_doc_search(state: PipelineState) -> dict:
+    """ts_list 중 대상 TS만 문서 검색 → TC 생성 + S3 저장."""
+    import time
+    from datetime import datetime, timezone
+
+    from qapilot.agents.tc_doc_search_agent import TCFromDocsAgent
+    from qapilot.shared.schemas import AgentInput, ToolInput
+    from qapilot.tools.domain_knowledge import DomainKnowledgeTool
+
+    ts_list = state.get("ts_list") or []
+    run_opts = state["run_options"]
+    trace_id = state["trace_id"]
+    trace = load_trace(trace_id) or {}
+    service_id = trace.get("service_id")
+
+    raw_targets = run_opts.get("tc_target_ts_ids") or []
+    if not raw_targets:
+        target_indices = list(range(min(2, len(ts_list))))
+    else:
+        target_indices = []
+        for t in raw_targets:
+            try:
+                idx = int(str(t).replace("TS-", "")) - 1
+                if 0 <= idx < len(ts_list):
+                    target_indices.append(idx)
+            except ValueError:
+                pass
+
+    # req_id → content 매핑 (검색 쿼리 품질 향상)
+    req_content_map: dict[str, str] = {}
+    for r in (state.get("requirements") or []):
+        if isinstance(r, dict):
+            req_content_map[r.get("req_id", "")] = r.get("content", "")
+
+    agent_logs = list(state.get("agent_logs") or [])
+    result_test_cases: dict[int, list] = {}
+
+    for idx in target_indices:
+        ts_item = ts_list[idx]
+        ts_name = ts_item.get("name", "")
+        domain_area = ts_item.get("domain_area", "")
+        req_ids = ts_item.get("requirements") or []
+        req_contents = " ".join(req_content_map.get(rid, rid) for rid in req_ids)
+        query = f"{ts_name} {domain_area} {req_contents}".strip()
+
+        tool = DomainKnowledgeTool(trace_id=trace_id)
+        try:
+            search_result = await tool.run(ToolInput(
+                trace_id=trace_id,
+                params={
+                    "action": "search",
+                    "query": query,
+                    "top_k": 5,
+                    "service_id": service_id or "",
+                    "score_threshold": 0.55,
+                },
+            ))
+            raw_rules = search_result.result.get("rules") or []
+        except Exception:
+            raw_rules = []
+
+        retrieved_docs = [
+            {
+                "content": r.get("content", "") if isinstance(r, dict) else "",
+                "source": r.get("source", "") if isinstance(r, dict) else "",
+                "score": r.get("similarity_score", r.get("score", 0.0)) if isinstance(r, dict) else 0.0,
+            }
+            for r in raw_rules
+        ]
+
+        start = time.monotonic()
+        agent = TCFromDocsAgent(trace_id=trace_id)
+        output = await agent.run(AgentInput(
+            trace_id=trace_id,
+            context={"ts_item": ts_item, "retrieved_docs": retrieved_docs},
+            params={},
+        ))
+        duration = round(time.monotonic() - start, 2)
+        test_cases = output.result.get("test_cases") or []
+        analysis = output.result.get("analysis") or []
+        result_test_cases[idx] = test_cases
+
+        if service_id:
+            provisional_ts_id = f"TS-{idx + 1:03d}"
+            payload = {
+                "trace_id": trace_id,
+                "ts_id": provisional_ts_id,
+                "ts_name": ts_name,
+                "generated_at": datetime.now(timezone.utc).isoformat(),
+                "source": "doc_search",
+                "analysis": analysis,
+                "test_cases": test_cases,
+                "retrieved_docs": retrieved_docs,
+                "metrics": {
+                    "model": output.metadata.model,
+                    "cost_usd": output.metadata.cost_usd,
+                    "duration_sec": duration,
+                    "doc_search_query": query,
+                    "doc_search_top_k": 5,
+                    "doc_search_results_count": len(retrieved_docs),
+                },
+            }
+            key = f"services/{service_id}/experiments/{trace_id}/tc_generation/{provisional_ts_id}.json"
+            s3_client.put_bytes(
+                key,
+                json.dumps(payload, ensure_ascii=False, indent=2).encode(),
+                "application/json",
+            )
+
+        agent_logs.append(output.metadata.model_dump())
+
+    return {"tc_by_ts_index": result_test_cases, "agent_logs": agent_logs}
+
+
+async def _save_experiment_scenarios(state: PipelineState) -> dict:
+    """ts_list + tc_by_ts_index를 병합해 최종 시나리오 파일로 디스크·DB 저장."""
+    ts_list = state.get("ts_list") or []
+    tc_by_index: dict = state.get("tc_by_ts_index") or {}
+    trace = load_trace(state["trace_id"]) or {}
+    service_id = trace.get("service_id")
+    trigger = state["run_options"].get("trigger") or "init"
+
+    scenarios_dir = _qapilot_path(state, "scenarios")
+    scenarios_dir.mkdir(parents=True, exist_ok=True)
+    saved_paths: list[str] = []
+    merged_scenarios: list[dict] = []
+
+    for i, ts_item in enumerate(ts_list):
+        ts_id = f"TS-{i + 1:03d}"
+        test_cases = []
+        for j, tc in enumerate(tc_by_index.get(i, []), start=1):
+            tc["tc_id"] = f"{ts_id}-TC-{j:02d}"
+            test_cases.append(tc)
+
+        ts = {
+            "ts_id": ts_id,
+            "name": ts_item.get("name", ""),
+            "description": ts_item.get("description", ""),
+            "trigger": trigger,
+            "affected_files": [],
+            "domain_rules_used": [],
+            "requirements": ts_item.get("requirements") or [],
+            "depends_on": [],
+            "test_cases": test_cases,
+        }
+        path = scenarios_dir / f"{ts_id}.json"
+        path.write_text(json.dumps(ts, ensure_ascii=False, indent=2), encoding="utf-8")
+        saved_paths.append(str(path))
+        merged_scenarios.append(ts)
+        if service_id:
+            upsert_scenario_version(service_id, ts_id, ts)
+
+    return {
+        "scenarios": merged_scenarios,
+        "saved_scenario_paths": saved_paths,
         "status": "completed",
     }
