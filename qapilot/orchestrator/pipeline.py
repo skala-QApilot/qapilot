@@ -320,7 +320,7 @@ async def _doc_import(state: PipelineState) -> dict:
     if not collection_alive:
         logger.warning("qdrant_collection_missing_reimport", name="domain_knowledge")
 
-    async def _import_path(doc_path: Path) -> None:
+    async def _import_path(doc_path: Path, _service_id: str | None = None) -> None:
         index_path = _qapilot_path(state, "domain", f"{doc_path.stem}.index.json")
         if collection_alive and index_path.exists():
             try:
@@ -331,12 +331,10 @@ async def _doc_import(state: PipelineState) -> dict:
             except Exception:
                 pass
         try:
-            await tool.run(
-                ToolInput(
-                    trace_id=trace_id,
-                    params={"action": "import", "file_path": str(doc_path)},
-                )
-            )
+            params: dict = {"action": "import", "file_path": str(doc_path)}
+            if _service_id:
+                params["service_id"] = _service_id
+            await tool.run(ToolInput(trace_id=trace_id, params=params))
         except Exception as e:
             logger.warning("doc_import_failed", file=str(doc_path), error=str(e))
 
@@ -363,7 +361,7 @@ async def _doc_import(state: PipelineState) -> dict:
             # 원본 파일명 유지를 위해 임시 디렉토리 안에 rename — index 도 stem 기준이라 일관성 확보.
             Path(tmp.name).rename(tmp_path)
             try:
-                await _import_path(tmp_path)
+                await _import_path(tmp_path, _service_id=service_id)
             finally:
                 tmp_path.unlink(missing_ok=True)
 
