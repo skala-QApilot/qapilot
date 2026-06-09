@@ -12,6 +12,7 @@ Created: 2026-06-04
 
 from __future__ import annotations
 
+import json
 import uuid
 
 from qapilot.db.connection import get_pool
@@ -26,6 +27,8 @@ def upsert_change_request(
     trigger: str = "chatbot",
     reason: str = "",
     status: str = "pending",
+    target_id: str | None = None,
+    content: dict | None = None,
 ) -> None:
     """change_requests 테이블에 행을 INSERT한다.
 
@@ -38,6 +41,10 @@ def upsert_change_request(
         trigger: "chatbot" | "file" | "code".
         reason: UI에 표시할 변경 이유 요약.
         status: "pending" (기본값).
+        target_id: 변경이 집중된 하위 대상의 id (예: target_tc_id) — TS 전체가
+            아니라 특정 TC만 검토 강조하고 싶을 때 사용 (이슈 #277 후속).
+        content: TC 단위 강조 범위 등 부가 정보 (예: {"changed_tc_ids": [...]})
+            — change_requests.content(jsonb)에 그대로 저장해 UI가 읽도록 한다.
     """
     pool = get_pool()
     if pool is None:
@@ -46,6 +53,7 @@ def upsert_change_request(
         return
 
     row_id = str(uuid.uuid4())
+    content_json = json.dumps(content, ensure_ascii=False) if content else None
 
     try:
         with pool.connection() as conn, conn.cursor() as cur:
@@ -59,10 +67,11 @@ def upsert_change_request(
             )
             cur.execute(
                 """
-                INSERT INTO change_requests (id, service_id, scenario_id, trigger, reason, status, type)
-                VALUES (%s, %s, %s, %s, %s, %s, 'ai_generated')
+                INSERT INTO change_requests
+                    (id, service_id, scenario_id, trigger, reason, status, type, target_id, content)
+                VALUES (%s, %s, %s, %s, %s, %s, 'ai_generated', %s, %s::jsonb)
                 """,
-                (row_id, service_id, scenario_id, trigger, reason, status),
+                (row_id, service_id, scenario_id, trigger, reason, status, target_id, content_json),
             )
     except Exception as e:
         _logger.warning(

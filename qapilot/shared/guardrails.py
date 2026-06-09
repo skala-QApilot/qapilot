@@ -21,6 +21,15 @@ _INJECTION_PATTERNS: list[re.Pattern] = [
     re.compile(r"disregard\s+(all\s+)?(prior|previous)", re.IGNORECASE),
 ]
 
+# 카드번호 패턴 — scenario_generator/code_generator는 결제 테스트 시나리오 등에서
+# "의도적으로" 더미 카드번호 형식의 합성 테스트 데이터를 만들어내므로 별도 취급한다
+# (정상 기능 출력을 민감정보 누출로 오탐해 파이프라인 전체를 실패시키는 문제 — 이슈 #181).
+_CARD_NUMBER_PATTERN = re.compile(r"\b\d{4}[-\s]?\d{4}[-\s]?\d{4}[-\s]?\d{4}\b")
+
+# 카드번호 패턴 검사를 건너뛸 에이전트 (BaseAgent._agent_name 기준).
+# 합성 테스트 데이터 생성이 본연의 기능이라 false positive 비용이 더 크다.
+_CARD_CHECK_EXEMPT_AGENTS: frozenset[str] = frozenset({"scenario_generator", "code_generator"})
+
 # 민감정보 패턴
 _SENSITIVE_PATTERNS: list[re.Pattern] = [
     re.compile(r"(sk-[a-zA-Z0-9]{20,})"),  # OpenAI API key
@@ -28,7 +37,7 @@ _SENSITIVE_PATTERNS: list[re.Pattern] = [
     re.compile(r"postgresql://\S+:\S+@"),  # DB 접속 URL
     re.compile(r"password\s*[:=]\s*\S+", re.IGNORECASE),
     re.compile(r"\b\d{6}[-\s]?\d{7}\b"),  # 주민등록번호 패턴
-    re.compile(r"\b\d{4}[-\s]?\d{4}[-\s]?\d{4}[-\s]?\d{4}\b"),  # 카드번호
+    _CARD_NUMBER_PATTERN,
 ]
 
 
@@ -66,14 +75,21 @@ class Guardrails:
                     )
 
     @staticmethod
-    def check_output(data: dict[str, Any]) -> None:
+    def check_output(data: dict[str, Any], agent_name: str | None = None) -> None:
         """출력 데이터에서 민감정보 누출을 감지한다.
+
+        agent_name이 _CARD_CHECK_EXEMPT_AGENTS에 속하면 카드번호 패턴 검사는
+        건너뛴다 (해당 에이전트는 합성 테스트 데이터로 카드번호 형식 값을
+        의도적으로 생성하므로, 그대로 검사하면 정상 출력을 누출로 오탐한다).
 
         Raises:
             AgentExecutionError: 민감정보 탐지 시.
         """
+        skip_card_check = agent_name in _CARD_CHECK_EXEMPT_AGENTS
         for text in _extract_strings(data):
             for pattern in _SENSITIVE_PATTERNS:
+                if pattern is _CARD_NUMBER_PATTERN and skip_card_check:
+                    continue
                 if pattern.search(text):
                     raise AgentExecutionError(
                         ErrorCode.AGENT_004,

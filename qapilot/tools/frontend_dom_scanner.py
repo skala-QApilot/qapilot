@@ -28,6 +28,23 @@ from typing import TypedDict
 # Frontend 디렉토리 후보 — qapilot init `_infer_target_url` 과 동일 순서.
 _FE_DIR_CANDIDATES: tuple[str, ...] = ("frontend", "web", "client", "ui", "app", "src")
 
+# 공용 레이아웃 컴포넌트 — route 생성 제외 대상.
+_LAYOUT_COMPONENT_NAMES: frozenset[str] = frozenset({
+    "navbar", "sidebar", "footer", "layout", "header", "breadcrumb",
+    "nav", "menu", "appbar", "topbar", "bottombar", "drawer", "toast",
+    "modal", "dialog", "snackbar", "loading", "spinner",
+})
+
+# 동적 testid 패턴 — ${...} / {{...}} 가 포함된 값은 런타임 미확정 → selector 후보 제외.
+_DYNAMIC_TESTID_PATTERN = re.compile(r"\$\{|{{")
+
+# data-testid 를 가진 임의 컨테이너(div/span/section 등) 수집 — plan-list 같은 assert anchor.
+_TESTID_CONTAINER_PATTERN = re.compile(
+    r'<(?P<tag>[a-zA-Z][\w-]*)\b(?P<attrs>[^>]*?\bdata-testid\s*=\s*["\'](?P<testid>[^"\']*)["\'][^>]*?)'
+    r"(?:/>|>(?P<inner>[\s\S]*?)</(?P=tag)>)",
+    re.IGNORECASE,
+)
+
 # 스캔 대상 확장자.
 _FE_EXTENSIONS: tuple[str, ...] = (".vue", ".tsx", ".jsx")
 
@@ -169,12 +186,16 @@ def _extract_elements_from_text(text: str, file_rel: str) -> list[FrontendElemen
         target_id = attrs.get("id", "")
         label_text = attrs.get("aria-label", "") or (label_map.get(target_id, "") if target_id else "")
 
+        raw_testid = attrs.get("data-testid") or attrs.get("data-test-id") or ""
+        is_dynamic = bool(_DYNAMIC_TESTID_PATTERN.search(raw_testid))
+
         element: FrontendElement = {
             "tag": tag,
             "text": inner[:100] if inner else "",
             "placeholder": attrs.get("placeholder", ""),
             "label": label_text,
-            "testid": attrs.get("data-testid") or attrs.get("data-test-id") or "",
+            "testid": "" if is_dynamic else raw_testid,
+            "dynamic_testid_pattern": raw_testid if is_dynamic else "",
             "name": attrs.get("name", ""),
             "id": target_id,
             "file": file_rel,
@@ -183,7 +204,7 @@ def _extract_elements_from_text(text: str, file_rel: str) -> list[FrontendElemen
             "actionable": tag in {"input", "button", "textarea", "select", "a"},
             "control_type": _control_type_for_tag(tag, attrs),
         }
-        if any(element[k] for k in ("text", "placeholder", "label", "testid", "name", "id")):
+        if any(element[k] for k in ("text", "placeholder", "label", "testid", "dynamic_testid_pattern", "name", "id")):
             found.append(element)
 
     # role="button" 추가 — _TARGET_TAGS 외 element 도 ARIA button 이면 포함.
@@ -196,12 +217,15 @@ def _extract_elements_from_text(text: str, file_rel: str) -> list[FrontendElemen
         inner = _clean_inner_text(raw_inner)
         if not inner:
             inner = _extract_literal_text(raw_inner)
+        raw_testid = attrs.get("data-testid") or attrs.get("data-test-id") or ""
+        is_dynamic = bool(_DYNAMIC_TESTID_PATTERN.search(raw_testid))
         element = {
             "tag": tag,
             "text": inner[:100] if inner else "",
             "placeholder": "",
             "label": attrs.get("aria-label", ""),
-            "testid": attrs.get("data-testid") or attrs.get("data-test-id") or "",
+            "testid": "" if is_dynamic else raw_testid,
+            "dynamic_testid_pattern": raw_testid if is_dynamic else "",
             "name": "",
             "id": attrs.get("id", ""),
             "file": file_rel,
@@ -210,7 +234,7 @@ def _extract_elements_from_text(text: str, file_rel: str) -> list[FrontendElemen
             "actionable": True,
             "control_type": "button",
         }
-        if any(element[k] for k in ("text", "label", "testid", "id")):
+        if any(element[k] for k in ("text", "label", "testid", "dynamic_testid_pattern", "id")):
             found.append(element)
 
     # feedback/status container — success toast, error message, alert 등
@@ -249,6 +273,43 @@ def _extract_elements_from_text(text: str, file_rel: str) -> list[FrontendElemen
                 for existing in found
             ):
                 found.append(element)
+
+    # data-testid 를 가진 임의 컨테이너 수집 (plan-list 같은 assert anchor)
+    # _TARGET_TAGS 에 없는 div/section 등도 수집해 assert 후보 풀 보강.
+    collected_testids = {e.get("testid") for e in found if e.get("testid")}
+    for match in _TESTID_CONTAINER_PATTERN.finditer(text):
+        tag = match.group("tag").lower()
+        if tag in _TARGET_TAGS:
+            continue  # 이미 처리됨
+        raw_testid = match.group("testid") or ""
+        if not raw_testid:
+            continue
+        is_dynamic = bool(_DYNAMIC_TESTID_PATTERN.search(raw_testid))
+        testid = "" if is_dynamic else raw_testid
+        dynamic_pattern = raw_testid if is_dynamic else ""
+        if testid and testid in collected_testids:
+            continue  # 중복 방지
+        raw_inner = match.group("inner") or ""
+        inner = _clean_inner_text(raw_inner)
+        element: FrontendElement = {
+            "tag": tag,
+            "text": inner[:100] if inner else "",
+            "placeholder": "",
+            "label": "",
+            "testid": testid,
+            "dynamic_testid_pattern": dynamic_pattern,
+            "name": "",
+            "id": "",
+            "file": file_rel,
+            "page": page,
+            "route": route,
+            "actionable": False,
+            "control_type": "container",
+        }
+        if testid or dynamic_pattern:
+            found.append(element)
+            if testid:
+                collected_testids.add(testid)
 
     return found
 
@@ -305,10 +366,22 @@ def _infer_page_name(file_rel: str) -> str:
 
 
 def _infer_route(file_rel: str) -> str:
-    stem = Path(file_rel).stem
+    path = Path(file_rel)
+    parts_lower = [p.lower() for p in path.parts]
+
+    # components/ 디렉토리 파일은 page 아님 → route 없음
+    if "components" in parts_lower:
+        return ""
+
+    stem = path.stem
     if not stem:
         return ""
     lowered = stem.lower()
+
+    # 공용 레이아웃 컴포넌트 → route 없음 (Navbar→/navbar 같은 가짜 route 방지)
+    if lowered in _LAYOUT_COMPONENT_NAMES:
+        return ""
+
     if lowered in {"index", "home"}:
         return "/"
     return f"/{lowered}"

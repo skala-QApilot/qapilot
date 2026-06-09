@@ -104,6 +104,21 @@ class TestRunRequestBody(BaseModel):
     qapilot_dir: str | None = Field(None, description="레거시 호환용 qapilot 작업 디렉터리")
 
 
+class ExperimentScenarioRequestBody(BaseModel):
+    service_id: str = Field(..., description="서비스 ID")
+    trigger: Literal["init"] = Field("init", description="실험 트리거 (항상 init)")
+    tc_target_ts_ids: list[str] | None = Field(None, description="TC 생성 대상 TS ID 목록. 미설정 시 앞 2개")
+    staging_url: str | None = Field(None, description="SUT base URL")
+    test_account: dict[str, Any] | None = Field(None, description="테스트 계정 정보")
+    domain_files: list[dict[str, Any]] | None = Field(None, description="도메인 문서 메타 목록")
+    repo_url: str | None = Field(None, description="단일 Git 저장소 URL")
+    token: str | None = Field(None, description="단일 Git 저장소 접근 토큰")
+    branch: str | None = Field(None, description="단일 Git 저장소 브랜치")
+    local_path: str | None = Field(None, description="로컬 스캔 경로")
+    repos: list[RepoPayload] | None = Field(None, description="멀티 Git 저장소 설정")
+    qapilot_dir: str | None = Field(None, description="레거시 호환용 qapilot 작업 디렉터리")
+
+
 def _submit_pipeline(
     service_id: str,
     trace_id: str,
@@ -143,6 +158,33 @@ def _revoke_pipeline(trace_id: str) -> bool:
         task.cancel()
         return True
     return False
+
+
+@router.post("/experiment/scenario")
+async def experiment_scenario(request: Request, body: ExperimentScenarioRequestBody) -> Any:
+    """PRD 전용 TS + doc-search TC 실험 파이프라인을 실행한다.
+
+    TS는 PRD 요구사항만으로, TC는 Qdrant 문서 검색 결과만으로 생성하며
+    각 단계의 결과를 S3에 별도 저장한다 (토큰/비용/시간 포함).
+    """
+    body_dict = body.model_dump(exclude_none=True)
+    error = _validate_common_body(body_dict)
+    if error:
+        return error
+
+    tc_target_ts_ids = _optional_list(body_dict, "tc_target_ts_ids")
+    options: RunOptions = {
+        "command": "prd_only_experiment",
+        "trigger": "init",
+        "user_input": None,
+        "scenario_ids": None,
+        "filter": None,
+        "tags": None,
+    }
+    if tc_target_ts_ids is not None:
+        options["tc_target_ts_ids"] = tc_target_ts_ids
+    _inject_git_options(body_dict, options)
+    return _start_pipeline(request, body_dict, options)
 
 
 @router.post("/scenario-generation")

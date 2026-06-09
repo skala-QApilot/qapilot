@@ -87,7 +87,7 @@ class RunOptions(TypedDict):
     - test: Layer 2~3 — 테스트 실행 + (필요 시) 장애 분석
     """
 
-    command: Literal["generate_scenarios", "generate_code", "test"]
+    command: Literal["generate_scenarios", "generate_code", "test", "prd_only_experiment"]
     # generate_scenarios 전용
     trigger: Literal["init", "code_change", "doc_update", "natural_lang"] | None
     user_input: str | None
@@ -109,6 +109,8 @@ class RunOptions(TypedDict):
     branch: str
     local_path: str
     repos: list[dict]
+    # prd_only_experiment 전용 — TC 생성 대상 TS ID 목록 (미설정 시 앞 2개)
+    tc_target_ts_ids: NotRequired[list[str] | None]
 
 
 # ── 코드베이스 스캔 ──

@@ -73,6 +73,7 @@ class LLMClient:
         user_prompt: str,
         model: str | None = None,
         temperature: float = 0.0,
+        json_mode: bool = False,
     ) -> LLMResponse:
         """LLM 채팅 호출. 재시도와 캐싱을 자동 처리한다.
 
@@ -109,7 +110,7 @@ class LLMClient:
             self._logger.debug("llm_cache_hit", model=model)
             return self._cache[cache_key]
 
-        response = await self._call_with_retry(system_prompt, user_prompt, model, temperature)
+        response = await self._call_with_retry(system_prompt, user_prompt, model, temperature, json_mode=json_mode)
         self.total_input_tokens += response.input_tokens
         self.total_output_tokens += response.output_tokens
         self.total_cost_usd = round(self.total_cost_usd + response.cost_usd, 6)
@@ -122,9 +123,13 @@ class LLMClient:
         user_prompt: str,
         model: str,
         temperature: float,
+        json_mode: bool = False,
     ) -> LLMResponse:
         """재시도 로직 (3회, 1s/2s/4s backoff)."""
-        llm = ChatOpenAI(model=model, temperature=temperature)
+        kwargs: dict = {"model": model, "temperature": temperature}
+        if json_mode:
+            kwargs["model_kwargs"] = {"response_format": {"type": "json_object"}}
+        llm = ChatOpenAI(**kwargs)
         messages = [SystemMessage(content=system_prompt), HumanMessage(content=user_prompt)]
 
         last_error: Exception | None = None
