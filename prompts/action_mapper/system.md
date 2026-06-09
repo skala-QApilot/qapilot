@@ -59,6 +59,33 @@ getByTestId > getByLabel > getByPlaceholder > getByText
   - 비즈니스 설명 문장이나 API 응답 문구를 새로 만들지 않는다.
 - `css` / `xpath`는 frontend DOM 인덱스로도 대상을 특정할 수 없을 때만 마지막 수단으로 사용한다.
 
+## [CRITICAL: 시나리오 `then` 절의 expected outcome 정확 매핑 — assert 격차 #248]
+시나리오의 `then` 절을 정독하여 **expected outcome 의 종류** 에 따라 assert 의 selector 를 다르게 매핑하라.
+모든 TC 의 assertion 을 동일한 success element 로 일괄 매핑하지 마라.
+
+### outcome 분류
+1. **Positive 성공** (`tags: ["normal"]` 또는 `then` 절에 "성공"/"완료"/"노출됨"/"표시됨"):
+   - success 관련 element 우선 (예: `*-success-*`, `*-success-toast`, `success-msg`)
+   - 또는 redirect 후 dashboard/home 의 element
+
+2. **Negative 에러** (`tags: ["edge_case"]` 또는 `then` 절에 "오류"/"실패"/"4xx"/"5xx"/"거부"/"불가"):
+   - error 관련 element 우선 (예: `*-error`, `*-error-toast`, `error-msg`, `signup-error`)
+   - 또는 error message text (시나리오의 then 에 명시된 메시지)
+   - HTTP status code (`400 Bad Request`, `409 Conflict`) 는 selector 에 박지 말고
+     해당 상태가 화면에 표시되는 **실제 element** (frontend DOM 인덱스의 error testid) 사용
+
+3. **Negative form validation** (`then` 절에 "빈"/"필수"/"입력"/"형식"):
+   - frontend 의 required validation 으로 막힘 → submit 후 페이지 변화 0
+   - 시나리오 의도에 따라:
+     - error element 가 있다면 그 testid
+     - 없다면 `assert_visible` 의 selector 를 입력 form 자체 (signup-submit 등) 로 유지
+       (= 페이지에 머무름 검증)
+
+### 절대 금지
+- 시나리오의 outcome 분류 (positive/negative) 무시하고 모든 TC 의 assert step 을 동일 element 로 일괄 매핑
+- HTTP status code, JSON body, 응답 메시지 그대로 selector/expected 에 박기 (실제 화면 element 로 치환)
+- frontend DOM 인덱스에 없는 testid/text 를 새로 창작
+
 ## selector 없는 액션 규칙
 - navigate: selector=null, selector_type=null, value에 이동 URL을 넣는다
 - reload/go_back/go_forward: selector=null, selector_type=null

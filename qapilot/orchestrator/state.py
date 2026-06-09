@@ -40,6 +40,12 @@ class PipelineState(TypedDict):
 
     # 공통
     trace_id: str
+    # SaaS 멀티 테넌트 service 식별자. runner.run_pipeline 의 service_id 인자 → initial_state.
+    # 노드 간 LangGraph propagation 정합을 위해 schema 명시 (#248). 본 필드 누락 시 TypedDict
+    # 가 strict 아니라 dict literal 추가는 통과하나, 일부 노드의 state.get("service_id") 가
+    # None 반환 → mirror fallback skip 등 격차 발생 (e2e trace `5ab07f0f`). CLI 단독 실행 시
+    # 빈 문자열 "" (default).
+    service_id: str
     status: str
     current_layer: str
     error: str | None
@@ -107,3 +113,8 @@ class PipelineState(TypedDict):
     # ── 메타 ──
     agent_logs: list[AgentMeta]
     total_cost: float
+
+    # ── natural_lang 챗봇 응답 ──
+    query_status: str | None
+    query_feedback: str | None
+    change_summary: list[str] | None

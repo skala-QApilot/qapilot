@@ -15,6 +15,7 @@ from zoneinfo import ZoneInfo
 from qapilot.db.run_reader import load_run, load_runs_by_service
 from qapilot.db.run_writer import upsert_run
 from qapilot.messaging.redis_pubsub import publish_run_event
+from qapilot.shared import progress
 from qapilot.shared.logger import get_logger
 
 _logger = get_logger("trace_store")
@@ -68,6 +69,7 @@ def update_trace(trace_id: str, state: dict) -> None:
         payload["scenario_results"] = scenario_results
     trace.update(payload)
     upsert_run(trace)
+    progress.reset(trace_id)
     publish_run_event(trace_id, "status", {
         "status": trace.get("status"),
         "completed_at": trace.get("completed_at"),
@@ -101,6 +103,7 @@ def update_trace_aborted(trace_id: str, error: str) -> None:
         }
     )
     upsert_run(trace)
+    progress.reset(trace_id)
     publish_run_event(trace_id, "status", {"status": "aborted", "error": error})
 
 
@@ -119,14 +122,18 @@ def _now_kst() -> str:
 
 
 def _result_summary(state: dict) -> dict:
-    return {
+    summary = {
         "scenarios_count": len(state.get("scenarios", [])),
         "action_mappings_count": len(state.get("action_mappings", [])),
         "generated_codes_count": len(state.get("generated_codes", [])),
         "ui_results_count": len(state.get("ui_results", [])),
         "has_mismatch": state.get("has_mismatch", False),
         "report_path": state.get("report_path"),
+        "query_status": state.get("query_status"),
+        "query_feedback": state.get("query_feedback"),
+        "change_summary": state.get("change_summary"),
     }
+    return summary
 
 
 def _average_confidence(agent_logs: list[dict]) -> float | None:

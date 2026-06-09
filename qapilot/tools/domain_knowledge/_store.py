@@ -92,7 +92,9 @@ class VectorStore:
     async def delete_by_source(self, source: str) -> None:
         """동일 source(파일명)의 기존 벡터를 모두 삭제한다.
 
-        재임포트 직전에 호출해 동일 파일의 이전 청크를 제거한다.
+        chunk_id 가 매 임포트마다 새 UUID 로 생성되어 upsert 만으로는 구버전
+        벡터가 그대로 남는다. 재임포트 직전에 호출해 동일 파일의 이전 청크를
+        제거함으로써 사실상 "교체"가 되도록 한다.
 
         Args:
             source: 파일명 (chunk payload 의 "source" 값과 동일).
@@ -213,12 +215,14 @@ class VectorStore:
         finally:
             await client.close()
 
-    def save_index(self, file_path: Path, chunk_count: int) -> None:
+    def save_index(self, file_path: Path, chunk_count: int, document_id: str | None = None) -> None:
         """.qapilot/domain/<stem>.index.json 에 임포트 인덱스를 저장한다.
 
         Args:
             file_path: 임포트한 원본 파일 경로.
             chunk_count: 생성된 청크 총 개수.
+            document_id: domain_documents row PK — 버전이 바뀌면 값이 달라지므로
+                다음 실행에서 "이 파일이 새 버전인지" 판단하는 기준이 된다.
         """
         _DOMAIN_DIR.mkdir(parents=True, exist_ok=True)
         index_path = _DOMAIN_DIR / f"{file_path.stem}.index.json"
@@ -226,6 +230,7 @@ class VectorStore:
             json.dumps(
                 {
                     "file": str(file_path),
+                    "document_id": document_id,
                     "chunks": chunk_count,
                     "collection": _QDRANT_COLLECTION,
                 },

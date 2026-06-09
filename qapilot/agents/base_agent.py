@@ -92,7 +92,7 @@ class BaseAgent(ABC):
 
                 # 출력 가드레일
                 try:
-                    Guardrails.check_output(execute_result.result)
+                    Guardrails.check_output(execute_result.result, self._agent_name)
                 except AgentExecutionError as e:
                     self.logger.error("output_guardrail_blocked", code=e.code, detail=e.context)
                     raise

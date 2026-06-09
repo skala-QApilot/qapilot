@@ -17,15 +17,58 @@ from qapilot.shared.errors import ErrorCode, ToolExecutionError
 from qapilot.shared.schemas import DBSnapshot, DBTestResult
 from qapilot.tools.base_tool import BaseTool
 
-MODULE_URL = os.getenv("QAPILOT_SUT_DB_URL", "")
-API_TOKEN = os.getenv("QAPILOT_SUT_DB_TOKEN", "")
+# PR #235 (#232) 후속: import 시점 eager capture 격차 본질 fix (#242).
+# 이전: `MODULE_URL = os.getenv(...)` module-level → main.py 의 load_dotenv 타이밍 의존 +
+# `load_dotenv(override=True)` 적용/revert 에도 취약. e2e trace `40fce3fa` / `c8aadf83` 모두
+# DBTestTool fail 잔존의 직접 원인.
+# 본 fix: 호출 시점 평가 (lazy) + .env 강제 로드 (1회 캐시) — main.py 의 load_dotenv 동작
+# (override 적용/revert) 와 완전히 무관.
+_DOTENV_LOADED = False
+
+
+def _ensure_dotenv() -> None:
+    """`.env` 의 값을 강제 로드 (override=True) + 1회 캐시.
+
+    main.py 의 module-level load_dotenv() 가 default override=False 로 shell stale env
+    를 덮어쓰지 않거나, 사용자가 override=True 를 revert 한 환경에서도 DBTestTool 호출
+    시점에 .env 의 값을 강제 적용. process 당 1회만 실행.
+    """
+    global _DOTENV_LOADED
+    if _DOTENV_LOADED:
+        return
+    try:
+        from dotenv import load_dotenv
+        load_dotenv(override=True)
+    except Exception:
+        pass  # dotenv 미설치 환경 graceful
+    _DOTENV_LOADED = True
+
+
+def _module_url() -> str:
+    """QAPILOT_SUT_DB_URL 을 호출 시점 평가. .env 강제 로드 보장."""
+    _ensure_dotenv()
+    return os.getenv("QAPILOT_SUT_DB_URL", "")
+
+
+def _api_token() -> str:
+    """QAPILOT_SUT_DB_TOKEN 을 호출 시점 평가."""
+    _ensure_dotenv()
+    return os.getenv("QAPILOT_SUT_DB_TOKEN", "")
+
+
+# 하위 호환 — 다른 module 이 MODULE_URL 을 import 하는 경우 대비 (pipeline._run_db_test_safe
+# 가 import 후 환경변수 사전 점검). 단 호출 시점이 import 후이고 .env 가 그 사이에 로드되면
+# stale 값. 따라서 신규 코드는 _module_url() 함수 사용 권장.
+MODULE_URL = _module_url()
+API_TOKEN = _api_token()
 
 
 def _auth_headers() -> dict:
-    """인증 헤더 반환."""
-    if not API_TOKEN:
+    """인증 헤더 반환. API_TOKEN 호출 시점 평가."""
+    token = _api_token()
+    if not token:
         return {}
-    return {"Authorization": f"Bearer {API_TOKEN}"}
+    return {"Authorization": f"Bearer {token}"}
 
 
 class DBTestTool(BaseTool):
@@ -44,7 +87,7 @@ class DBTestTool(BaseTool):
         """DB 테이블 목록 조회."""
         try:
             async with httpx.AsyncClient() as client:
-                response = await client.get(f"{MODULE_URL}/db/tables", headers=_auth_headers())
+                response = await client.get(f"{_module_url()}/db/tables", headers=_auth_headers())
                 response.raise_for_status()
                 return response.json()["data"]["tables"]
         except httpx.ConnectError as e:
@@ -57,7 +100,7 @@ class DBTestTool(BaseTool):
         try:
             async with httpx.AsyncClient() as client:
                 response = await client.get(
-                    f"{MODULE_URL}/db/snapshot", params={"table": table}, headers=_auth_headers()
+                    f"{_module_url()}/db/snapshot", params={"table": table}, headers=_auth_headers()
                 )
                 response.raise_for_status()
                 return response.json()["data"]
@@ -71,7 +114,7 @@ class DBTestTool(BaseTool):
         try:
             async with httpx.AsyncClient() as client:
                 response = await client.post(
-                    f"{MODULE_URL}/db/seed", json={"sql": seed_sql}, headers=_auth_headers()
+                    f"{_module_url()}/db/seed", json={"sql": seed_sql}, headers=_auth_headers()
                 )
                 response.raise_for_status()
         except httpx.ConnectError as e:
@@ -83,7 +126,7 @@ class DBTestTool(BaseTool):
         """SQL 쿼리 로그 조회."""
         try:
             async with httpx.AsyncClient() as client:
-                response = await client.get(f"{MODULE_URL}/db/sql-logs", headers=_auth_headers())
+                response = await client.get(f"{_module_url()}/db/sql-logs", headers=_auth_headers())
                 response.raise_for_status()
                 return response.json()["data"]["logs"]
         except httpx.ConnectError as e:
@@ -95,7 +138,7 @@ class DBTestTool(BaseTool):
         """롤백 수행."""
         try:
             async with httpx.AsyncClient() as client:
-                response = await client.post(f"{MODULE_URL}/db/rollback", headers=_auth_headers())
+                response = await client.post(f"{_module_url()}/db/rollback", headers=_auth_headers())
                 response.raise_for_status()
         except httpx.ConnectError as e:
             raise ToolExecutionError(ErrorCode.TOOL_004, f"DB 스캔 모듈 연결 실패: {e}")
@@ -107,7 +150,7 @@ class DBTestTool(BaseTool):
         tc_id = params.get("tc_id", "unknown")
         seed_sql = params.get("seed_sql")
 
-        if not MODULE_URL:
+        if not _module_url():
             raise ValueError("QAPILOT_SUT_DB_URL 환경변수가 설정되지 않았습니다.")
 
         tables = await self._get_tables()

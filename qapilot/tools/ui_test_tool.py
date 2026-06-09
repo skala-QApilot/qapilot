@@ -669,7 +669,29 @@ class UITestTool(BaseTool):
                 url if url.startswith(("http://", "https://"))
                 else f"{target_url.rstrip('/')}{url}"
             )
-            await page.goto(full)
+            # #41 본질 (#244 후속): 기존 `page.goto(full)` 은 default `wait_until="load"` 사용
+            # → SPA (Vue/React) hydrate 전에 후속 fill/click step 진행 → v-model reactive
+            # 미반영 → form submit 시 빈 form → POST 호출 0건. e2e trace `7be2a2ab` 본질.
+            # `_ensure_page_loaded` (line 300) / `_try_auto_navigate` (line 534) 와 정합 —
+            # `networkidle` + 10s timeout cap (long-poll/SSE graceful) + 실패 시 fallback.
+            try:
+                await page.goto(full, wait_until="networkidle", timeout=10000)
+            except Exception as e:
+                self.logger.warning("ui_navigate_networkidle_timeout",
+                                    target=full, error=str(e)[:80])
+                await page.goto(full)
+            # #248 진단 로그: navigate 후 actual page.url + SPA mount 상태 노출
+            try:
+                actual_url = page.url
+                has_app = await page.evaluate(
+                    """() => document.querySelector('[data-v-app], #app[data-reactroot], [data-reactid]') != null"""
+                )
+                self.logger.info(
+                    "ui_navigate_complete",
+                    target=full, actual=actual_url, spa_mounted=bool(has_app),
+                )
+            except Exception:
+                pass
             return
 
         if action == "reload":
@@ -767,6 +789,28 @@ class UITestTool(BaseTool):
         # chain 의미 없이 즉시 raise, locator timeout / assertion 만 graceful 흡수.
         # timeout_ms 는 chain 2차+ 와 동일한 _CHAIN_FALLBACK_TIMEOUT_MS — fallback 시도는
         # 모두 short timeout 으로 e2e 총 시간 폭증 회피.
+        #
+        # testid 류 selector 는 exact match 가 본질 — fuzzy fallback 차단.
+        # 격차: e2e trace `40fce3fa` 의 `signup-success-toast` (assert_visible) 가
+        # fuzzy match 로 `signup-submit` (회원가입 버튼) 에 0.6+ 매칭 → 버튼 visible
+        # 이라 가짜 PASS. testid 는 SUT 컨벤션상 정확 일치가 의미. 매칭 실패 시
+        # SUT 가 시나리오 의도대로 작동 안 함을 fail 로 보고하는 게 정답.
+        selector_type = (step.get("selector_type") or "").lower()
+        if selector_type in {"testid", "test_id", "data-testid", "data-test-id"}:
+            self.logger.warning(
+                "ui_fallback_dom_scan_skipped_testid",
+                action=action,
+                selector_type=step.get("selector_type"),
+                selector=step.get("selector"),
+                reason="testid 는 exact match 가 본질 — fuzzy fallback 차단 (false positive 방지)",
+            )
+            if last_error is not None:
+                raise last_error
+            raise ToolExecutionError(
+                ErrorCode.TOOL_UI_LOCATOR_NOT_FOUND,
+                f"testid {step.get('selector')!r} 미존재 — SUT 가 시나리오 의도대로 작동 안 함",
+            )
+
         fallback_locator = await self._fallback_dom_scan(page, step)
         if fallback_locator is not None:
             try:
@@ -797,6 +841,17 @@ class UITestTool(BaseTool):
         # 페이지 어디든 substring/fuzzy 매칭되면 graceful pass.
         # 호출 1회만 (chain attempt 마다 호출하면 evaluate × N 누적 → 120s timeout 위험).
         # evaluate timeout 5s 명시 — Playwright default (30s) 우회.
+        #
+        # testid 류 selector 는 page-wide fuzzy 도 차단 (위 _fallback_dom_scan 와 동일 이유).
+        # testid 가 page-wide text 에 매칭되는 건 의미 없음 (testid 는 hidden attribute).
+        if selector_type in {"testid", "test_id", "data-testid", "data-test-id"}:
+            if last_error is not None:
+                raise last_error
+            raise ToolExecutionError(
+                ErrorCode.TOOL_UI_LOCATOR_NOT_FOUND,
+                f"testid {step.get('selector')!r} 미존재 — page-wide fuzzy fallback 도 차단",
+            )
+
         if action in {"assert", "assert_visible", "assert_text"}:
             target_text = step.get("expected") if action == "assert_text" else step.get("selector")
             if not target_text:
@@ -992,11 +1047,183 @@ class UITestTool(BaseTool):
 
         if action == "fill":
             await locator.fill(value or "", **kw)
+            # #252 fill history cache — click submit 직전 form_state.empty_required
+            # 발견 시 cache 에서 재주입. trace `2dc1a980` 진단: fill verify (ui_fill_
+            # mismatch 없음) 통과했음에도 click 직전 form_state 의 password 만 빈 채
+            # = fill 후~click 사이에 Vue v-model 가 reset. 본 cache 로 재주입 가능.
+            sel = step.get("selector")
+            if sel:
+                if not hasattr(self, "_fill_history"):
+                    self._fill_history = {}
+                self._fill_history[sel] = value or ""
+                # #254 진단 — cache 저장 시점의 value content 노출. trace `b201373d`
+                # 진단: ui_fill_retry_check will_retry=true 인데 ui_fill_retry_input
+                # 0건 = `if not cached: continue` 으로 skip = cache value 빈 string.
+                # 본 log 로 fill 시 actually 빈 string 저장하는지 확정.
+                self.logger.info(
+                    "ui_fill_cached",
+                    selector=sel,
+                    value_type=type(value).__name__,
+                    value_len=len(value) if isinstance(value, str) else -1,
+                    value_repr=repr(value)[:60],
+                )
+            # PR #244 native setter — Vue 3 v-model / React controlled input 호환성.
+            try:
+                await locator.evaluate(
+                    """(el, v) => {
+                        if (!el) return;
+                        const proto = el instanceof HTMLTextAreaElement
+                            ? HTMLTextAreaElement.prototype
+                            : HTMLInputElement.prototype;
+                        const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+                        if (setter) setter.call(el, v);
+                        else el.value = v;
+                        el.dispatchEvent(new Event('input', {bubbles: true}));
+                        el.dispatchEvent(new Event('change', {bubbles: true}));
+                    }""",
+                    value or "",
+                )
+                await locator.blur(timeout=500)
+            except Exception as e:
+                self.logger.warning("ui_fill_setter_failed", error=str(e)[:80])
+            # #251 본질 강화: PR #250 의 2 RAF (~32ms) 가 e2e trace `b305817d` 에서
+            # 부족 — POST 0건 잔존. Vue 의 v-model 은 microtask (nextTick) 에서
+            # reactive update commit. RAF 는 frame 단위 (~16ms) 라 timing 보장 X.
+            # 본 fix: 명시적 100ms wait 로 microtask + nextTick 모두 완료 보장.
+            # 본인 reproduce 정상 동작 (POST 201) 과 e2e 의 timing 격차 흡수.
+            try:
+                page = locator.page
+                await page.wait_for_timeout(100)
+            except Exception:
+                pass
+            # fill verify — actual input.value 가 expected 와 동일한지 검증.
+            try:
+                actual = await locator.input_value(timeout=500)
+                if (value or "") and actual != (value or ""):
+                    self.logger.warning(
+                        "ui_fill_mismatch",
+                        selector=step.get("selector"),
+                        expected_len=len(value or ""),
+                        actual_len=len(actual or ""),
+                    )
+            except Exception:
+                pass
             return
         if action == "clear":
             await locator.clear(**kw)
             return
         if action == "click":
+            # #251: button[type=submit] click 전 form 의 reactive state 검증 +
+            # empty_required 있으면 강제 setter retry. 본인 PR #250 의 단순 노출
+            # 진단을 한 단계 더 — 빈 채로 발견 시 같은 form 의 모든 빈 required
+            # input 에 placeholder/data-testid 기반 추정 값 재주입 + reactive
+            # event dispatch. PR #251 의 100ms wait 와 함께 race 본질 흡수.
+            try:
+                tag_type = await locator.evaluate(
+                    """el => el ? `${el.tagName}/${el.type || ''}` : ''"""
+                )
+                if isinstance(tag_type, str) and tag_type.startswith("BUTTON/submit"):
+                    form_state = await locator.evaluate(
+                        """el => {
+                            const form = el.closest('form');
+                            if (!form) return {form_present: false};
+                            const inputs = Array.from(form.querySelectorAll('input, textarea, select'));
+                            const empty_required = inputs
+                                .filter(i => i.required && !i.value)
+                                .map(i => ({
+                                    name: i.name || i.id || i.getAttribute('data-testid') || 'unnamed',
+                                    type: i.type || '',
+                                }));
+                            return {
+                                form_present: true,
+                                total_inputs: inputs.length,
+                                empty_required: empty_required,
+                            };
+                        }"""
+                    )
+                    # #253 진단 강화 — cache_keys 함께 log 로 cache 의 actual content 노출
+                    cache = getattr(self, "_fill_history", {})
+                    self.logger.info(
+                        "ui_click_submit_attempted",
+                        selector=step.get("selector"),
+                        tag_type=tag_type,
+                        form_state=form_state,
+                        fill_history_keys=list(cache.keys()),
+                    )
+                    # #252 본질 fix — empty_required 있으면 cache 에서 재주입.
+                    empty = (form_state or {}).get("empty_required") or []
+                    # #253: 본인 PR #252 retry 가 actually 발동했는지 명시적 log
+                    self.logger.info(
+                        "ui_fill_retry_check",
+                        empty_count=len(empty),
+                        cache_count=len(cache),
+                        will_retry=bool(empty and cache),
+                    )
+                    if empty and cache:
+                        page = locator.page
+                        retry_count = 0
+                        for em in empty:
+                            name = em.get("name") if isinstance(em, dict) else em
+                            # cache 매칭: selector 가 testid 이면 name=testid 정합
+                            cached = cache.get(name)
+                            if not cached:
+                                # data-testid 외 id/name 매칭도 시도 (cache 의 모든 키 검색)
+                                for cs, cv in cache.items():
+                                    if cs == name:
+                                        cached = cv
+                                        break
+                            # #254 진단: continue 직전에 cached 의 actual content 노출
+                            self.logger.info(
+                                "ui_fill_retry_cached_lookup",
+                                name=name,
+                                cached_type=type(cached).__name__,
+                                cached_len=len(cached) if isinstance(cached, str) else -1,
+                                will_continue=not bool(cached),
+                            )
+                            if not cached:
+                                continue
+                            try:
+                                result = await page.evaluate(
+                                    """({sel, v}) => {
+                                        const el = document.querySelector(
+                                            `[data-testid="${sel}"], #${sel}, [name="${sel}"]`
+                                        );
+                                        if (!el) return {ok: false, reason: 'no_el'};
+                                        const proto = el instanceof HTMLTextAreaElement
+                                            ? HTMLTextAreaElement.prototype
+                                            : HTMLInputElement.prototype;
+                                        const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+                                        if (setter) setter.call(el, v);
+                                        else el.value = v;
+                                        el.dispatchEvent(new Event('input', {bubbles: true}));
+                                        el.dispatchEvent(new Event('change', {bubbles: true}));
+                                        return {ok: true, value_len: el.value.length};
+                                    }""",
+                                    {"sel": name, "v": cached},
+                                )
+                                # #253: retry per-input log — 어느 input 어떻게 처리됐는지
+                                self.logger.info(
+                                    "ui_fill_retry_input",
+                                    name=name, cached_len=len(cached), result=result,
+                                )
+                                retry_count += 1
+                            except Exception as e:
+                                self.logger.warning(
+                                    "ui_fill_retry_evaluate_failed",
+                                    name=name, error=f"{type(e).__name__}: {str(e)[:120]}",
+                                )
+                        if retry_count:
+                            try:
+                                await page.wait_for_timeout(150)
+                            except Exception:
+                                pass
+                            self.logger.warning(
+                                "ui_fill_retry_before_submit",
+                                retried=retry_count,
+                                empty_required=empty,
+                            )
+            except Exception:
+                pass
             await locator.click(**kw)
             return
         if action == "dblclick":

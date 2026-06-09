@@ -26,6 +26,7 @@ from qapilot.agents.scenario_generator.parser import (
 )
 from qapilot.agents.scenario_generator.repository import save_scenarios
 from qapilot.agents.base_agent import BaseAgent
+from qapilot.shared import progress
 from qapilot.shared.schemas import ExecuteResult
 
 # 라우터별 도메인 검색 키워드 — Qdrant 검색 쿼리 및 requirements 필터링에 사용
@@ -191,20 +192,67 @@ class ScenarioGeneratorAgent(BaseAgent):
         mismatches: list,
         last_error: str | None,
     ) -> ExecuteResult:
-        """요구사항 없을 때의 라우터 기반 fallback."""
+        """요구사항 없을 때의 라우터 기반 fallback.
+
+        code_change 트리거일 때: 기존 TS의 affected_files와 매칭되는 router_file이 있으면
+        새 TS를 생성하지 않고 _run_update_ts 로 기존 TS를 업데이트한다.
+        라우터 파일이 삭제된 경우(git diff에 있지만 router_map에 없는) 기존 TS를 orphaned 처리한다.
+        """
         from qapilot.tools.domain_knowledge import DomainKnowledgeTool
 
         router_map = self._sort_router_map(self._build_router_map(affected_files))
         all_scenarios: list = []
+        all_updated: list = []
         confidence_sum = 0.0
 
-        for router_file, endpoints in router_map.items():
+        # code_change: 기존 TS 로드 (router_file 매칭 + orphan 탐지용)
+        existing_scenarios: list[dict] = []
+        if trigger == "code_change":
+            existing_scenarios = self._load_all_scenarios()
+
+        for _idx, (router_file, endpoints) in enumerate(router_map.items()):
+            progress.item(getattr(self, "trace_id", None), "scenario_generate", _idx, len(router_map))
             basename = router_file.split("/")[-1].replace(".py", "").replace(".ts", "").replace(".js", "")
             keywords = _ROUTER_KEYWORDS.get(basename, [])
             query = " ".join(keywords) if keywords else basename
             router_domain_rules = await self._fetch_domain_rules(query, top_k=5)
             router_domain_rules_text = DomainKnowledgeTool.format_rules_for_prompt(router_domain_rules) or "없음"
 
+            # code_change: 기존 TS가 이 router_file을 커버하면 update 경로
+            existing_ts = next(
+                (ts for ts in existing_scenarios if router_file in ts.get("affected_files", [])),
+                None,
+            ) if trigger == "code_change" else None
+
+            if existing_ts:
+                synthetic_req = {
+                    "req_id": "",
+                    "domain_area": basename,
+                    "content": f"{router_file} 파일 변경",
+                    "action_type": "update",
+                    "target_ts_id": existing_ts["ts_id"],
+                    "target_level": "ts",
+                }
+                updated_ts, ts_confidence = await self._run_update_ts(
+                    synthetic_req, existing_ts, scan_result,
+                    router_domain_rules_text, trigger, mismatch_text, endpoints,
+                )
+                if self._scenario_content_unchanged(updated_ts, existing_ts):
+                    updated_ts["_unchanged"] = True
+                else:
+                    updated_ts["_change_type"] = "ts_updated"
+                    updated_ts["_change_target"] = existing_ts["ts_id"]
+                    updated_ts["_change_tc_ids"] = self._changed_test_case_ids(updated_ts, existing_ts)
+                all_updated.append(updated_ts)
+                confidence_sum += ts_confidence
+                self.logger.info(
+                    "scenario_updated_code_change",
+                    ts_id=existing_ts["ts_id"],
+                    router_file=router_file,
+                )
+                continue
+
+            # 기존 TS 없음 → 새 TS 생성
             user_prompt = self.with_correction_hint(
                 self.prompts.render(
                     domain_rules=router_domain_rules_text,
@@ -230,13 +278,47 @@ class ScenarioGeneratorAgent(BaseAgent):
             all_scenarios.extend(ts_scenarios)
             confidence_sum += ts_confidence
 
-        confidence = round(confidence_sum / len(router_map), 3) if router_map else 0.5
+        # orphan 탐지: affected_files가 git diff에 있지만 router_map에 없는 TS
+        # → 해당 라우터 파일이 삭제된 것으로 판단, 기존 TS를 검토 대상으로 마킹
+        orphaned_ts_ids: list[str] = []
+        if trigger == "code_change" and existing_scenarios and affected_files:
+            router_map_files = set(router_map.keys())
+            changed_file_set = set(affected_files)
+            for ts in existing_scenarios:
+                for af in ts.get("affected_files", []):
+                    if af in changed_file_set and af not in router_map_files:
+                        ts_id = ts.get("ts_id", "")
+                        if ts_id and ts_id not in orphaned_ts_ids:
+                            orphaned_ts_ids.append(ts_id)
+                            self.logger.info(
+                                "scenario_orphaned_code_change",
+                                ts_id=ts_id,
+                                deleted_file=af,
+                            )
+
+        num_processed = len(router_map) or 1
+        confidence = round(confidence_sum / num_processed, 3) if confidence_sum else 0.5
         all_scenarios = self._deduplicate_scenarios(all_scenarios)
         all_scenarios = self._renumber_and_set_depends_on(all_scenarios)
+        # 기존 TS 번호(DB + all_updated)와의 충돌 방지 — DB 기반 서비스에서도 동작하도록
+        existing_nums_in_memory: set[int] = set()
+        for ts in existing_scenarios:
+            parts = ts.get("ts_id", "").split("-")
+            if len(parts) == 2 and parts[1].isdigit():
+                existing_nums_in_memory.add(int(parts[1]))
+        for ts in all_updated:
+            parts = ts.get("ts_id", "").split("-")
+            if len(parts) == 2 and parts[1].isdigit():
+                existing_nums_in_memory.add(int(parts[1]))
+        all_scenarios = self._avoid_ts_id_conflicts(all_scenarios, existing_nums_in_memory)
         # 디스크 영속화는 pipeline._save_scenarios 노드에서 수행 (위 메서드와 동일 사유).
 
+        result_data: dict = {"scenarios": all_scenarios + all_updated, "prd_code_mismatches": mismatches}
+        if orphaned_ts_ids:
+            result_data["orphaned_ts_ids"] = orphaned_ts_ids
+
         return ExecuteResult(
-            result={"scenarios": all_scenarios, "prd_code_mismatches": mismatches},
+            result=result_data,
             confidence=confidence,
         )
 
@@ -272,7 +354,8 @@ class ScenarioGeneratorAgent(BaseAgent):
 
         req_endpoint_map = self._map_requirements_to_endpoints(target_requirements, all_endpoints)
 
-        for req in target_requirements:
+        for _idx, req in enumerate(target_requirements):
+            progress.item(getattr(self, "trace_id", None), "scenario_generate", _idx, len(target_requirements))
             domain_area = req.get("domain_area") or "기타"
             req_id = req.get("req_id", "")
             action_type = req.get("action_type", "create")
@@ -292,8 +375,81 @@ class ScenarioGeneratorAgent(BaseAgent):
             area_domain_rules = domain_rules or await self._fetch_domain_rules(domain_area, top_k=5)
             area_domain_rules_text = DomainKnowledgeTool.format_rules_for_prompt(area_domain_rules) or "없음"
 
+            # ── delete 분기: TS/TC 삭제 검토 요청 ──────────────────────────────
+            # target_ts_id 유무와 관계없이 반드시 continue — create 브랜치로 낙하 방지
+            if action_type == "delete":
+                target_tc_id = req.get("target_tc_id")
+                if target_level == "tc":
+                    # TC 단위 삭제: TS에서 해당 TC를 제거하고 _deleted_tc_ids 마킹
+                    if target_ts_id and target_tc_id:
+                        existing_ts = self._load_scenario_file(target_ts_id)
+                        if existing_ts is None:
+                            self.logger.warning(
+                                "delete_tc_target_ts_not_found",
+                                target_ts_id=target_ts_id,
+                                target_tc_id=target_tc_id,
+                                req_id=req_id,
+                            )
+                        else:
+                            original_tcs = existing_ts.get("test_cases") or []
+                            tc_exists = any(tc.get("tc_id") == target_tc_id for tc in original_tcs)
+                            if not tc_exists:
+                                self.logger.warning(
+                                    "delete_tc_not_found_in_ts",
+                                    target_ts_id=target_ts_id,
+                                    target_tc_id=target_tc_id,
+                                    req_id=req_id,
+                                )
+                            else:
+                                # TC를 제거하지 않고 _pending_delete: True로 마킹해 파일에 보존.
+                                # 프론트엔드가 빨간 스타일로 표시 → 사용자 검토 후 승인/거절.
+                                # 승인 시 Spring이 _pending_delete TC를 실제 제거, 거절 시 rollback.
+                                for tc in original_tcs:
+                                    if tc.get("tc_id") == target_tc_id:
+                                        tc["_pending_delete"] = True
+                                existing_ts["test_cases"] = original_tcs
+                                existing_ts["_deleted_tc_ids"] = [target_tc_id]
+                                existing_ts["_change_type"] = "tc_deleted"
+                                all_updated.append(existing_ts)
+                                self.logger.info(
+                                    "tc_delete_requested",
+                                    ts_id=target_ts_id,
+                                    tc_id=target_tc_id,
+                                )
+                    else:
+                        self.logger.warning(
+                            "delete_tc_target_not_resolved",
+                            domain_area=domain_area,
+                            target_ts_id=target_ts_id,
+                            target_tc_id=target_tc_id,
+                            req_id=req_id,
+                        )
+                else:
+                    # TS 단위 삭제
+                    if target_ts_id:
+                        existing_ts = self._load_scenario_file(target_ts_id)
+                        if existing_ts is None:
+                            self.logger.warning(
+                                "delete_target_not_found",
+                                target_ts_id=target_ts_id,
+                                req_id=req_id,
+                            )
+                        else:
+                            existing_ts["_ts_delete_requested"] = True
+                            all_updated.append(existing_ts)
+                            self.logger.info("scenario_delete_requested", ts_id=target_ts_id)
+                    else:
+                        self.logger.warning(
+                            "delete_target_not_resolved",
+                            domain_area=domain_area,
+                            req_id=req_id,
+                        )
+                continue
+
             # ── update 분기: 기존 TS 로드 후 수정 ──────────────────────────────
-            if action_type == "update" and target_ts_id:
+            # create + target_ts_id: 기존 TS에 새 TC/TV 추가 (추가해줘 패턴)
+            is_add_to_existing = action_type == "create" and target_ts_id and target_level in ("tc", "tv")
+            if is_add_to_existing or (action_type == "update" and target_ts_id):
                 existing_ts = self._load_scenario_file(target_ts_id)
                 if existing_ts is None:
                     self.logger.warning(
@@ -304,6 +460,8 @@ class ScenarioGeneratorAgent(BaseAgent):
                     # 대상 TS 없으면 create로 폴백
                 else:
                     if target_level == "tc":
+                        # create+tc: target_tc_id=None → 새 TC 추가
+                        # update+tc: target_tc_id 있음 → 기존 TC 수정
                         updated_ts, ts_confidence = await self._run_update_tc(
                             req, existing_ts, scan_result, area_domain_rules_text,
                             trigger, mismatch_text, req_endpoints,
@@ -313,11 +471,30 @@ class ScenarioGeneratorAgent(BaseAgent):
                             req, existing_ts, scan_result, area_domain_rules_text,
                             trigger, mismatch_text, req_endpoints,
                         )
-                    else:  # "ts" (default)
+                    else:  # "ts" (default) — update only
                         updated_ts, ts_confidence = await self._run_update_ts(
                             req, existing_ts, scan_result, area_domain_rules_text,
                             trigger, mismatch_text, req_endpoints,
                         )
+                    if self._scenario_content_unchanged(updated_ts, existing_ts):
+                        # LLM이 재생성했지만 TC 구성이 기존과 실질적으로 동일한 경우 —
+                        # (요구사항 재추출 결과의 표현 차이로 _diff_status="updated"로
+                        # 잘못 분류된 doc_update 등) "AI 생성"(검토 대기) 표시를 띄우지
+                        # 않도록 변경 없음으로 마킹한다.
+                        updated_ts["_unchanged"] = True
+                    else:
+                        # 변경 정보 태그 — _save_scenarios에서 change_summary 생성에 사용
+                        if target_level == "tc":
+                            # target_tc_id가 있으면 기존 TC 수정, 없으면 새 TC 추가
+                            updated_ts["_change_type"] = "tc_updated" if req.get("target_tc_id") else "tc_added"
+                        elif target_level == "tv":
+                            updated_ts["_change_type"] = "tv_updated"
+                        else:
+                            updated_ts["_change_type"] = "ts_updated"
+                        updated_ts["_change_target"] = req.get("target_tc_id") if target_level in ("tc", "tv") else target_ts_id
+                        # TC 단위 강조 범위 — 검토 화면에서 TS 전체가 아닌 실제로
+                        # 바뀐 TC(및 그 TV)에만 "AI 생성" 표시를 좁히기 위한 정보.
+                        updated_ts["_change_tc_ids"] = self._changed_test_case_ids(updated_ts, existing_ts)
                     all_updated.append(updated_ts)
                     confidence_sum += ts_confidence
                     self.logger.info(
@@ -355,13 +532,23 @@ class ScenarioGeneratorAgent(BaseAgent):
             self._correct_api_method_mismatches(ts_scenarios)
             self._pin_req_id(ts_scenarios, req_id)
             self._fill_api_for_domain(ts_scenarios, req, router_files, req_endpoints)
+            # create 변경 정보 태그
+            target_ts_id_for_create = req.get("target_ts_id")
+            for ts in ts_scenarios:
+                if target_ts_id_for_create:
+                    ts["_change_type"] = "tc_added"
+                    ts["_change_target"] = target_ts_id_for_create
+                else:
+                    ts["_change_type"] = "ts_created"
             all_scenarios.extend(ts_scenarios)
             confidence_sum += ts_confidence
 
         # update 결과는 ts_id 고정 — 재번호 부여 없이 바로 덮어쓴다.
+        # delete 요청(_ts_delete_requested)은 파일 내용 변경 없이 pipeline에서 change_request만 등록.
         from qapilot.agents.scenario_generator.repository import save_scenario
         for ts in all_updated:
-            save_scenario(ts)
+            if not ts.get("_ts_delete_requested"):
+                save_scenario(ts)
 
         confidence = round(confidence_sum / max(len(requirements), 1), 3)
 
@@ -387,7 +574,10 @@ class ScenarioGeneratorAgent(BaseAgent):
         call_count = len(target_requirements)
 
         for _attempt in range(_MAX_FILL_RETRIES):
-            coverage = compute_coverage(all_scenarios, target_requirements)
+            # all_updated 도 포함해 커버리지를 계산 — 안 그러면 update 로 처리된
+            # 요구사항이 "미커버"로 잘못 판정되어 불필요한 gap-fill 재생성이 발생한다
+            # (doc_update 증분 재생성은 create+update 가 한 배치에 섞이는 게 일반적).
+            coverage = compute_coverage(all_scenarios + all_updated, target_requirements)
             self.logger.info(
                 "coverage_check",
                 attempt=_attempt,
@@ -450,7 +640,7 @@ class ScenarioGeneratorAgent(BaseAgent):
                 )
 
         # 최종 커버리지 로그
-        final_coverage = compute_coverage(all_scenarios, target_requirements)
+        final_coverage = compute_coverage(all_scenarios + all_updated, target_requirements)
         self.logger.info(
             "final_coverage",
             rate=final_coverage["rate"],
@@ -466,6 +656,15 @@ class ScenarioGeneratorAgent(BaseAgent):
         confidence = round(confidence_sum / call_count, 3) if call_count else 0.5
         all_scenarios = self._deduplicate_scenarios(all_scenarios)
         all_scenarios = self._renumber_and_set_depends_on(all_scenarios)
+        # DB-only 서비스에서도 기존 TS 번호를 감지해 충돌을 방지한다.
+        import re as _re
+        _existing_for_conflict = self._load_all_scenarios()
+        _existing_nums: set[int] = set()
+        for _ts in _existing_for_conflict + all_updated:
+            _m = _re.match(r"TS-(\d+)$", _ts.get("ts_id", ""))
+            if _m:
+                _existing_nums.add(int(_m.group(1)))
+        all_scenarios = self._avoid_ts_id_conflicts(all_scenarios, _existing_nums or None)
         save_scenarios(all_scenarios)
 
         self.logger.info(
@@ -479,7 +678,10 @@ class ScenarioGeneratorAgent(BaseAgent):
 
         return ExecuteResult(
             result={
-                "scenarios": all_scenarios,
+                # all_updated 를 함께 반환 — 그렇지 않으면 create+update 가 섞인 배치에서
+                # update 결과가 _save_scenarios 로 전달되지 못해 DB upsert/change_request
+                # 등록이 누락된다 (이전엔 all_scenarios 가 비어있을 때만 all_updated 를 반환).
+                "scenarios": all_scenarios + all_updated,
                 "prd_code_mismatches": mismatches,
                 "coverage": {
                     "rate": final_coverage["rate"],
@@ -1265,6 +1467,132 @@ class ScenarioGeneratorAgent(BaseAgent):
 
     # ── update 액션 헬퍼 (#201) ────────────────────────────────────────────────
 
+    # doc_update 등으로 TS를 재생성할 때 _run_update_ts 가 req_id 를 파이프라인 값으로
+    # 덮어쓰기 때문에, 내용(given/when/then/values 등)이 동일해도 dict 전체 비교 시
+    # 다른 것으로 판단되는 문제가 있다. 비교에서 제외할 메타데이터 키를 명시적으로 정의해
+    # "실질 내용이 같으면 변경 없음"으로 처리한다.
+    _TC_METADATA_KEYS: frozenset[str] = frozenset({"req_id", "last_run_status"})
+
+    @classmethod
+    def _tc_content(cls, tc: dict) -> dict:
+        """TC 딕셔너리에서 비교에 사용할 내용 필드만 추출한다.
+
+        req_id 등 파이프라인이 주입하는 메타데이터, _ 로 시작하는 내부 마커는 제외.
+        """
+        return {k: v for k, v in tc.items() if k not in cls._TC_METADATA_KEYS and not k.startswith("_")}
+
+    @classmethod
+    def _scenario_content_unchanged(cls, updated: dict, existing: dict) -> bool:
+        """update 결과가 기존 시나리오와 실질적으로 동일한지 비교한다 (이슈 #261 후속).
+
+        요구사항 재추출 결과의 표현 차이(_diff_status="updated" 오분류 등)로
+        실질 변경이 없는데도 LLM이 재생성한 경우, name/test_cases 가 기존과
+        동일하면 변경 없음으로 간주해 불필요한 "AI 생성" 표시를 막는다.
+
+        TC 비교 시 req_id 등 메타데이터 필드는 제외한다 — doc_update 재생성 시
+        파이프라인이 req_id 를 덮어써 내용이 같아도 다른 것으로 판단되는 문제 방지.
+        """
+        updated_tcs = [cls._tc_content(tc) for tc in updated.get("test_cases") or []]
+        existing_tcs = [cls._tc_content(tc) for tc in existing.get("test_cases") or []]
+        return (
+            updated.get("name") == existing.get("name")
+            and updated_tcs == existing_tcs
+        )
+
+    @classmethod
+    def _changed_test_case_ids(cls, updated: dict, existing: dict) -> list[str]:
+        """update 결과에서 실질적으로 변경/추가된 TC의 tc_id 목록을 반환한다 (이슈 #277 후속).
+
+        TS 전체에 "AI 생성" 표시가 붙으면 어떤 TC가 실제로 바뀌었는지 구분하기
+        어려우므로, tc_id 기준으로 기존 TC와 내용을 비교해 변경/추가된 TC만 골라
+        검토 화면의 강조 범위를 TC 단위로 좁힌다.
+
+        req_id 등 메타데이터는 비교에서 제외 — _scenario_content_unchanged 와 동일한
+        이유로, 내용이 실질적으로 같은 TC 를 잘못 "변경됨"으로 분류하지 않기 위함.
+        """
+        existing_map = {tc.get("tc_id"): tc for tc in existing.get("test_cases", []) if tc.get("tc_id")}
+        changed: list[str] = []
+        for tc in updated.get("test_cases", []):
+            tc_id = tc.get("tc_id")
+            if not tc_id:
+                continue
+            prior = existing_map.get(tc_id)
+            if prior is None or cls._tc_content(tc) != cls._tc_content(prior):
+                changed.append(tc_id)
+        return changed
+
+    def _avoid_ts_id_conflicts(
+        self,
+        scenarios: list[dict],
+        extra_existing_nums: set[int] | None = None,
+    ) -> list[dict]:
+        """create 경로 시나리오의 ts_id가 기존 파일 또는 기존 TS(DB)와 충돌하면 다음 번호로 재할당한다.
+
+        natural_lang "추가해줘" 쿼리로 새 TS를 생성할 때 기존 TS를 덮어쓰는 문제를 방지한다.
+        extra_existing_nums: DB에서 로드한 기존 TS 번호 집합 — disk check를 보완한다.
+        """
+        from pathlib import Path
+
+        existing_nums: set[int] = set(extra_existing_nums or set())
+
+        qapilot_dir = getattr(self, "_qapilot_dir_override", None)
+        if qapilot_dir:
+            scenarios_dir = Path(qapilot_dir) / "scenarios"
+            if scenarios_dir.exists():
+                for p in scenarios_dir.glob("TS-*.json"):
+                    parts = p.stem.split("-")
+                    if len(parts) == 2 and parts[1].isdigit():
+                        existing_nums.add(int(parts[1]))
+
+        if not existing_nums:
+            return scenarios
+
+        next_num = max(existing_nums) + 1
+        result = []
+        for ts in scenarios:
+            ts_id = ts.get("ts_id", "")
+            parts = ts_id.split("-")
+            if len(parts) == 2 and parts[1].isdigit() and int(parts[1]) in existing_nums:
+                new_ts_id = f"TS-{next_num:03d}"
+                next_num += 1
+                # TC ID도 새 ts_id 기준으로 갱신 (TS-001-TC-01 → TS-010-TC-01)
+                updated_tcs = [
+                    {**tc, "tc_id": f"{new_ts_id}-TC-{j:02d}"}
+                    for j, tc in enumerate(ts.get("test_cases", []), start=1)
+                ]
+                ts = {**ts, "ts_id": new_ts_id, "test_cases": updated_tcs}
+                self.logger.info("ts_id_conflict_resolved", old=ts_id, new=new_ts_id)
+            result.append(ts)
+        return result
+
+    def _load_all_scenarios(self) -> list[dict]:
+        """서비스의 모든 기존 TS를 로드한다 (DB 우선, qapilot_dir 폴백)."""
+        import json
+        from pathlib import Path
+        from qapilot.db.scenario_reader import load_latest_scenarios
+
+        service_id = getattr(self, "_service_id", None)
+        if service_id:
+            rows = load_latest_scenarios(str(service_id))
+            if rows:
+                return rows
+
+        qapilot_dir = getattr(self, "_qapilot_dir_override", None)
+        if not qapilot_dir:
+            return []
+
+        scenarios_dir = Path(qapilot_dir) / "scenarios"
+        if not scenarios_dir.exists():
+            return []
+
+        result = []
+        for p in sorted(scenarios_dir.glob("TS-*.json")):
+            try:
+                result.append(json.loads(p.read_text(encoding="utf-8")))
+            except Exception:
+                pass
+        return result
+
     def _load_scenario_file(self, ts_id: str) -> dict | None:
         """기존 시나리오를 DB 우선, 필요 시 qapilot_dir fallback 으로 로드한다."""
         import json
@@ -1282,6 +1610,18 @@ class ScenarioGeneratorAgent(BaseAgent):
             path = Path(qapilot_dir) / "scenarios" / f"{ts_id}.json"
             if path.exists():
                 return json.loads(path.read_text(encoding="utf-8"))
+            # 디스크 없음 → DB 폴백
+            try:
+                from qapilot.shared.trace_store import load_trace
+                from qapilot.db.scenario_reader import load_latest_scenarios
+                trace = load_trace(self.trace_id) or {}
+                service_id = trace.get("service_id")
+                if service_id:
+                    all_ts = load_latest_scenarios(service_id, scenario_ids=[ts_id])
+                    if all_ts:
+                        return all_ts[0]
+            except Exception:
+                pass
             return None
         return load_scenario(ts_id)
 
@@ -1295,7 +1635,10 @@ class ScenarioGeneratorAgent(BaseAgent):
         mismatch_text: str,
         req_endpoints: list,
     ) -> tuple[dict, float]:
-        """기존 TS 전체를 재생성한다. ts_id는 기존 값을 유지한다."""
+        """기존 TS에서 변경이 필요한 TC만 delta 출력받아 tc_id 기준으로 병합한다.
+
+        변경 없는 TC는 보존하고, 변경된 TC는 교체하며, 신규 TC는 추가한다.
+        """
         ts_id = existing_ts["ts_id"]
         req_id = req.get("req_id", "")
         router_files = list(dict.fromkeys(ep.get("file", "") for ep in req_endpoints if ep.get("file")))
@@ -1308,7 +1651,9 @@ class ScenarioGeneratorAgent(BaseAgent):
             f"## 수정 대상 시나리오 (ts_id: {ts_id} 유지)\n"
             f"현재 TS 이름: {existing_ts.get('name', '')}\n"
             f"현재 TC 목록:\n{existing_tc_summary}\n\n"
-            f"위 TS를 아래 요구사항 변경에 맞게 전체 재생성하라. "
+            f"변경이 필요한 TC만 출력하라. 변경 없는 TC는 출력하지 마라 — 코드에서 기존 TC를 보존한다.\n"
+            f"수정된 TC는 기존 tc_id를 그대로 유지하라 (예: {ts_id}-TC-01).\n"
+            f"신규 TC는 tc_id를 {ts_id}-TC-NEW-01 형식으로 부여하라.\n"
             f"ts_id는 반드시 {ts_id}로 고정하라."
         )
 
@@ -1324,17 +1669,54 @@ class ScenarioGeneratorAgent(BaseAgent):
         )
 
         response = await self.llm.chat(system_prompt=self.prompts.system(), user_prompt=user_prompt)
-        ts_scenarios, ts_confidence = parse_response(response.content, trigger, router_files, [])
+        ts_scenarios, ts_confidence = parse_response(
+            response.content, trigger, router_files, [], preserve_tc_ids=True
+        )
 
         if not ts_scenarios:
-            return existing_ts, 0.3
+            return {**existing_ts, "_unchanged": True}, 0.3
 
-        updated = ts_scenarios[0]
-        updated["ts_id"] = ts_id
-        for j, tc in enumerate(updated.get("test_cases", [])):
-            tc["tc_id"] = f"{ts_id}-TC-{j + 1:02d}"
-            if not tc.get("req_id"):
-                tc["req_id"] = req_id
+        # tc_id 기준 병합: 기존 TC 보존 + 변경 TC 교체 + 신규 TC 추가
+        # _to_delete: true TC는 _pending_delete: true 로 마킹해 UI가 빨간 스타일로 표시하도록 한다.
+        delta_tcs = ts_scenarios[0].get("test_cases", [])
+        delta_map = {tc.get("tc_id", ""): tc for tc in delta_tcs}
+        existing_tcs = existing_ts.get("test_cases", [])
+
+        merged_tcs = []
+        used_tc_ids = set()
+        for tc in existing_tcs:
+            tc_id = tc.get("tc_id", "")
+            if tc_id in delta_map:
+                delta_tc = delta_map[tc_id]
+                if delta_tc.get("_to_delete"):
+                    # 삭제 대상: 기존 TC를 _pending_delete=True 로 마킹해 보존
+                    merged_tcs.append({**tc, "_pending_delete": True})
+                else:
+                    merged = {**delta_tc}
+                    if not merged.get("req_id"):
+                        merged["req_id"] = req_id
+                    merged_tcs.append(merged)
+            else:
+                merged_tcs.append(tc)
+            used_tc_ids.add(tc_id)
+
+        # 신규 TC (기존 tc_id에 없는 것, _to_delete 전용 항목 제외)
+        for tc in delta_tcs:
+            tc_id = tc.get("tc_id", "")
+            if tc_id not in used_tc_ids and not tc.get("_to_delete"):
+                if not tc.get("req_id"):
+                    tc["req_id"] = req_id
+                merged_tcs.append(tc)
+
+        # TS 메타데이터(name, description 등)는 LLM 출력 우선, test_cases는 병합 결과 사용
+        llm_ts = ts_scenarios[0]
+        updated = {**existing_ts, **llm_ts, "test_cases": merged_tcs, "ts_id": ts_id}
+
+        # 삭제 대기 TC id 목록 — pipeline._save_scenarios 에서 change_request.content 에 포함
+        deleted_tc_ids = [tc["tc_id"] for tc in merged_tcs if tc.get("_pending_delete")]
+        if deleted_tc_ids:
+            updated["_deleted_tc_ids"] = deleted_tc_ids
+
         return updated, ts_confidence
 
     async def _run_update_tc(
@@ -1357,14 +1739,39 @@ class ScenarioGeneratorAgent(BaseAgent):
             (tc for tc in existing_ts.get("test_cases", []) if tc.get("tc_id") == target_tc_id),
             None,
         )
-        update_context = (
-            f"## TC 수정 모드 (ts_id: {ts_id} 유지)\n"
-            f"대상 TC: {target_tc_id or '신규 TC 추가'}\n"
-            f"현재 TC 내용: {target_tc}\n\n"
-            f"위 TC를 아래 요구사항에 맞게 수정하라. "
-            f"scenarios에 원소 1개, test_cases에 수정된 TC만 출력하라. "
-            f"tc_id는 {target_tc_id or '새 TC ID'}로 고정하라."
-        )
+
+        self.logger.info("run_update_tc_debug", ts_id=ts_id, target_tc_id=target_tc_id, mode="update" if (target_tc_id and target_tc) else "add")
+
+        if target_tc_id and target_tc:
+            # update: 기존 TC 전체 재작성 — 사용자가 명시적으로 지칭한 TC를 요구사항에 맞게 수정
+            import json as _json
+            existing_tc_json = _json.dumps(target_tc, ensure_ascii=False, indent=2)
+            update_context = (
+                f"## TC 수정 모드 (ts_id: {ts_id}, tc_id: {target_tc_id} 유지)\n"
+                f"수정 대상 TC 현재 내용:\n```json\n{existing_tc_json}\n```\n\n"
+                f"위 TC를 아래 요구사항에 맞게 수정하라.\n"
+                f"- 요구사항이 '더 구체적으로', '상세하게' 등을 요청하면 given/when/then을 실질적으로 구체화하라:\n"
+                f"  given: 어떤 데이터/상태가 준비되어야 하는지 (파라미터, 인증 상태 등)\n"
+                f"  when: 어떤 API/동작을 수행하는지 (HTTP 메서드, 경로, 입력값 포함)\n"
+                f"  then: 어떤 결과가 반환되는지 (응답 코드, 반환 필드 목록, 상태 변화)\n"
+                f"- 코드베이스 정보가 없어도 도메인 지식으로 구체화 가능하다. 일반적인 REST API 규칙과 도메인 지식을 활용하라.\n"
+                f"- tc_id는 반드시 {target_tc_id}로 고정하고, "
+                f"scenarios에 원소 1개, test_cases에 수정된 TC 전체(name/given/when/then/values/tags/depends_on)를 출력하라."
+            )
+        else:
+            # create+tc: 새 TC 추가 — 완전한 새 TC 생성
+            update_context = (
+                f"## 새 TC 추가 모드 (ts_id: {ts_id} 유지)\n"
+                f"기존 TC 목록:\n" +
+                "\n".join(
+                    f"  [{tc.get('tc_id', '')}] {tc.get('name', '')}"
+                    for tc in existing_ts.get("test_cases", [])
+                ) +
+                f"\n\n위 TS에 아래 요구사항에 맞는 새 TC를 추가하라. "
+                f"scenarios에 원소 1개, test_cases에 새 TC만 출력하라. "
+                f"기존 TC와 주제가 유사해도 조건(횟수·입력값·결과)이 다르면 별도 TC로 추가한다. "
+                f"given/when/then이 완전히 동일한 TC만 중복으로 간주하라."
+            )
 
         user_prompt = self.prompts.render(
             domain_rules=area_domain_rules_text,
@@ -1381,20 +1788,26 @@ class ScenarioGeneratorAgent(BaseAgent):
         ts_scenarios, ts_confidence = parse_response(response.content, trigger, router_files, [])
 
         if not ts_scenarios or not ts_scenarios[0].get("test_cases"):
-            return existing_ts, 0.3
+            return {**existing_ts, "_unchanged": True}, 0.3
 
-        new_tc = ts_scenarios[0]["test_cases"][0]
-        new_tc["tc_id"] = target_tc_id or new_tc.get("tc_id", "")
-        if not new_tc.get("req_id"):
-            new_tc["req_id"] = req_id
+        output_tc = ts_scenarios[0]["test_cases"][0]
+        if not output_tc.get("req_id"):
+            output_tc["req_id"] = req_id
 
-        if target_tc_id:
+        if target_tc_id and target_tc:
+            # update: LLM이 전체 TC를 재작성했으므로 output_tc를 그대로 교체
+            # tc_id는 반드시 원본 유지
+            output_tc["tc_id"] = target_tc_id
             updated_tcs = [
-                new_tc if tc.get("tc_id") == target_tc_id else tc
+                output_tc if tc.get("tc_id") == target_tc_id else tc
                 for tc in existing_ts.get("test_cases", [])
             ]
         else:
-            updated_tcs = list(existing_ts.get("test_cases", [])) + [new_tc]
+            # create+tc: 새 TC 추가 — LLM 생성 tc_id 대신 TS 기준으로 자동 부여
+            existing_tcs = list(existing_ts.get("test_cases", []))
+            next_num = len(existing_tcs) + 1
+            output_tc["tc_id"] = f"{ts_id}-TC-{next_num:02d}"
+            updated_tcs = existing_tcs + [output_tc]
 
         return {**existing_ts, "test_cases": updated_tcs}, ts_confidence
 
@@ -1447,10 +1860,12 @@ class ScenarioGeneratorAgent(BaseAgent):
         )
 
         response = await self.llm.chat(system_prompt=self.prompts.system(), user_prompt=user_prompt)
-        ts_scenarios, ts_confidence = parse_response(response.content, trigger, router_files, [])
+        ts_scenarios, ts_confidence = parse_response(
+            response.content, trigger, router_files, [], preserve_tc_ids=True
+        )
 
         if not ts_scenarios:
-            return existing_ts, 0.3
+            return {**existing_ts, "_unchanged": True}, 0.3
 
         new_tc_map = {tc.get("tc_id", ""): tc for tc in ts_scenarios[0].get("test_cases", [])}
         updated_tcs: list = []
@@ -1513,10 +1928,68 @@ class ScenarioGeneratorAgent(BaseAgent):
         filtered = {f: eps for f, eps in router_map.items() if is_meaningful(eps)}
 
         if affected_files:
-            in_scope = {f: eps for f, eps in filtered.items() if f in affected_files}
-            return in_scope or filtered
+            scoped_files = self._resolve_affected_router_files(affected_files, filtered)
+            in_scope = {f: eps for f, eps in filtered.items() if f in scoped_files}
+            return in_scope
 
         return filtered
+
+    def _resolve_affected_router_files(
+        self,
+        affected_files: list[str],
+        router_map: dict[str, list[dict]],
+    ) -> set[str]:
+        """Git diff 파일에서 실제 영향을 받는 라우터 파일 집합을 계산한다.
+
+        직접 라우터 파일이 바뀐 경우만 포함하면 main.py 의 include_router 변경,
+        service/config/helper 변경처럼 라우터가 참조하는 파일 변경을 놓친다. 반대로
+        매칭 실패 시 전체 라우터로 확장하면 변경 범위를 벗어난 시나리오까지 수정된다.
+        따라서 import/call index 로 연결된 라우터만 보수적으로 포함한다.
+        """
+        affected_set = set(affected_files)
+        router_files = set(router_map.keys())
+        scoped = affected_set & router_files
+
+        callgraph: dict[str, list[str]] = self._read_index_json("callgraph.json")  # type: ignore[assignment]
+        functions: list[dict] = self._read_index_json("functions.json")  # type: ignore[assignment]
+
+        affected_stems = {Path(f).stem for f in affected_set}
+        router_stems = {Path(f).stem: f for f in router_files}
+
+        def imports_module(imports: list[str], stem: str) -> bool:
+            pattern = re.compile(rf"(^|\b|\.|/){re.escape(stem)}(\b|\.|/|$)")
+            return any(pattern.search(line) for line in imports or [])
+
+        # main/app 등 진입점 변경: 해당 파일이 import/include 하는 라우터만 포함.
+        for changed in affected_set:
+            imports = callgraph.get(changed, [])
+            for stem, router_file in router_stems.items():
+                if imports_module(imports, stem):
+                    scoped.add(router_file)
+
+        # 라우터가 변경 파일의 모듈을 import 하면 해당 라우터를 포함.
+        for router_file in router_files:
+            imports = callgraph.get(router_file, [])
+            if any(imports_module(imports, stem) for stem in affected_stems):
+                scoped.add(router_file)
+
+        # 라우터 핸들러가 변경 파일에 정의된 helper 함수를 호출하면 해당 라우터를 포함.
+        changed_function_names = {
+            fn.get("name")
+            for fn in functions
+            if fn.get("file") in affected_set and fn.get("name")
+        }
+        if changed_function_names:
+            for router_file in router_files:
+                for fn in functions:
+                    if fn.get("file") != router_file:
+                        continue
+                    calls = set(fn.get("calls") or [])
+                    if calls & changed_function_names:
+                        scoped.add(router_file)
+                        break
+
+        return scoped
 
     def _sort_router_map(self, router_map: dict[str, list[dict]]) -> dict[str, list[dict]]:
         """_ROUTER_PRIORITY 순서로 라우터맵을 정렬한다. 목록에 없는 라우터는 뒤에 붙는다."""
