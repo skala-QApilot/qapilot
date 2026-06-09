@@ -101,6 +101,27 @@ def put_file(key: str, path: str, content_type: str) -> dict | None:
         return None
 
 
+def head_object(key: str) -> dict | None:
+    """S3 HEAD — 객체 존재 + 메타 확인 (cache skip 정책용).
+
+    반환:
+      {"bytes": <ContentLength>, "etag": <ETag>}  객체 존재
+      None                                          미존재 / S3 비활성
+
+    본인 PoC 3 (metadata_indices upsert) 의 "같은 commit_sha 재스캔 시 PUT skip"
+    판단 헬퍼. get_object 대비 본문 다운로드 없음 — 빠름 + 저렴.
+    """
+    client, bucket = get_client()
+    if client is None:
+        return None
+    try:
+        resp = client.head_object(Bucket=bucket, Key=key)
+        return {"bytes": int(resp.get("ContentLength", 0)), "etag": resp.get("ETag")}
+    except Exception:
+        # NoSuchKey / 404 등 — graceful (None 으로 "미존재" 시그널)
+        return None
+
+
 def get_object(key: str) -> bytes | None:
     """S3 GET. 반환: bytes 또는 None (실패/비활성).
 
