@@ -11,9 +11,7 @@ Created: 2026-05-07
 from __future__ import annotations
 
 import asyncio
-import json
 import os
-from pathlib import Path
 from typing import Any
 
 from qapilot.shared.schemas import DomainRule
@@ -22,8 +20,6 @@ from qapilot.tools.domain_knowledge._embedder import EMBED_DIM, embed_with_retry
 _QDRANT_COLLECTION = "domain_knowledge"
 _EMBED_BATCH = 20
 _TOP_K_DEFAULT = 5
-
-_DOMAIN_DIR = Path(".qapilot/domain")
 
 
 class VectorStore:
@@ -42,13 +38,14 @@ class VectorStore:
         """
         self._logger = logger
 
-    async def embed_and_store(self, chunks: list[dict]) -> tuple[int, int]:
+    async def embed_and_store(self, chunks: list[dict], service_id: str | None = None) -> tuple[int, int]:
         """청크를 배치로 임베딩하여 Qdrant에 upsert한다.
 
         임베딩 실패 시 배치 단위로 최대 MAX_EMBED_RETRY회 재시도한다.
 
         Args:
             chunks: chunk_id, source, section, text 키를 가진 청크 목록.
+            service_id: 서비스 식별자. payload에 포함되어 검색 시 필터링에 사용된다.
 
         Returns:
             tuple[int, int]: (저장 성공 건수, 저장 실패 건수).
@@ -80,6 +77,7 @@ class VectorStore:
                             "section": chunk["section"],
                             "text": chunk["text"],
                             "category": "document",
+                            **({"service_id": service_id} if service_id else {}),
                         },
                     )
                     for chunk, vector in zip(batch, vectors)
@@ -90,6 +88,29 @@ class VectorStore:
             await client.close()
 
         return stored, failed
+
+    async def delete_by_source(self, source: str) -> None:
+        """동일 source(파일명)의 기존 벡터를 모두 삭제한다.
+
+        재임포트 직전에 호출해 동일 파일의 이전 청크를 제거한다.
+
+        Args:
+            source: 파일명 (chunk payload 의 "source" 값과 동일).
+        """
+        from qdrant_client import AsyncQdrantClient
+        from qdrant_client.models import FieldCondition, Filter, MatchValue
+
+        client = AsyncQdrantClient(url=self._qdrant_url())
+        try:
+            resp = await client.get_collections()
+            if _QDRANT_COLLECTION not in {c.name for c in resp.collections}:
+                return
+            await client.delete(
+                collection_name=_QDRANT_COLLECTION,
+                points_selector=Filter(must=[FieldCondition(key="source", match=MatchValue(value=source))]),
+            )
+        finally:
+            await client.close()
 
     async def collection_exists(self) -> bool:
         """Qdrant 컬렉션 존재 여부를 반환한다."""
@@ -104,7 +125,13 @@ class VectorStore:
         finally:
             await client.close()
 
-    async def search(self, query: str, top_k: int = _TOP_K_DEFAULT) -> list[DomainRule]:
+    async def search(
+        self,
+        query: str,
+        top_k: int = _TOP_K_DEFAULT,
+        service_id: str | None = None,
+        score_threshold: float = 0.0,
+    ) -> list[DomainRule]:
         """쿼리를 임베딩하여 Qdrant에서 유사 도메인 규칙을 검색한다.
 
         컬렉션이 없으면 빈 목록을 반환한다 (Qdrant 재시작 등으로 컬렉션이 소실된 경우).
@@ -112,11 +139,14 @@ class VectorStore:
         Args:
             query: 검색 쿼리 문자열.
             top_k: 반환할 최대 결과 수.
+            service_id: 서비스 식별자. 지정 시 해당 서비스의 문서만 검색한다.
+            score_threshold: 이 값 미만의 유사도를 가진 결과를 제외한다. 0.0이면 필터 없음.
 
         Returns:
             list[DomainRule]: 유사도 순으로 정렬된 도메인 규칙 목록.
         """
         from qdrant_client import AsyncQdrantClient
+        from qdrant_client.models import FieldCondition, Filter, MatchValue
 
         client = AsyncQdrantClient(url=self._qdrant_url())
 
@@ -129,10 +159,18 @@ class VectorStore:
             embedder = get_embedder()
             vecs = await asyncio.to_thread(embedder.encode, [query], normalize_embeddings=True)
             vector = vecs[0].tolist()
+
+            query_filter = (
+                Filter(must=[FieldCondition(key="service_id", match=MatchValue(value=service_id))])
+                if service_id
+                else None
+            )
             response = await client.query_points(
                 collection_name=_QDRANT_COLLECTION,
                 query=vector,
                 limit=top_k,
+                query_filter=query_filter,
+                score_threshold=score_threshold if score_threshold > 0.0 else None,
             )
             hits = response.points
         finally:
@@ -142,6 +180,7 @@ class VectorStore:
             {
                 "rule_id": str(hit.id),
                 "source": hit.payload.get("source", ""),
+                "section": hit.payload.get("section", ""),
                 "category": hit.payload.get("category", ""),
                 "content": hit.payload.get("text", ""),
                 "similarity_score": round(hit.score, 4),

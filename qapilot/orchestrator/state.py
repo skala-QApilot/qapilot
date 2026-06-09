@@ -100,6 +100,10 @@ class PipelineState(TypedDict):
     # ── 리포트 ──
     report_path: str | None
 
+    # ── prd_only_experiment ──
+    ts_list: list[dict]            # TSFromPRDAgent 출력
+    tc_by_ts_index: dict           # index → list[dict] (TC 목록)
+
     # ── 메타 ──
     agent_logs: list[AgentMeta]
     total_cost: float

@@ -88,10 +88,12 @@ class DomainKnowledgeTool(BaseTool):
         if not file_path.exists():
             raise ToolExecutionError(ErrorCode.TOOL_002, f"파일 없음: {file_path}")
 
+        service_id = params.get("service_id") or None
         self.logger.info("doc_import_start", file=str(file_path))
         chunks = self._parser.parse_and_chunk(file_path)
-        stored, failed = await self._store.embed_and_store(chunks)
-        self._store.save_index(file_path, len(chunks))
+        # chunk_id 가 매번 새 UUID 라 upsert 만으로는 구버전 벡터가 남는다 — 재임포트 전 정리.
+        await self._store.delete_by_source(file_path.name)
+        stored, failed = await self._store.embed_and_store(chunks, service_id=service_id)
         self.logger.info("doc_import_done", stored=stored, failed=failed)
 
         return {
@@ -121,8 +123,15 @@ class DomainKnowledgeTool(BaseTool):
         if not query:
             raise ToolExecutionError(ErrorCode.TOOL_001, "search에는 query 파라미터가 필요합니다.")
 
+        service_id = params.get("service_id") or None
+        score_threshold = float(params.get("score_threshold", 0.0))
         expanded = self._glossary.expand(query)
-        rules = await self._store.search(query=expanded, top_k=int(params.get("top_k", 5)))
+        rules = await self._store.search(
+            query=expanded,
+            top_k=int(params.get("top_k", 5)),
+            service_id=service_id,
+            score_threshold=score_threshold,
+        )
         return {"query": query, "expanded_query": expanded, "rules": rules}
 
     async def _add_rule(self, params: dict) -> dict:
