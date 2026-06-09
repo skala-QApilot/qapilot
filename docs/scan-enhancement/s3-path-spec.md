@@ -1,6 +1,6 @@
 # S3 Path / SHA / TTL / Lifecycle 규약
 
-> 본 문서는 본인 영역의 S3 저장 규약을 정의한다. 코드베이스 원본 + 메타데이터 + 기존 codebase-index 의 path 통일.
+> 본 문서는 본 데이터 layer 의 S3 저장 규약을 정의한다. 코드베이스 원본 + 메타데이터 + 기존 codebase-index 의 path 통일.
 
 ---
 
@@ -15,40 +15,40 @@
 | 본문 (blob) | **S3** (object storage) | `.py` `.vue` `.ts` 파일 텍스트 + 추출된 메타데이터 JSON | 책의 본문 |
 | 인덱스 (catalog) | **PostgreSQL `metadata_indices` 테이블** | `s3_key`, `service_id`, `commit_hash`, `kind/sub_kind`, `bytes`, `sha256`, `confidence`, `scanned_at` | 도서관 카드 카탈로그 |
 
-#### S3 만 쓰지 않는 이유
+#### S3 - RDB 연계 구조
 "어떤 service 의 최신 frontend.selectors 가 어디 있나?" 를 알려면 매번 `list_objects` 해야 함 (느림 + 비쌈). RDB 에 카탈로그가 있으면:
 ```sql
 SELECT s3_key FROM metadata_indices
 WHERE service_id=? AND kind='frontend' AND sub_kind='selectors'
 ORDER BY scanned_at DESC LIMIT 1
 ```
-한 쿼리로 끝. + 본인 PR #240 의 `_load_codebase_index_from_db_mirror()` 패턴 그대로 재사용 (검증된 패턴).
+한 쿼리로 끝. + 기존 PR #240 의 `_load_codebase_index_from_db_mirror()` 패턴 그대로 재사용 (검증된 패턴).
 
 #### 그래프 DB 안 쓰는 이유
-본인 데이터는 "service × commit × 영역" 의 단순 다차원 lookup. joins 없음. 그래프 DB 는 callgraph 처럼 관계 탐색용 — 이미 `codebase_indices.callgraph` 가 JSON 으로 충분.
+데이터는 "service × commit × 영역" 의 단순 다차원 lookup. joins 없음. 그래프 DB 는 callgraph 처럼 관계 탐색용 — 이미 `codebase_indices.callgraph` 가 JSON 으로 충분.
 
 #### NoSQL document store (Mongo 등) 안 쓰는 이유
-본인 인덱스는 schema 가 고정 (kind, sub_kind, s3_key, ...). RDB 의 `CHECK` constraint + `UNIQUE` 제약이 더 안전. 본인 기존 `codebase_indices` 와 정합.
+인덱스는 schema 가 고정 (kind, sub_kind, s3_key, ...). RDB 의 `CHECK` constraint + `UNIQUE` 제약이 더 안전. 기존 `codebase_indices` 와 정합.
 
 ---
 
 ### Q2. 다음 단계 (PoC 4+) 에서 어떻게 사용하나?
 
-유빈 agent 가 TC/TV 생성 시 본인 헬퍼 호출 → LLM context 주입:
+유빈 agent 가 TC/TV 생성 시 헬퍼 호출 → LLM context 주입:
 
 ```text
 [유빈 TC generator]
    │
    │ ① load_metadata_index(service_id, "frontend", "selectors")
    ▼
-[본인 헬퍼: scan_storage.load_metadata_index]
+[헬퍼: scan_storage.load_metadata_index]
    │ DB: SELECT s3_key FROM metadata_indices WHERE ... ORDER BY scanned_at DESC LIMIT 1
    │ S3: GET s3_key
    │ → dict (FrontendSelectorsIndex JSON)
    │
    │ ② load_source(service_id, sha, "backend/app/auth.py", line_start=10, line_end=50)
    ▼
-[본인 헬퍼: scan_storage.load_source]
+[헬퍼: scan_storage.load_source]
    │ S3: GET services/{sid}/source/{sha}/backend/app/auth.py
    │ → line range 만 잘라서 반환 (token 절감)
    │
@@ -70,7 +70,7 @@ ORDER BY scanned_at DESC LIMIT 1
 - **격차 A-1 (오라클) 완화** — schemas (Pydantic field) 로 "이메일 검증 룰" 확인 가능
 - **격차 A-3 (런타임 상태)** — TV pool 도 같은 load_* 패턴 (PoC 6)
 
-본인 PoC 2 의 `FrontendSelectorsIndex` 가 바로 이 prompt context 의 입력.
+PoC 2 의 `FrontendSelectorsIndex` 가 바로 이 prompt context 의 입력.
 
 ---
 
@@ -86,13 +86,13 @@ ORDER BY scanned_at DESC LIMIT 1
 | 과거 commit | `git log` 전체 + `git checkout <old_sha>` 가능 | 못 봄 |
 | 사용처 | 개발 | CI / 1회 스캔 |
 
-#### 본인 PoC 에서 쓰는 이유
-- 본인은 **현재 코드만** 필요 — 과거 history 무관. commit 추적은 `metadata_indices.commit_hash` 컬럼만 있으면 충분.
+#### PoC 에서 쓰는 이유
+- **현재 코드만** 필요 — 과거 history 무관. commit 추적은 `metadata_indices.commit_hash` 컬럼만 있으면 충분.
 - 1회 clone → 스캔 → S3 PUT → 즉시 폐기 (workspace) → 디스크 자국 0.
 - 대용량 service repo 의 history 가 GB 일 때, depth 1 = 코드 자체 크기만 (예: 50MB).
 
 #### Trade-off
-- 단점: 과거 commit 접근 불가 — 단 본인은 service 등록 시점 HEAD 만 필요하므로 무관.
+- 단점: 과거 commit 접근 불가 — 단 service 등록 시점 HEAD 만 필요하므로 무관.
 - repeat scan = 새 SHA 마다 다시 `git clone --depth 1` (캐시는 S3 의 `head_object` skip 으로).
 
 ---
@@ -111,13 +111,13 @@ qapilot-local (bucket — PoC, production 은 별도)
         │       ├── callgraph.json
         │       ├── manifest.json
         │       └── frontend.json
-        ├── metadata-index/                          # 신규 — 본 PoC 추가
+        ├── metadata-index/                          # 신규 (본 작업으로 추가)
         │   └── {commit_sha}/
         │       ├── frontend-selectors.json
         │       ├── frontend-routes.json
         │       ├── backend-schemas.json
         │       └── sut_tests-patterns.json
-        ├── source/                                  # 신규 — 코드베이스 원본 PoC
+        ├── source/                                  # 신규 — 코드베이스 원본
         │   └── {commit_sha}/
         │       └── {relative_path}                  # ex: backend/app/main.py
         ├── generated-code/                          # 기존 (변경 X)
@@ -140,12 +140,12 @@ services/{service_id}/metadata-index/{commit_sha}/{kind}-{sub_kind}.json
 예: services/9f2a7d4f-.../metadata-index/76ff013448.../frontend-selectors.json
 ```
 
-- `commit_sha` = 풀 SHA (40자) 또는 짧은 hash (12자, 본인 기존 패턴과 정합)
+- `commit_sha` = 풀 SHA (40자) 또는 짧은 hash (12자, 기존 패턴과 정합)
 - 파일명 = `{kind}-{sub_kind}.json` — 한 파일 = 한 record
 - `kind` ∈ `{frontend, backend, sut_tests}`
 - `sub_kind` ∈ `{selectors, routes, schemas, patterns}`
 
-### 2.2 source (코드베이스 원본 PoC)
+### 2.2 source (코드베이스 원본)
 ```
 services/{service_id}/source/{commit_sha}/{relative_path}
 예: services/9f2a7d4f-.../source/76ff013448.../backend/app/main.py
@@ -177,12 +177,12 @@ services/{service_id}/source/{commit_sha}/{relative_path}
 ### 3.2 Cache 정책
 - 같은 (service_id, commit_sha) 의 metadata-index / source 이미 S3 에 있으면 **PUT skip**
 - `head_object` 로 확인 (list_objects 대신 — 빠름)
-- 본인 mirror fallback 패턴 (#240) 그대로 재사용
+- 기존 PR #240 의 mirror fallback 패턴 그대로 재사용
 
 ### 3.3 짧은 hash vs 풀 SHA
 - 기존 `codebase_indices` 의 `commit_hash` = `character varying` = 풀 SHA (길이 제한 없음)
-- 본인 신규 `metadata_indices` = 동일하게 `character varying`
-- S3 path 의 `{commit_sha}` = **짧은 12자** 사용 (path 길이 절감 + 본인 기존 패턴과 정합)
+- 신규 `metadata_indices` = 동일하게 `character varying`
+- S3 path 의 `{commit_sha}` = **짧은 12자** 사용 (path 길이 절감 + 기존 패턴과 정합)
   - 단 DB 의 commit_hash 는 풀 SHA 저장 (lookup 시 짧은 hash 로 LIKE 검색)
 
 ---
@@ -221,21 +221,21 @@ service A 의 commit SHA 가 76ff... 으로 동일:
 ### 5.1 PoC 단계 결정
 - 단일 MinIO instance + 단일 credentials (`minioadmin/minioadmin`)
 - service 간 격리 = **path prefix 만** (`services/{service_id}/...`)
-- 본인 누적 PR (mirror_writer 등) 도 동일 패턴
+- 누적 PR (mirror_writer 등) 도 동일 패턴
 
 ### 5.2 향후 production 시점 (별도 검토 필요)
 - multi-tenant 시 service A 의 owner 가 service B 코드 접근 막아야
 - AWS S3 IAM Policy 분리 (`Resource: arn:aws:s3:::qapilot-prod/services/{service_id}/*`)
-- 본인이 #257 처럼 별도 이슈 발의
+- #257 처럼 별도 이슈 발의
 
 ### 5.3 GitHub 인증 (별개 layer)
 - service 등록 시 `repos[].token` (GitHub PAT) = **GitHub 접근** 만
 - MinIO/S3 와 무관
-- 본인이 한 번 PAT 으로 `git clone --depth 1` → S3 PUT → 폐기 → 이후 S3 접근만 (PAT 재사용 X)
+- 한 번 PAT 으로 `git clone --depth 1` → S3 PUT → 폐기 → 이후 S3 접근만 (PAT 재사용 X)
 
 ---
 
-## 6. 조회 인터페이스 (본인 헬퍼 시그니처)
+## 6. 조회 인터페이스 (헬퍼 시그니처)
 
 ### 6.1 source 조회
 ```python
@@ -252,7 +252,7 @@ def load_source(
     line_range 없으면 전체 본문.
     
     캐시 정책:
-    - 본인 메모리 LRU (per-process, 100MB cap)
+    - 메모리 LRU (per-process, 100MB cap)
     - 같은 (service_id, sha, path) 호출 = cache hit
     """
 ```
@@ -267,7 +267,7 @@ def load_metadata_index(
 ) -> dict:
     """metadata_indices DB → S3 mirror fallback.
     
-    본인 PR #240 mirror fallback 패턴 그대로:
+    기존 PR #240 mirror fallback 패턴 그대로:
     1. 디스크 cache (선택)
     2. DB 의 s3_key 확인
     3. S3 GET
@@ -276,7 +276,7 @@ def load_metadata_index(
 ```
 
 ### 6.3 코드베이스-index 조회 (기존 — 변경 X)
-- 본인 `qapilot/db/code_reader.load_codebase_index(service_id, kind)` 그대로
+- `qapilot/db/code_reader.load_codebase_index(service_id, kind)` 그대로
 
 ---
 
@@ -295,10 +295,10 @@ def load_metadata_index(
 
 ---
 
-## 8. 본인 작업 우선순위
+## 8. 본 작업 우선순위
 
 1. **PoC 1** (본 단위): docs + Pydantic model + DDL ← 현재 작업
-2. **PoC 3**: S3 writer (`upsert_metadata_index()`) + 본인 mirror 패턴
+2. **PoC 3**: S3 writer (`upsert_metadata_index()`) + 기존 mirror 패턴
 3. **PoC 4**: S3 reader (`load_metadata_index()` + `load_source()`)
 
 source/ 디렉토리 저장은 PoC 2 (AST 추출) 와 같이 진행 — AST 추출 후 원본도 PUT.

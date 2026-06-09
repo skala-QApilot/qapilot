@@ -363,7 +363,7 @@
 ### 4.4 활용
 - TC 생성 시 `auth-setup` 패턴 → 시나리오의 precondition (로그인) 흐름 재사용
 - `db-seed` 패턴 → TV 생성 시 같은 패턴으로 seed
-- `wait-strategy` → 본인 UITestTool 의 wait 정책에 활용
+- `wait-strategy` → UITestTool 의 wait 정책에 활용
 - `page-object` → ActionMapper 의 selector 매핑 시 참조 (셀렉터 카탈로그 보강)
 
 ---

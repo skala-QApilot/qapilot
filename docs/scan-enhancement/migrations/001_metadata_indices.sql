@@ -5,7 +5,7 @@
 -- 목적:
 --   기존 codebase_indices = SUT 구조 추출 (불변 fact, AST 결과)
 --   신규 metadata_indices = TC/TV 생성 보조 (LLM 친화 schema 변환)
---   개념 분리 + sub_kind 자유 확장 + 본인 mirror fallback 패턴 (#240) 재사용
+--   개념 분리 + sub_kind 자유 확장 + 기존 PR #240 의 mirror fallback 패턴 재사용
 --
 -- 영역 분류:
 --   kind     | sub_kind   | 추출 방법       | confidence

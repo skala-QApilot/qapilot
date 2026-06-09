@@ -1,6 +1,6 @@
-# PoC 6 — backend.schemas + frontend.routes 추출기 (본인 4영역 완성)
+# PoC 6 — backend.schemas + frontend.routes 추출기 (4영역 완성)
 
-> 본인 영역 (주환). 본인 4 영역 (selectors/routes/schemas/patterns) 의 마지막 2 영역 구현.
+> 데이터 layer 담당 (주환). 4 영역 (selectors/routes/schemas/patterns) 의 마지막 2 영역 구현.
 
 ---
 
@@ -10,13 +10,13 @@
 |---|---|
 | **PoC 6.A** | Pydantic BaseModel + SQLAlchemy Mapped/Column → `backend.schemas` |
 | **PoC 6.B** | Vue Router `createRouter({routes: [...]})` → `frontend.routes` |
-| **도구** | tree-sitter-python (PoC 6.A) + tree-sitter-javascript/typescript (PoC 6.B) — 본인 기존 의존성 |
+| **도구** | tree-sitter-python (PoC 6.A) + tree-sitter-javascript/typescript (PoC 6.B) — 기존 의존성 |
 | **검증** | 50/50 단위 PASS + 실 환경 (mini-bss-lite) end-to-end |
-| **상태** | ✅ commit (브랜치 `feat/me/scan-enhancement-foundation`) |
+| **상태** | ✅ commit (브랜치 `feat/juhwan/scan-enhancement-foundation`) |
 
 ---
 
-## 2. 본인 4영역 완성
+## 2. 4영역 완성
 
 | kind | sub_kind | 추출기 | 상태 |
 |---|---|---|---|
@@ -177,7 +177,7 @@ createRouter({ routes: [{ path: '/foo', component: Foo }] })
         → valid=False, reason="regex(^[^@\s]+@[^@\s]+\.[^@\s]+$) FAIL"                    ✅
 ```
 
-본인 4영역 + 저장/조회/검증 사이클 모두 실 데이터로 정합 확인.
+4영역 + 저장/조회/검증 사이클 모두 실 데이터로 정합 확인.
 
 ---
 
@@ -198,7 +198,7 @@ mock 격리 — 실 S3/DB 의존 없이 추출 + Pydantic 모델 매핑 검증.
 
 ---
 
-## 7. 본인 영역 데이터 layer 완성 — 유빈 agent 의 4 public API
+## 7. 본 데이터 layer 데이터 layer 완성 — 유빈 agent 의 4 public API
 
 ```python
 from qapilot.shared.scan_storage import load_metadata_index, load_source
@@ -218,9 +218,9 @@ code   = load_source(sid, sha, "auth.py", line_start=42, line_end=58)  # PoC 4
 
 ---
 
-## 8. 후속 (PoC 6 의 framework 확장 — 본인 추가 작업 가능)
+## 8. 후속 (PoC 6 의 framework 확장 — 추가 작업 가능)
 
-본인이 후속 단위로 framework 확장 가능:
+후속 단위로 framework 확장 가능:
 
 | 확장 | 추출기 | 도구 |
 |---|---|---|
@@ -230,6 +230,6 @@ code   = load_source(sid, sha, "auth.py", line_start=42, line_end=58)  # PoC 4
 | Cypress patterns | `cypress_parser.py` | tree-sitter-javascript |
 | Jest / Vitest patterns | `jest_parser.py` | tree-sitter-typescript |
 
-본인이 vue_router_parser 가 이미 JS+TS 둘 다 지원하므로, React Router 추출기는 80% 재사용 가능.
+vue_router_parser 가 이미 JS+TS 둘 다 지원하므로, React Router 추출기는 80% 재사용 가능.
 
-다른 SUT (kshyun Spring service 등) 의 `@RestController` + `@Entity` 추출은 Java 별도 (tree-sitter-java, 본인 의존성 있음) → 후속 단위.
+다른 SUT (kshyun Spring service 등) 의 `@RestController` + `@Entity` 추출은 Java 별도 (tree-sitter-java, 의존성 있음) → 후속 단위.

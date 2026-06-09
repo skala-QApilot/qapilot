@@ -1,6 +1,6 @@
 # PoC 3 — metadata_indices Writer (DB + S3 mirror)
 
-> 본인 영역 (주환). 2026-06-09 토론 결정 4 (별도 `metadata_indices` 테이블) 의 writer 구현.
+> 데이터 layer 담당 (주환). 2026-06-09 토론 결정 4 (별도 `metadata_indices` 테이블) 의 writer 구현.
 
 ---
 
@@ -9,17 +9,17 @@
 | | |
 |---|---|
 | **목적** | Pydantic 메타데이터 index → S3 (본문 PUT) + PostgreSQL (카탈로그 upsert) 동시 기록 |
-| **재사용** | 본인 PR #240 `upsert_codebase_index` mirror 패턴 그대로 차용 |
+| **재사용** | 기존 PR #240 `upsert_codebase_index` mirror 패턴 그대로 차용 |
 | **추가 기능** | cache skip (`head_object` bytes 일치 시 PUT 생략), force flag, source/ 본문 별도 헬퍼 |
 | **검증** | 14/14 단위 PASS + 실 환경 (PostgreSQL + MinIO) end-to-end 통과 |
-| **상태** | ✅ commit (브랜치 `feat/me/scan-enhancement-foundation`) |
+| **상태** | ✅ commit (브랜치 `feat/juhwan/scan-enhancement-foundation`) |
 
 ---
 
 ## 2. 흐름도 (caller → writer → S3/DB)
 
 ```text
-[caller — 본인 scanner 또는 직접 호출]
+[caller — scanner 또는 직접 호출]
    │
    │ FrontendSelectorsIndex(service_id=..., commit_sha=..., by_route={...})
    ▼
@@ -173,7 +173,7 @@ def load_metadata_index(
     sub_kind: str,
     commit_hash: str | None = None,  # None 시 최신
 ) -> dict | None:
-    """DB 의 s3_key → S3 GET → JSON parse. 본인 mirror fallback 패턴."""
+    """DB 의 s3_key → S3 GET → JSON parse. 기존 mirror fallback 패턴."""
 
 def load_source(
     service_id: str,

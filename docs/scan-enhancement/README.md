@@ -29,7 +29,7 @@
                        │ ActionMapping
                        ▼
                   CodeGenerator → UITestTool → cross_check
-                  (본인 2026-06-07 누적 14 PR 의 격차들)
+                  (2026-06-07 누적 14 PR 의 격차들)
 ```
 
 **문제**:
@@ -43,7 +43,7 @@
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│ Scan Layer (본인 영역)                                       │
+│ Scan Layer (본 데이터 layer)                                       │
 │ ┌─────────────────────────────────────────────────────────┐│
 │ │ 기존 codebase-index (5 kind + frontend) [그대로 유지]   ││
 │ └─────────────────────────────────────────────────────────┘│
@@ -55,13 +55,13 @@
 │ │   - sut_tests.patterns   (기존 e2e/spec 의 패턴)         ││
 │ └─────────────────────────────────────────────────────────┘│
 │ ┌─────────────────────────────────────────────────────────┐│
-│ │ 신규 source/ (코드베이스 원본 PoC)                       ││
+│ │ 신규 source/ (코드베이스 원본)                       ││
 │ │   - S3 path: services/{service_id}/source/{sha}/{path}   ││
 │ │   - TTL 30일                                              ││
 │ └─────────────────────────────────────────────────────────┘│
 └──────┬───────────────────────────────────────────────────────┘
        │  load_metadata_index() / load_source() / DBTool snapshot
-       │  (조회 헬퍼 - 본인 영역)
+       │  (조회 헬퍼 - 본 데이터 layer)
        ▼
 ┌─────────────────────────────────────────────────────────────┐
 │ TC/TV Generator Agent (유빈 영역)                            │
@@ -69,7 +69,7 @@
 │   TS + 정책서/약관/API 문서 → TC (G/W/T 자연어)              │
 │   TC + 코드베이스/메타데이터/DB → TV (별도 entity, pool)     │
 └────────────────────┬────────────────────────────────────────┘
-                     │  TVValidator.validate() ← 본인 헬퍼
+                     │  TVValidator.validate() ← 헬퍼
                      ▼
                 재시도 (best-of-N, max 2회)
 ```
@@ -137,23 +137,23 @@ metadata_indices:
 - `codebase_indices` = SUT 구조 추출 (불변 fact, AST 결과)
 - `metadata_indices` = TC/TV 생성 보조 (LLM 친화 schema 변환)
 - 개념적 분리 + sub_kind 자유 확장
-- 본인 PR #240 mirror fallback 패턴 그대로 재사용
+- 기존 PR #240 mirror fallback 패턴 그대로 재사용
 
 ### 결정 5: DBTool TV 검증 = **snapshot 활용 (PoC) + 큰 SUT 시점 협업 발의**
 
 - PoC = 기존 `/db/snapshot?table=customers` 활용
-- 본인 cache layer (TV 생성 중 재사용) — `db_state_cache: {(service_id, table) → snapshot}`
-- TVValidator helper = 본인 영역 utility, 호출자 = 유빈 agent
+- cache layer (TV 생성 중 재사용) — `db_state_cache: {(service_id, table) → snapshot}`
+- TVValidator helper = 본 데이터 layer utility, 호출자 = 유빈 agent
 - 큰 SUT (10만 row+) 사용 시점 = `/db/query` endpoint E 영역 (kshyun) 협업
 
 ---
 
 ## 2. 컴포넌트 연결부
 
-### 본인 영역 → 유빈 영역 (인터페이스)
+### 본 데이터 layer → 유빈 영역 (인터페이스)
 
 ```python
-# 본인이 제공 (qapilot/shared/scan_storage.py 가칭)
+# 제공 (qapilot/shared/scan_storage.py 가칭)
 def load_metadata_index(
     service_id: str,
     kind: str,           # "frontend" | "backend" | "sut_tests"
@@ -169,14 +169,14 @@ def load_source(
     line_end: int | None = None,
 ) -> str: ...
 
-# 본인이 제공 (qapilot/shared/db_state.py 가칭)
+# 제공 (qapilot/shared/db_state.py 가칭)
 async def get_db_snapshot_cached(
     service_id: str,
     table: str,
     ttl_seconds: int = 60,
 ) -> list[dict]: ...
 
-# 본인이 제공 (qapilot/shared/tv_validator.py)
+# 제공 (qapilot/shared/tv_validator.py)
 class TVValidator:
     async def validate(
         self,
@@ -200,9 +200,9 @@ async def _execute(self, ...):
         if result.valid: break
 ```
 
-### 본인 영역 → 본인 PR #240 패턴 재사용 (mirror fallback)
+### 본 데이터 layer → 기존 PR #240 패턴 재사용 (mirror fallback)
 
-신규 헬퍼들은 본인이 2026-06-07 에 만든 `_load_codebase_index_from_db_mirror()` 패턴 그대로:
+신규 헬퍼들은 2026-06-07 에 만든 `_load_codebase_index_from_db_mirror()` 패턴 그대로:
 1. 디스크 cache 우선
 2. S3 mirror fallback
 3. service_id 인자로 멀티 테넌트 안전
@@ -223,8 +223,8 @@ docs/scan-enhancement/
 ├── poc6-backend-schemas-and-vue-routes.md  # PoC 6 — backend.schemas + frontend.routes  ✅
 ├── poc7-8-validator-and-db-cache.md  # PoC 7+8 — TVValidator + DBTool TTL cache  ✅
 ├── poc9-10-orchestrator.md         # PoC 9+10 — source dumper + 4영역 통합 orchestrator  ✅
-├── file-inventory.md               # 본인이 만든 모든 files 분류 (extractor/writer/reader/shared/...)
-├── verification.md                 # 회의 결론 ↔ 본인 구현 역추적 검증 + 미흡 영역 명시
+├── file-inventory.md               # 구현한 모든 files 분류 (extractor/writer/reader/shared/...)
+├── verification.md                 # 회의 결론 ↔ 구현 역추적 검증 + 미흡 영역 명시
 ├── before-after.md                 # Before/After (툴/아키텍처/퀄리티 3 측면)
 └── migrations/
     └── 001_metadata_indices.sql    # DDL
@@ -259,7 +259,7 @@ PoC 1 = README + spec + Pydantic + DDL. PoC 2 = Vue SFC parser (frontend.selecto
 
 ---
 
-## 4. 본인 영역 작업 트랙 + PoC 단위
+## 4. 본 데이터 layer 작업 트랙 + PoC 단위
 
 ### 트랙 1 — 코드 스캔 고도화
 - (1.1) 테스트 코드 스캔 — `tests/e2e/`, `tests/`, `spec/` 추출 → `sut_tests.patterns`
@@ -272,7 +272,7 @@ PoC 1 = README + spec + Pydantic + DDL. PoC 2 = Vue SFC parser (frontend.selecto
 
 ### 트랙 3 — DB 스캔 툴 활용 연결
 - (3.1) 기존 DBTool snapshot 활용 + cache layer
-- (3.2) `TVValidator` helper (본인 utility, 유빈 호출)
+- (3.2) `TVValidator` helper (utility, 유빈 호출)
 - (3.3) 큰 SUT 시점 `/db/query` E 영역 협업 발의
 
 ### PoC 단위 (작은 단위 commit)
@@ -292,7 +292,7 @@ PoC 1 = README + spec + Pydantic + DDL. PoC 2 = Vue SFC parser (frontend.selecto
 | **PoC 9** | git clone --depth 1 + source/ S3 dump helper | ✅ |
 | **PoC 10** | scan_all_metadata 4영역 통합 orchestrator | ✅ |
 
-#### 본인 4영역 완성
+#### 4영역 완성
 
 - ✅ `frontend.selectors` (PoC 2)
 - ✅ `frontend.routes` (PoC 6.B)
@@ -301,7 +301,7 @@ PoC 1 = README + spec + Pydantic + DDL. PoC 2 = Vue SFC parser (frontend.selecto
 
 #### Framework 확장 (추후)
 
-다른 framework 추출기는 본인이 후속 단위로 추가 가능:
+다른 framework 추출기는 후속 단위로 추가 가능:
 - React JSX (`react_jsx_parser.py` — @babel/parser subprocess, vue-bridge 패턴 동형)
 - React Router (`react_router_parser.py` — vue_router_parser 의 80% 재사용)
 - Playwright / Cypress / Jest / Vitest (각각 tree-sitter-typescript/javascript)
@@ -309,13 +309,13 @@ PoC 1 = README + spec + Pydantic + DDL. PoC 2 = Vue SFC parser (frontend.selecto
 
 ---
 
-## 5. 격차 매핑 (토론 8 격차 → 본인 작업 단위)
+## 5. 격차 매핑 (토론 8 격차 → 본 작업 단위)
 
 | 격차 | 작업 단위 | PR 또는 PoC |
 |---|---|---|
 | A-1 오라클 | 메타데이터 → 명세 1차 우선화 가능하게 함 (단 명세 우선화 자체는 유빈 agent) | PoC 5 (sut_tests 추가) |
 | A-2 도메인 hardcoded | AST 추출로 도메인 무관 | PoC 2~5 |
-| A-3 런타임 상태 전달 | TV pool entity | (유빈 agent + 본인 TV pool 저장) |
+| A-3 런타임 상태 전달 | TV pool entity | (유빈 agent + TV pool 저장) |
 | B-3 캐시 미구현 | `(sha, path)` cache + S3 SHA 키 | PoC 3 |
 | B-4 결정성 | LLM seed 고정 + AST 결정성 | PoC 2, 5 |
 

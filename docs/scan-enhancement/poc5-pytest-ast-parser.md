@@ -1,6 +1,6 @@
 # PoC 5 — pytest AST 추출 (sut_tests.patterns)
 
-> 본인 영역 (주환). sut_tests.patterns 영역의 첫 framework (pytest). PoC 2 의 vue_sfc_parser 와 동형 — 추출기는 framework 일반, mini-bss-lite 의 test 파일은 검증 fixture 로만 사용.
+> 데이터 layer 담당 (주환). sut_tests.patterns 영역의 첫 framework (pytest). PoC 2 의 vue_sfc_parser 와 동형 — 추출기는 framework 일반, mini-bss-lite 의 test 파일은 검증 fixture 로만 사용.
 
 ---
 
@@ -9,10 +9,10 @@
 | | |
 |---|---|
 | **목적** | pytest `def test_*` + `@pytest.fixture` 함수를 `TestPatternRecord` (Pydantic) 로 추출 |
-| **도구** | `tree-sitter-python` (본인 의존성 이미 있음 — codebase_scanner_tool 에서 사용 중) |
+| **도구** | `tree-sitter-python` (의존성 이미 있음 — codebase_scanner_tool 에서 사용 중) |
 | **분류** | AST 만 — fixture / auth-setup / mock / unknown (LLM 의미 분류는 후속 PoC) |
 | **검증 fixture** | mini-bss-lite/backend/tests/ (상현 commit `3fc4330` 의 9 파일) |
-| **상태** | ✅ commit (브랜치 `feat/me/scan-enhancement-foundation`) |
+| **상태** | ✅ commit (브랜치 `feat/juhwan/scan-enhancement-foundation`) |
 
 ---
 
@@ -20,7 +20,7 @@
 
 ### 2.1 추출기는 framework 일반 — SUT 의 비즈니스 도메인과 무관
 
-본인 PoC 2 (Vue SFC) 와 동형:
+PoC 2 (Vue SFC) 와 동형:
 
 | 층위 | PoC 2 (frontend.selectors) | PoC 5 (sut_tests.patterns) |
 |---|---|---|
@@ -53,7 +53,7 @@ _AUTH_URL_KEYWORDS = ("/auth", "/login", "/signup", "/logout",
 ### 3.1 함수 수집 대상
 - `def test_*` 또는 `async def test_*`
 - `@pytest.fixture` 또는 `@pytest.fixture(...)` 데코레이터가 붙은 함수
-- 그 외 일반 helper 함수 = 제외 (본 PoC 단계 — 후속에서 확장)
+- 그 외 일반 helper 함수 = 제외 (PoC 단계 — 후속에서 확장)
 
 ### 3.2 framework 감지 (`_detect_framework`)
 다음 중 하나라도 있으면 pytest:
@@ -72,7 +72,7 @@ _AUTH_URL_KEYWORDS = ("/auth", "/login", "/signup", "/logout",
 | body 에 `.get(...)` / `.post(...)` / `.put(...)` / `.patch(...)` / `.delete(...)` + URL 에 인증 키워드 | **auth-setup** |
 | 그 외 | **unknown** (LLM 의미 분류 대기) |
 
-`unknown` = **모호하다는 사실을 명확히 표현**. false positive 안 만듦 — 본인 영역 책임은 "확실한 것만 분류, 나머지는 LLM 보강에 위임".
+`unknown` = **모호하다는 사실을 명확히 표현**. false positive 안 만듦 — 본 데이터 layer 책임은 "확실한 것만 분류, 나머지는 LLM 보강에 위임".
 
 ---
 
@@ -139,7 +139,7 @@ fixture: `tests/fixtures/pytest/sample_auth_test.py` — 2 fixture + 4 test (aut
 
 ## 6. 격차 매핑 (PoC 0 의 8 격차)
 
-| 격차 | 본 PoC 5 의 기여 |
+| 격차 | PoC 5 의 기여 |
 |---|---|
 | **A-1 오라클** | `TestPatternRecord.snippet` 으로 SUT 의 검증 인텐션 직접 LLM 에 노출 → 명세 vs 코드 동작 차이 발견 가능 |
 | **A-2 도메인 hardcoded** | URL 키워드 = HTTP 인증 일반 (auth/login/signup/...). 비즈니스 도메인 (요금제/주문) 키워드 0 |
@@ -150,7 +150,7 @@ fixture: `tests/fixtures/pytest/sample_auth_test.py` — 2 fixture + 4 test (aut
 
 ## 7. 다음
 
-| PoC | 본 PoC 5 와의 관계 |
+| PoC | PoC 5 와의 관계 |
 |---|---|
 | 5.1 (LLM 의미 분류) | `unknown` 83개 → LLM 으로 `db-seed/cleanup/wait-strategy/page-object/assertion` 분류 + confidence 0.85 |
 | 5.2 (Playwright extractor) | 같은 패턴 — `qapilot/scan/extractors/playwright_parser.py` + framework="playwright" |

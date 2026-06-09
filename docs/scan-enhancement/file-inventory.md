@@ -1,4 +1,4 @@
-# 파일 인벤토리 — 본인 영역 신규/수정 (브랜치 `feat/me/scan-enhancement-foundation`)
+# 파일 인벤토리 — 데이터 layer 신규/수정 (브랜치 `feat/juhwan/scan-enhancement-foundation`)
 
 > 총 **40 files changed, +7496 insertions** (develop 기준 diff).
 
@@ -20,7 +20,7 @@
 | `poc7-8-validator-and-db-cache.md` | TVValidator + DBTool TTL cache | 7 + 8 |
 | `poc9-10-orchestrator.md` | source dumper + 4영역 통합 orchestrator | 9 + 10 |
 | `file-inventory.md` | 본 인벤토리 (이 문서) | 종합 |
-| `verification.md` | 회의 결론 ↔ 본인 구현 역추적 | 종합 |
+| `verification.md` | 회의 결론 ↔ 구현 역추적 | 종합 |
 | `before-after.md` | Before/After 3 측면 | 종합 |
 
 ---
@@ -120,9 +120,9 @@ mock 격리 — 실 PostgreSQL/MinIO/Node/LLM 의존 없이 단위 검증 가능
 
 ---
 
-## 8. 외부 의존성 (`pyproject.toml`) — 본인이 추가한 것 X
+## 8. 외부 의존성 (`pyproject.toml`) — 추가한 것 X
 
-본인이 기존 의존성만 사용:
+기존 의존성만 사용:
 - `tree-sitter`, `tree-sitter-python`, `tree-sitter-javascript`, `tree-sitter-typescript` (이미 있음 — `codebase_scanner_tool.py` 에서 사용 중)
 - `pydantic` v2 (이미 있음)
 - `psycopg` pool (이미 있음 — `db.connection.get_pool`)

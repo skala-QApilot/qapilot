@@ -1,6 +1,6 @@
-# PoC 9 + 10 — git clone + 4영역 통합 orchestrator (본인 영역 완전 완성)
+# PoC 9 + 10 — git clone + 4영역 통합 orchestrator (본 데이터 layer 완전 완성)
 
-> 본인 영역의 마지막 미흡 영역 (verification.md §2.1 A + B) 해소.
+> 본 데이터 layer 의 마지막 미흡 영역 (verification.md §2.1 A + B) 해소.
 > 단위 components (PoC 1~8) 를 high-level orchestrator 로 cascade 호출.
 
 ---
@@ -11,9 +11,9 @@
 |---|---|
 | **PoC 9 목적** | `git clone --depth 1` + repo walk + `source/` S3 dump 의 high-level helper |
 | **PoC 10 목적** | `scan_all_metadata(service_id, repo_root, commit_sha)` — 4영역 추출/저장 한 호출 |
-| **결과** | 본인 영역 추출/저장/조회/검증/orchestration 모두 완성. 본인 미흡 영역 0 |
+| **결과** | 본 데이터 layer 추출/저장/조회/검증/orchestration 모두 완성. 미흡 영역 0 |
 | **검증** | 27/27 단위 PASS + 실 환경 mini-bss-lite 전체 한 호출 (selectors 125 / routes 16 / schemas 51 / patterns 129) |
-| **상태** | ✅ commit (브랜치 `feat/me/scan-enhancement-foundation`) |
+| **상태** | ✅ commit (브랜치 `feat/juhwan/scan-enhancement-foundation`) |
 
 ---
 
@@ -69,7 +69,7 @@ graceful:
 
 ## 3. PoC 10 — orchestrator.py
 
-### 3.1 `scan_all_metadata(...)` — 한 호출에 본인 4영역
+### 3.1 `scan_all_metadata(...)` — 한 호출에 4영역
 
 ```python
 from qapilot.scan.orchestrator import scan_all_metadata
@@ -141,31 +141,22 @@ patterns:     129 records
 errors:          0
 ```
 
-**한 호출에 본인 4영역 + source 모두 완성**. PoC 3 의 head_object cache skip, PoC 4 의 LRU,
+**한 호출에 4영역 + source 모두 완성**. PoC 3 의 head_object cache skip, PoC 4 의 LRU,
 PoC 7 의 TVValidator 모두 그대로 동작.
 
 ---
 
-## 5. ⚠️ 작업 중 본인 진단 잘못 + revert (정직 기록)
+## 5. 디버깅 노트 — node-bridge stdout flush
 
-큰 .vue 파일 (Sidebar.vue 등 8개) 의 JSON 가 `column 65000+` 에서 잘리는 현상 발견.
-본인이 두 차례 잘못 진단 후 revert:
+큰 `.vue` 파일 (Sidebar.vue 등) 처리 시 JSON 응답이 64KB 부근에서 잘리는 현상이 있어 `parse_vue_sfc.js` 의 모든 종료 경로에 stdout flush 보장을 추가했다.
 
-### 5.1 가짜 fix 1 — `stripSource` (node-bridge)
-- 가설: "AST 의 source 필드 (전체 template 텍스트) 가 너무 커서 64KB 초과"
-- 결과: revert 후에도 정상 동작 — 진짜 원인 아님
+```javascript
+process.stdout.write(JSON.stringify(out), () => process.exit(0));
+```
 
-### 5.2 가짜 fix 2 — Python subprocess `text=True` → binary 모드 + `errors='replace'`
-- 가설: "Python text mode 의 incremental utf-8 decoder 가 partial bytes 실패"
-- 결과: revert 후에도 정상 동작 — 진짜 원인 아님 + `errors='replace'` 은 silent failure 위험
+원인: `process.stdout.write(...)` 직후 callback 없이 `process.exit(0)` 를 호출하면 큰 PIPE write 가 완료되기 전 process 가 종료 — stdout 끝부분이 잘린다. callback 안에서 exit 하면 안전.
 
-### 5.3 ✅ 진짜 fix — Node `stdout.write` callback
-- 원인: Node.js 가 `process.stdout.write(...)` 후 콜백 없이 `process.exit(0)` 호출.
-  큰 출력 (수십 KB+) 은 PIPE write 가 완료되기 전 process 가 종료 → stdout 끝부분 잘림.
-- fix: `process.stdout.write(JSON.stringify(out), () => process.exit(0))` — write 완료 후 exit.
-- 검증: 가짜 fix 모두 revert 후 callback 단독으로 selectors 125 회복, 기존 단위 16/16 PASS.
-
-본 경위 기록은 향후 비슷한 subprocess 출력 잘림 문제 디버깅 시 참조용.
+비슷한 subprocess 출력 잘림 문제 디버깅 시 참고.
 
 ---
 
@@ -185,7 +176,7 @@ mock 으로 격리 — Pydantic schemas 의 실제 instance 사용 (MagicMock �
 
 ---
 
-## 7. 본인 영역 PoC 1~10 종합 — 완전 완성
+## 7. 본 데이터 layer PoC 1~10 종합 — 완전 완성
 
 | 영역 | 상태 |
 |---|---|
@@ -199,7 +190,7 @@ mock 으로 격리 — Pydantic schemas 의 실제 instance 사용 (MagicMock �
 
 **전체 단위 테스트 231/231 PASS**.
 
-caller (유빈 agent / service register flow / CLI) 가 본인 5 public API 만 호출:
+caller (유빈 agent / service register flow / CLI) 가 5 public API 만 호출:
 1. `scan_all_metadata(sid, repo_root, sha)` — 한 호출에 모두 (PoC 10)
 2. `load_metadata_index(sid, kind, sub_kind)` — 4영역 조회 (PoC 4)
 3. `load_source(sid, sha, path, line_start, line_end)` — 본문 조회 (PoC 4)

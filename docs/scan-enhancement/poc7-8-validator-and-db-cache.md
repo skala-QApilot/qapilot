@@ -1,7 +1,7 @@
 # PoC 7 + 8 — TVValidator + DBTool TTL cache (유빈 agent 검증 helper)
 
-> 본인 영역 (주환). 유빈 TC/TV agent 가 호출할 검증 utility.
-> PoC 6 (다른 영역 routes/schemas) 는 추후 작업 — 본 PoC 7/8 은 독립 동작.
+> 데이터 layer 담당 (주환). 유빈 TC/TV agent 가 호출할 검증 utility.
+> PoC 6 (다른 영역 routes/schemas) 는 추후 작업 — PoC 7/8 은 독립 동작.
 
 ---
 
@@ -13,7 +13,7 @@
 | **PoC 8 목적** | DBTool snapshot 의 process-local TTL cache (TVValidator 의 DB 입력 helper) |
 | **재사용** | PoC 4 의 LRU 패턴 + TTL 추가, DBTestTool 의 기존 `_get_snapshot/_get_tables` |
 | **검증** | PoC 7 = 50/50, PoC 8 = 18/18 PASS (총 68 케이스, mock 격리) |
-| **상태** | ✅ commit (브랜치 `feat/me/scan-enhancement-foundation`) |
+| **상태** | ✅ commit (브랜치 `feat/juhwan/scan-enhancement-foundation`) |
 
 ---
 
@@ -24,7 +24,7 @@
    │  ① TV 생성 (LLM)
    │     tv_field = {"name": "email", "value": "test@example.com", "source": "llm"}
    │
-   │  ② 메타데이터 + DB 입력 준비 (본인 helper 들)
+   │  ② 메타데이터 + DB 입력 준비 (helper 들)
    ├─→ load_metadata_index(sid, "backend", "schemas")     [PoC 4]
    │     → BackendSchemasIndex (request_schemas / db_models)
    ├─→ get_db_snapshot_cached(sid, "customers")           [PoC 8]
@@ -120,7 +120,7 @@ snap = await get_db_snapshot_cached(service_id, "customers")      # TTL 60s
 
 현재 DBTestTool 은 단일 `QAPILOT_SUT_DB_URL` 환경변수 가정. multi-service 시점에:
 1. DBTestTool 의 `_module_url()` 을 service 별 분기로 확장 (격차 12 후속)
-2. 본인 cache 의 `service_id` 키가 그대로 격리 보장 (코드 변경 없음)
+2. cache 의 `service_id` 키가 그대로 격리 보장 (코드 변경 없음)
 
 회의 결정 5 의 옵션 B (`/db/query` endpoint) 도입은 별도 — E 영역 (kshyun) 협업 후속.
 
@@ -193,11 +193,11 @@ mock 격리 — 실 DB/HTTP 의존 없이 cache 동작 검증.
 
 ---
 
-## 8. PoC 6 (추후 작업) — 본 PoC 와의 관계
+## 8. PoC 6 (추후 작업) — PoC 와의 관계
 
 PoC 6 (`frontend.routes` + `backend.schemas` 추출기) 완성 시:
 - `load_metadata_index(sid, "backend", "schemas")` → 자동으로 BackendSchemasIndex 반환
 - PoC 7 의 `schemas` 인자에 그대로 주입 가능
 - 현재 단계 = caller 가 직접 dict 구성 (mini-bss-lite Pydantic 수동 매핑) 가능
 
-PoC 6 늦어져도 본 PoC 7/8 은 독립 동작.
+PoC 6 늦어져도 PoC 7/8 은 독립 동작.

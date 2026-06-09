@@ -1,6 +1,6 @@
 # PoC 4 — Scan Storage 조회 헬퍼 (유빈 agent 의 entry point)
 
-> 본인 영역 (주환). 유빈 agent (TC/TV generator) 가 호출할 통합 API.
+> 데이터 layer 담당 (주환). 유빈 agent (TC/TV generator) 가 호출할 통합 API.
 
 ---
 
@@ -9,10 +9,10 @@
 | | |
 |---|---|
 | **목적** | `load_metadata_index(...)` + `load_source(...)` — 데이터 layer 의 single entry point |
-| **재사용** | 본인 PR #240 `load_codebase_index` 패턴 그대로 (DB s3_key → S3 GET → JSON parse) |
+| **재사용** | 기존 PR #240 `load_codebase_index` 패턴 그대로 (DB s3_key → S3 GET → JSON parse) |
 | **추가 기능** | process-local LRU 캐시, line range 슬라이싱, `commit=None` 자동 최신 해결 |
 | **검증** | 18/18 단위 PASS + 실 환경 (PostgreSQL + MinIO) end-to-end 8/8 PASS |
-| **상태** | ✅ commit (브랜치 `feat/me/scan-enhancement-foundation`) |
+| **상태** | ✅ commit (브랜치 `feat/juhwan/scan-enhancement-foundation`) |
 
 ---
 
@@ -82,7 +82,7 @@ snippet = load_source(service_id, sha,
    code_snippet = load_source(sid, sha, "auth.py", line_start=42, line_end=58)
               │
               ▼
-[PoC 4 본인] scan_storage.py
+[PoC 4 ] scan_storage.py
    ├─ load_metadata_index
    │     ├─ commit_hash=None → get_latest_commit_hash (DB)
    │     ├─ cache hit? → 반환
@@ -135,7 +135,7 @@ mini-bss-lite `Signup.vue` → PoC 2 추출 → PoC 3 저장 → PoC 4 조회 (8
 | Test | 결과 |
 |---|---|
 | explicit commit 으로 metadata 조회 | ✅ kind/sub_kind/routes/inputs 정확 |
-| `commit=None` → 최신 자동 해결 | ✅ 본인이 방금 PUT 한 commit 으로 자동 매칭 |
+| `commit=None` → 최신 자동 해결 | ✅ 방금 PUT 한 commit 으로 자동 매칭 |
 | 같은 호출 4회 반복 | ✅ cache: hits=4, misses=1 |
 | source 전체 본문 (3585 chars) | ✅ `data-testid="email"` 포함 |
 | source line range 27-33 (email input) | ✅ 6 lines 정확 (`<input` ... `data-testid="email"`) |
@@ -172,7 +172,7 @@ mock 으로 격리 — 실 PostgreSQL/MinIO 의존 없이 단위 검증.
 
 ## 8. 다음 (PoC 5+)
 
-| PoC | 본 PoC 4 와의 관계 |
+| PoC | PoC 4 와의 관계 |
 |---|---|
 | 5 (React jsx 확장) | `react_jsx_parser` 결과도 같은 `FrontendSelectorsIndex` → PoC 3 → PoC 4 그대로 사용 |
 | 5 (3 영역 추가) | `routes/schemas/patterns` 각각 `load_metadata_index(kind, sub_kind)` 호출만 변경 |
