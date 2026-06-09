@@ -222,6 +222,9 @@ docs/scan-enhancement/
 ├── poc5-pytest-ast-parser.md       # PoC 5 — pytest AST 추출 (sut_tests.patterns)  ✅
 ├── poc6-backend-schemas-and-vue-routes.md  # PoC 6 — backend.schemas + frontend.routes  ✅
 ├── poc7-8-validator-and-db-cache.md  # PoC 7+8 — TVValidator + DBTool TTL cache  ✅
+├── file-inventory.md               # 본인이 만든 40 files 분류 (extractor/writer/reader/shared/...)
+├── verification.md                 # 회의 결론 ↔ 본인 구현 역추적 검증 + 미흡 영역 명시
+├── before-after.md                 # Before/After (툴/아키텍처/퀄리티 3 측면)
 └── migrations/
     └── 001_metadata_indices.sql    # DDL
 
