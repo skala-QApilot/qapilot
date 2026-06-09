@@ -219,6 +219,7 @@ docs/scan-enhancement/
 ├── poc2-vue-sfc-parser.md          # PoC 2 — Vue SFC AST 추출 (9/9, 100%)  ✅
 ├── poc3-metadata-writer.md         # PoC 3 — DB+S3 mirror writer + cache skip  ✅
 ├── poc4-scan-storage.md            # PoC 4 — load_metadata_index + load_source + LRU  ✅
+├── poc5-pytest-ast-parser.md       # PoC 5 — pytest AST 추출 (sut_tests.patterns)  ✅
 └── migrations/
     └── 001_metadata_indices.sql    # DDL
 
@@ -230,7 +231,8 @@ qapilot/
 │   └── tv_validator.py             # TV 검증 helper (PoC 6)
 ├── scan/                           # ✅ PoC 2 신설
 │   └── extractors/
-│       └── vue_sfc_parser.py       # Vue SFC → InputElement/ButtonElement/...
+│       ├── vue_sfc_parser.py       # ✅ PoC 2 — Vue SFC → InputElement/ButtonElement/...
+│       └── pytest_ast_parser.py    # ✅ PoC 5 — pytest → TestPatternRecord (fixture/auth-setup/mock/unknown)
 ├── node-bridge/                    # ✅ PoC 2 신설 (Node.js subprocess)
 │   ├── package.json                # @vue/compiler-sfc 의존성
 │   ├── parse_vue_sfc.js            # SFC parser script
