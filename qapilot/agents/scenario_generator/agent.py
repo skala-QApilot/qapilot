@@ -1521,6 +1521,17 @@ class ScenarioGeneratorAgent(BaseAgent):
                 changed.append(tc_id)
         return changed
 
+    @staticmethod
+    def _next_tc_id(ts_id: str, existing_tcs: list[dict]) -> str:
+        """기존 TC 목록에서 숫자 suffix의 다음 TC ID를 반환한다."""
+        pattern = re.compile(rf"^{re.escape(ts_id)}-TC-(\d+)$", re.IGNORECASE)
+        nums: list[int] = []
+        for tc in existing_tcs:
+            m = pattern.match(str(tc.get("tc_id") or ""))
+            if m:
+                nums.append(int(m.group(1)))
+        return f"{ts_id}-TC-{(max(nums) + 1) if nums else 1:02d}"
+
     def _avoid_ts_id_conflicts(
         self,
         scenarios: list[dict],
@@ -1704,6 +1715,7 @@ class ScenarioGeneratorAgent(BaseAgent):
         for tc in delta_tcs:
             tc_id = tc.get("tc_id", "")
             if tc_id not in used_tc_ids and not tc.get("_to_delete"):
+                tc["tc_id"] = self._next_tc_id(ts_id, merged_tcs)
                 if not tc.get("req_id"):
                     tc["req_id"] = req_id
                 merged_tcs.append(tc)
@@ -1805,8 +1817,7 @@ class ScenarioGeneratorAgent(BaseAgent):
         else:
             # create+tc: 새 TC 추가 — LLM 생성 tc_id 대신 TS 기준으로 자동 부여
             existing_tcs = list(existing_ts.get("test_cases", []))
-            next_num = len(existing_tcs) + 1
-            output_tc["tc_id"] = f"{ts_id}-TC-{next_num:02d}"
+            output_tc["tc_id"] = self._next_tc_id(ts_id, existing_tcs)
             updated_tcs = existing_tcs + [output_tc]
 
         return {**existing_ts, "test_cases": updated_tcs}, ts_confidence

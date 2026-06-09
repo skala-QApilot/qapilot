@@ -230,7 +230,7 @@ class NaturalLanguageAgent(BaseAgent):
         if item["priority"] not in ("high", "medium", "low"):
             raise ValueError(f"허용되지 않는 priority: {item['priority']}")
         action_type = item.get("action_type", "create")
-        if action_type not in ("create", "update"):
+        if action_type not in ("create", "update", "delete"):
             action_type = "create"
         target_level = item.get("target_level", "ts")
         if target_level not in ("ts", "tc", "tv"):

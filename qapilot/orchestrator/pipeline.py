@@ -537,6 +537,79 @@ def _build_existing_scenarios_summary(state: PipelineState) -> list[dict]:
     return _to_summary(_load_existing_scenarios_full(state))
 
 
+def _coerce_explicit_scenario_tc_add(
+    user_input: str,
+    requirements: list[dict],
+    existing_scenarios: list[dict],
+) -> None:
+    """명시적 "XXX 시나리오에 YYY 케이스 추가" 요청을 create+tc로 보정한다.
+
+    LLM이 이런 문장을 create+ts로 오분류하면 ScenarioGeneratorAgent가 새 TS를 만든다.
+    사용자가 기존 TS명을 직접 쓴 경우에는 임베딩 유사도보다 명시적 지시를 우선한다.
+    """
+    normalized_input = re.sub(r"\s+", "", user_input)
+    has_add_intent = bool(re.search(r"추가|생성|만들", user_input, flags=re.IGNORECASE))
+    has_case_intent = bool(re.search(r"테스트\s*케이스|케이스|TC", user_input, flags=re.IGNORECASE))
+    if not (has_add_intent and has_case_intent):
+        return
+
+    for ts in existing_scenarios:
+        ts_id = ts.get("ts_id")
+        title = str(ts.get("title") or ts.get("name") or "").strip()
+        if not ts_id or not title:
+            continue
+        normalized_title = re.sub(r"\s+", "", title)
+        if normalized_title and normalized_title in normalized_input:
+            for req in requirements:
+                req["action_type"] = "create"
+                req["target_level"] = "tc"
+                req["target_ts_id"] = ts_id
+                req["target_tc_id"] = None
+            return
+
+
+def _coerce_explicit_tc_delete(
+    user_input: str,
+    requirements: list[dict],
+    existing_scenarios: list[dict],
+) -> None:
+    """명시적 TC 삭제 요청을 delete+tc로 보정하고 가능한 좌표를 직접 주입한다."""
+    if not re.search(r"삭제|제거|지워|없애|delete", user_input, flags=re.IGNORECASE):
+        return
+
+    direct_tc = re.search(r"\b(TS-\d{3}-TC-\d{2})\b", user_input, flags=re.IGNORECASE)
+    if direct_tc:
+        tc_id = direct_tc.group(1).upper()
+        ts_id = tc_id.split("-TC-")[0]
+        for req in requirements:
+            req["action_type"] = "delete"
+            req["target_level"] = "tc"
+            req["target_ts_id"] = ts_id
+            req["target_tc_id"] = tc_id
+        return
+
+    is_tc_delete = bool(re.search(r"테스트\s*케이스|TC|tc|케이스", user_input))
+    if not is_tc_delete:
+        return
+
+    normalized_input = re.sub(r"\s+", "", user_input)
+    matched_ts_id: str | None = None
+    for ts in existing_scenarios:
+        ts_id = ts.get("ts_id")
+        title = str(ts.get("title") or ts.get("name") or "").strip()
+        normalized_title = re.sub(r"\s+", "", title)
+        if ts_id and normalized_title and normalized_title in normalized_input:
+            matched_ts_id = str(ts_id)
+            break
+
+    for req in requirements:
+        req["action_type"] = "delete"
+        req["target_level"] = "tc"
+        if matched_ts_id:
+            req["target_ts_id"] = matched_ts_id
+        req["target_tc_id"] = req.get("target_tc_id") or None
+
+
 async def _rough_match_scenarios(
     user_input: str,
     existing_scenarios: list[dict],
@@ -592,13 +665,14 @@ async def _rough_match_scenarios(
     # ── 인메모리 폴백 ──────────────────────────────────────────────────────
     ts_texts = [ts.get("title") or ts.get("ts_id", "") for ts in existing_scenarios]
     ts_vecs = await _asyncio.to_thread(embedder.encode, ts_texts, normalize_embeddings=True)
-    ts_vecs = ts_vecs or []
+    if ts_vecs is None or len(ts_vecs) == 0:
+        return []
 
     sims = [float(np.dot(query_vec, ts_vec)) for ts_vec in ts_vecs]
     candidates = [
         {**ts, "_similarity": round(sims[i], 4)}
         for i, ts in enumerate(existing_scenarios)
-        if sims and sims[i] >= threshold
+        if sims[i] >= threshold
     ]
     candidates.sort(key=lambda x: x["_similarity"], reverse=True)
     return candidates[:top_n]
@@ -672,12 +746,18 @@ async def _resolve_scenario_targets(
 
         action_type = req.get("action_type", "create")
         target_level = req.get("target_level", "ts")
+        preset_ts_id = req.get("target_ts_id")
+
+        if preset_ts_id:
+            ts_by_id = {ts.get("ts_id"): ts for ts in existing_scenarios}
+            matched_ts_id = str(preset_ts_id)
+            matched_ts = ts_by_id.get(matched_ts_id)
 
         # create + ts: 완전 새 TS 생성이므로 target_ts_id 스킵 (기존 TS 교체 방지)
         if action_type == "create" and target_level == "ts":
             continue
 
-        if service_id:
+        if matched_ts is None and service_id:
             try:
                 from qapilot.tools.scenario_index import ScenarioVectorStore
 
@@ -696,11 +776,11 @@ async def _resolve_scenario_targets(
                     "resolve_targets_qdrant_ts_fallback", error=str(e)
                 )
 
-        if matched_ts_id is None:
+        if matched_ts is None:
             # 인메모리 폴백
             ts_vecs = await _get_ts_vecs()
             # _get_ts_vecs may return None or an empty value; guard before iteration.
-            if not ts_vecs:
+            if ts_vecs is None or len(ts_vecs) == 0:
                 continue
             ts_sims = [float(np.dot(q_vec, tv)) for tv in ts_vecs]
             best_ts_idx = int(np.argmax(ts_sims))
@@ -1300,10 +1380,25 @@ async def _requirement_extract(state: PipelineState) -> dict:
                     req["target_level"] = "ts"
                     req["domain_area"] = _re.sub(r"\s*(시나리오\s*)?삭제\s*$", "", domain).strip() or domain
 
+        _coerce_explicit_scenario_tc_add(user_input, requirements, existing_scenarios_summary)
+        _coerce_explicit_tc_delete(user_input, requirements, existing_scenarios_summary)
+
+        resolve_candidates = list(top_candidates)
+        known_candidate_ids = {c.get("ts_id") for c in resolve_candidates}
+        explicit_ts_ids = {
+            r.get("target_ts_id")
+            for r in requirements
+            if r.get("target_ts_id")
+        }
+        for ts in existing_scenarios_summary:
+            if ts.get("ts_id") in explicit_ts_ids and ts.get("ts_id") not in known_candidate_ids:
+                resolve_candidates.append(ts)
+                known_candidate_ids.add(ts.get("ts_id"))
+
         # 3단계: top_candidates 안에서 target_ts_id / target_tc_id 확정 주입 (이슈 #186, #221)
         try:
             requirements = await _resolve_scenario_targets(
-                requirements, top_candidates, service_id=_service_id
+                requirements, resolve_candidates, service_id=_service_id
             )
         except Exception as e:
             get_logger("orchestrator").warning("scenario_target_resolve_failed", error=str(e))
@@ -3376,8 +3471,7 @@ async def _report(state: PipelineState) -> dict:
         )
 
     return {
-        "scenarios": merged_scenarios,
-        "saved_scenario_paths": saved_paths,
+        "report_path": str(report_path),
         "status": "completed",
     }
 
