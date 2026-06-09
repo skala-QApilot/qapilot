@@ -590,6 +590,52 @@ async def test_update_ts_기존_ts_id_유지(mock_save_one, mock_save_all):
 
 @patch("qapilot.agents.scenario_generator.agent.save_scenarios")
 @patch("qapilot.agents.scenario_generator.repository.save_scenario")
+async def test_update_ts_신규_TC_NEW_id를_다음_번호로_정규화(mock_save_one, mock_save_all):
+    """TS delta 모드에서 LLM의 TC-NEW 플레이스홀더는 저장 전 실제 TC 번호로 바뀐다."""
+    regen_json = {
+        "scenarios": [
+            {
+                "name": "로그인 시나리오",
+                "test_cases": [
+                    {
+                        "tc_id": "TS-001-TC-NEW-01",
+                        "name": "잘못된 이메일 형식으로 회원가입 시도",
+                        "given": "잘못된 형식의 이메일이 제공된 상태에서",
+                        "when": "회원가입을 요청하면",
+                        "then": "이메일 형식 오류가 반환된다",
+                        "values": [],
+                        "tags": ["edge_case"],
+                        "req_id": "REQ-002",
+                    }
+                ],
+            }
+        ],
+        "confidence": 0.9,
+    }
+    req = {**UPDATE_REQ, "target_level": "ts"}
+    agent = ScenarioGeneratorAgent(trace_id="test-update-ts-new-id")
+    agent.llm.chat = AsyncMock(return_value=_make_llm_response(regen_json))
+    agent._load_scenario_file = MagicMock(return_value=EXISTING_TS)  # type: ignore[method-assign]
+    _patch_index(agent, [{"method": "POST", "path": "/api/auth/login", "file": "auth.py"}])
+
+    input_data = AgentInput(
+        trace_id="test-update-ts-new-id",
+        context={"requirements": [req], "domain_rules": [], "scan_result": SAMPLE_SCAN_RESULT, "qapilot_dir": "/tmp"},
+        params={"trigger": "natural_lang", "affected_only": False},
+    )
+    output = await agent.run(input_data)
+    ts = output.result["scenarios"][0]
+    tc_ids = [tc["tc_id"] for tc in ts["test_cases"]]
+
+    assert "TS-001-TC-NEW-01" not in tc_ids
+    assert "TS-001-TC-02" in tc_ids
+    assert len(ts["test_cases"]) == 2
+    mock_save_one.assert_called_once()
+    mock_save_all.assert_not_called()
+
+
+@patch("qapilot.agents.scenario_generator.agent.save_scenarios")
+@patch("qapilot.agents.scenario_generator.repository.save_scenario")
 async def test_update_target_없으면_create_폴백(mock_save_one, mock_save_all):
     """target_ts_id가 null이면 update 대신 create 경로로 폴백한다."""
     req = {**UPDATE_REQ, "target_ts_id": None}
