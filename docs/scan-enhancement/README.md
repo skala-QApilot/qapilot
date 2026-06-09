@@ -265,13 +265,33 @@ PoC 1 = README + spec + Pydantic + DDL. PoC 2 = Vue SFC parser (frontend.selecto
 - (3.3) 큰 SUT 시점 `/db/query` E 영역 협업 발의
 
 ### PoC 단위 (작은 단위 commit)
-- **PoC 1** (본 단위): docs + Pydantic model + DDL
-- **PoC 2**: AST 추출 PoC — selectors (Vue 의 `data-testid` 만 우선)
-- **PoC 3**: S3 저장 + metadata_indices writer
-- **PoC 4**: 조회 헬퍼
-- **PoC 5**: 다른 3 영역 (routes/schemas/test_patterns) 확장
-- **PoC 6**: TVValidator helper
-- **PoC 7**: DBTool 활용 통합
+
+| PoC | 산출물 | 상태 |
+|---|---|---|
+| **PoC 1** | docs + Pydantic model + DDL | ✅ |
+| **PoC 2** | Vue SFC AST 추출 (frontend.selectors) | ✅ |
+| **PoC 3** | S3 writer (`upsert_metadata_index`) + cache skip | ✅ |
+| **PoC 4** | 조회 헬퍼 (`load_metadata_index` + `load_source`) | ✅ |
+| **PoC 5** | pytest AST 추출 (`sut_tests.patterns` 첫 framework) | ✅ |
+| **PoC 5.1** | LLM 의미 분류 (unknown → db-seed/cleanup/...) | ✅ |
+| **PoC 6** | 다른 영역 확장 (`frontend.routes` + `backend.schemas`) + 다른 framework (Playwright/Cypress) | **추후 작업** |
+| **PoC 7** | TVValidator helper (schema/format/DB 존재성 검증) | 진행 중 |
+| **PoC 8** | DBTool snapshot + TTL cache (TVValidator 의 DB 입력 helper) | 진행 중 |
+
+#### PoC 6 — 추후 작업 명시
+
+본인 데이터 layer 의 4 영역 중 현재 완성된 영역:
+- ✅ `frontend.selectors` (PoC 2 + 3 + 4)
+- ✅ `sut_tests.patterns` (PoC 5 + 5.1)
+- ❌ `frontend.routes` (PoC 6 — 추후)
+- ❌ `backend.schemas` (PoC 6 — 추후)
+
+다른 framework 도 PoC 6 범위:
+- React JSX (`react_jsx_parser.py` — @babel/parser subprocess, vue-bridge 패턴 동형)
+- Playwright (TypeScript test files — tree-sitter-typescript)
+- Cypress / Jest / Vitest
+
+PoC 7/8 은 위 영역 의존 없이 단독 동작 — PoC 6 늦어져도 TVValidator + DBTool 통합 가능.
 
 ---
 
