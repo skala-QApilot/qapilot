@@ -227,6 +227,7 @@ docs/scan-enhancement/
 ├── verification.md                 # 회의 결론 ↔ 구현 역추적 검증 + 미흡 영역 명시
 ├── before-after.md                 # Before/After (툴/아키텍처/퀄리티 3 측면)
 ├── deep-verification.md            # 심층 의미적 역검증 (외부 reviewer 시각)
+├── db-schema-management.md         # DB schema 자동 생성 보완 노트 (develop 머지 후 발견)
 └── migrations/
     └── 001_metadata_indices.sql    # DDL
 
