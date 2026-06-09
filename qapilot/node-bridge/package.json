@@ -1,0 +1,13 @@
+{
+  "name": "qapilot-node-bridge",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Node.js subprocess bridge for Vue SFC parsing (PoC 2, 본인 영역).",
+  "main": "parse_vue_sfc.js",
+  "dependencies": {
+    "@vue/compiler-sfc": "^3.5.13"
+  },
+  "scripts": {
+    "parse": "node parse_vue_sfc.js"
+  }
+}
