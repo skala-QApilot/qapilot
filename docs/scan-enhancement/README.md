@@ -220,6 +220,7 @@ docs/scan-enhancement/
 ├── poc3-metadata-writer.md         # PoC 3 — DB+S3 mirror writer + cache skip  ✅
 ├── poc4-scan-storage.md            # PoC 4 — load_metadata_index + load_source + LRU  ✅
 ├── poc5-pytest-ast-parser.md       # PoC 5 — pytest AST 추출 (sut_tests.patterns)  ✅
+├── poc6-backend-schemas-and-vue-routes.md  # PoC 6 — backend.schemas + frontend.routes  ✅
 ├── poc7-8-validator-and-db-cache.md  # PoC 7+8 — TVValidator + DBTool TTL cache  ✅
 └── migrations/
     └── 001_metadata_indices.sql    # DDL
@@ -232,8 +233,10 @@ qapilot/
 │   └── db_state.py                 # ✅ PoC 8 신설 (DBTool snapshot + TTL cache)
 ├── scan/                           # ✅ PoC 2 신설
 │   └── extractors/
-│       ├── vue_sfc_parser.py       # ✅ PoC 2 — Vue SFC → InputElement/ButtonElement/...
-│       ├── pytest_ast_parser.py    # ✅ PoC 5 — pytest → TestPatternRecord (fixture/auth-setup/mock/unknown)
+│       ├── vue_sfc_parser.py       # ✅ PoC 2   — Vue SFC → frontend.selectors (Input/Button/...)
+│       ├── vue_router_parser.py    # ✅ PoC 6.B — Vue Router → frontend.routes
+│       ├── backend_schema_parser.py # ✅ PoC 6.A — Pydantic/SQLAlchemy → backend.schemas
+│       ├── pytest_ast_parser.py    # ✅ PoC 5   — pytest → sut_tests.patterns (fixture/auth-setup/mock/unknown)
 │       └── llm_pattern_classifier.py  # ✅ PoC 5.1 — unknown → db-seed/cleanup/... (confidence 0.85)
 ├── node-bridge/                    # ✅ PoC 2 신설 (Node.js subprocess)
 │   ├── package.json                # @vue/compiler-sfc 의존성
@@ -276,24 +279,25 @@ PoC 1 = README + spec + Pydantic + DDL. PoC 2 = Vue SFC parser (frontend.selecto
 | **PoC 4** | 조회 헬퍼 (`load_metadata_index` + `load_source`) | ✅ |
 | **PoC 5** | pytest AST 추출 (`sut_tests.patterns` 첫 framework) | ✅ |
 | **PoC 5.1** | LLM 의미 분류 (unknown → db-seed/cleanup/...) | ✅ |
-| **PoC 6** | 다른 영역 확장 (`frontend.routes` + `backend.schemas`) + 다른 framework (Playwright/Cypress) | **추후 작업** |
-| **PoC 7** | TVValidator helper (schema/format/DB 존재성 검증) | 진행 중 |
-| **PoC 8** | DBTool snapshot + TTL cache (TVValidator 의 DB 입력 helper) | 진행 중 |
+| **PoC 6.A** | `backend.schemas` 추출 (Pydantic BaseModel + SQLAlchemy Mapped/Column) | ✅ |
+| **PoC 6.B** | `frontend.routes` 추출 (Vue Router createRouter routes) | ✅ |
+| **PoC 7** | TVValidator helper (schema/format/DB 존재성 검증) | ✅ |
+| **PoC 8** | DBTool snapshot + TTL cache (TVValidator 의 DB 입력 helper) | ✅ |
 
-#### PoC 6 — 추후 작업 명시
+#### 본인 4영역 완성
 
-본인 데이터 layer 의 4 영역 중 현재 완성된 영역:
-- ✅ `frontend.selectors` (PoC 2 + 3 + 4)
+- ✅ `frontend.selectors` (PoC 2)
+- ✅ `frontend.routes` (PoC 6.B)
+- ✅ `backend.schemas` (PoC 6.A)
 - ✅ `sut_tests.patterns` (PoC 5 + 5.1)
-- ❌ `frontend.routes` (PoC 6 — 추후)
-- ❌ `backend.schemas` (PoC 6 — 추후)
 
-다른 framework 도 PoC 6 범위:
+#### Framework 확장 (추후)
+
+다른 framework 추출기는 본인이 후속 단위로 추가 가능:
 - React JSX (`react_jsx_parser.py` — @babel/parser subprocess, vue-bridge 패턴 동형)
-- Playwright (TypeScript test files — tree-sitter-typescript)
-- Cypress / Jest / Vitest
-
-PoC 7/8 은 위 영역 의존 없이 단독 동작 — PoC 6 늦어져도 TVValidator + DBTool 통합 가능.
+- React Router (`react_router_parser.py` — vue_router_parser 의 80% 재사용)
+- Playwright / Cypress / Jest / Vitest (각각 tree-sitter-typescript/javascript)
+- Java JPA / Spring `@RestController` (tree-sitter-java)
 
 ---
 
