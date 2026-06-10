@@ -30,6 +30,12 @@
 
 {{db_snapshot}}
 
+## 코드베이스 본문 (production 코드 — 실 구현 로직)
+
+이 TC 가 호출할 endpoint 의 실제 구현 코드 일부다. 검증 규칙 / 에러 메시지 / 응답 형식을 정확히 보고 그에 맞는 값을 만들어라.
+
+{{source_snippets}}
+
 ## 이전 검증 실패 피드백 (있는 경우)
 
 {{validation_feedback}}
@@ -43,6 +49,7 @@
 3. `tags=[edge_case]` + `then` 절이 "409 Conflict" 또는 "이미 존재" 등이면 위 DB 데이터의 값을 그대로 사용.
 4. `tags=[edge_case]` + `then` 절이 "400 Bad Request" 등 validation fail 이면 의도적으로 schema 위반.
 5. **sensitive 필드 (password / token / secret / api_key 등) 는 values 에 포함하지 마라** — 시스템이 별도 처리.
-6. 추론 불가능한 값이면 `purpose` 에 "스키마 정보 부족" 명시.
+6. **위 "코드베이스 본문" 의 실 구현 로직을 보고** 검증 규칙 (예: `existing = db.scalar(...)` → 중복 체크 / `raise HTTPException(409, ...)` → 409 에러 메시지) 을 정확히 반영하라. 문서에 없어도 코드에 있으면 우선.
+7. 추론 불가능한 값이면 `purpose` 에 "스키마 정보 부족" 명시.
 
 JSON 만 출력하라. 마크다운 코드블록 X.

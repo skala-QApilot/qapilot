@@ -11,6 +11,8 @@ from qapilot.shared.metadata_filters import (
     filter_patterns_by_req_id,
     filter_schemas_by_api,
     filter_selectors_by_route,
+    find_endpoint_function_range,
+    pick_source_files_for_tc,
     pick_table_for_tc,
 )
 
@@ -307,3 +309,184 @@ def test_pick_table_no_api(signup_schemas_with_db):
     # filter_schemas_by_api 가 api None 시 db_models 전체 그대로 반환
     # → 첫 번째 (dict 순서 — Customer)
     assert table == "customers"
+
+
+# ────────────────────────────────────────────────────────────────────────
+# pick_source_files_for_tc — load_source 호출 대상 결정
+# ────────────────────────────────────────────────────────────────────────
+
+@pytest.fixture
+def schemas_with_extracted_from():
+    """SchemaField 가 extracted_from (file/line) 보존한 schemas."""
+    return {
+        "request_schemas": {
+            "SignupRequest": {
+                "fields": [
+                    {"name": "email",
+                     "extracted_from": {"file": "backend/app/schemas.py",
+                                         "line_start": 9, "line_end": 12,
+                                         "commit_sha": "f" * 40}},
+                    {"name": "password",
+                     "extracted_from": {"file": "backend/app/schemas.py",
+                                         "line_start": 13, "line_end": 13}},
+                ],
+            },
+        },
+        "db_models": {
+            "Customer": {
+                "columns": [
+                    {"name": "id",
+                     "extracted_from": {"file": "backend/app/models.py",
+                                         "line_start": 11, "line_end": 11}},
+                ],
+            },
+        },
+    }
+
+
+def test_pick_source_files_router_inference(schemas_with_extracted_from):
+    """TC.api 의 path → router 파일 + schemas/models 의 extracted_from."""
+    tc = {"api": "POST /api/auth/signup"}
+    out = pick_source_files_for_tc(tc, schemas=schemas_with_extracted_from)
+    files = [o[0] for o in out]
+    # 1. router 파일 추측
+    assert "backend/app/routers/auth.py" in files
+    # 2. schemas 의 첫 field extracted_from
+    assert "backend/app/schemas.py" in files
+    # 3. db_models 의 첫 column extracted_from
+    assert "backend/app/models.py" in files
+
+
+def test_pick_source_files_line_range_from_extracted_from(schemas_with_extracted_from):
+    """schemas/models 의 line_start/line_end 가 그대로 반환."""
+    tc = {"api": "POST /api/auth/signup"}
+    out = pick_source_files_for_tc(tc, schemas=schemas_with_extracted_from)
+    schemas_target = next(o for o in out if o[0] == "backend/app/schemas.py")
+    assert schemas_target[1] == 9    # line_start
+    assert schemas_target[2] == 12   # line_end
+
+
+def test_pick_source_files_router_whole_file(schemas_with_extracted_from):
+    """router 파일은 line range None (전체)."""
+    tc = {"api": "POST /api/auth/signup"}
+    out = pick_source_files_for_tc(tc, schemas=schemas_with_extracted_from)
+    router_target = next(o for o in out if "routers/auth.py" in o[0])
+    assert router_target[1] is None
+    assert router_target[2] is None
+
+
+def test_pick_source_files_skip_api_prefix():
+    """`api` / `v1` / `v2` / `rest` 같은 prefix 는 router segment 추출 시 skip."""
+    out = pick_source_files_for_tc({"api": "GET /api/v1/users"}, schemas={})
+    # /api/v1/users → users (api/v1 skip)
+    assert any("routers/users.py" in o[0] for o in out)
+
+
+def test_pick_source_files_no_api():
+    """api 없으면 router 추측 X — schemas/db_models 기반만."""
+    out = pick_source_files_for_tc({"name": "x"}, schemas=None)
+    assert out == []
+
+
+# ────────────────────────────────────────────────────────────────────────
+# find_endpoint_function_range — router 파일 안 endpoint 함수 정확 line range
+# ────────────────────────────────────────────────────────────────────────
+
+_SAMPLE_ROUTER = '''from fastapi import APIRouter, Depends
+from app.deps import get_db
+
+router = APIRouter()
+
+
+@router.post("/signup", response_model=CustomerOut)
+def signup(payload: SignupRequest, db = Depends(get_db)):
+    existing = db.scalar(...)
+    if existing:
+        raise HTTPException(409, "이미 가입됨")
+    customer = Customer(email=payload.email)
+    db.add(customer)
+    db.commit()
+    return customer
+
+
+@router.post("/login")
+def login(payload: LoginRequest):
+    return {"token": "abc"}
+
+
+@router.get("/me")
+def me():
+    return {"id": 1}
+'''
+
+
+def test_find_endpoint_range_signup():
+    """POST /signup → signup 함수만 정확히 추출."""
+    result = find_endpoint_function_range(_SAMPLE_ROUTER, "POST /api/auth/signup")
+    assert result is not None
+    ls, le = result
+    sliced = "\n".join(_SAMPLE_ROUTER.splitlines()[ls - 1:le])
+    assert "def signup" in sliced
+    assert "def login" not in sliced
+    assert "def me" not in sliced
+
+
+def test_find_endpoint_range_login():
+    """POST /login → login 함수만."""
+    result = find_endpoint_function_range(_SAMPLE_ROUTER, "POST /api/auth/login")
+    assert result is not None
+    ls, le = result
+    sliced = "\n".join(_SAMPLE_ROUTER.splitlines()[ls - 1:le])
+    assert "def login" in sliced
+    assert "def signup" not in sliced
+
+
+def test_find_endpoint_range_get_me():
+    """GET /me → me 함수만."""
+    result = find_endpoint_function_range(_SAMPLE_ROUTER, "GET /api/auth/me")
+    assert result is not None
+    ls, le = result
+    sliced = "\n".join(_SAMPLE_ROUTER.splitlines()[ls - 1:le])
+    assert "def me" in sliced
+    assert "def signup" not in sliced
+
+
+def test_find_endpoint_range_no_match():
+    """다른 endpoint 는 None."""
+    assert find_endpoint_function_range(_SAMPLE_ROUTER, "POST /api/nonexistent") is None
+
+
+def test_find_endpoint_range_method_mismatch():
+    """method 불일치 시 None."""
+    # signup 은 POST 인데 GET 요청
+    assert find_endpoint_function_range(_SAMPLE_ROUTER, "GET /api/auth/signup") is None
+
+
+def test_find_endpoint_range_empty_input():
+    assert find_endpoint_function_range("", "POST /signup") is None
+    assert find_endpoint_function_range(_SAMPLE_ROUTER, None) is None
+    assert find_endpoint_function_range(_SAMPLE_ROUTER, "") is None
+
+
+def test_find_endpoint_range_signup_reduces_size():
+    """signup 만 잘라낸 결과가 전체 router 보다 명확히 작음."""
+    result = find_endpoint_function_range(_SAMPLE_ROUTER, "POST /api/auth/signup")
+    ls, le = result
+    sliced = "\n".join(_SAMPLE_ROUTER.splitlines()[ls - 1:le])
+    # signup 본문만 ≈ 전체의 절반 이하
+    assert len(sliced) < len(_SAMPLE_ROUTER) * 0.6
+
+
+def test_pick_source_files_max_files_limit():
+    """max_files cap 적용."""
+    tc = {"api": "POST /api/auth/signup"}
+    schemas = {
+        "request_schemas": {"S": {"fields": [
+            {"name": "f", "extracted_from": {"file": "a.py", "line_start": 1, "line_end": 1}},
+        ]}},
+        "db_models": {"M": {"columns": [
+            {"name": "c", "extracted_from": {"file": "b.py", "line_start": 2, "line_end": 2}},
+        ]}},
+    }
+    out = pick_source_files_for_tc(tc, schemas=schemas, max_files=2)
+    assert len(out) == 2

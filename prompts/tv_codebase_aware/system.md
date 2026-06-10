@@ -62,8 +62,17 @@ TC 의 tags 와 then 절을 본다:
 입력에 DB 실제 데이터가 들어 있고 시나리오가 "이미 존재하는" 케이스면 그 값을 그대로 쓴다.
 `source: "db"` 로 표시.
 
-### 4. 코드베이스의 기존 테스트 패턴을 참고한다
-입력의 `patterns` 에 기존 테스트 코드 snippet 이 있으면 거기서 쓰는 값 형식을 따라간다.
+### 4. 코드베이스의 기존 테스트 패턴 + production 코드를 참고한다
+
+**production 코드 (입력의 `source_snippets`)**:
+실제 endpoint 구현 본문이다. 다음을 정확히 읽고 반영하라:
+- 검증 규칙 (예: `if existing: raise HTTPException(409, ...)` → 409 에러 메시지 확인)
+- 응답 형식 (예: `return CustomerOut(...)` → 성공 시 어떤 필드 들어가는지)
+- 비즈니스 로직 (예: `age = relativedelta(...).years` → 나이 계산식)
+- **문서에 없는 정보도 production 코드에 있으면 코드 우선**.
+
+**테스트 패턴 (입력의 `patterns`)**:
+SUT 의 기존 테스트 코드 snippet. 거기서 쓰는 값 형식을 따라간다.
 (예: 기존 테스트가 `"test@example.com"` 형식이면 같은 형식으로)
 
 ### 5. 한국어 비즈니스 도메인 추측 금지

@@ -57,6 +57,37 @@ def _format_existing_values(values: list[dict]) -> str:
     return _format_dict_compact(values, max_chars=1500)
 
 
+def _format_source_snippets(snippets: list[dict] | None) -> str:
+    """load_source 결과를 LLM prompt 친화 format 으로.
+
+    각 snippet 마다 file path / line range 헤더 + 본문.
+    총 길이 cap (12000 chars) — 너무 큰 경우 truncate.
+    """
+    if not snippets:
+        return "코드베이스 본문 없음 (load_source 결과 비어 있음)"
+    parts: list[str] = []
+    total = 0
+    cap = 12000
+    for s in snippets:
+        file = s.get("file", "?")
+        ls = s.get("line_start")
+        le = s.get("line_end")
+        content = s.get("content") or ""
+        # 헤더 + 본문
+        range_str = f"L{ls}-{le}" if ls and le else "전체"
+        header = f"\n[{file} ({range_str})]"
+        body = content[:6000]  # 단일 snippet 6000자 cap
+        if len(content) > 6000:
+            body = body + "\n... (truncated)"
+        block = header + "\n```\n" + body + "\n```"
+        if total + len(block) > cap:
+            parts.append("\n... (남은 snippet 생략 — token cap)")
+            break
+        parts.append(block)
+        total += len(block)
+    return "\n".join(parts)
+
+
 def _format_db_snapshot(snapshot: dict | None) -> str:
     if not snapshot:
         return "DB snapshot 없음"
@@ -166,6 +197,8 @@ class TVFromCodebaseAgent(BaseAgent):
         schemas_raw = context.get("schemas")
         patterns_raw = context.get("patterns")
         db_snapshot = context.get("db_snapshot")  # {"table": ..., "rows": [...]} 또는 None
+        # 코드베이스 본문 (load_source 결과) — [{file, line_start, line_end, content}, ...]
+        source_snippets: list[dict] = context.get("source_snippets") or []
 
         # ── 1. TC 기반 필터링 ──────────────────────────────────────────
         filtered = filter_metadata_for_tc(
@@ -216,6 +249,7 @@ class TVFromCodebaseAgent(BaseAgent):
                 selectors=_format_dict_compact(filtered["selectors"]),
                 patterns=_format_dict_compact(filtered["patterns"], max_chars=1500),
                 db_snapshot=_format_db_snapshot(sanitized_db_snapshot),
+                source_snippets=_format_source_snippets(source_snippets),
                 validation_feedback=feedback,
             )
 
