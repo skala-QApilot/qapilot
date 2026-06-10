@@ -14,7 +14,7 @@ import fnmatch
 import json
 import re
 from abc import ABC, abstractmethod
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 from typing import Any
 from urllib.parse import quote, urlparse
 
@@ -425,6 +425,7 @@ class GitCodebaseScannerTool(BaseTool):
 
         file_infos_all: list[FileInfo] = []
         frontend_elements_all: list[dict] = []
+        all_file_contents: list[tuple[str, str]] = []  # (prefixed_path, content_text) — 임시 dir dump 용
         git_diffs: list[GitDiff] = []
         languages: list[str] = []
         frameworks: list[str] = []
@@ -444,6 +445,7 @@ class GitCodebaseScannerTool(BaseTool):
                 continue
             file_infos_all.extend(result["file_infos"])
             frontend_elements_all.extend(result.get("frontend_elements") or [])
+            all_file_contents.extend(result.get("file_contents_text") or [])
             if result["git_diff"]:
                 git_diffs.append(result["git_diff"])
             languages.append(f"{repo['role']}:{result['language']}")
@@ -474,6 +476,34 @@ class GitCodebaseScannerTool(BaseTool):
             endpoints=scan_result["endpoint_count"],
             repos=len(repos),
         )
+
+        # 임시 디렉토리에 모든 file content reconstruct — 본인 데이터 layer 의 scan_all_metadata
+        # 가 SaaS 흐름에서 file system walk 가능하도록. trace 종료 시 OS 정책으로 자동 정리
+        # (tempfile.mkdtemp 의 디렉토리는 /var/folders/T/ 에 생성됨).
+        temp_repo_root: str | None = None
+        if all_file_contents:
+            import tempfile
+
+            tid_prefix = (getattr(self, "trace_id", None) or "x")[:8]
+            temp_repo_root = tempfile.mkdtemp(prefix=f"qapilot_git_{tid_prefix}_")
+            for prefixed_path, content_text in all_file_contents:
+                # 보안 — '..' 같은 path traversal 방지
+                safe_rel = Path(prefixed_path)
+                if safe_rel.is_absolute() or ".." in safe_rel.parts:
+                    self.logger.warning("git_temp_dir_skip_unsafe_path", path=prefixed_path)
+                    continue
+                target_path = Path(temp_repo_root) / safe_rel
+                target_path.parent.mkdir(parents=True, exist_ok=True)
+                try:
+                    target_path.write_text(content_text, encoding="utf-8")
+                except OSError as e:
+                    self.logger.warning("git_temp_dir_write_failed", path=prefixed_path, error=str(e))
+            self.logger.info(
+                "git_temp_repo_root_dumped",
+                path=temp_repo_root,
+                files=len(all_file_contents),
+            )
+
         return {
             "scan_result": scan_result,
             "_metadata": {
@@ -481,6 +511,7 @@ class GitCodebaseScannerTool(BaseTool):
                 "scan_status": scan_status,
                 "files_scanned": len(file_infos_all),
                 "repos_scanned": len([r for r in results if not isinstance(r, BaseException)]),
+                "temp_repo_root": temp_repo_root,
             },
         }
 
@@ -597,6 +628,9 @@ class GitCodebaseScannerTool(BaseTool):
             "language": language,
             "framework": framework,
             "frontend_elements": frontend_elements,
+            # 모든 file 의 (prefixed_path, content_text) — 본인 데이터 layer 의 scan_all_metadata
+            # 가 디스크 path 위에서 동작해야 하므로 _execute 가 임시 dir 에 dump 한다.
+            "file_contents_text": frontend_sources,
         }
 
     @staticmethod
