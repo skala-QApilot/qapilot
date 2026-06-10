@@ -1,16 +1,12 @@
-"""agent_router / runner / state 의 domain_files 주입 흐름 검증 (격차 #207 sub-D).
+"""agent_router / runner 의 target_root 주입 흐름 검증.
 
-격차 12 (test_account) 동형 패턴. Spring sub-C (이슈 #210) 가 body 에
-`domain_files=[{file_id, filename, s3_key, version, type, reflected?}, ...]` 채워
-보내면 → agent_router → state.domain_files → sub-F Part 2 (pipeline._doc_import) 가
-각 entry 의 s3_key 를 s3_client.download (sub-E) 로 받아 처리.
+SaaS 흐름에서 Spring 이 body 로 보낸 service.target_root 가 다음 경로로 전파:
+- runner.run_pipeline 시그니처 → initial_state.target_root 저장
+- agent_router._start_pipeline 의 body 추출 → annotate_trace 저장 → _submit_pipeline 전달
 
-본 PR 은 **통로만** — 실제 활용은 sub-F Part 2 (#213) 가 담당.
-본 테스트는 통로 두 지점 단위 검증:
-- runner.run_pipeline 시그니처 + initial_state.domain_files 저장
-- agent_router._start_pipeline 의 body 추출 + _submit_pipeline 전달 + trace 보존
+격차 12 (test_account inject) 와 동형 패턴.
 
-상세: memory/project_qapilot_prd_docs_saas_wire_gap.md
+상세: plan glistening-snuggling-treasure.md (SaaS target_root state 주입).
 """
 from __future__ import annotations
 
@@ -18,74 +14,26 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from qapilot.api import agent_router as router_module
 
 
 # ── runner.run_pipeline 시그니처 검증 ──────────────────────────────────────────
 
 
-def test_run_pipeline_accepts_domain_files_kwarg():
-    """run_pipeline 시그니처에 domain_files 인자가 추가되어야 함."""
+def test_run_pipeline_accepts_target_root_kwarg():
+    """run_pipeline 시그니처에 target_root 인자가 추가되어야 함."""
     import inspect
 
     from qapilot.orchestrator.runner import run_pipeline
     sig = inspect.signature(run_pipeline)
-    assert "domain_files" in sig.parameters
-    assert sig.parameters["domain_files"].default is None
+    assert "target_root" in sig.parameters
+    assert sig.parameters["target_root"].default is None
 
 
-def test_run_pipeline_initial_state_stores_domain_files(tmp_path: Path):
-    """run_pipeline 진입 시 initial_state.domain_files 에 list 그대로 저장."""
-    import asyncio
-    from qapilot.orchestrator import runner as runner_module
-
-    captured: dict[str, Any] = {}
-
-    class _FakeGraph:
-        def compile(self):
-            async def _ainvoke(state):
-                captured["state"] = state
-                state["status"] = "completed"
-                state["agent_logs"] = []
-                return state
-
-            mock_app = MagicMock()
-            mock_app.ainvoke = _ainvoke
-            return mock_app
-
-    docs = [
-        {
-            "file_id": "f-1",
-            "filename": "PRD.md",
-            "s3_key": "services/svc-1/domain/f-1/v1/PRD.md",
-            "version": 1,
-            "type": "PRD",
-        },
-        {
-            "file_id": "f-2",
-            "filename": "정책_v3.md",
-            "s3_key": "services/svc-1/domain/f-2/v2/정책_v3.md",
-            "version": 2,
-            "type": "POLICY",
-        },
-    ]
-
-    with patch.object(runner_module, "build_pipeline", return_value=_FakeGraph()):
-        asyncio.run(
-            runner_module.run_pipeline(
-                options={"command": "test", "trigger": None, "user_input": None,
-                         "scenario_ids": None, "filter": None, "tags": None},
-                qapilot_dir=tmp_path,
-                trace_id="trace-x",
-                domain_files=docs,
-            )
-        )
-
-    assert captured["state"]["domain_files"] == docs
-
-
-def test_run_pipeline_domain_files_none_when_missing(tmp_path: Path):
-    """domain_files 미전달 시 initial_state.domain_files = None (CLI 호환)."""
+def test_run_pipeline_initial_state_stores_target_root(tmp_path: Path):
+    """run_pipeline 진입 시 initial_state.target_root 에 str 그대로 저장."""
     import asyncio
     from qapilot.orchestrator import runner as runner_module
 
@@ -109,15 +57,16 @@ def test_run_pipeline_domain_files_none_when_missing(tmp_path: Path):
                 options={"command": "test", "trigger": None, "user_input": None,
                          "scenario_ids": None, "filter": None, "tags": None},
                 qapilot_dir=tmp_path,
-                trace_id="trace-x",
+                trace_id="trace-tr",
+                target_root="/Users/x/skala/mini-bss-lite",
             )
         )
 
-    assert captured["state"]["domain_files"] is None
+    assert captured["state"]["target_root"] == "/Users/x/skala/mini-bss-lite"
 
 
-def test_run_pipeline_rejects_non_list_domain_files(tmp_path: Path):
-    """domain_files 가 list 아니면 None (방어적)."""
+def test_run_pipeline_target_root_none_when_missing(tmp_path: Path):
+    """target_root 미전달 시 initial_state.target_root = None (graceful)."""
     import asyncio
     from qapilot.orchestrator import runner as runner_module
 
@@ -141,33 +90,61 @@ def test_run_pipeline_rejects_non_list_domain_files(tmp_path: Path):
                 options={"command": "test", "trigger": None, "user_input": None,
                          "scenario_ids": None, "filter": None, "tags": None},
                 qapilot_dir=tmp_path,
-                trace_id="trace-x",
-                domain_files="not-a-list",  # type: ignore[arg-type]
+                trace_id="trace-tr",
             )
         )
 
-    assert captured["state"]["domain_files"] is None
+    assert captured["state"]["target_root"] is None
+
+
+def test_run_pipeline_rejects_empty_string_target_root(tmp_path: Path):
+    """target_root = '' (빈 문자열) 은 None 으로 변환 (방어적)."""
+    import asyncio
+    from qapilot.orchestrator import runner as runner_module
+
+    captured: dict[str, Any] = {}
+
+    class _FakeGraph:
+        def compile(self):
+            async def _ainvoke(state):
+                captured["state"] = state
+                state["status"] = "completed"
+                state["agent_logs"] = []
+                return state
+
+            mock_app = MagicMock()
+            mock_app.ainvoke = _ainvoke
+            return mock_app
+
+    with patch.object(runner_module, "build_pipeline", return_value=_FakeGraph()):
+        asyncio.run(
+            runner_module.run_pipeline(
+                options={"command": "test", "trigger": None, "user_input": None,
+                         "scenario_ids": None, "filter": None, "tags": None},
+                qapilot_dir=tmp_path,
+                trace_id="trace-tr",
+                target_root="",
+            )
+        )
+
+    assert captured["state"]["target_root"] is None
 
 
 # ── agent_router._start_pipeline body 추출 + _submit_pipeline 전달 ──────────────
 
 
-def _fake_request(trace_id: str = "trace-y") -> Any:
+def _fake_request(trace_id: str = "trace-tr") -> Any:
     req = MagicMock()
     req.state.trace_id = trace_id
     return req
 
 
-def test_start_pipeline_extracts_domain_files_from_body(tmp_path: Path):
-    """body 의 domain_files list 가 _submit_pipeline 호출 인자로 전달."""
-    docs = [
-        {"file_id": "f-1", "filename": "PRD.md",
-         "s3_key": "services/svc-1/domain/f-1/v1/PRD.md", "version": 1},
-    ]
+def test_start_pipeline_extracts_target_root_from_body(tmp_path: Path):
+    """body 의 target_root str 이 _submit_pipeline 호출 인자로 전달 (7번째 positional)."""
     body = {
         "qapilot_dir": str(tmp_path),
         "service_id": "svc-1",
-        "domain_files": docs,
+        "target_root": "/Users/x/skala/mini-bss-lite",
     }
     options = {
         "command": "test", "trigger": None, "user_input": None,
@@ -176,7 +153,7 @@ def test_start_pipeline_extracts_domain_files_from_body(tmp_path: Path):
     captured: dict[str, Any] = {}
 
     def _fake_submit(qd, tid, opts, su, ta=None, df=None, tr=None):
-        captured["domain_files"] = df
+        captured["target_root"] = tr
 
     with patch.object(router_module, "_submit_pipeline", side_effect=_fake_submit), \
          patch.object(router_module, "create_trace"), \
@@ -184,11 +161,11 @@ def test_start_pipeline_extracts_domain_files_from_body(tmp_path: Path):
         resp = router_module._start_pipeline(_fake_request(), body, options)  # type: ignore[arg-type]
 
     assert resp.status_code == 202
-    assert captured["domain_files"] == docs
+    assert captured["target_root"] == "/Users/x/skala/mini-bss-lite"
 
 
-def test_start_pipeline_domain_files_none_when_body_missing(tmp_path: Path):
-    """body 에 domain_files 없으면 None 전달 (Spring sub-C 미머지 graceful)."""
+def test_start_pipeline_target_root_none_when_body_missing(tmp_path: Path):
+    """body 에 target_root 없으면 None 전달 (CLI / 미주입 graceful)."""
     body = {
         "qapilot_dir": str(tmp_path),
         "service_id": "svc-1",
@@ -200,22 +177,22 @@ def test_start_pipeline_domain_files_none_when_body_missing(tmp_path: Path):
     captured: dict[str, Any] = {}
 
     def _fake_submit(qd, tid, opts, su, ta=None, df=None, tr=None):
-        captured["domain_files"] = df
+        captured["target_root"] = tr
 
     with patch.object(router_module, "_submit_pipeline", side_effect=_fake_submit), \
          patch.object(router_module, "create_trace"), \
          patch.object(router_module, "annotate_trace"):
         router_module._start_pipeline(_fake_request(), body, options)  # type: ignore[arg-type]
 
-    assert captured["domain_files"] is None
+    assert captured["target_root"] is None
 
 
-def test_start_pipeline_rejects_non_list_domain_files(tmp_path: Path):
-    """body.domain_files 가 dict / str 등 비-list 면 None (방어적)."""
+def test_start_pipeline_rejects_non_str_target_root(tmp_path: Path):
+    """body.target_root 가 dict / list 등 비-str 이면 None (방어적)."""
     body = {
         "qapilot_dir": str(tmp_path),
         "service_id": "svc-1",
-        "domain_files": {"not": "a list"},  # 잘못된 형식
+        "target_root": {"unexpected": "dict"},
     }
     options = {
         "command": "test", "trigger": None, "user_input": None,
@@ -224,23 +201,22 @@ def test_start_pipeline_rejects_non_list_domain_files(tmp_path: Path):
     captured: dict[str, Any] = {}
 
     def _fake_submit(qd, tid, opts, su, ta=None, df=None, tr=None):
-        captured["domain_files"] = df
+        captured["target_root"] = tr
 
     with patch.object(router_module, "_submit_pipeline", side_effect=_fake_submit), \
          patch.object(router_module, "create_trace"), \
          patch.object(router_module, "annotate_trace"):
         router_module._start_pipeline(_fake_request(), body, options)  # type: ignore[arg-type]
 
-    assert captured["domain_files"] is None
+    assert captured["target_root"] is None
 
 
-def test_start_pipeline_annotates_trace_with_domain_files(tmp_path: Path):
-    """trace.json 에 domain_files 저장 — resume 시 복원 위한 보존."""
-    docs = [{"file_id": "f-1", "s3_key": "k", "version": 1}]
+def test_start_pipeline_annotates_trace_with_target_root(tmp_path: Path):
+    """trace.json 에 target_root 저장 — resume 시 복원 위한 보존."""
     body = {
         "qapilot_dir": str(tmp_path),
         "service_id": "svc-1",
-        "domain_files": docs,
+        "target_root": "/path/to/sut",
     }
     options = {
         "command": "test", "trigger": None, "user_input": None,
@@ -257,4 +233,4 @@ def test_start_pipeline_annotates_trace_with_domain_files(tmp_path: Path):
         router_module._start_pipeline(_fake_request(), body, options)  # type: ignore[arg-type]
 
     assert annotate_calls, "annotate_trace 가 호출되어야 함"
-    assert annotate_calls[0].get("domain_files") == docs
+    assert annotate_calls[0].get("target_root") == "/path/to/sut"

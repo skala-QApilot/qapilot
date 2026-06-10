@@ -59,6 +59,14 @@ class PipelineState(TypedDict):
     # → _test_execution 이 cfg.project.target_url 로 fallback 한다.
     staging_url: str
 
+    # SUT 코드베이스 root 경로 (격차 SaaS target_root, PR #269/#271 후속). SaaS 호출 경로에서
+    # Spring 이 `services.target_root` 컬럼을 body 의 `target_root` 로 채워 보내면 agent_router
+    # 가 state 에 주입. `_resolve_project_root` 가 cfg.project.root 다음, qapilot_dir derive 전
+    # 우선 사용 → 본인 데이터 layer 의 `scan_all_metadata` / `load_source` 가 SUT 실제 코드
+    # path 로 동작. CLI 단독 실행 / Spring 미주입 시 None — cfg.project.root 또는 state.qapilot_dir
+    # derive fallback. 둘 다 fail 시 TV codebase-aware 단계가 `tv_metadata_index_empty` graceful skip.
+    target_root: str | None
+
     # SUT 인증 정보 (격차 12 SaaS 후속). SaaS 호출 경로에서 Spring 이 body 에 `test_account`
     # dict ({email, password, login_path?}) 를 채워 보내면 agent_router 가 state 에 주입.
     # _test_execution 이 cfg.project.test_account 보다 우선 사용 (staging_url 동형).

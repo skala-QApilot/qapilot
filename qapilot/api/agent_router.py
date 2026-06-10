@@ -67,6 +67,7 @@ class ScenarioGenerationRequestBody(BaseModel):
         description="PRD-only 실험 모드 전환 + TC 생성 대상 TS ID 목록. 제공 시(빈 리스트 포함) prd_only_experiment 파이프라인 사용.",
     )
     staging_url: str | None = Field(None, description="SUT base URL")
+    target_root: str | None = Field(None, description="SUT 코드베이스 root 경로 (Spring service.target_root)")
     test_account: dict[str, Any] | None = Field(None, description="테스트 계정 정보")
     domain_files: list[dict[str, Any]] | None = Field(None, description="도메인 문서 메타 목록")
     repo_url: str | None = Field(None, description="단일 Git 저장소 URL")
@@ -81,6 +82,7 @@ class CodeGenerationRequestBody(BaseModel):
     service_id: str = Field(..., description="서비스 ID")
     scenario_ids: list[str] | None = Field(None, description="대상 시나리오 ID 목록")
     staging_url: str | None = Field(None, description="SUT base URL")
+    target_root: str | None = Field(None, description="SUT 코드베이스 root 경로 (Spring service.target_root)")
     test_account: dict[str, Any] | None = Field(None, description="테스트 계정 정보")
     domain_files: list[dict[str, Any]] | None = Field(None, description="도메인 문서 메타 목록")
     repo_url: str | None = Field(None, description="단일 Git 저장소 URL")
@@ -98,6 +100,7 @@ class TestRunRequestBody(BaseModel):
     tags: list[str] | None = Field(None, description="태그 필터")
     resume_from_trace: str | None = Field(None, description="이어 실행할 이전 trace ID")
     staging_url: str | None = Field(None, description="SUT base URL")
+    target_root: str | None = Field(None, description="SUT 코드베이스 root 경로 (Spring service.target_root)")
     test_account: dict[str, Any] | None = Field(None, description="테스트 계정 정보")
     domain_files: list[dict[str, Any]] | None = Field(None, description="도메인 문서 메타 목록")
     repo_url: str | None = Field(None, description="단일 Git 저장소 URL")
@@ -116,19 +119,20 @@ def _submit_pipeline(
     staging_url: str | None,
     test_account: dict | None = None,
     domain_files: list[dict] | None = None,
+    target_root: str | None = None,
 ) -> None:
     if _CELERY_ENABLED:
         from qapilot.db.run_writer import set_task_id
         from qapilot.worker.tasks import run_pipeline_task
 
         result = run_pipeline_task.delay(
-            service_id, trace_id, dict(options), staging_url, test_account, domain_files
+            service_id, trace_id, dict(options), staging_url, test_account, domain_files, target_root
         )
         set_task_id(trace_id, result.id)
         logger.info("agent_pipeline_submitted_celery", trace_id=trace_id, task_id=result.id)
     else:
         task = asyncio.create_task(
-            _run_pipeline_task(service_id, trace_id, options, staging_url, test_account, domain_files)
+            _run_pipeline_task(service_id, trace_id, options, staging_url, test_account, domain_files, target_root)
         )
         _running_tasks[trace_id] = task
 
@@ -374,13 +378,15 @@ async def resume_run(trace_id: str) -> Any:
     }
     service_id = str(trace.get("service_id") or "")
     staging_url = str(trace.get("staging_url") or "").strip() or None
+    target_root_saved = trace.get("target_root")
+    target_root = target_root_saved if isinstance(target_root_saved, str) and target_root_saved else None
     test_account_saved = trace.get("test_account")
     test_account = test_account_saved if isinstance(test_account_saved, dict) else None
     domain_files_saved = trace.get("domain_files")
     domain_files = domain_files_saved if isinstance(domain_files_saved, list) else None
 
     annotate_trace(trace_id, status="running", error=None, completed_at=None)
-    _submit_pipeline(service_id, trace_id, options, staging_url, test_account, domain_files)
+    _submit_pipeline(service_id, trace_id, options, staging_url, test_account, domain_files, target_root)
     logger.info("agent_pipeline_resumed", trace_id=trace_id, mode="celery" if _CELERY_ENABLED else "asyncio")
     return ok({"trace_id": trace_id, "status": "running"})
 
@@ -483,6 +489,7 @@ async def _run_pipeline_task(
     staging_url: str | None = None,
     test_account: dict | None = None,
     domain_files: list[dict] | None = None,
+    target_root: str | None = None,
 ) -> None:
     try:
         state = await run_pipeline(
@@ -492,6 +499,7 @@ async def _run_pipeline_task(
             staging_url=staging_url,
             test_account=test_account,
             domain_files=domain_files,
+            target_root=target_root,
         )
         update_trace(trace_id, dict(state))
     except asyncio.CancelledError:
@@ -513,6 +521,8 @@ def _start_pipeline(request: Request, body: dict[str, Any], options: RunOptions)
 
     trace_id = request.state.trace_id
     staging_url = str(body.get("staging_url") or "").strip() or None
+    target_root_body = body.get("target_root")
+    target_root = target_root_body if isinstance(target_root_body, str) and target_root_body else None
     test_account_body = body.get("test_account")
     test_account = test_account_body if isinstance(test_account_body, dict) else None
     domain_files_body = body.get("domain_files")
@@ -525,10 +535,11 @@ def _start_pipeline(request: Request, body: dict[str, Any], options: RunOptions)
         filter=options.get("filter"),
         tags=options.get("tags"),
         staging_url=staging_url,
+        target_root=target_root,
         test_account=test_account,
         domain_files=domain_files,
     )
-    _submit_pipeline(service_id, trace_id, options, staging_url, test_account, domain_files)
+    _submit_pipeline(service_id, trace_id, options, staging_url, test_account, domain_files, target_root)
     logger.info(
         "agent_pipeline_started",
         service_id=service_id,
