@@ -10,7 +10,11 @@ import numpy as np
 import pytest
 
 from qapilot.agents.natural_language_agent import NaturalLanguageAgent
-from qapilot.orchestrator.pipeline import _resolve_scenario_targets
+from qapilot.orchestrator.pipeline import (
+    _coerce_explicit_scenario_tc_add,
+    _coerce_explicit_tc_delete,
+    _resolve_scenario_targets,
+)
 from qapilot.shared.config import QApilotConfig
 from qapilot.shared.session_store import (
     get_last_exchange,
@@ -194,6 +198,23 @@ def test_validate_requirement_update_with_tc_level(agent):
     assert result["target_tc_id"] is None   # 매칭 레이어에서 주입
 
 
+def test_validate_requirement_preserves_delete_action(agent):
+    """LLM이 delete를 반환하면 validate 단계에서 create로 되돌리지 않는다."""
+    item = {
+        "req_id": "REQ-001",
+        "req_type": "functional",
+        "content": "청소년 요금제에 약정 가입 시도하는 테스트 케이스를 삭제한다.",
+        "priority": "medium",
+        "domain_area": "신규 가입",
+        "action_type": "delete",
+        "target_level": "tc",
+    }
+    result = agent._validate_requirement(item)
+
+    assert result["action_type"] == "delete"
+    assert result["target_level"] == "tc"
+
+
 # ── _resolve_scenario_targets 임베딩 매칭 단위 테스트 ────────────────────────────
 
 _MOCK_SCENARIOS = [
@@ -216,6 +237,116 @@ _MOCK_SCENARIOS = [
 ]
 
 
+def test_coerce_explicit_scenario_tc_add_overrides_create_ts():
+    """'기존 TS명에 케이스 추가'는 LLM이 create+ts로 오분류해도 create+tc가 되어야 한다."""
+    requirements = [
+        {
+            "req_id": "REQ-001",
+            "content": "순차적 회선 해지 요청 케이스를 추가한다.",
+            "domain_area": "회선 해지",
+            "action_type": "create",
+            "target_level": "ts",
+            "target_ts_id": None,
+            "target_tc_id": None,
+        }
+    ]
+    scenarios = [
+        {"ts_id": "TS-010", "title": "회선 해지 시나리오", "test_cases": []},
+        {"ts_id": "TS-011", "title": "회선 가입 시나리오", "test_cases": []},
+    ]
+
+    _coerce_explicit_scenario_tc_add(
+        "회선 해지 시나리오에 순차적 회선 해지 요청 케이스 추가해줘",
+        requirements,
+        scenarios,
+    )
+
+    assert requirements[0]["action_type"] == "create"
+    assert requirements[0]["target_level"] == "tc"
+    assert requirements[0]["target_ts_id"] == "TS-010"
+    assert requirements[0]["target_tc_id"] is None
+
+
+def test_coerce_explicit_scenario_tc_add_matches_without_spacing():
+    """사용자 입력과 TS 제목의 공백 차이가 있어도 명시적 TS명을 우선한다."""
+    requirements = [
+        {
+            "req_id": "REQ-001",
+            "content": "순차적 회선 해지 요청 케이스를 추가한다.",
+            "domain_area": "회선해지",
+            "action_type": "create",
+            "target_level": "ts",
+            "target_ts_id": None,
+            "target_tc_id": None,
+        }
+    ]
+    scenarios = [
+        {"ts_id": "TS-010", "title": "회선 해지 시나리오", "test_cases": []},
+    ]
+
+    _coerce_explicit_scenario_tc_add(
+        "회선해지시나리오에 순차적 회선 해지 요청 TC 생성",
+        requirements,
+        scenarios,
+    )
+
+    assert requirements[0]["target_level"] == "tc"
+    assert requirements[0]["target_ts_id"] == "TS-010"
+
+
+def test_coerce_explicit_tc_delete_by_full_tc_id():
+    requirements = [
+        {
+            "req_id": "REQ-001",
+            "content": "TS-005-TC-04를 삭제한다.",
+            "domain_area": "테스트",
+            "action_type": "create",
+            "target_level": "ts",
+            "target_ts_id": None,
+            "target_tc_id": None,
+        }
+    ]
+
+    _coerce_explicit_tc_delete("TS-005-TC-04 삭제", requirements, [])
+
+    assert requirements[0]["action_type"] == "delete"
+    assert requirements[0]["target_level"] == "tc"
+    assert requirements[0]["target_ts_id"] == "TS-005"
+    assert requirements[0]["target_tc_id"] == "TS-005-TC-04"
+
+
+def test_coerce_explicit_tc_delete_uses_named_scenario_scope():
+    requirements = [
+        {
+            "req_id": "REQ-001",
+            "content": "청소년 요금제에 약정 가입 시도하는 테스트 케이스를 삭제한다.",
+            "domain_area": "요금제 변경",
+            "action_type": "create",
+            "target_level": "ts",
+            "target_ts_id": None,
+            "target_tc_id": None,
+        }
+    ]
+    scenarios = [
+        {
+            "ts_id": "TS-005",
+            "title": "신규 가입 시나리오",
+            "test_cases": [{"tc_id": "TS-005-TC-04", "title": "청소년 요금제에 약정 가입 시도"}],
+        }
+    ]
+
+    _coerce_explicit_tc_delete(
+        "신규 가입 시나리오에서 청소년 요금제에 약정 가입 시도하는 테스트 케이스 삭제",
+        requirements,
+        scenarios,
+    )
+
+    assert requirements[0]["action_type"] == "delete"
+    assert requirements[0]["target_level"] == "tc"
+    assert requirements[0]["target_ts_id"] == "TS-005"
+    assert requirements[0]["target_tc_id"] is None
+
+
 def _make_vec(seed: int, dim: int = 8) -> np.ndarray:
     """재현 가능한 단위 벡터를 만든다."""
     rng = np.random.default_rng(seed)
@@ -225,9 +356,9 @@ def _make_vec(seed: int, dim: int = 8) -> np.ndarray:
 
 def _make_embedder_mock(query_vec: np.ndarray, ts_vecs: list, tc_vecs: list | None = None):
     """encode 호출 순서에 따라 적절한 벡터 배열을 반환하는 mock."""
-    # pipeline 호출 순서: ts_texts → query_texts → (tc_texts)
+    # pipeline 호출 순서: query_texts → ts_texts → (tc_texts)
     call_count = [0]
-    all_returns = [np.array(ts_vecs), query_vec.reshape(1, -1)]
+    all_returns = [query_vec.reshape(1, -1), np.array(ts_vecs)]
     if tc_vecs is not None:
         all_returns.append(np.array(tc_vecs))
 
