@@ -3686,8 +3686,11 @@ async def _tv_generate_codebase_aware(state: PipelineState) -> dict:
 
     from qapilot.agents.tv_codebase_aware_agent import TVFromCodebaseAgent
     from qapilot.shared.db_state import get_db_snapshot_cached
-    from qapilot.shared.metadata_filters import pick_table_for_tc
-    from qapilot.shared.scan_storage import load_metadata_index
+    from qapilot.shared.metadata_filters import (
+        pick_source_files_for_tc,
+        pick_table_for_tc,
+    )
+    from qapilot.shared.scan_storage import load_metadata_index, load_source
     from qapilot.shared.schemas import AgentInput
 
     trace_id = state["trace_id"]
@@ -3718,6 +3721,14 @@ async def _tv_generate_codebase_aware(state: PipelineState) -> dict:
     agent_logs = list(state.get("agent_logs") or [])
     updated_tc_by_index: dict = {}
 
+    # ── 현재 SHA — load_source 호출용 (codebase_scan_exp 에서 적재된 source/{sha}) ──
+    scan_meta = state.get("scan_result") or {}
+    commit_sha = (scan_meta.get("git_diff") or {}).get("commit_hash") or ""
+    if not commit_sha:
+        # codebase_scan_exp 가 안 돈 경우 — load_source 건너뜀, 다른 단계는 계속
+        logger.info("tv_no_commit_sha", trace_id=trace_id,
+                    reason="codebase_scan 결과에 git_diff.commit_hash 없음")
+
     for idx, tcs in tc_by_index.items():
         updated_tcs: list[dict] = []
         for tc in tcs:
@@ -3742,6 +3753,37 @@ async def _tv_generate_codebase_aware(state: PipelineState) -> dict:
                         table=table_name, error=str(e),
                     )
 
+            # ── 코드베이스 본문 (production 코드) — TC 관련 파일 load_source ──
+            source_snippets: list[dict] = []
+            if commit_sha:
+                source_targets = pick_source_files_for_tc(tc, schemas=schemas)
+                for file_path, line_start, line_end in source_targets:
+                    try:
+                        content = load_source(
+                            service_id, commit_sha, file_path,
+                            line_start=line_start, line_end=line_end,
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            "tv_load_source_failed",
+                            trace_id=trace_id, tc_name=tc.get("name"),
+                            file=file_path, error=str(e),
+                        )
+                        continue
+                    if content:
+                        source_snippets.append({
+                            "file": file_path,
+                            "line_start": line_start,
+                            "line_end": line_end,
+                            "content": content,
+                        })
+                if source_snippets:
+                    logger.info(
+                        "tv_source_loaded",
+                        trace_id=trace_id, tc_name=tc.get("name"),
+                        files=[s["file"] for s in source_snippets],
+                    )
+
             start = time.monotonic()
             try:
                 agent = TVFromCodebaseAgent(trace_id=trace_id)
@@ -3754,6 +3796,7 @@ async def _tv_generate_codebase_aware(state: PipelineState) -> dict:
                         "schemas": schemas,
                         "patterns": patterns,
                         "db_snapshot": db_snapshot,
+                        "source_snippets": source_snippets,
                     },
                     params={},
                 ))
