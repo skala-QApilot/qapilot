@@ -11,6 +11,7 @@ from qapilot.shared.metadata_filters import (
     filter_patterns_by_req_id,
     filter_schemas_by_api,
     filter_selectors_by_route,
+    pick_table_for_tc,
 )
 
 
@@ -226,3 +227,83 @@ def test_filter_metadata_no_tc_data():
     )
     assert result["selectors"]["by_route"] == {}
     assert result["schemas"]["db_models"] == {"Customer": {}}
+
+
+# ────────────────────────────────────────────────────────────────────────
+# pick_table_for_tc — DB snapshot 조회 대상 테이블 선택
+# ────────────────────────────────────────────────────────────────────────
+
+@pytest.fixture
+def signup_schemas_with_db():
+    return {
+        "request_schemas": {
+            "SignupRequest": {"fields": [{"name": "email"}, {"name": "password"}]},
+        },
+        "db_models": {
+            "Customer": {
+                "table_name": "customers",
+                "columns": [{"name": "email"}, {"name": "password_hash"}],
+            },
+            "Plan": {"table_name": "plans", "columns": [{"name": "id"}]},
+        },
+    }
+
+
+def test_pick_table_filter_fallback(signup_schemas_with_db):
+    """1/2 매칭 실패 → filter_schemas_by_api 의 첫 번째 db_model."""
+    table = pick_table_for_tc(
+        {"api": "POST /api/auth/signup"}, signup_schemas_with_db,
+    )
+    # SignupRequest 의 email 필드가 Customer 의 email 컬럼과 매칭 → Customer
+    assert table == "customers"
+
+
+def test_pick_table_exact_match():
+    """db_model 이름 = api last segment 인 경우 정확 매칭."""
+    schemas = {
+        "request_schemas": {},
+        "db_models": {
+            "signup": {"table_name": "signups", "columns": []},
+            "other": {"table_name": "others", "columns": []},
+        },
+    }
+    table = pick_table_for_tc(
+        {"api": "POST /api/auth/signup"}, schemas,
+    )
+    assert table == "signups"
+
+
+def test_pick_table_partial_table_name():
+    """table_name 안에 last segment 가 포함된 경우."""
+    schemas = {
+        "request_schemas": {},
+        "db_models": {
+            "Order": {"table_name": "order_history", "columns": []},
+        },
+    }
+    table = pick_table_for_tc(
+        {"api": "GET /api/orders"}, schemas,
+    )
+    # "orders" 의 last segment 가 "order_history" 안에 부분 포함 X — fallback 으로 첫 번째
+    # 단 _last_segment("/api/orders") = "orders"
+    # "orders" in "order_history" = False (실제 'order' 포함이지만 'orders' 는 False)
+    # → fallback 으로 db_models 의 첫 번째 = "order_history"
+    assert table == "order_history"
+
+
+def test_pick_table_no_schemas():
+    assert pick_table_for_tc({"api": "POST /signup"}, None) is None
+    assert pick_table_for_tc({"api": "POST /signup"}, {}) is None
+
+
+def test_pick_table_no_db_models():
+    schemas = {"request_schemas": {"Req": {}}, "db_models": {}}
+    assert pick_table_for_tc({"api": "POST /signup"}, schemas) is None
+
+
+def test_pick_table_no_api(signup_schemas_with_db):
+    """api 없으면 filter fallback 의 첫 번째 db_model."""
+    table = pick_table_for_tc({"name": "x"}, signup_schemas_with_db)
+    # filter_schemas_by_api 가 api None 시 db_models 전체 그대로 반환
+    # → 첫 번째 (dict 순서 — Customer)
+    assert table == "customers"

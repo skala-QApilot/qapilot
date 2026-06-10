@@ -3686,6 +3686,7 @@ async def _tv_generate_codebase_aware(state: PipelineState) -> dict:
 
     from qapilot.agents.tv_codebase_aware_agent import TVFromCodebaseAgent
     from qapilot.shared.db_state import get_db_snapshot_cached
+    from qapilot.shared.metadata_filters import pick_table_for_tc
     from qapilot.shared.scan_storage import load_metadata_index
     from qapilot.shared.schemas import AgentInput
 
@@ -3720,13 +3721,26 @@ async def _tv_generate_codebase_aware(state: PipelineState) -> dict:
     for idx, tcs in tc_by_index.items():
         updated_tcs: list[dict] = []
         for tc in tcs:
-            # 휴리스틱 — TC.api 의 last segment 를 테이블 이름으로 시도
+            # schemas.db_models 기반으로 TC 와 가장 관련 깊은 테이블 1개 선택 + DB snapshot 조회
+            # (sensitive 컬럼은 TV agent 안에서 strip_sensitive_from_db_snapshot 으로 제거)
             db_snapshot = None
-            api = tc.get("api") or ""
-            if api and "/" in api:
-                # POST /api/auth/signup → customers (signup 의 도메인 추측)
-                # 정확 매핑은 TC 만으로 어렵 — 일단 None 으로 두고 향후 schema.db_models 활용
-                pass
+            table_name = pick_table_for_tc(tc, schemas)
+            if table_name:
+                try:
+                    db_snapshot = await get_db_snapshot_cached(service_id, table_name)
+                    if db_snapshot:
+                        rows = (db_snapshot.get("rows") or [])
+                        logger.info(
+                            "tv_db_snapshot_loaded",
+                            trace_id=trace_id, tc_name=tc.get("name"),
+                            table=table_name, row_count=len(rows),
+                        )
+                except Exception as e:
+                    logger.warning(
+                        "tv_db_snapshot_failed",
+                        trace_id=trace_id, tc_name=tc.get("name"),
+                        table=table_name, error=str(e),
+                    )
 
             start = time.monotonic()
             try:
