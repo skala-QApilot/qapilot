@@ -61,6 +61,13 @@ REQUIRED_ENV = (
     "S3_SECRET_KEY",
 )
 
+# sensitive 필드 placeholder 치환용 — 실 테스트 실행까지 갈 때만 필요.
+# (시나리오 생성까지만 확인할 거면 미설정도 OK)
+SENSITIVE_ENV = (
+    "TEST_PASSWORD",
+    "TEST_PASSWORD_HASH",
+)
+
 
 def check_env() -> bool:
     _section("1. 환경변수 (.env 로드)")
@@ -78,8 +85,20 @@ def check_env() -> bool:
             _ok(f"{key} = {val[:30]}...")
         else:
             _fail(f"{key} 미설정",
-                  fix=f"cp qapilot-server/.env.example .env 후 값 채우기")
+                  fix=f"cp .env.example .env 후 값 채우기")
             ok = False
+
+    # sensitive 환경변수 — 미설정이면 시나리오 생성까지는 OK, 실 테스트 실행 시 fail
+    print()
+    for key in SENSITIVE_ENV:
+        val = os.environ.get(key)
+        if val:
+            _ok(f"{key} 설정됨 — 실 테스트 실행 시 sensitive placeholder 치환됨")
+        else:
+            _warn(
+                f"{key} 미설정 — 시나리오 생성까지는 OK, "
+                "실 테스트 실행 시 sensitive placeholder 가 literal 그대로 form 에 입력됨"
+            )
     return ok
 
 

@@ -108,11 +108,26 @@ form.password.fill("actual_password") — HTML5 검증 통과
 
 ### 4.1 환경변수 명명 규칙
 TC.values 의 sensitive placeholder = `process.env.TEST_<FIELD_UPPERCASE>` 형식.
-운영 환경에서 다음 환경변수 등록 필요:
+
+**팀원이 별도 설정할 필요 없음** — `.env.example` 에 mini-bss-lite 기본값이 포함되어 있다:
+```bash
+cd ~/skala/last_project/qapilot
+cp .env.example .env       # 또는 본인 .env 에 TEST_* 가 이미 있는지 확인
+```
+
+```env
+# .env.example 안 (PR #272 매커니즘)
+TEST_PASSWORD=Passw0rd!
+TEST_PASSWORD_HASH=Passw0rd!
+```
+
+다른 SUT 사용 시 그 SUT 의 테스트 계정 값으로 변경:
 - `TEST_PASSWORD`
 - `TEST_API_KEY`
 - `TEST_TOKEN`
 - 등등 (필요한 sensitive 필드 종류만큼)
+
+`scripts/setup_check.py` 가 환경변수 설정 여부 확인 — 미설정 시 warning + 영향 안내.
 
 ### 4.2 secret 스캔 (옵션)
 본 작업의 `dump_source_to_s3` 가 코드를 그대로 S3 에 PUT 한다. 운영 시점에 다음 추가 권장:
