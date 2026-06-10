@@ -162,13 +162,29 @@ def test_strip_sensitive_from_db_snapshot_skips_non_dict_rows():
 # ────────────────────────────────────────────────────────────────────────
 
 @pytest.mark.parametrize("field,expected", [
-    ("password", "${TEST_PASSWORD}"),
-    ("api_key", "${TEST_API_KEY}"),
-    ("access-key", "${TEST_ACCESS_KEY}"),
-    ("credit card", "${TEST_CREDIT_CARD}"),
+    ("password", "process.env.TEST_PASSWORD"),
+    ("api_key", "process.env.TEST_API_KEY"),
+    ("access-key", "process.env.TEST_ACCESS_KEY"),
+    ("credit card", "process.env.TEST_CREDIT_CARD"),
 ])
 def test_make_placeholder(field, expected):
     assert make_placeholder(field) == expected
+
+
+def test_make_placeholder_matches_resolve_js_value_regex():
+    """본인 placeholder 가 _resolve_js_value 의 process.env.X 패턴과 정합.
+
+    qapilot/orchestrator/pipeline.py:_resolve_js_value:
+        env_match = re.fullmatch(r"process\\.env\\.([A-Z0-9_]+)", token)
+    """
+    import re
+    pattern = re.compile(r"process\.env\.([A-Z0-9_]+)")
+    for field in ["password", "api_key", "token", "secret", "access-key"]:
+        placeholder = make_placeholder(field)
+        m = pattern.fullmatch(placeholder)
+        assert m is not None, f"{placeholder!r} does NOT match process.env.X pattern"
+        # 환경변수 이름 캡처도 확인
+        assert m.group(1).startswith("TEST_")
 
 
 # ────────────────────────────────────────────────────────────────────────
@@ -184,7 +200,7 @@ def test_build_sensitive_value_entries_basic():
     for e in entries:
         assert e["sensitive"] is True
         assert e["source"] == "placeholder"
-        assert e["value"].startswith("${TEST_")
+        assert e["value"].startswith("process.env.TEST_")
         assert "환경변수" in e["purpose"]
 
 
@@ -218,7 +234,7 @@ def test_merge_values_with_sensitive():
     assert "password" in fields
     # password 는 placeholder
     pw = next(v for v in merged if v["field"] == "password")
-    assert pw["value"] == "${TEST_PASSWORD}"
+    assert pw["value"] == "process.env.TEST_PASSWORD"
     assert pw["sensitive"] is True
 
 
@@ -233,7 +249,7 @@ def test_merge_overrides_llm_response_for_sensitive():
     merged = merge_values_with_sensitive(llm_values, sensitive_entries)
     pw = next(v for v in merged if v["field"] == "password")
     # LLM 의 "***hacked***" 가 아니라 placeholder
-    assert pw["value"] == "${TEST_PASSWORD}"
+    assert pw["value"] == "process.env.TEST_PASSWORD"
 
 
 def test_merge_with_empty_llm_values():

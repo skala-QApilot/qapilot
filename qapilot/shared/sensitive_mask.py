@@ -25,8 +25,11 @@ _SENSITIVE_KEYWORDS = (
     "private_key", "access_key", "credit_card", "ssn", "card_number",
 )
 
-# placeholder 형식 — 액션매핑이 환경변수에서 가져감
-_PLACEHOLDER_TEMPLATE = "${{TEST_{upper}}}"
+# placeholder 형식 — `_resolve_js_value` 의 `process.env.X` 패턴과 정합.
+# generated_code 의 JS 안에 `await page.fill(process.env.TEST_X)` 형태로 박힘 →
+# `_resolve_js_value` 가 환경변수 `TEST_X` 으로 자동 치환.
+# 환경변수 미설정 시 빈 string → PR #256 의 ActionMapping 원본 value fallback.
+_PLACEHOLDER_TEMPLATE = "process.env.TEST_{upper}"
 
 
 def is_sensitive_field(field_name: str, *, schema_field_spec: dict | None = None) -> bool:
@@ -130,12 +133,18 @@ def strip_sensitive_from_db_snapshot(
 def make_placeholder(field_name: str) -> str:
     """sensitive 필드의 placeholder 생성.
 
-    형식: ${TEST_<UPPERCASE_FIELD>}
-    예: password → ${TEST_PASSWORD}
-        api_key → ${TEST_API_KEY}
+    형식: process.env.TEST_<UPPERCASE_FIELD>
+    예: password → process.env.TEST_PASSWORD
+        api_key → process.env.TEST_API_KEY
 
-    액션매핑이 PR #256 의 ActionMapping 원본 value fallback 으로 실행 시
-    실제 값을 환경변수에서 가져감.
+    실행 흐름:
+    1. TC.values 의 sensitive 필드 = "process.env.TEST_PASSWORD"
+    2. CodeGenerator 가 generated_code 의 JS 안에 그대로 박음
+       (예: `await page.fill(process.env.TEST_PASSWORD)`)
+    3. 실행 시점에 `_resolve_js_value` 의 정규식 `r"process\\.env\\.([A-Z0-9_]+)"`
+       으로 매칭 → `os.getenv("TEST_PASSWORD")` 호출
+    4. 환경변수 설정 시 그 값으로 치환, 미설정 시 빈 string —
+       PR #256 의 ActionMapping 원본 value fallback 으로 처리.
     """
     upper = field_name.upper().replace("-", "_").replace(" ", "_")
     return _PLACEHOLDER_TEMPLATE.format(upper=upper)
@@ -151,7 +160,7 @@ def build_sensitive_value_entries(
     각 entry:
         {
             "field": "password",
-            "value": "${TEST_PASSWORD}",
+            "value": "process.env.TEST_PASSWORD",
             "type": "string",
             "purpose": "민감 정보 — 액션매핑 시점에 환경변수에서 가져옴",
             "source": "placeholder",

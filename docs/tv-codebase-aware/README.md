@@ -92,7 +92,7 @@ mini-bss-lite 만 봐도 코드베이스가 selectors 125 + routes 16 + schemas 
 본 작업도 같은 위험 — "마스킹된 값을 LLM 에 보이는" 방식은 같은 문제 재발. 따라서:
 
 - **sensitive 필드는 LLM 컨텍스트에서 완전 제외**한다 (마스킹된 형태 노출 자체를 안 한다).
-- TC.values 의 sensitive 필드는 **LLM 이 생성하지 않고** TV agent 가 placeholder (`${TEST_PASSWORD}`) 로 저장한다.
+- TC.values 의 sensitive 필드는 **LLM 이 생성하지 않고** TV agent 가 placeholder (`process.env.TEST_PASSWORD`) 로 저장한다.
 - 액션매핑 단계의 PR #256 의 ActionMapping 원본 value fallback 으로 실행 시점에 실제 값이 들어간다.
 
 `SchemaField.sensitive=True` 표시 (`backend_schema_parser` 가 `password*` 컬럼에 자동으로 붙임) 를 이용해서 LLM 호출 직전에 sensitive 필드를 컨텍스트에서 제거한다.

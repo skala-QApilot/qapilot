@@ -3677,7 +3677,7 @@ async def _tv_generate_codebase_aware(state: PipelineState) -> dict:
     2. sensitive 필드 LLM 컨텍스트 제외 (`sensitive_mask` — PR #256 본질 재발 방지)
     3. (선택) DB snapshot 일부 LLM 에 주입
     4. TVFromCodebaseAgent 호출 → TVValidator 검증 → 재시도
-    5. sensitive 필드는 placeholder ($TEST_PASSWORD) 머지
+    5. sensitive 필드는 placeholder (process.env.TEST_PASSWORD) 머지
 
     조회 실패 / 메타데이터 미존재 시 graceful — TC.values 그대로 보존.
     """
