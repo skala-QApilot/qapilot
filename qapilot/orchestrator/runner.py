@@ -23,6 +23,7 @@ async def run_pipeline(
     staging_url: str | None = None,
     test_account: dict | None = None,
     domain_files: list[dict] | None = None,
+    target_root: str | None = None,
     # CLI 하위 호환 — qapilot_dir 를 직접 지정하면 그대로 사용, 없으면 temp dir 사용.
     qapilot_dir: str | Path | None = None,
 ) -> PipelineState:
@@ -35,6 +36,8 @@ async def run_pipeline(
         staging_url: SUT base URL.
         test_account: SUT 인증 정보.
         domain_files: 도메인 문서 메타 리스트.
+        target_root: SUT 코드베이스 root (Spring service.target_root). `_resolve_project_root`
+            가 cfg.project.root 다음, qapilot_dir derive 전 우선 사용.
         qapilot_dir: CLI 하위 호환 — 지정 시 해당 디렉토리 사용, 없으면 temp dir.
     """
     trace_id = trace_id or TraceModule.generate_trace_id()
@@ -65,6 +68,7 @@ async def run_pipeline(
         "error": None,
         "qapilot_dir": work_dir,
         "staging_url": staging_url or "",
+        "target_root": target_root if isinstance(target_root, str) and target_root else None,
         "test_account": test_account if isinstance(test_account, dict) else None,
         "domain_files": domain_files if isinstance(domain_files, list) else None,
         # Layer 1A
