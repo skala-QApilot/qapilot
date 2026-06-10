@@ -3687,6 +3687,7 @@ async def _tv_generate_codebase_aware(state: PipelineState) -> dict:
     from qapilot.agents.tv_codebase_aware_agent import TVFromCodebaseAgent
     from qapilot.shared.db_state import get_db_snapshot_cached
     from qapilot.shared.metadata_filters import (
+        find_endpoint_function_range,
         pick_source_files_for_tc,
         pick_table_for_tc,
     )
@@ -3754,6 +3755,7 @@ async def _tv_generate_codebase_aware(state: PipelineState) -> dict:
                     )
 
             # ── 코드베이스 본문 (production 코드) — TC 관련 파일 load_source ──
+            # router 파일은 endpoint 함수만 추출 (전체 60% 가 무관한 endpoint 노이즈 회피)
             source_snippets: list[dict] = []
             if commit_sha:
                 source_targets = pick_source_files_for_tc(tc, schemas=schemas)
@@ -3770,13 +3772,39 @@ async def _tv_generate_codebase_aware(state: PipelineState) -> dict:
                             file=file_path, error=str(e),
                         )
                         continue
-                    if content:
-                        source_snippets.append({
-                            "file": file_path,
-                            "line_start": line_start,
-                            "line_end": line_end,
-                            "content": content,
-                        })
+                    if not content:
+                        continue
+
+                    # router 파일은 endpoint 함수만 추출 (정보 희석 회피)
+                    is_router_file = (
+                        "/routers/" in file_path
+                        and line_start is None and line_end is None
+                    )
+                    if is_router_file:
+                        endpoint_range = find_endpoint_function_range(content, tc.get("api"))
+                        if endpoint_range:
+                            ep_ls, ep_le = endpoint_range
+                            # line range 만 잘라내기 (cache hit — S3 GET 안 함)
+                            sliced = load_source(
+                                service_id, commit_sha, file_path,
+                                line_start=ep_ls, line_end=ep_le,
+                            )
+                            if sliced:
+                                line_start, line_end = ep_ls, ep_le
+                                content = sliced
+                                logger.info(
+                                    "tv_endpoint_extracted",
+                                    trace_id=trace_id, tc_name=tc.get("name"),
+                                    file=file_path, line_range=f"{ep_ls}-{ep_le}",
+                                    original_chars=len(content), endpoint_chars=len(sliced),
+                                )
+
+                    source_snippets.append({
+                        "file": file_path,
+                        "line_start": line_start,
+                        "line_end": line_end,
+                        "content": content,
+                    })
                 if source_snippets:
                     logger.info(
                         "tv_source_loaded",
