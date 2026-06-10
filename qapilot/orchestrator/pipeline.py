@@ -37,6 +37,8 @@ from qapilot.orchestrator.state import PipelineState
 from qapilot.shared import progress
 from qapilot.shared.logger import get_logger
 from qapilot.shared.trace_store import load_trace
+
+logger = get_logger(source="orchestrator")
 from qapilot.storage import s3_client
 from qapilot.tools.frontend_dom_scanner import scan_frontend_directory
 
