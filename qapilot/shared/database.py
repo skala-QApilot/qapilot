@@ -37,7 +37,14 @@ class Base(DeclarativeBase):
 
 
 async def create_tables() -> None:
-    """애플리케이션 기동 시 테이블을 생성한다 (없는 경우에만)."""
+    """애플리케이션 기동 시 테이블을 생성한다 (없는 경우에만).
+
+    `Base.metadata` 에 등록된 모델만 생성된다. 신규 모델 추가 시 본 함수 호출
+    이전에 import 되어 있어야 한다.
+    """
+    # ORM 모델 import — Base.metadata 등록 보장
+    from qapilot.shared import models  # noqa: F401
+
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
 

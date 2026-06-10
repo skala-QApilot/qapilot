@@ -126,18 +126,22 @@ def build_pipeline() -> StateGraph:
     graph.add_edge("report", END)
 
     # ═══════════════════════════════════════════════════
-    # prd_only_experiment — PRD-only TS + doc-search TC
+    # prd_only_experiment — PRD-only TS + doc-search TC + codebase-aware TV
     # ═══════════════════════════════════════════════════
     graph.add_node("doc_import_exp",            _doc_import)
     graph.add_node("requirement_extract_exp",   _requirement_extract)
+    graph.add_node("codebase_scan_exp",         _codebase_scan)
     graph.add_node("ts_generate_prd_only",      _ts_generate_prd_only)
     graph.add_node("tc_generate_doc_search",    _tc_generate_doc_search)
+    graph.add_node("tv_generate_codebase_aware", _tv_generate_codebase_aware)
     graph.add_node("save_experiment_scenarios", _save_experiment_scenarios)
 
     graph.add_edge("doc_import_exp",            "requirement_extract_exp")
-    graph.add_edge("requirement_extract_exp",   "ts_generate_prd_only")
+    graph.add_edge("requirement_extract_exp",   "codebase_scan_exp")
+    graph.add_edge("codebase_scan_exp",         "ts_generate_prd_only")
     graph.add_edge("ts_generate_prd_only",      "tc_generate_doc_search")
-    graph.add_edge("tc_generate_doc_search",    "save_experiment_scenarios")
+    graph.add_edge("tc_generate_doc_search",    "tv_generate_codebase_aware")
+    graph.add_edge("tv_generate_codebase_aware", "save_experiment_scenarios")
     graph.add_edge("save_experiment_scenarios", END)
 
     # ═══════════════════════════════════════════════════
@@ -3661,6 +3665,120 @@ async def _tc_generate_doc_search(state: PipelineState) -> dict:
         agent_logs.append(output.metadata.model_dump())
 
     return {"tc_by_ts_index": result_test_cases, "agent_logs": agent_logs}
+
+
+async def _tv_generate_codebase_aware(state: PipelineState) -> dict:
+    """TC 의 values 칸을 코드베이스/메타데이터/DB 기반으로 채운다.
+
+    회의 4단계 워크플로우 Step 4. TC 자체는 변경 안 하고 values 만 채움.
+
+    각 TC 마다:
+    1. TC.api / req_id 로 4영역 메타데이터 필터링 (`metadata_filters`)
+    2. sensitive 필드 LLM 컨텍스트 제외 (`sensitive_mask` — PR #256 본질 재발 방지)
+    3. (선택) DB snapshot 일부 LLM 에 주입
+    4. TVFromCodebaseAgent 호출 → TVValidator 검증 → 재시도
+    5. sensitive 필드는 placeholder ($TEST_PASSWORD) 머지
+
+    조회 실패 / 메타데이터 미존재 시 graceful — TC.values 그대로 보존.
+    """
+    import time
+    from datetime import datetime, timezone
+
+    from qapilot.agents.tv_codebase_aware_agent import TVFromCodebaseAgent
+    from qapilot.shared.db_state import get_db_snapshot_cached
+    from qapilot.shared.scan_storage import load_metadata_index
+    from qapilot.shared.schemas import AgentInput
+
+    trace_id = state["trace_id"]
+    trace = load_trace(trace_id) or {}
+    service_id = trace.get("service_id")
+    tc_by_index: dict = state.get("tc_by_ts_index") or {}
+    if not tc_by_index or not service_id:
+        return {}
+
+    # ── 4영역 메타데이터 로드 (LRU cache — 같은 service 호출 1회) ──
+    try:
+        selectors = load_metadata_index(service_id, "frontend", "selectors")
+        routes = load_metadata_index(service_id, "frontend", "routes")
+        schemas = load_metadata_index(service_id, "backend", "schemas")
+        patterns = load_metadata_index(service_id, "sut_tests", "patterns")
+    except Exception as e:
+        logger.warning("tv_metadata_load_failed", trace_id=trace_id, error=str(e))
+        selectors = routes = schemas = patterns = None
+
+    if not any([selectors, routes, schemas, patterns]):
+        logger.info(
+            "tv_metadata_index_empty",
+            trace_id=trace_id, service_id=service_id,
+            reason="codebase_scan 미수행 또는 metadata-index 빈 상태",
+        )
+        return {}
+
+    agent_logs = list(state.get("agent_logs") or [])
+    updated_tc_by_index: dict = {}
+
+    for idx, tcs in tc_by_index.items():
+        updated_tcs: list[dict] = []
+        for tc in tcs:
+            # 휴리스틱 — TC.api 의 last segment 를 테이블 이름으로 시도
+            db_snapshot = None
+            api = tc.get("api") or ""
+            if api and "/" in api:
+                # POST /api/auth/signup → customers (signup 의 도메인 추측)
+                # 정확 매핑은 TC 만으로 어렵 — 일단 None 으로 두고 향후 schema.db_models 활용
+                pass
+
+            start = time.monotonic()
+            try:
+                agent = TVFromCodebaseAgent(trace_id=trace_id)
+                output = await agent.run(AgentInput(
+                    trace_id=trace_id,
+                    context={
+                        "tc": tc,
+                        "selectors": selectors,
+                        "routes": routes,
+                        "schemas": schemas,
+                        "patterns": patterns,
+                        "db_snapshot": db_snapshot,
+                    },
+                    params={},
+                ))
+                duration = round(time.monotonic() - start, 2)
+                new_values = output.result.get("values") or []
+                validation_passed = output.result.get("validation_passed", False)
+
+                if new_values:
+                    new_tc = dict(tc)
+                    new_tc["values"] = new_values
+                    new_tc["tv_validation_passed"] = validation_passed
+                    new_tc["tv_validation_reasons"] = (
+                        output.result.get("validation_reasons") or []
+                    )
+                    updated_tcs.append(new_tc)
+                else:
+                    updated_tcs.append(tc)
+
+                agent_logs.append(output.metadata.model_dump())
+                logger.info(
+                    "tv_codebase_aware_done",
+                    trace_id=trace_id,
+                    tc_name=tc.get("name"),
+                    values_count=len(new_values),
+                    validation_passed=validation_passed,
+                    duration_sec=duration,
+                )
+            except Exception as e:
+                logger.warning(
+                    "tv_codebase_aware_failed",
+                    trace_id=trace_id,
+                    tc_name=tc.get("name"),
+                    error=str(e),
+                )
+                updated_tcs.append(tc)  # graceful — 원본 보존
+
+        updated_tc_by_index[idx] = updated_tcs
+
+    return {"tc_by_ts_index": updated_tc_by_index, "agent_logs": agent_logs}
 
 
 async def _save_experiment_scenarios(state: PipelineState) -> dict:
