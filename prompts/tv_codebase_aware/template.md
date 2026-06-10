@@ -10,6 +10,10 @@
 - **when**: {{tc_when}}
 - **then**: {{tc_then}}
 
+## 아직 근거가 부족한 claim ({...} 포함)
+
+{{unresolved_claims}}
+
 ## 기존 values (placeholder)
 
 {{existing_values}}
@@ -51,5 +55,8 @@
 5. **sensitive 필드 (password / token / secret / api_key 등) 는 values 에 포함하지 마라** — 시스템이 별도 처리.
 6. **위 "코드베이스 본문" 의 실 구현 로직을 보고** 검증 규칙 (예: `existing = db.scalar(...)` → 중복 체크 / `raise HTTPException(409, ...)` → 409 에러 메시지) 을 정확히 반영하라. 문서에 없어도 코드에 있으면 우선.
 7. 추론 불가능한 값이면 `purpose` 에 "스키마 정보 부족" 명시.
+
+근거가 있는 경우에만 `claims.given/when/then` 을 채워라. 근거가 부족하면 해당 key 는 생략하라.
+`claims` 에는 `{...}` placeholder 를 제거한 최종 문장을 넣되, 문서가 아니라 **위 코드/DB/스키마 근거로 확인된 내용만** 넣어라.
 
 JSON 만 출력하라. 마크다운 코드블록 X.

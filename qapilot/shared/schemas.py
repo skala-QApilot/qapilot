@@ -192,6 +192,10 @@ class TestValue(TypedDict):
     value: str
     type: str
     purpose: str
+    status: NotRequired[str]
+    source: NotRequired[str]
+    evidence_refs: NotRequired[list[str]]
+    unresolved: NotRequired[bool]
 
 
 class TestCase(TypedDict):
@@ -207,6 +211,18 @@ class TestCase(TypedDict):
     req_id: str | None
     api: str | None  # 검증 대상 API (예: "POST /api/orders")
     depends_on: list[str]  # 선행 TC ID 목록 (예: ["TS-034-TC-01"])
+    given_status: NotRequired[str]
+    when_status: NotRequired[str]
+    then_status: NotRequired[str]
+    given_source: NotRequired[str]
+    when_source: NotRequired[str]
+    then_source: NotRequired[str]
+    given_evidence_refs: NotRequired[list[str]]
+    when_evidence_refs: NotRequired[list[str]]
+    then_evidence_refs: NotRequired[list[str]]
+    given_unresolved: NotRequired[bool]
+    when_unresolved: NotRequired[bool]
+    then_unresolved: NotRequired[bool]
 
 
 class TestScenario(TypedDict):

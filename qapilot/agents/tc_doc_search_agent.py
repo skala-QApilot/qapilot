@@ -14,6 +14,8 @@ from typing import Any
 from qapilot.agents.base_agent import BaseAgent
 from qapilot.shared.schemas import ExecuteResult
 
+_PLACEHOLDER_TOKEN_RE = re.compile(r"\{[^{}]+\}")
+
 
 def _format_requirements(requirements: list[str]) -> str:
     if not requirements:
@@ -124,19 +126,63 @@ class TCFromDocsAgent(BaseAgent):
             if not isinstance(tc, dict) or not tc.get("name"):
                 continue
             sources = tc.get("sources") or []
+            given = str(tc.get("given", ""))
+            when = str(tc.get("when", ""))
+            then = str(tc.get("then", ""))
             valid.append({
                 "name": str(tc.get("name", "")),
                 "technique": str(tc.get("technique", "")),
-                "given": str(tc.get("given", "")),
-                "when": str(tc.get("when", "")),
-                "then": str(tc.get("then", "")),
-                "values": tc.get("values") or [],
+                "given": given,
+                "when": when,
+                "then": then,
+                "values": _normalize_values(tc.get("values") or [], sources),
                 "tags": tc.get("tags") or ["normal"],
                 "req_id": tc.get("req_id"),
                 "api": tc.get("api"),
                 "sources": sources,
                 "doc_verified": "codebase" in sources,
                 "depends_on": tc.get("depends_on") or [],
+                **_claim_meta("given", given, sources),
+                **_claim_meta("when", when, sources),
+                **_claim_meta("then", then, sources),
             })
 
         return valid, analysis, confidence
+
+
+def _contains_placeholder(text: str) -> bool:
+    return bool(_PLACEHOLDER_TOKEN_RE.search(text or ""))
+
+
+def _claim_meta(prefix: str, text: str, sources: list[str]) -> dict[str, Any]:
+    unresolved = _contains_placeholder(text)
+    status = "unresolved" if unresolved else "grounded_doc"
+    evidence_refs = [s for s in sources if isinstance(s, str)]
+    return {
+        f"{prefix}_status": status,
+        f"{prefix}_source": "doc_draft",
+        f"{prefix}_evidence_refs": evidence_refs,
+        f"{prefix}_unresolved": unresolved,
+    }
+
+
+def _normalize_values(values: list[Any], sources: list[str]) -> list[dict[str, Any]]:
+    normalized: list[dict[str, Any]] = []
+    evidence_refs = [s for s in sources if isinstance(s, str)]
+    for value in values:
+        if not isinstance(value, dict):
+            continue
+        raw_value = value.get("value")
+        value_text = "" if raw_value is None else str(raw_value)
+        unresolved = _contains_placeholder(value_text)
+        normalized.append({
+            "field": str(value.get("field", "")),
+            "value": raw_value,
+            "type": str(value.get("type", "string")),
+            "purpose": str(value.get("purpose", "")),
+            "status": "unresolved" if unresolved else "grounded_doc",
+            "source": "doc_draft",
+            "evidence_refs": evidence_refs,
+            "unresolved": unresolved,
+        })
+    return normalized

@@ -3867,11 +3867,21 @@ async def _tv_generate_codebase_aware(state: PipelineState) -> dict:
                 ))
                 duration = round(time.monotonic() - start, 2)
                 new_values = output.result.get("values") or []
+                resolved_claims = output.result.get("claims") or {}
                 validation_passed = output.result.get("validation_passed", False)
 
-                if new_values:
+                if new_values or resolved_claims:
                     new_tc = dict(tc)
-                    new_tc["values"] = new_values
+                    if new_values:
+                        new_tc["values"] = _merge_value_provenance(tc.get("values") or [], new_values)
+                    for claim_key in ("given", "when", "then"):
+                        resolved_text = resolved_claims.get(claim_key)
+                        if resolved_text:
+                            new_tc[claim_key] = resolved_text
+                            new_tc[f"{claim_key}_status"] = "grounded_code"
+                            new_tc[f"{claim_key}_source"] = "code"
+                            new_tc[f"{claim_key}_evidence_refs"] = [s["file"] for s in source_snippets if s.get("file")]
+                            new_tc[f"{claim_key}_unresolved"] = False
                     new_tc["tv_validation_passed"] = validation_passed
                     new_tc["tv_validation_reasons"] = (
                         output.result.get("validation_reasons") or []
@@ -3901,6 +3911,34 @@ async def _tv_generate_codebase_aware(state: PipelineState) -> dict:
         updated_tc_by_index[idx] = updated_tcs
 
     return {"tc_by_ts_index": updated_tc_by_index, "agent_logs": agent_logs}
+
+
+def _merge_value_provenance(existing_values: list[dict], new_values: list[dict]) -> list[dict]:
+    """새로 생성된 values 를 기존 provenance 와 병합한다."""
+    existing_by_field = {
+        str(v.get("field") or ""): v
+        for v in existing_values
+        if isinstance(v, dict) and v.get("field")
+    }
+    merged: list[dict] = []
+    for value in new_values:
+        if not isinstance(value, dict):
+            continue
+        field = str(value.get("field") or "")
+        previous = existing_by_field.get(field) or {}
+        merged_value = dict(previous)
+        merged_value.update(value)
+        if not merged_value.get("status"):
+            merged_value["status"] = "grounded_code"
+        if not merged_value.get("source") or merged_value.get("source") == "llm":
+            merged_value["source"] = "code"
+        merged_value["unresolved"] = bool(_contains_placeholder_value(merged_value.get("value")))
+        merged.append(merged_value)
+    return merged
+
+
+def _contains_placeholder_value(value: Any) -> bool:
+    return isinstance(value, str) and bool(re.search(r"\{[^{}]+\}", value))
 
 
 async def _save_experiment_scenarios(state: PipelineState) -> dict:

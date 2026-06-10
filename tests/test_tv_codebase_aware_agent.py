@@ -7,8 +7,11 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from qapilot.agents.tv_codebase_aware_agent import (
+    TVFromCodebaseAgent,
     _build_type_hint_map,
+    _collect_unresolved_claims,
     _extract_json,
+    _format_unresolved_claims,
     _infer_scenario_intent,
     _pick_schema_name,
 )
@@ -118,3 +121,27 @@ def test_build_type_hint_map_request_overrides_db():
         "db_models": {"M": {"columns": [{"name": "email", "type": "str"}]}},
     }
     assert _build_type_hint_map(schemas)["email"] == "EmailStr"
+
+
+def test_collect_unresolved_claims():
+    tc = {
+        "given": "사용자가 {duplicate email} 을 입력한다.",
+        "when": "회원가입을 시도한다.",
+        "then": "{중복 이메일 오류 메시지}가 표시된다.",
+    }
+    claims = _collect_unresolved_claims(tc)
+    assert claims == {
+        "given": "사용자가 {duplicate email} 을 입력한다.",
+        "then": "{중복 이메일 오류 메시지}가 표시된다.",
+    }
+    assert "given" in _format_unresolved_claims(claims)
+
+
+def test_parse_claims_and_values():
+    agent = TVFromCodebaseAgent(trace_id="tv-parse")
+    parsed = agent._parse(
+        '{"claims":{"then":"Email already registered가 표시된다."},"values":[{"field":"email","value":"duplicate@example.com","type":"string","purpose":"코드 기반","source":"code"}],"confidence":0.93}'
+    )
+    assert parsed["claims"]["then"] == "Email already registered가 표시된다."
+    assert parsed["values"][0]["source"] == "code"
+    assert parsed["confidence"] == 0.93

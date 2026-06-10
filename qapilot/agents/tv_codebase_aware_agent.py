@@ -142,6 +142,7 @@ def _extract_json(text: str) -> str:
 _EXISTING_HINTS = ("이미", "존재", "duplicate", "409", "conflict", "있는", "기존")
 # "신규" / "없는" / "new" / "201" / "Created" → expects_absent
 _ABSENT_HINTS = ("신규", "없는", "new", "201", "created", "처음", "최초")
+_PLACEHOLDER_RE = re.compile(r"\{[^{}]+\}")
 
 
 def _infer_scenario_intent(tc: dict) -> dict:
@@ -232,7 +233,9 @@ class TVFromCodebaseAgent(BaseAgent):
 
         last_validation: ValidationResult | None = None
         llm_values: list[dict] = []
+        resolved_claims: dict[str, str] = {}
         confidence = 0.5
+        unresolved_claims = _collect_unresolved_claims(tc)
 
         for attempt in range(_MAX_RETRY + 1):
             feedback = self._build_feedback(last_validation)
@@ -244,6 +247,7 @@ class TVFromCodebaseAgent(BaseAgent):
                 tc_given=str(tc.get("given", "")),
                 tc_when=str(tc.get("when", "")),
                 tc_then=str(tc.get("then", "")),
+                unresolved_claims=_format_unresolved_claims(unresolved_claims),
                 existing_values=_format_existing_values(tc.get("values") or []),
                 schemas=_format_dict_compact(sanitized_schemas),
                 selectors=_format_dict_compact(filtered["selectors"]),
@@ -260,6 +264,7 @@ class TVFromCodebaseAgent(BaseAgent):
 
             parsed = self._parse(response.content)
             llm_values = parsed["values"]
+            resolved_claims = parsed["claims"]
             confidence = parsed["confidence"]
 
             # 검증 — values 의 각 field 마다 TVValidator 호출
@@ -276,6 +281,7 @@ class TVFromCodebaseAgent(BaseAgent):
         return ExecuteResult(
             result={
                 "values": merged_values,
+                "claims": resolved_claims,
                 "validation_passed": (last_validation.valid if last_validation else False),
                 "validation_reasons": (
                     last_validation.reasons if last_validation and not last_validation.valid else []
@@ -295,9 +301,10 @@ class TVFromCodebaseAgent(BaseAgent):
                 "tv_codebase_aware_parse_error",
                 error=str(e), raw=content[:300],
             )
-            return {"values": [], "confidence": 0.0}
+            return {"values": [], "claims": {}, "confidence": 0.0}
 
         raw_values = data.get("values") or []
+        raw_claims = data.get("claims") or {}
         valid: list[dict] = []
         for v in raw_values:
             if not isinstance(v, dict) or not v.get("field"):
@@ -309,7 +316,12 @@ class TVFromCodebaseAgent(BaseAgent):
                 "purpose": str(v.get("purpose", "")),
                 "source": str(v.get("source", "llm")),
             })
-        return {"values": valid, "confidence": float(data.get("confidence", 0.7))}
+        claims: dict[str, str] = {}
+        if isinstance(raw_claims, dict):
+            for key in ("given", "when", "then"):
+                if raw_claims.get(key) is not None:
+                    claims[key] = str(raw_claims.get(key) or "")
+        return {"values": valid, "claims": claims, "confidence": float(data.get("confidence", 0.7))}
 
     def _validate_values(
         self,
@@ -371,3 +383,18 @@ def _build_type_hint_map(schemas: dict[str, Any]) -> dict[str, str]:
             if name and ctype and name not in out:
                 out[name] = ctype
     return out
+
+
+def _collect_unresolved_claims(tc: dict[str, Any]) -> dict[str, str]:
+    unresolved: dict[str, str] = {}
+    for key in ("given", "when", "then"):
+        text = str(tc.get(key, "") or "")
+        if _PLACEHOLDER_RE.search(text):
+            unresolved[key] = text
+    return unresolved
+
+
+def _format_unresolved_claims(claims: dict[str, str]) -> str:
+    if not claims:
+        return "없음"
+    return _format_dict_compact(claims, max_chars=1000)

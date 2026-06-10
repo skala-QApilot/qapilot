@@ -182,7 +182,10 @@ def build_sensitive_value_entries(
             "value": make_placeholder(fname),
             "type": type_hint_map.get(fname, "string"),
             "purpose": "민감 정보 — 액션매핑 시점에 환경변수에서 가져옴",
+            "status": "placeholder",
             "source": "placeholder",
+            "evidence_refs": [],
+            "unresolved": False,
             "sensitive": True,
         })
     return out
