@@ -22,7 +22,7 @@
 
 | 옵션 | 동작 | 위험 |
 |---|---|---|
-| α (채택) | sensitive 필드를 LLM 컨텍스트에서 완전 제외. TC.values 에는 `${TEST_PASSWORD}` placeholder | 가장 안전 |
+| α (채택) | sensitive 필드를 LLM 컨텍스트에서 완전 제외. TC.values 에는 `process.env.TEST_PASSWORD` placeholder | 가장 안전 |
 | β | LLM 에 마스킹된 형태 (예: `***`) 보임 + 응답 unmask | **PR #256 본질** — LLM 이 `***` 그대로 응답에 박을 위험 |
 | γ | 마스킹 안 함 — 실제 password LLM 노출 | 데이터 누출 + 학습 흡수 |
 
@@ -86,12 +86,12 @@ if generated_codes:
 
 ### 본 작업이 그대로 활용
 
-본 작업의 TC.values 에 들어가는 placeholder (`${TEST_PASSWORD}`) 는 PR #256 의 ActionMapping fallback 으로 실행 시 실제 값이 들어간다.
+본 작업의 TC.values 에 들어가는 placeholder (`process.env.TEST_PASSWORD`) 는 PR #256 의 ActionMapping fallback 으로 실행 시 실제 값이 들어간다.
 
 ```
-TC.values: [{field: password, value: ${TEST_PASSWORD}, sensitive: true}]
+TC.values: [{field: password, value: process.env.TEST_PASSWORD, sensitive: true}]
   ↓ (액션매핑 단계)
-ActionMapping.steps[]: [{value: ${TEST_PASSWORD}}]
+ActionMapping.steps[]: [{value: process.env.TEST_PASSWORD}]
   ↓ (CodeGenerator → generated_code)
 generated_code.js: await page.getByTestId("password").fill(process.env.TEST_PASSWORD)
   ↓ (실행 시점 — pipeline._resolve_js_value)
@@ -107,7 +107,7 @@ form.password.fill("actual_password") — HTML5 검증 통과
 ## 4. 운영 시점 추가 권장
 
 ### 4.1 환경변수 명명 규칙
-TC.values 의 sensitive placeholder = `${TEST_<FIELD_UPPERCASE>}` 형식.
+TC.values 의 sensitive placeholder = `process.env.TEST_<FIELD_UPPERCASE>` 형식.
 운영 환경에서 다음 환경변수 등록 필요:
 - `TEST_PASSWORD`
 - `TEST_API_KEY`
@@ -145,6 +145,6 @@ LLM provider 의 데이터 보존 정책 확인 권장 (OpenAI 의 경우 API �
 mini-bss-lite 의 `backend/app/models.py` 의 `Customer.password_hash` 가 sensitive 로 자동 마킹된다 (`backend_schema_parser` 의 `password` 키워드 휴리스틱).
 
 본 작업 e2e 실행 후 산출물:
-- TC.values 의 password 필드가 `${TEST_PASSWORD}` 인지 확인
+- TC.values 의 password 필드가 `process.env.TEST_PASSWORD` 인지 확인
 - LLM prompt 의 schemas dict 에 password 가 없는지 확인 (로그)
 - DB snapshot 에 password_hash 가 없는지 확인 (로그)

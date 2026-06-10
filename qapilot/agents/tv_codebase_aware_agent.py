@@ -11,7 +11,7 @@ LLM 호출 → TVValidator 검증 → invalid 면 한두 번 재시도.
 
 sensitive 필드 처리 (Option α — PR #256 본질 재발 방지):
 - sensitive 필드는 LLM 컨텍스트에서 완전 제외
-- TC.values 에는 placeholder ($TEST_PASSWORD 등) 로 저장
+- TC.values 에는 placeholder (process.env.TEST_PASSWORD 등) 로 저장
 - 액션매핑 단계의 PR #256 fallback 으로 실행 시 실제 값 주입
 """
 
