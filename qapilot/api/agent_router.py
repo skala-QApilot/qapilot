@@ -158,8 +158,12 @@ def _revoke_pipeline(trace_id: str) -> bool:
 async def scenario_generation(request: Request, body: ScenarioGenerationRequestBody) -> Any:
     """시나리오 생성 파이프라인을 실행한다.
 
-    `tc_target_ts_ids` 필드가 제공된 경우(빈 리스트 포함) PRD-only 실험 파이프라인
-    (prd_only_experiment)을 실행한다. 미제공 시 일반 generate_scenarios 파이프라인을 실행한다.
+    분기 정책 (PR #277 부터 — SaaS 본질 흐름 default):
+    1. `tc_target_ts_ids` 명시 제공 (빈 리스트 포함) → `prd_only_experiment` (디버깅/특정 TS 지정용)
+    2. 그 외 `trigger="init"` → `prd_only_experiment` **default** (SaaS UI 흐름 — TV codebase-aware
+       + 본인 데이터 layer 5 public API 활용. 시나리오 품질 향상)
+    3. `trigger="code_change"` / `doc_update"` / `natural_lang"` → 기존 `generate_scenarios`
+       (증분 스캔 / 챗봇 응답 등 — `prd_only_experiment` 와 다른 의미)
     """
     body_dict = body.model_dump(exclude_none=True)
 
@@ -183,12 +187,29 @@ async def scenario_generation(request: Request, body: ScenarioGenerationRequestB
         _inject_git_options(body_dict, options)
         return _start_pipeline(request, body_dict, options)
 
-    # 일반 시나리오 생성 모드
+    # 일반 시나리오 생성 모드 진입 — trigger 분기 전에 init default 처리
     error = _validate_scenario_generation(body_dict)
     if error:
         return error
 
     trigger = _scenario_trigger(body_dict)
+
+    # PR #277: SaaS UI 흐름의 init trigger 는 prd_only_experiment 로 자동 진입.
+    # 본인 PR #269 의 TV codebase-aware 노드 + 5 public API (scan_all_metadata /
+    # load_metadata_index / load_source / get_db_snapshot_cached / TVValidator) 실 활용.
+    # code_change / doc_update / natural_lang 은 증분 또는 챗봇 흐름이라 기존 generate_scenarios 유지.
+    if trigger == "init":
+        options: RunOptions = {
+            "command": "prd_only_experiment",
+            "trigger": "init",
+            "user_input": None,
+            "scenario_ids": None,
+            "filter": None,
+            "tags": None,
+            "tc_target_ts_ids": [],  # 빈 리스트 = 전체 TS 대상
+        }
+        _inject_git_options(body_dict, options)
+        return _start_pipeline(request, body_dict, options)
     session_id = _optional_str(body_dict, "session_id")
     if trigger == "natural_lang" and not session_id:
         session_id = new_session_id()
