@@ -269,8 +269,9 @@ def _resolve_project_root(state: PipelineState) -> Path | None:
     """frontend 스캔용 SUT 루트를 추론한다.
 
     우선순위:
-    1) qapilot.config.yaml 의 project.root / repo_path
-    2) state.qapilot_dir 가 `<root>/.qapilot[/service]` 형태일 때 `<root>`
+    1) qapilot.config.yaml 의 project.root / repo_path (CLI 흐름)
+    2) state.target_root (SaaS 흐름 — Spring 이 body 로 보낸 service.target_root)
+    3) state.qapilot_dir 가 `<root>/.qapilot[/service]` 형태일 때 `<root>` (legacy fallback)
     """
     from qapilot.shared.config import load_config
 
@@ -280,6 +281,12 @@ def _resolve_project_root(state: PipelineState) -> Path | None:
             path = Path(raw).expanduser().resolve()
             if path.is_dir():
                 return path
+
+    target_root = state.get("target_root")
+    if target_root:
+        path = Path(target_root).expanduser().resolve()
+        if path.is_dir():
+            return path
 
     qapilot_dir = state.get("qapilot_dir")
     if not qapilot_dir:
