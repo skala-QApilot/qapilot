@@ -11,6 +11,7 @@ from qapilot.shared.metadata_filters import (
     filter_patterns_by_req_id,
     filter_schemas_by_api,
     filter_selectors_by_route,
+    find_endpoint_function_range,
     pick_source_files_for_tc,
     pick_table_for_tc,
 )
@@ -385,6 +386,95 @@ def test_pick_source_files_no_api():
     """api 없으면 router 추측 X — schemas/db_models 기반만."""
     out = pick_source_files_for_tc({"name": "x"}, schemas=None)
     assert out == []
+
+
+# ────────────────────────────────────────────────────────────────────────
+# find_endpoint_function_range — router 파일 안 endpoint 함수 정확 line range
+# ────────────────────────────────────────────────────────────────────────
+
+_SAMPLE_ROUTER = '''from fastapi import APIRouter, Depends
+from app.deps import get_db
+
+router = APIRouter()
+
+
+@router.post("/signup", response_model=CustomerOut)
+def signup(payload: SignupRequest, db = Depends(get_db)):
+    existing = db.scalar(...)
+    if existing:
+        raise HTTPException(409, "이미 가입됨")
+    customer = Customer(email=payload.email)
+    db.add(customer)
+    db.commit()
+    return customer
+
+
+@router.post("/login")
+def login(payload: LoginRequest):
+    return {"token": "abc"}
+
+
+@router.get("/me")
+def me():
+    return {"id": 1}
+'''
+
+
+def test_find_endpoint_range_signup():
+    """POST /signup → signup 함수만 정확히 추출."""
+    result = find_endpoint_function_range(_SAMPLE_ROUTER, "POST /api/auth/signup")
+    assert result is not None
+    ls, le = result
+    sliced = "\n".join(_SAMPLE_ROUTER.splitlines()[ls - 1:le])
+    assert "def signup" in sliced
+    assert "def login" not in sliced
+    assert "def me" not in sliced
+
+
+def test_find_endpoint_range_login():
+    """POST /login → login 함수만."""
+    result = find_endpoint_function_range(_SAMPLE_ROUTER, "POST /api/auth/login")
+    assert result is not None
+    ls, le = result
+    sliced = "\n".join(_SAMPLE_ROUTER.splitlines()[ls - 1:le])
+    assert "def login" in sliced
+    assert "def signup" not in sliced
+
+
+def test_find_endpoint_range_get_me():
+    """GET /me → me 함수만."""
+    result = find_endpoint_function_range(_SAMPLE_ROUTER, "GET /api/auth/me")
+    assert result is not None
+    ls, le = result
+    sliced = "\n".join(_SAMPLE_ROUTER.splitlines()[ls - 1:le])
+    assert "def me" in sliced
+    assert "def signup" not in sliced
+
+
+def test_find_endpoint_range_no_match():
+    """다른 endpoint 는 None."""
+    assert find_endpoint_function_range(_SAMPLE_ROUTER, "POST /api/nonexistent") is None
+
+
+def test_find_endpoint_range_method_mismatch():
+    """method 불일치 시 None."""
+    # signup 은 POST 인데 GET 요청
+    assert find_endpoint_function_range(_SAMPLE_ROUTER, "GET /api/auth/signup") is None
+
+
+def test_find_endpoint_range_empty_input():
+    assert find_endpoint_function_range("", "POST /signup") is None
+    assert find_endpoint_function_range(_SAMPLE_ROUTER, None) is None
+    assert find_endpoint_function_range(_SAMPLE_ROUTER, "") is None
+
+
+def test_find_endpoint_range_signup_reduces_size():
+    """signup 만 잘라낸 결과가 전체 router 보다 명확히 작음."""
+    result = find_endpoint_function_range(_SAMPLE_ROUTER, "POST /api/auth/signup")
+    ls, le = result
+    sliced = "\n".join(_SAMPLE_ROUTER.splitlines()[ls - 1:le])
+    # signup 본문만 ≈ 전체의 절반 이하
+    assert len(sliced) < len(_SAMPLE_ROUTER) * 0.6
 
 
 def test_pick_source_files_max_files_limit():

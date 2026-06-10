@@ -232,6 +232,74 @@ def filter_patterns_by_req_id(
 # 통합 helper — TC 1개 → 필터된 4영역 메타데이터
 # ────────────────────────────────────────────────────────────────────────
 
+def find_endpoint_function_range(
+    source_content: str,
+    api: str | None,
+) -> tuple[int, int] | None:
+    """FastAPI router 파일 본문에서 TC.api 에 매칭되는 endpoint 함수의 line range 찾기.
+
+    매칭 패턴:
+        @router.<method>("<path>"[, ...])  ← decorator
+        def <function_name>(...):           ← 함수 시작
+            ...
+            <line 1>
+            <line 2>
+            ...                              ← 함수 본문 (다음 @router 또는 다음 top-level def 까지)
+
+    Args:
+        source_content: router 파일 전체 본문 (load_source 결과).
+        api: TC.api (예: "POST /api/auth/signup").
+
+    Returns:
+        (line_start, line_end) 1-based inclusive. 매칭 실패 시 None.
+        line_start = `@router...` decorator 의 line
+        line_end = 함수 본문의 마지막 line
+    """
+    if not source_content or not api:
+        return None
+    method, path = _parse_api(api)
+    if not method or not path:
+        return None
+
+    # API path 의 last segment 만 매칭 (router prefix 무시)
+    # 예: "/api/auth/signup" → "/signup" 만 매칭 (FastAPI router 안 path 는 보통 prefix 제외)
+    last_seg = "/" + _last_segment(path)
+
+    lines = source_content.splitlines()
+    method_lower = method.lower()
+    # 1. @router.<method>("<path>"...) decorator 위치 찾기
+    decorator_pattern = re.compile(
+        rf'@router\.{method_lower}\s*\(\s*["\']({re.escape(path)}|{re.escape(last_seg)})["\']',
+        re.IGNORECASE,
+    )
+    decorator_line = -1
+    for i, line in enumerate(lines):
+        if decorator_pattern.search(line):
+            decorator_line = i
+            break
+    if decorator_line < 0:
+        return None
+
+    # 2. decorator 다음 def 찾기 (보통 다음 줄 또는 가까운 줄)
+    func_line = -1
+    for i in range(decorator_line + 1, min(decorator_line + 5, len(lines))):
+        if re.match(r"\s*def\s+\w+", lines[i]):
+            func_line = i
+            break
+    if func_line < 0:
+        return None
+
+    # 3. 함수 본문 끝 찾기 — 다음 @router 또는 다음 top-level def 또는 EOF
+    end_line = len(lines) - 1
+    for j in range(func_line + 1, len(lines)):
+        stripped = lines[j].lstrip()
+        if stripped.startswith("@router") or re.match(r"^def\s+\w+", lines[j]):
+            end_line = j - 1
+            break
+
+    return (decorator_line + 1, end_line + 1)  # 1-based
+
+
 def pick_source_files_for_tc(
     tc: dict[str, Any],
     *,
