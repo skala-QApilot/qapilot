@@ -382,6 +382,19 @@ def test_전역_api_null_채움은_요구사항_매핑_api만_사용한다():
     assert scenarios[0]["test_cases"][0]["api"] == "PATCH /api/orders/{order_id}/change-plan"
 
 
+def test_get_full_ep_path는_api_절대경로에_prefix를_중복하지_않는다():
+    agent = ScenarioGeneratorAgent(trace_id="test-trace")
+
+    ep = {
+        "method": "PATCH",
+        "path": "/api/orders/{order_id}/change-plan",
+        "file": "backend/app/routers/orders.py",
+        "handler": "change_order_plan",
+    }
+
+    assert agent._get_full_ep_path(ep) == "PATCH /api/orders/{order_id}/change-plan"
+
+
 def test_요구사항_분리에서_API검증_불가_NFR은_제외된다():
     """성능/가용성 NFR은 제외하고 X-Trace-Id는 API 검증 대상으로 남긴다."""
     agent = ScenarioGeneratorAgent(trace_id="test-trace")

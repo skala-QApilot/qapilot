@@ -1692,6 +1692,7 @@ async def _save_scenarios(state: PipelineState) -> dict:
         logger.info("save_scenarios_skipped", query_status=query_status)
         return {
             "saved_scenario_paths": [],
+            "saved_local_mirror_paths": [],
             "status": "completed",
             "query_status": query_status,
             "query_feedback": state.get("query_feedback"),
@@ -1707,6 +1708,8 @@ async def _save_scenarios(state: PipelineState) -> dict:
 
     trigger = state["run_options"].get("trigger") or "init"
     saved_paths: list[str] = []
+    local_mirror_paths: list[str] = []
+    local_mirror_paths: list[str] = []
     # service_id 는 trace.json 에서 — Spring 이 create_trace 시점에 넣어둔 값.
     trace = load_trace(state["trace_id"]) or {}
     service_id = trace.get("service_id")
@@ -1783,6 +1786,10 @@ async def _save_scenarios(state: PipelineState) -> dict:
             if service_id:
                 payload = _ensure_payload_dict(ts)
                 upsert_scenario_version(service_id, ts_id, payload)
+                _upload_scenario_json_to_s3(service_id, ts_id, payload)
+                mirror_path = _write_scenario_local_mirror(service_id, ts_id, payload)
+                if mirror_path:
+                    local_mirror_paths.append(mirror_path)
                 await _upsert_scenario_index(service_id, payload)
                 if not is_unchanged:
                     upsert_change_request(
@@ -1830,6 +1837,10 @@ async def _save_scenarios(state: PipelineState) -> dict:
             if service_id:
                 payload = _ensure_payload_dict(ts)
                 upsert_scenario_version(service_id, ts_id, payload)
+                _upload_scenario_json_to_s3(service_id, ts_id, payload)
+                mirror_path = _write_scenario_local_mirror(service_id, ts_id, payload)
+                if mirror_path:
+                    local_mirror_paths.append(mirror_path)
                 await _upsert_scenario_index(service_id, payload)
                 # code_change/doc_update 로 (재)생성된 시나리오는 AI 변경 요청으로 등록해
                 # 목록에 "AI 생성" 표시(검토 대기) 가 뜨도록 한다 — natural_lang(chatbot) 과
@@ -1924,6 +1935,7 @@ async def _save_scenarios(state: PipelineState) -> dict:
 
     result: dict = {
         "saved_scenario_paths": saved_paths,
+        "saved_local_mirror_paths": local_mirror_paths,
         "status": "completed",
     }
     if trigger == "natural_lang" and change_summary:
@@ -3941,6 +3953,44 @@ def _contains_placeholder_value(value: Any) -> bool:
     return isinstance(value, str) and bool(re.search(r"\{[^{}]+\}", value))
 
 
+def _upload_scenario_json_to_s3(service_id: str | None, ts_id: str, payload: dict) -> None:
+    """최신 scenario JSON 을 S3 `services/{service_id}/scenarios/{ts_id}.json` 에 업로드."""
+    if not (service_id and ts_id):
+        return
+    body = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+    key = f"services/{service_id}/scenarios/{ts_id}.json"
+    result = s3_client.put_bytes(key, body, "application/json")
+    if result is None:
+        logger.warning("scenario_s3_upload_failed", service_id=service_id, ts_id=ts_id, key=key)
+    else:
+        logger.info("scenario_s3_uploaded", service_id=service_id, ts_id=ts_id, key=key, bytes=result["bytes"])
+
+
+def _repo_root_for_local_mirror() -> Path | None:
+    """`qapilot-local/services/...` 미러를 쓸 repo root 를 추론한다."""
+    current = Path(__file__).resolve()
+    markers = ("QApilot-UI", "qapilot-server", "qapilot")
+    for parent in current.parents:
+        if all((parent / marker).exists() for marker in markers):
+            return parent
+    return None
+
+
+def _write_scenario_local_mirror(service_id: str | None, ts_id: str, payload: dict) -> str | None:
+    """최종 scenario JSON 을 `qapilot-local/services/{service_id}/scenarios` 에도 저장."""
+    if not (service_id and ts_id):
+        return None
+    repo_root = _repo_root_for_local_mirror()
+    if repo_root is None:
+        logger.warning("scenario_local_mirror_root_unresolved", service_id=service_id, ts_id=ts_id)
+        return None
+    target = repo_root / "qapilot-local" / "services" / service_id / "scenarios" / f"{ts_id}.json"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    logger.info("scenario_local_mirror_written", service_id=service_id, ts_id=ts_id, path=str(target))
+    return str(target)
+
+
 async def _save_experiment_scenarios(state: PipelineState) -> dict:
     """ts_list + tc_by_ts_index를 병합해 최종 시나리오 파일로 디스크·DB 저장."""
     ts_list = state.get("ts_list") or []
@@ -3952,6 +4002,7 @@ async def _save_experiment_scenarios(state: PipelineState) -> dict:
     scenarios_dir = _qapilot_path(state, "scenarios")
     scenarios_dir.mkdir(parents=True, exist_ok=True)
     saved_paths: list[str] = []
+    local_mirror_paths: list[str] = []
     merged_scenarios: list[dict] = []
 
     for i, ts_item in enumerate(ts_list):
@@ -3978,9 +4029,14 @@ async def _save_experiment_scenarios(state: PipelineState) -> dict:
         merged_scenarios.append(ts)
         if service_id:
             upsert_scenario_version(service_id, ts_id, ts)
+            _upload_scenario_json_to_s3(service_id, ts_id, ts)
+            mirror_path = _write_scenario_local_mirror(service_id, ts_id, ts)
+            if mirror_path:
+                local_mirror_paths.append(mirror_path)
 
     return {
         "scenarios": merged_scenarios,
         "saved_scenario_paths": saved_paths,
+        "saved_local_mirror_paths": local_mirror_paths,
         "status": "completed",
     }

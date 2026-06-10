@@ -41,3 +41,87 @@ def test_parse_marks_unresolved_claims_and_values():
     assert tc["values"][0]["status"] == "unresolved"
     assert tc["values"][0]["source"] == "doc_draft"
     assert tc["values"][1]["status"] == "grounded_doc"
+
+
+def test_parse_preserves_channel_prefixed_then():
+    agent = TCFromDocsAgent(trace_id="tc-doc-search-test")
+    payload = {
+        "analysis": [],
+        "confidence": 0.81,
+        "test_cases": [
+            {
+                "name": "회원가입 성공",
+                "technique": "동등 분할",
+                "given": "사용자가 유효한 가입 정보를 입력한다.",
+                "when": "회원가입을 완료한다.",
+                "then": "UI) 이메일, 이름, 가입 일자가 표시된다.\nDB) users에 사용자 정보가 저장된다.",
+                "values": [],
+                "tags": ["normal"],
+                "sources": ["PRD_v1.0.md"],
+                "depends_on": [],
+            }
+        ],
+    }
+
+    test_cases, _analysis, confidence = agent._parse(json.dumps(payload, ensure_ascii=False))
+
+    assert confidence == 0.81
+    assert test_cases[0]["then"] == (
+        "UI) 이메일, 이름, 가입 일자가 표시된다.\n"
+        "DB) users에 사용자 정보가 저장된다."
+    )
+    assert test_cases[0]["then_status"] == "grounded_doc"
+
+
+def test_parse_aligns_api_with_when_inline_endpoint():
+    agent = TCFromDocsAgent(trace_id="tc-doc-search-test")
+    payload = {
+        "analysis": [],
+        "confidence": 0.79,
+        "test_cases": [
+            {
+                "name": "요금제 변경",
+                "technique": "상태 전이",
+                "given": "사용자가 유효한 주문을 가지고 있다.",
+                "when": "PATCH /api/orders/{order_id}/change-plan 엔드포인트로 요금제 변경 요청을 하면",
+                "then": "API) 변경된 주문 정보가 반환된다.",
+                "values": [],
+                "tags": ["normal"],
+                "api": "PATCH /api/orders/api/orders/{order_id}/cancel",
+                "sources": ["PRD_v4.0.md"],
+                "depends_on": [],
+            }
+        ],
+    }
+
+    test_cases, _analysis, confidence = agent._parse(json.dumps(payload, ensure_ascii=False))
+
+    assert confidence == 0.79
+    assert test_cases[0]["api"] == "PATCH /api/orders/{order_id}/change-plan"
+
+
+def test_parse_dedupes_duplicated_api_prefix_without_when_inline_endpoint():
+    agent = TCFromDocsAgent(trace_id="tc-doc-search-test")
+    payload = {
+        "analysis": [],
+        "confidence": 0.75,
+        "test_cases": [
+            {
+                "name": "주문 생성",
+                "technique": "동등 분할",
+                "given": "사용자가 유효한 정보를 입력한다.",
+                "when": "주문 생성을 요청한다.",
+                "then": "API) 생성된 주문 정보가 반환된다.",
+                "values": [],
+                "tags": ["normal"],
+                "api": "POST /api/orders/api/orders",
+                "sources": ["PRD_v4.0.md"],
+                "depends_on": [],
+            }
+        ],
+    }
+
+    test_cases, _analysis, confidence = agent._parse(json.dumps(payload, ensure_ascii=False))
+
+    assert confidence == 0.75
+    assert test_cases[0]["api"] == "POST /api/orders"

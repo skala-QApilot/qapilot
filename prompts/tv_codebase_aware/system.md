@@ -48,6 +48,10 @@ TC 가 진짜로 실행될 때 통과할 수 있는 값을 만든다.
 ```
 
 ⚠️ `claims` 는 unresolved placeholder 가 실제 코드 근거로 해소될 때만 넣어라. 근거가 없으면 key 를 비워 두거나 생략하라.
+⚠️ `claims.then` 은 `UI)`, `API)`, `DB)` 접두어를 사용해 필요한 assertion만 적는다.
+⚠️ 여러 backend 를 구분해야 하면 `API[service-name])` 형식을 사용해도 된다.
+⚠️ 여러 저장소/스키마를 구분해야 하면 `DB[schema-or-store])` 형식을 사용해도 된다.
+API 응답 검증이 불필요하면 `API)`를 쓰지 말고, DB 변경 검증이 불필요하면 `DB)`를 쓰지 마라.
 ⚠️ **출력에 sensitive 필드 (password / token / secret 등) 절대 포함하지 마라.**
 이런 필드는 시스템이 별도로 placeholder 로 처리한다. 본 응답에 넣으면 무시되고 덮어써진다.
 

@@ -60,6 +60,10 @@
 이 규칙은 `given/when/then`에도 동일하게 적용된다. 특히 에러 메시지, HTTP 상태코드,
 중복 데이터 값, 토큰 값처럼 실행/코드/DB를 봐야 아는 내용은 확정형 문장으로 쓰지 말고
 `{중복 이메일 오류 메시지}`, `{HTTP 상태코드}`, `{duplicate email}`처럼 남겨라.
+`then`은 한 문자열 안에 채널별 결과를 `UI)`, `API)`, `DB)` 접두어로 구분해 작성한다.
+여러 backend 를 구분해야 하면 `API[service-name])` 형식을 사용해도 된다.
+여러 저장소/스키마를 구분해야 하면 `DB[schema-or-store])` 형식을 사용해도 된다.
+필요한 채널만 포함하고, 여러 채널이 필요하면 줄바꿈(`\n`)으로 구분한다.
 
 적용 기준:
 - 문서에 해당 필드 자체가 언급되지 않은 경우 → `{필드 설명}` (예: `{생년월일 YYYY-MM-DD}`)
@@ -75,6 +79,12 @@
 ## 규칙
 - 문서·요구사항에 없는 동작을 추측하거나 발명하지 마라.
 - Given-When-Then은 **완전한 한국어 문장**으로 작성한다.
+- `when` 안에 `METHOD /api/...` 엔드포인트를 적었다면 `api` 필드는 그 값과 정확히 동일해야 한다.
+- `api` 에 `/api/orders/api/orders` 같은 중복 prefix 를 만들지 마라.
+- `then`은 `UI)`, `API)`, `DB)` 접두어를 사용해 필요한 assertion만 기록한다.
+- 여러 backend가 문서에 명시되어 있으면 `API[service-name])` 형식으로 구분해도 된다.
+- 여러 DB/schema/store 가 문서에 명시되어 있으면 `DB[schema-or-store])` 형식으로 구분해도 된다.
+- API 응답 검증이 불필요하면 `API)`를 쓰지 말고, DB 상태 변경 검증이 불필요하면 `DB)`를 쓰지 마라.
 - **TC 유형별 최소 개수 (총 최소 6개)**:
   - normal: 2개 이상
   - edge_case: 2개 이상
@@ -104,7 +114,7 @@
       "technique": "string",
       "given": "string",
       "when": "string",
-      "then": "string",
+      "then": "UI) string\\nAPI) string\\nAPI[auth-service]) string\\nDB) string\\nDB[user-db]) string",
       "values": [
         {"field": "string", "value": "string | {설명}", "type": "string", "purpose": "string"}
       ],

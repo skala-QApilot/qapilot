@@ -145,3 +145,15 @@ def test_parse_claims_and_values():
     assert parsed["claims"]["then"] == "Email already registered가 표시된다."
     assert parsed["values"][0]["source"] == "code"
     assert parsed["confidence"] == 0.93
+
+
+def test_parse_preserves_channel_prefixed_then_claim():
+    agent = TVFromCodebaseAgent(trace_id="tv-parse")
+    parsed = agent._parse(
+        '{"claims":{"then":"UI) 이메일, 이름, 가입 일자가 표시된다.\\nDB) users에 사용자 정보가 저장된다."},"values":[],"confidence":0.91}'
+    )
+    assert parsed["claims"]["then"] == (
+        "UI) 이메일, 이름, 가입 일자가 표시된다.\n"
+        "DB) users에 사용자 정보가 저장된다."
+    )
+    assert parsed["confidence"] == 0.91

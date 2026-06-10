@@ -15,6 +15,8 @@ from qapilot.agents.base_agent import BaseAgent
 from qapilot.shared.schemas import ExecuteResult
 
 _PLACEHOLDER_TOKEN_RE = re.compile(r"\{[^{}]+\}")
+_INLINE_API_RE = re.compile(r"\b(GET|POST|PUT|PATCH|DELETE)\s+(/api/[^\s,\)\]]+)", re.IGNORECASE)
+_API_VALUE_RE = re.compile(r"^\s*(GET|POST|PUT|PATCH|DELETE)\s+(/\S+)\s*$", re.IGNORECASE)
 
 
 def _format_requirements(requirements: list[str]) -> str:
@@ -67,6 +69,46 @@ def _extract_json(text: str) -> str:
             if depth == 0:
                 return text[start : i + 1]
     return text[start:]
+
+
+def _dedupe_api_prefix(path: str) -> str:
+    cleaned = path.strip()
+    while True:
+        prefix_match = re.match(r"^(/api/[^/]+)", cleaned)
+        if not prefix_match:
+            return cleaned
+        prefix = prefix_match.group(1)
+        remainder = cleaned[len(prefix):]
+        if not remainder.startswith(prefix):
+            return cleaned
+        cleaned = prefix + remainder[len(prefix):]
+
+
+def _normalize_api_value(api: Any) -> str | None:
+    if api is None:
+        return None
+    text = str(api).strip()
+    if not text or text.lower() == "null":
+        return None
+    m = _API_VALUE_RE.match(text)
+    if not m:
+        return text
+    return f"{m.group(1).upper()} {_dedupe_api_prefix(m.group(2))}"
+
+
+def _extract_inline_api(text: str) -> str | None:
+    m = _INLINE_API_RE.search(text or "")
+    if not m:
+        return None
+    return f"{m.group(1).upper()} {_dedupe_api_prefix(m.group(2))}"
+
+
+def _align_tc_api_fields(tc: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(tc)
+    inline_api = _extract_inline_api(str(normalized.get("when", "") or ""))
+    api = _normalize_api_value(normalized.get("api"))
+    normalized["api"] = inline_api or api
+    return normalized
 
 
 class TCFromDocsAgent(BaseAgent):
@@ -125,6 +167,7 @@ class TCFromDocsAgent(BaseAgent):
         for tc in raw_tcs:
             if not isinstance(tc, dict) or not tc.get("name"):
                 continue
+            tc = _align_tc_api_fields(tc)
             sources = tc.get("sources") or []
             given = str(tc.get("given", ""))
             when = str(tc.get("when", ""))
