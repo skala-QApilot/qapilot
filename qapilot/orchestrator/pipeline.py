@@ -968,9 +968,26 @@ async def _codebase_scan(state: PipelineState) -> dict:
     # L2: spec §6.1 정합 디스크 캐시 (Tool 본체 무수정)
     _save_codebase_index_to_disk(scan, state)
 
+    # SaaS 흐름 — Git mode 의 임시 dir dump path 자동 주입.
+    # GitCodebaseScannerTool 이 REST API 로 받은 file content 를 임시 dir 에 reconstruct
+    # 한 결과. 사용자가 등록 시 GitHub repo URL 만 입력하면 8001 내부에서 본인 데이터
+    # layer 의 scan_all_metadata 가 동작할 수 있는 본질적 path. state.target_root 우선순위
+    # 는 cfg → state.target_root → state.qapilot_dir derive 순 (CLI 우선, SaaS 자동 주입).
+    git_temp_repo_root = (result.result.get("_metadata") or {}).get("temp_repo_root")
+
     # metadata-index (PoC 10): 4영역 AST 추출 → S3/DB
     if scan:
-        _project_root = _resolve_project_root(state)
+        # Git mode 의 임시 dir 이 있으면 그것 우선 사용 (SaaS 본질),
+        # 없으면 기존 _resolve_project_root (CLI cfg / state.target_root / qapilot_dir derive)
+        if git_temp_repo_root:
+            _project_root = Path(git_temp_repo_root)
+            logger.info(
+                "metadata_index_using_git_temp_repo_root",
+                path=str(_project_root),
+            )
+        else:
+            _project_root = _resolve_project_root(state)
+
         if _project_root is not None:
             _trace = load_trace(state["trace_id"]) or {}
             _service_id = _trace.get("service_id")
@@ -990,11 +1007,16 @@ async def _codebase_scan(state: PipelineState) -> dict:
                 except Exception as _e:
                     logger.warning("metadata_index_failed", error=str(_e))
 
-    return {
+    return_dict: dict[str, Any] = {
         "trace_id": trace_id,
         "scan_result": scan,
         "current_layer": "L1A",
     }
+    # 후속 노드도 git temp dir 활용 가능하도록 state.target_root 갱신.
+    # CLI cfg / 사용자 명시 target_root 우선순위는 _resolve_project_root 가 관리.
+    if git_temp_repo_root:
+        return_dict["target_root"] = git_temp_repo_root
+    return return_dict
 
 
 async def _domain_knowledge(state: PipelineState) -> dict:
