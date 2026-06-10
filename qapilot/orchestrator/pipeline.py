@@ -3599,9 +3599,15 @@ async def _tc_generate_doc_search(state: PipelineState) -> dict:
     trace = load_trace(trace_id) or {}
     service_id = trace.get("service_id")
 
-    raw_targets = run_opts.get("tc_target_ts_ids") or []
-    if not raw_targets:
+    # tc_target_ts_ids 의미 구분 (PR #278 부터):
+    # - None / 미주입 → 기존 default (처음 2 TS만 — CLI / dev 디버깅 용)
+    # - [] 빈 리스트 → 전체 TS 처리 (SaaS UI 흐름 — PR #277 자동 진입에서 채움)
+    # - [TS-x, ...] 명시 리스트 → 지정 TS만 (디버깅)
+    raw_targets = run_opts.get("tc_target_ts_ids")
+    if raw_targets is None:
         target_indices = list(range(min(2, len(ts_list))))
+    elif len(raw_targets) == 0:
+        target_indices = list(range(len(ts_list)))  # 전체 TS
     else:
         target_indices = []
         for t in raw_targets:
