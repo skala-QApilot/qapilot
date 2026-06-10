@@ -232,6 +232,54 @@ def filter_patterns_by_req_id(
 # 통합 helper — TC 1개 → 필터된 4영역 메타데이터
 # ────────────────────────────────────────────────────────────────────────
 
+def pick_table_for_tc(
+    tc: dict[str, Any],
+    schemas: dict[str, Any] | None,
+) -> str | None:
+    """TC + schemas 로부터 가장 관련 깊은 DB 테이블 이름 1개 선택.
+
+    DB snapshot 조회 (`get_db_snapshot_cached`) 의 입력으로 사용.
+
+    매칭 우선순위:
+    1. TC.api 의 last segment 와 db_model 이름이 일치 (예: signup → SignupModel)
+    2. TC.api 의 last segment 가 db_model 의 table_name 안에 있음 (signup → "signups")
+    3. filter_schemas_by_api 가 좁힌 db_models 의 첫 번째
+    4. None — caller 가 graceful 처리
+
+    Returns:
+        DB 테이블 이름 (예: "customers") 또는 None.
+    """
+    if not schemas:
+        return None
+    db_models = schemas.get("db_models") or {}
+    if not db_models:
+        return None
+
+    api = tc.get("api")
+    _, path = _parse_api(api)
+    if path:
+        key = _last_segment(path).lower()
+        # 1. 정확 매칭
+        for model_name, model in db_models.items():
+            tname = (model.get("table_name") or "").lower()
+            if tname == key or model_name.lower() == key:
+                return model.get("table_name")
+        # 2. 부분 매칭
+        for model in db_models.values():
+            tname = (model.get("table_name") or "").lower()
+            if key and key in tname:
+                return model.get("table_name")
+
+    # 3. filter_schemas_by_api 로 좁힌 db_models 의 첫 번째 (가장 관련 깊다고 가정)
+    filtered = filter_schemas_by_api(schemas, api)
+    filtered_models = filtered.get("db_models") or {}
+    if filtered_models:
+        first = next(iter(filtered_models.values()))
+        return first.get("table_name")
+
+    return None
+
+
 def filter_metadata_for_tc(
     tc: dict[str, Any],
     *,
