@@ -158,7 +158,7 @@ def test_start_pipeline_extracts_test_account_from_body(tmp_path: Path):
     }
     captured: dict[str, Any] = {}
 
-    def _fake_submit(qd, tid, opts, su, ta=None, df=None):
+    def _fake_submit(qd, tid, opts, su, ta=None, df=None, tr=None):
         captured["test_account"] = ta
         captured["staging_url"] = su
 
@@ -185,7 +185,7 @@ def test_start_pipeline_test_account_none_when_body_missing(tmp_path: Path):
     }
     captured: dict[str, Any] = {}
 
-    def _fake_submit(qd, tid, opts, su, ta=None, df=None):
+    def _fake_submit(qd, tid, opts, su, ta=None, df=None, tr=None):
         captured["test_account"] = ta
 
     with patch.object(router_module, "_submit_pipeline", side_effect=_fake_submit), \
@@ -209,7 +209,7 @@ def test_start_pipeline_rejects_non_dict_test_account(tmp_path: Path):
     }
     captured: dict[str, Any] = {}
 
-    def _fake_submit(qd, tid, opts, su, ta=None, df=None):
+    def _fake_submit(qd, tid, opts, su, ta=None, df=None, tr=None):
         captured["test_account"] = ta
 
     with patch.object(router_module, "_submit_pipeline", side_effect=_fake_submit), \
