@@ -232,6 +232,78 @@ def filter_patterns_by_req_id(
 # 통합 helper — TC 1개 → 필터된 4영역 메타데이터
 # ────────────────────────────────────────────────────────────────────────
 
+def pick_source_files_for_tc(
+    tc: dict[str, Any],
+    *,
+    schemas: dict[str, Any] | None = None,
+    max_files: int = 3,
+) -> list[tuple[str, int | None, int | None]]:
+    """TC + schemas → load_source 로 가져올 (file, line_start, line_end) 리스트.
+
+    회의 verbatim "코드베이스 기반 value 생성" 의 "코드베이스" 의 핵심:
+    production 코드 본문 (예: routers/auth.py:signup 함수) 을 LLM 에 노출하기 위해
+    어떤 파일 / 어떤 line range 를 가져올지 결정한다.
+
+    선택 정책:
+    1. TC.api 의 path 첫 의미 segment 로 router 파일 추측
+       (예: POST /api/auth/signup → backend/app/routers/auth.py 전체)
+    2. 필터된 request_schemas 의 첫 field 의 extracted_from (Pydantic 정의 위치)
+       - line_start ~ line_end 그대로 (보통 schemas.py 의 한 줄)
+    3. 필터된 db_models 의 첫 column 의 extracted_from (SQLAlchemy 정의 위치)
+
+    Returns:
+        [(file_path, line_start, line_end), ...] — load_source 에 그대로 넘김.
+        line_start/line_end 가 None 이면 파일 전체.
+
+    한계 (의도적):
+    - production endpoint 함수의 정확한 line range 는 메타데이터에 없음
+      (본 데이터 layer 는 schema 추출기만 — endpoint extractor 는 후속)
+    - 현재는 router 파일 전체 (~2-15KiB) load — 한 endpoint 당 600~5000 token
+    """
+    out: list[tuple[str, int | None, int | None]] = []
+    api = tc.get("api")
+    _, path = _parse_api(api)
+
+    # 1. router 파일 추측 — TC.api 의 path 첫 의미 segment
+    if path:
+        parts = [p for p in path.split("/") if p]
+        # /api/auth/signup → ["api", "auth", "signup"] → "auth" (api/ 같은 prefix skip)
+        domain_segment = None
+        for p in parts:
+            if p.lower() not in ("api", "v1", "v2", "rest"):
+                domain_segment = p
+                break
+        if domain_segment:
+            # FastAPI 패턴 — backend/app/routers/<domain>.py
+            out.append((f"backend/app/routers/{domain_segment}.py", None, None))
+
+    # 2. 필터된 request_schemas 의 fields 의 extracted_from
+    if schemas and len(out) < max_files:
+        req_schemas = schemas.get("request_schemas") or {}
+        for spec in req_schemas.values():
+            fields = spec.get("fields") or []
+            if fields:
+                ef = fields[0].get("extracted_from") or {}
+                file = ef.get("file")
+                if file:
+                    out.append((file, ef.get("line_start"), ef.get("line_end")))
+                break  # 첫 schema 만
+
+    # 3. 필터된 db_models 의 columns 의 extracted_from
+    if schemas and len(out) < max_files:
+        db_models = schemas.get("db_models") or {}
+        for model in db_models.values():
+            cols = model.get("columns") or []
+            if cols:
+                ef = cols[0].get("extracted_from") or {}
+                file = ef.get("file")
+                if file:
+                    out.append((file, ef.get("line_start"), ef.get("line_end")))
+                break
+
+    return out[:max_files]
+
+
 def pick_table_for_tc(
     tc: dict[str, Any],
     schemas: dict[str, Any] | None,
