@@ -146,10 +146,17 @@ class CrossCheckAgent(BaseAgent):
         )
 
         user_prompt = self.with_correction_hint(user_prompt, last_error)
-        response = await self.llm.chat(system_prompt, user_prompt)
+        # json_mode — fence 감싼 응답으로 파싱 실패가 만연 (run d054cbe6: 16/32
+        # CC_PARSE_FAIL, 그 전엔 전부 조용한 pass 1.0 으로 은폐돼 있었음).
+        response = await self.llm.chat(system_prompt, user_prompt, json_mode=True)
 
         try:
-            parsed = json.loads(response.content)
+            raw = (response.content or "").strip()
+            if raw.startswith("```"):
+                # ```json ... ``` fence 제거 (json_mode 미지원 모델 안전망)
+                raw = raw.split("\n", 1)[1] if "\n" in raw else raw
+                raw = raw.rsplit("```", 1)[0]
+            parsed = json.loads(raw)
             mismatches = [CrossCheckMismatch(**m) for m in parsed.get("mismatches", [])]
             match_score = float(parsed.get("match_score", 1.0))
             matched_fields = int(parsed.get("matched_fields", 0))

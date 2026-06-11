@@ -3374,12 +3374,23 @@ async def _cross_check(state: PipelineState) -> dict:
             tid = tc.get("tc_id")
             if not tid:
                 continue
-            # 입력 완전성 — 매핑의 fill step 수가 TC values 대비 결손이면
-            # "의도한 입력을 만들지 못한 실행" (form prevent 구제 금지의 근거).
-            values_n = len(tc.get("values") or [])
+            # 입력 완전성 — 같은 TS 의 형제 TC 대비 fill 결손 (상대 비교).
+            # 절대 기준 (values 수) 은 조회형 TC (fill 0 정상, values 는 조회
+            # 파라미터) 를 오판해 27/32 과잉 unverified (run d054cbe6).
+            # 같은 TS 의 max fill 이 2+ 인데 본 TC 가 그 절반 미만이면 결손.
             am_steps = (am_by_tc.get(str(tid)) or {}).get("steps") or []
             fill_n = sum(1 for s in am_steps if str(s.get("action") or "") == "fill")
-            inputs_complete = None if values_n == 0 else (fill_n >= max(1, values_n - 1))
+            ts_prefix = str(tid).split("-TC-")[0]
+            sibling_fills = [
+                sum(1 for s in (am_by_tc.get(k) or {}).get("steps") or []
+                    if str(s.get("action") or "") == "fill")
+                for k in am_by_tc if k.startswith(ts_prefix + "-TC-")
+            ]
+            ts_max_fill = max(sibling_fills) if sibling_fills else 0
+            inputs_complete = (
+                None if ts_max_fill < 2
+                else (fill_n * 2 >= ts_max_fill)
+            )
             tc_intent_map[str(tid)] = {
                 "name": tc.get("name") or "",
                 "tags": tc.get("tags") or [],
