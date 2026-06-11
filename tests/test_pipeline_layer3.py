@@ -14,11 +14,15 @@ from qapilot.orchestrator import pipeline as P
 
 
 def _state_with_mismatch() -> dict:
+    # 상호작용 전부 통과 + assert 실패 = PRODUCT_DEFECT_CANDIDATE — LLM root cause
+    # 경로를 타는 fixture. (상호작용 step 실패는 _classify_failure 가
+    # TEST_DEFECT_MAPPING 으로 결정 분류해 LLM 을 타지 않음 — 2026-06-11 재설계)
     return {
         "trace_id": "trace-l3",
         "ui_results": [{"tc_id": "TC-1", "status": "fail", "steps": [
-            {"step_no": 1, "action": "click", "status": "fail",
-             "error": "TOOL_UI_LOCATOR_NOT_FOUND: ..."},
+            {"step_no": 1, "action": "click", "status": "pass"},
+            {"step_no": 2, "action": "assert_text", "status": "fail",
+             "error": "TOOL_UI_ASSERTION_FAIL: ..."},
         ]}],
         "cross_check_results": [
             {"tc_id": "TC-1", "match_score": 0.2, "mismatched_fields": 3,

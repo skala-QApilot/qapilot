@@ -69,7 +69,9 @@ def insert_defects(
         top = candidates[0]
 
         cc = cc_by_tc.get(tc_id) or {}
-        category = _infer_category(cc.get("error_code"))
+        # 결정적 1차 분류 (pipeline._classify_failure) 가 있으면 그것이 진실 —
+        # TEST_DEFECT/ENV 계열을 SUT defect (UI_ERROR) 로 오기록하던 격차 해소.
+        category = rc.get("category") or _infer_category(cc.get("error_code"))
 
         fr = fix_by_tc.get(tc_id) or {}
         suggestions = fr.get("suggestions") or []

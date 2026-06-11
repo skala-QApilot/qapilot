@@ -3409,17 +3409,72 @@ async def _cross_check(state: PipelineState) -> dict:
     }
 
 
-async def _root_cause(state: PipelineState) -> dict:
-    """Layer 3 두 번째 노드 — RootCauseAgent 호출 (FR-010).
+_INTERACTION_ACTIONS = {
+    "navigate", "fill", "clear", "click", "dblclick", "hover", "select",
+    "check", "uncheck", "press", "upload", "wait", "wait_for_url",
+    "wait_for_load_state", "wait_for_response", "reload", "go_back", "go_forward",
+}
 
-    cross_check_results 의 mismatch TC 별로 원인 후보 Top-N 추론.
-    Cross-check 결과의 error_code / summary / mismatches 를 params 로 전달.
+
+def _classify_failure(cc: dict, ui_result: dict | None) -> tuple[str, str]:
+    """실패의 결정적 1차 분류 — (category, reason).
+
+    run 45522e5d 진단: 코드 컨텍스트 0 인 상태에서 모든 실패를 LLM root cause 에
+    넣으면 환각 진단 (무관 파일을 confidence 0.90 으로 지목) + 테스트 측 결함이
+    전부 SUT defect 로 기록 (false defect ~96%). 분류는 error code/step 구조로
+    결정적으로 가능 — PRODUCT_DEFECT_CANDIDATE 만 LLM 추론 대상.
+
+    분류:
+    - ENV_TIMEOUT: TC 실행 타임아웃/예외 — 사전조건(데이터 상태)·인프라 문제
+    - ENV_UNVERIFIED: API/DB 검증 자체가 미수행 — 환경 설정 문제
+    - TEST_DEFECT_MAPPING: 상호작용 step (fill/click/navigate …) 실패 —
+      셀렉터/매핑/화면 전제의 테스트 측 결함 (SUT 결함 아님)
+    - PRODUCT_DEFECT_CANDIDATE: 상호작용 전부 통과 후 assert 만 실패 —
+      앱이 의도와 다르게 동작했을 후보 (LLM 정밀 분석 대상)
+    """
+    ui = ui_result or {}
+    err = str(ui.get("error") or "")
+    if "타임아웃" in err or "TC 실행 예외" in err or "TOOL_001" in err:
+        return "ENV_TIMEOUT", (
+            f"TC 실행 타임아웃/예외 — 사전조건 데이터 상태 또는 인프라 점검 필요: {err[:120]}"
+        )
+
+    steps = ui.get("steps") or []
+    failed = next((s for s in steps if s.get("status") == "fail"), None)
+    if failed is None:
+        if cc.get("api_unverified") or cc.get("db_unverified"):
+            return "ENV_UNVERIFIED", "API/DB 검증 미수행 — trace capture / DB 접속 환경 점검 필요"
+        return "PRODUCT_DEFECT_CANDIDATE", "UI 통과 + 정합성 mismatch — 제품 결함 후보"
+
+    action = str(failed.get("action") or "")
+    ferr = str(failed.get("error") or "")
+    if action in _INTERACTION_ACTIONS:
+        return "TEST_DEFECT_MAPPING", (
+            f"상호작용 step 실패 (action={action}) — 셀렉터/매핑/화면 전제의 "
+            f"테스트 측 결함 우선 의심: {ferr[:120]}"
+        )
+    return "PRODUCT_DEFECT_CANDIDATE", (
+        f"상호작용 전부 통과 후 assert 실패 (action={action}) — "
+        "앱 동작이 시나리오 의도와 다름 (제품 결함 후보)"
+    )
+
+
+async def _root_cause(state: PipelineState) -> dict:
+    """Layer 3 두 번째 노드 — 결정적 분류 → 제품 결함 후보만 RootCauseAgent (FR-010).
+
+    cross_check_results 의 mismatch TC 를 _classify_failure 로 1차 분류.
+    TEST/ENV 계열은 결정적 원인으로 즉시 기록 (LLM 호출 0 — 환각·비용 차단),
+    PRODUCT_DEFECT_CANDIDATE 만 LLM Top-N 추론.
     """
     from qapilot.agents.root_cause_agent import RootCauseAgent
     from qapilot.shared.schemas import AgentInput
 
     trace_id = state["trace_id"]
     cross_check_results = state.get("cross_check_results") or []
+    ui_by_tc = {
+        str(r.get("tc_id")): r for r in (state.get("ui_results") or [])
+        if r.get("tc_id")
+    }
 
     root_cause_results: list[dict] = []
     # agent_logs 누적 append — Layer 3 cost 집계 (#232).
@@ -3429,6 +3484,20 @@ async def _root_cause(state: PipelineState) -> dict:
         if not cc.get("has_mismatch"):
             continue
         tc_id = cc.get("tc_id", "unknown")
+
+        category, reason = _classify_failure(cc, ui_by_tc.get(str(tc_id)))
+        if category != "PRODUCT_DEFECT_CANDIDATE":
+            logger.info(
+                "failure_classified_deterministic",
+                trace_id=trace_id, tc_id=tc_id, category=category,
+            )
+            root_cause_results.append({
+                "tc_id": tc_id,
+                "category": category,
+                "classified_deterministic": True,
+                "candidates": [{"cause": reason, "confidence": 1.0, "category": category}],
+            })
+            continue
 
         try:
             agent = RootCauseAgent(trace_id=trace_id)
@@ -3458,15 +3527,15 @@ async def _root_cause(state: PipelineState) -> dict:
             )
             agent_logs = agent_logs + [output.metadata.model_dump()]
             root_causes = output.result.get("root_causes") or []
-            # 단일 또는 list — list 첫 번째를 결과로
+            # 단일 또는 list — list 첫 번째를 결과로. 분류 category 보존.
             if isinstance(root_causes, list) and root_causes:
-                root_cause_results.append(dict(root_causes[0]))
+                rc_item = dict(root_causes[0])
             elif isinstance(root_causes, dict):
-                root_cause_results.append(dict(root_causes))
+                rc_item = dict(root_causes)
             else:
-                root_cause_results.append({
-                    "tc_id": tc_id, "candidates": [],
-                })
+                rc_item = {"tc_id": tc_id, "candidates": []}
+            rc_item.setdefault("category", "PRODUCT_DEFECT_CANDIDATE")
+            root_cause_results.append(rc_item)
         except Exception as e:
             root_cause_results.append({
                 "tc_id": tc_id,
@@ -3492,9 +3561,36 @@ async def _fix_recommend(state: PipelineState) -> dict:
     # agent_logs 누적 append — Layer 3 cost 집계 (#232).
     agent_logs = state.get("agent_logs", [])
 
+    # 결정 분류 카테고리별 가이드 — LLM 호출 없이 즉시 권고 (테스트/환경 결함은
+    # SUT 수정 권고가 아니라 테스트 자산/환경 수정 권고가 정답).
+    _DETERMINISTIC_GUIDES = {
+        "TEST_DEFECT_MAPPING": (
+            "테스트 측 결함 — SUT 수정 대상 아님. ActionMapper 매핑/DOM 인덱스/화면 "
+            "전제(라우트·인증·데이터 상태)를 점검하고 코드 생성을 재실행하라."
+        ),
+        "ENV_TIMEOUT": (
+            "환경/사전조건 결함 — SUT 수정 대상 아님. TC 가 요구하는 사전 상태 "
+            "(예: 활성 주문 보유 계정) 를 API fixture 또는 시드로 구성하거나, "
+            "per-step 타임아웃 예산을 점검하라."
+        ),
+        "ENV_UNVERIFIED": (
+            "검증 환경 부재 — API trace capture / QAPILOT_SUT_DB_URL 설정을 점검하라. "
+            "이 TC 의 결과는 미검증 상태이며 pass/fail 판정에 사용하면 안 된다."
+        ),
+    }
+
     for rc in root_cause_results:
         tc_id = rc.get("tc_id", "unknown")
         candidates = rc.get("candidates") or []
+
+        if rc.get("classified_deterministic"):
+            guide = _DETERMINISTIC_GUIDES.get(rc.get("category") or "", "")
+            fix_results.append({
+                "tc_id": tc_id,
+                "category": rc.get("category"),
+                "suggestions": [{"description": guide}] if guide else [],
+            })
+            continue
 
         try:
             agent = FixRecommenderAgent(trace_id=trace_id)
