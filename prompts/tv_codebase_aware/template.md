@@ -1,18 +1,17 @@
-아래 TC 의 `values` 칸을 실제 사용 가능한 값으로 채워라.
+아래 TC 골격의 given/when/then 과 value 를 **함께, 모순 없이** 작성하라.
 
-## TC 정보
+## TC 골격 (given/when/then/value 는 아직 비어 있음 — 네가 만든다)
 
 - **name**: {{tc_name}}
+- **intent**: {{tc_intent}}
+- **technique**: {{tc_technique}}
 - **api**: {{tc_api}}
 - **req_id**: {{tc_req_id}}
 - **tags**: {{tc_tags}}
-- **given**: {{tc_given}}
-- **when**: {{tc_when}}
-- **then**: {{tc_then}}
 
-## 기존 values (placeholder)
+## 검색된 문서 (given/when/then 의 비즈니스 근거 — 정책서/약관/API)
 
-{{existing_values}}
+{{retrieved_docs}}
 
 ## 관련 스키마 (sensitive 필드 제외됨)
 
@@ -44,12 +43,12 @@
 
 ## 지시사항
 
-1. 위 스키마의 `validators` (min_length / max_length / pattern / required) 를 **반드시 만족**시켜라.
-2. TC 의 `tags` 와 `then` 을 보고 시나리오 의도를 파악하라 — 성공 케이스 / 실패 케이스 / 경계값.
-3. `tags=[edge_case]` + `then` 절이 "409 Conflict" 또는 "이미 존재" 등이면 위 DB 데이터의 값을 그대로 사용.
-4. `tags=[edge_case]` + `then` 절이 "400 Bad Request" 등 validation fail 이면 의도적으로 schema 위반.
-5. **sensitive 필드 (password / token / secret / api_key 등) 는 values 에 포함하지 마라** — 시스템이 별도 처리.
-6. **위 "코드베이스 본문" 의 실 구현 로직을 보고** 검증 규칙 (예: `existing = db.scalar(...)` → 중복 체크 / `raise HTTPException(409, ...)` → 409 에러 메시지) 을 정확히 반영하라. 문서에 없어도 코드에 있으면 우선.
+1. **먼저 `intent` 와 검색 문서, 코드 제약을 종합**해 이 TC 가 무엇을 검증하는지 정하라.
+2. 그 의도에 맞는 **given/when/then(완전한 한국어 문장)과 values 를 동시에** 작성하라. when 이 가리키는 입력과 value 가 서로 모순되면 안 된다.
+3. 위 스키마의 `validators` (min_length / max_length / pattern / required) 를 정상 케이스면 **만족**, 검증 위반 의도면 **정확히 그 제약을 위반**시키고 when 문장도 같은 위반을 서술하라.
+4. `intent=expects_existing` 이면 위 DB 데이터의 값을 그대로 사용(`source: "db"`). `intent=expects_absent` 면 DB 에 없는 신규 값.
+5. **sensitive 필드 (password / token / secret / api_key 등) 는 values 에 포함하지 마라** — 시스템이 별도 처리. (단 when/then 문장에서 "비밀번호 7자" 처럼 언급은 가능)
+6. **위 "코드베이스 본문" 의 실 구현 로직을 보고** 검증 규칙 (예: `existing = db.scalar(...)` → 중복 체크 / `raise HTTPException(409, ...)` → 409 에러 메시지) 을 then 절과 value 에 정확히 반영하라. 문서에 없어도 코드에 있으면 우선.
 7. 추론 불가능한 값이면 `purpose` 에 "스키마 정보 부족" 명시.
 
 JSON 만 출력하라. 마크다운 코드블록 X.

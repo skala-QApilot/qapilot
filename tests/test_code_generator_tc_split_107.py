@@ -144,7 +144,7 @@ def test_render_generated_code_uses_normalized_selectors(mock_llm_client):
     code = agent._render_generated_code(mapping, scenario)
     assert code is not None
     assert "page.getByTestId(\"email\").fill(\"newuser@example.com\")" in code
-    assert "page.getByTestId(\"password\").fill(process.env.E2E_USER_PASSWORD)" in code
+    assert "page.getByTestId(\"password\").fill(process.env.TEST_PASSWORD)" in code
     assert "page.getByLabel(\"이름\").fill(\"John Doe\")" in code
     assert "page.getByTestId(\"signup-submit\").click()" in code
     assert "page.getByPlaceholder(\"이메일을 입력하세요\")" not in code

@@ -69,6 +69,27 @@ def get_sensitive_field_names(schemas: dict[str, Any] | None) -> set[str]:
     return names
 
 
+def get_sensitive_request_field_names(schemas: dict[str, Any] | None) -> set[str]:
+    """request_schema 입력 필드 중 sensitive 한 것만 반환 (placeholder 주입용).
+
+    `get_sensitive_field_names` 와 달리 **db_models 컬럼은 보지 않는다.**
+    이유: TC.values 는 "사용자가 폼에 입력하는 값" 인데, password_hash / token 같은
+    DB 컬럼·응답 필드는 입력값이 아니다. 이를 placeholder 로 주입하면 폼에 없는 필드가
+    모든 TC 에 박힌다 (실측: password_hash 96%, token 91% TC 오염).
+
+    DB 스냅샷 마스킹용 sensitive set 은 여전히 `get_sensitive_field_names`(request+db) 를 쓴다.
+    """
+    if not schemas:
+        return set()
+    names: set[str] = set()
+    for spec in (schemas.get("request_schemas") or {}).values():
+        for f in spec.get("fields") or []:
+            fname = f.get("name", "")
+            if fname and is_sensitive_field(fname, schema_field_spec=f):
+                names.add(fname)
+    return names
+
+
 def strip_sensitive_from_schemas(schemas: dict[str, Any] | None) -> dict[str, Any]:
     """schemas 의 sensitive 필드를 dict 에서 제거.
 

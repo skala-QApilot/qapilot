@@ -348,7 +348,10 @@ class CodeGeneratorAgent(BaseAgent):
         if isinstance(value, str) and _ENV_REF_RE.match(value.strip()):
             return value.strip()
         if any(token in selector_text for token in ("비밀번호", "password", "pwd", "pass")):
-            return "process.env.E2E_USER_PASSWORD"
+            # sensitive_mask 의 placeholder 규칙(process.env.TEST_<FIELD>)과 env 이름 통일.
+            # 기존 E2E_USER_PASSWORD 와 값생성측 TEST_PASSWORD 가 달라 실행 경로별로
+            # 읽는 env 가 갈리던 문제 해소.
+            return "process.env.TEST_PASSWORD"
         return value
 
     def _js_value(self, value: Any) -> str:

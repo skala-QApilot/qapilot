@@ -1,13 +1,19 @@
-"""코드베이스/DB 기반 TV(Test Value) 채우기 Agent.
+"""TC 내용(given/when/then/value) 통합 생성 Agent — 문서+코드베이스+DB 기반.
 
-회의 4단계 워크플로우의 Step 4 — TC + 코드베이스/메타데이터/DB → TV.
+정합성(coherence) 설계: given/when/then 과 value 를 **한 컨텍스트에서 함께** 생성한다.
+앞 단계(TCFromDocsAgent)는 TC 골격(name/intent/technique/tags/api/req_id)만 열거하고,
+본 Agent 가 검색 문서 + 코드베이스 메타데이터/본문 + DB 스냅샷을 모두 보고
+given/when/then 과 value 를 동시에 만든다 → gwt 와 value 가 서로 모순되지 않는다.
 
-TC 자체는 변경하지 않고 `values` 만 채운다. 입력으로:
-- TC 1개 (name/api/req_id/given/when/then/기존 values)
+입력으로:
+- TC 골격 1개 (name/intent/technique/tags/api/req_id)
+- 본 TS 의 검색 문서 (retrieved_docs)
 - 본 TC 관련 메타데이터 (필터링된 schemas/selectors/routes/patterns)
-- 본 TC 관련 DB snapshot (sensitive 컬럼 제외)
+- 본 TC 관련 DB snapshot (sensitive 컬럼 제외) + production 코드 본문 (source_snippets)
 
-LLM 호출 → TVValidator 검증 → invalid 면 한두 번 재시도.
+LLM 호출 → TVValidator 로 value 검증 → invalid 면 한두 번 재시도.
+
+scenario_intent 는 골격의 `intent` 필드를 그대로 사용한다 (then 키워드 재추론 대신).
 
 sensitive 필드 처리 (Option α — PR #256 본질 재발 방지):
 - sensitive 필드는 LLM 컨텍스트에서 완전 제외
@@ -27,6 +33,7 @@ from qapilot.shared.schemas import ExecuteResult
 from qapilot.shared.sensitive_mask import (
     build_sensitive_value_entries,
     get_sensitive_field_names,
+    get_sensitive_request_field_names,
     merge_values_with_sensitive,
     strip_sensitive_from_db_snapshot,
     strip_sensitive_from_schemas,
@@ -49,12 +56,6 @@ def _format_dict_compact(d: Any, *, indent: int = 2, max_chars: int = 4000) -> s
     if len(text) > max_chars:
         text = text[:max_chars] + f"\n... (truncated, {len(text)} chars total)"
     return text
-
-
-def _format_existing_values(values: list[dict]) -> str:
-    if not values:
-        return "없음 (placeholder 도 없음)"
-    return _format_dict_compact(values, max_chars=1500)
 
 
 def _format_source_snippets(snippets: list[dict] | None) -> str:
@@ -86,6 +87,21 @@ def _format_source_snippets(snippets: list[dict] | None) -> str:
         parts.append(block)
         total += len(block)
     return "\n".join(parts)
+
+
+def _format_retrieved_docs(docs: list[dict] | None) -> str:
+    """TS 검색 문서를 LLM prompt 친화 format 으로 (given/when/then 근거)."""
+    if not docs:
+        return "검색된 문서 없음 (요구사항/스키마 기반으로 작성)"
+    parts: list[str] = []
+    for i, d in enumerate(docs, start=1):
+        if not isinstance(d, dict):
+            continue
+        src = d.get("source", "")
+        score = d.get("score", 0.0)
+        content = (d.get("content", "") or "")[:2000]
+        parts.append(f"[문서 {i}] 출처: {src} (유사도: {score:.2f})\n{content}")
+    return "\n\n---\n\n".join(parts) if parts else "검색된 문서 없음"
 
 
 def _format_db_snapshot(snapshot: dict | None) -> str:
@@ -163,6 +179,23 @@ def _infer_scenario_intent(tc: dict) -> dict:
     return intent
 
 
+def _resolve_scenario_intent(tc: dict) -> dict:
+    """골격의 `intent` 필드를 TVValidator 의도 dict 로 변환.
+
+    TCFromDocsAgent 가 명시한 `intent` 를 우선 사용한다 (then 키워드 재추론 제거).
+    intent 가 비어 있으면(레거시 TC) then/tags 기반 _infer_scenario_intent 로 fallback.
+    """
+    explicit = (tc.get("intent") or "").strip()
+    if explicit == "expects_existing":
+        return {"expects_existing_in_db": True}
+    if explicit == "expects_absent":
+        return {"expects_absent_in_db": True}
+    if not explicit:
+        return _infer_scenario_intent(tc)
+    # normal / boundary / auth / expects_validation_error → DB 존재성 제약 없음
+    return {}
+
+
 def _pick_schema_name(schemas: dict[str, Any]) -> str | None:
     """필터링된 schemas 에서 검증 대상 schema 이름 선택 — request 우선."""
     req = schemas.get("request_schemas") or {}
@@ -191,6 +224,8 @@ class TVFromCodebaseAgent(BaseAgent):
         last_error: str | None = None,
     ) -> ExecuteResult:
         tc: dict = context.get("tc") or {}
+        # TS 검색 문서 — given/when/then 작성 근거 (정합성: gwt 와 value 를 같은 컨텍스트에서)
+        retrieved_docs: list[dict] = context.get("retrieved_docs") or []
         # 4영역 메타데이터 raw (호출자가 load_metadata_index 으로 받아서 그대로 전달)
         selectors_raw = context.get("selectors")
         routes_raw = context.get("routes")
@@ -210,10 +245,14 @@ class TVFromCodebaseAgent(BaseAgent):
         )
 
         # ── 2. sensitive 필드 식별 + LLM 컨텍스트에서 제외 ─────────────
+        # 마스킹(LLM/DB 스냅샷에서 가리기)용 — request + db 컬럼 전체
         sensitive_names = get_sensitive_field_names(filtered["schemas"])
+        # placeholder 주입용 — request 입력 필드만 (db 컬럼 password_hash/token 제외).
+        # 폼에 없는 DB 컬럼을 모든 TC.values 에 박는 오염 방지.
+        input_sensitive_names = get_sensitive_request_field_names(filtered["schemas"])
         type_hint_map = _build_type_hint_map(filtered["schemas"])
         sensitive_entries = build_sensitive_value_entries(
-            sensitive_names, type_hint_map=type_hint_map,
+            input_sensitive_names, type_hint_map=type_hint_map,
         )
 
         sanitized_schemas = strip_sensitive_from_schemas(filtered["schemas"])
@@ -227,10 +266,11 @@ class TVFromCodebaseAgent(BaseAgent):
 
         # ── 3. LLM 호출 + 재시도 흐름 ──────────────────────────────────
         validator = TVValidator()
-        scenario_intent = _infer_scenario_intent(tc)
+        scenario_intent = _resolve_scenario_intent(tc)  # 골격 intent 우선 (재추론 제거)
         schema_name = _pick_schema_name(sanitized_schemas)
 
         last_validation: ValidationResult | None = None
+        gwt: dict[str, str] = {"given": "", "when": "", "then": ""}
         llm_values: list[dict] = []
         confidence = 0.5
 
@@ -241,10 +281,9 @@ class TVFromCodebaseAgent(BaseAgent):
                 tc_api=str(tc.get("api", "") or "(없음)"),
                 tc_req_id=str(tc.get("req_id", "") or "(없음)"),
                 tc_tags=", ".join(tc.get("tags") or []),
-                tc_given=str(tc.get("given", "")),
-                tc_when=str(tc.get("when", "")),
-                tc_then=str(tc.get("then", "")),
-                existing_values=_format_existing_values(tc.get("values") or []),
+                tc_intent=str(tc.get("intent", "") or "normal"),
+                tc_technique=str(tc.get("technique", "") or "(미지정)"),
+                retrieved_docs=_format_retrieved_docs(retrieved_docs),
                 schemas=_format_dict_compact(sanitized_schemas),
                 selectors=_format_dict_compact(filtered["selectors"]),
                 patterns=_format_dict_compact(filtered["patterns"], max_chars=1500),
@@ -259,6 +298,7 @@ class TVFromCodebaseAgent(BaseAgent):
             )
 
             parsed = self._parse(response.content)
+            gwt = parsed["gwt"]
             llm_values = parsed["values"]
             confidence = parsed["confidence"]
 
@@ -275,6 +315,9 @@ class TVFromCodebaseAgent(BaseAgent):
 
         return ExecuteResult(
             result={
+                "given": gwt["given"],
+                "when": gwt["when"],
+                "then": gwt["then"],
                 "values": merged_values,
                 "validation_passed": (last_validation.valid if last_validation else False),
                 "validation_reasons": (
@@ -287,6 +330,7 @@ class TVFromCodebaseAgent(BaseAgent):
     # ── 내부 헬퍼 ──────────────────────────────────────────────────────
 
     def _parse(self, content: str) -> dict[str, Any]:
+        empty_gwt = {"given": "", "when": "", "then": ""}
         try:
             cleaned = _extract_json(content)
             data = json.loads(cleaned)
@@ -295,7 +339,13 @@ class TVFromCodebaseAgent(BaseAgent):
                 "tv_codebase_aware_parse_error",
                 error=str(e), raw=content[:300],
             )
-            return {"values": [], "confidence": 0.0}
+            return {"gwt": empty_gwt, "values": [], "confidence": 0.0}
+
+        gwt = {
+            "given": str(data.get("given", "") or ""),
+            "when": str(data.get("when", "") or ""),
+            "then": str(data.get("then", "") or ""),
+        }
 
         raw_values = data.get("values") or []
         valid: list[dict] = []
@@ -309,7 +359,7 @@ class TVFromCodebaseAgent(BaseAgent):
                 "purpose": str(v.get("purpose", "")),
                 "source": str(v.get("source", "llm")),
             })
-        return {"values": valid, "confidence": float(data.get("confidence", 0.7))}
+        return {"gwt": gwt, "values": valid, "confidence": float(data.get("confidence", 0.7))}
 
     def _validate_values(
         self,

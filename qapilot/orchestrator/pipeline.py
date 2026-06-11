@@ -3547,7 +3547,13 @@ async def _ts_generate_prd_only(state: PipelineState) -> dict:
     from qapilot.shared.schemas import AgentInput
 
     trace_id = state["trace_id"]
-    requirements = state.get("requirements") or []
+    _all_reqs = state.get("requirements") or []
+    # E2E TS는 기능 요구사항만 대상 — 비기능(성능/보안/운영/호환성)은 TS 생성 제외
+    requirements = [r for r in _all_reqs if r.get("req_type") == "functional"]
+    if len(requirements) < len(_all_reqs):
+        logger.info("ts_filter_non_functional", trace_id=trace_id,
+                    total=len(_all_reqs), functional=len(requirements),
+                    dropped=len(_all_reqs) - len(requirements))
 
     start = time.monotonic()
     agent = TSFromPRDAgent(trace_id=trace_id)
@@ -3573,7 +3579,7 @@ async def _ts_generate_prd_only(state: PipelineState) -> dict:
                 "duration_sec": duration,
             },
         }
-        key = f"services/{service_id}/experiments/{trace_id}/ts_generation.json"
+        key = f"services/{service_id}/scenario-runs/{trace_id}/ts_generation.json"
         s3_client.put_bytes(
             key,
             json.dumps(payload, ensure_ascii=False, indent=2).encode(),
@@ -3626,6 +3632,7 @@ async def _tc_generate_doc_search(state: PipelineState) -> dict:
 
     agent_logs = list(state.get("agent_logs") or [])
     result_test_cases: dict[int, list] = {}
+    result_docs: dict[int, list] = {}  # 통합 TC 단계에서 재사용할 TS별 검색 문서
 
     for idx in target_indices:
         ts_item = ts_list[idx]
@@ -3659,6 +3666,7 @@ async def _tc_generate_doc_search(state: PipelineState) -> dict:
             }
             for r in raw_rules
         ]
+        result_docs[idx] = retrieved_docs
 
         start = time.monotonic()
         agent = TCFromDocsAgent(trace_id=trace_id)
@@ -3679,7 +3687,7 @@ async def _tc_generate_doc_search(state: PipelineState) -> dict:
                 "ts_id": provisional_ts_id,
                 "ts_name": ts_name,
                 "generated_at": datetime.now(timezone.utc).isoformat(),
-                "source": "doc_search",
+                "source": "doc_search_enumeration",
                 "analysis": analysis,
                 "test_cases": test_cases,
                 "retrieved_docs": retrieved_docs,
@@ -3692,7 +3700,7 @@ async def _tc_generate_doc_search(state: PipelineState) -> dict:
                     "doc_search_results_count": len(retrieved_docs),
                 },
             }
-            key = f"services/{service_id}/experiments/{trace_id}/tc_generation/{provisional_ts_id}.json"
+            key = f"services/{service_id}/scenario-runs/{trace_id}/tc_generation/{provisional_ts_id}.json"
             s3_client.put_bytes(
                 key,
                 json.dumps(payload, ensure_ascii=False, indent=2).encode(),
@@ -3701,7 +3709,11 @@ async def _tc_generate_doc_search(state: PipelineState) -> dict:
 
         agent_logs.append(output.metadata.model_dump())
 
-    return {"tc_by_ts_index": result_test_cases, "agent_logs": agent_logs}
+    return {
+        "tc_by_ts_index": result_test_cases,
+        "docs_by_ts_index": result_docs,
+        "agent_logs": agent_logs,
+    }
 
 
 async def _tv_generate_codebase_aware(state: PipelineState) -> dict:
@@ -3735,26 +3747,30 @@ async def _tv_generate_codebase_aware(state: PipelineState) -> dict:
     trace = load_trace(trace_id) or {}
     service_id = trace.get("service_id")
     tc_by_index: dict = state.get("tc_by_ts_index") or {}
-    if not tc_by_index or not service_id:
+    docs_by_index: dict = state.get("docs_by_ts_index") or {}
+    if not tc_by_index:
         return {}
 
-    # ── 4영역 메타데이터 로드 (LRU cache — 같은 service 호출 1회) ──
-    try:
-        selectors = load_metadata_index(service_id, "frontend", "selectors")
-        routes = load_metadata_index(service_id, "frontend", "routes")
-        schemas = load_metadata_index(service_id, "backend", "schemas")
-        patterns = load_metadata_index(service_id, "sut_tests", "patterns")
-    except Exception as e:
-        logger.warning("tv_metadata_load_failed", trace_id=trace_id, error=str(e))
-        selectors = routes = schemas = patterns = None
+    # ── 4영역 메타데이터 로드 (service_id 있을 때만, LRU cache) ──
+    selectors = routes = schemas = patterns = None
+    if service_id:
+        try:
+            selectors = load_metadata_index(service_id, "frontend", "selectors")
+            routes = load_metadata_index(service_id, "frontend", "routes")
+            schemas = load_metadata_index(service_id, "backend", "schemas")
+            patterns = load_metadata_index(service_id, "sut_tests", "patterns")
+        except Exception as e:
+            logger.warning("tv_metadata_load_failed", trace_id=trace_id, error=str(e))
+            selectors = routes = schemas = patterns = None
 
     if not any([selectors, routes, schemas, patterns]):
+        # 정합성 설계: 메타데이터가 없어도 중단하지 않는다 — given/when/then 은
+        # 검색 문서 기반으로 생성해야 한다 (value 만 약해짐).
         logger.info(
             "tv_metadata_index_empty",
             trace_id=trace_id, service_id=service_id,
-            reason="codebase_scan 미수행 또는 metadata-index 빈 상태",
+            reason="codebase_scan 미수행/빈 상태 — 문서 기반 gwt 만 생성, value 약화 가능",
         )
-        return {}
 
     agent_logs = list(state.get("agent_logs") or [])
     updated_tc_by_index: dict = {}
@@ -3769,6 +3785,8 @@ async def _tv_generate_codebase_aware(state: PipelineState) -> dict:
 
     for idx, tcs in tc_by_index.items():
         updated_tcs: list[dict] = []
+        # 이 TS 의 검색 문서 — 통합 단계에서 given/when/then 의 근거로 재사용
+        retrieved_docs = docs_by_index.get(idx) or docs_by_index.get(str(idx)) or []
         for tc in tcs:
             # schemas.db_models 기반으로 TC 와 가장 관련 깊은 테이블 1개 선택 + DB snapshot 조회
             # (sensitive 컬럼은 TV agent 안에서 strip_sensitive_from_db_snapshot 으로 제거)
@@ -3856,6 +3874,7 @@ async def _tv_generate_codebase_aware(state: PipelineState) -> dict:
                     trace_id=trace_id,
                     context={
                         "tc": tc,
+                        "retrieved_docs": retrieved_docs,
                         "selectors": selectors,
                         "routes": routes,
                         "schemas": schemas,
@@ -3869,22 +3888,26 @@ async def _tv_generate_codebase_aware(state: PipelineState) -> dict:
                 new_values = output.result.get("values") or []
                 validation_passed = output.result.get("validation_passed", False)
 
+                # 정합성: given/when/then 과 value 를 함께 생성 → TC 골격에 병합
+                new_tc = dict(tc)
+                for fld in ("given", "when", "then"):
+                    val = output.result.get(fld)
+                    if val:
+                        new_tc[fld] = val
                 if new_values:
-                    new_tc = dict(tc)
                     new_tc["values"] = new_values
-                    new_tc["tv_validation_passed"] = validation_passed
-                    new_tc["tv_validation_reasons"] = (
-                        output.result.get("validation_reasons") or []
-                    )
-                    updated_tcs.append(new_tc)
-                else:
-                    updated_tcs.append(tc)
+                new_tc["tv_validation_passed"] = validation_passed
+                new_tc["tv_validation_reasons"] = (
+                    output.result.get("validation_reasons") or []
+                )
+                updated_tcs.append(new_tc)
 
                 agent_logs.append(output.metadata.model_dump())
                 logger.info(
                     "tv_codebase_aware_done",
                     trace_id=trace_id,
                     tc_name=tc.get("name"),
+                    gwt_generated=bool(output.result.get("when")),
                     values_count=len(new_values),
                     validation_passed=validation_passed,
                     duration_sec=duration,

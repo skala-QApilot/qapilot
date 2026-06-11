@@ -1,4 +1,4 @@
-아래 테스트 시나리오 정보와 검색된 문서를 바탕으로 3단계 분석을 수행한 후 TC를 생성하라.
+아래 테스트 시나리오 정보와 검색된 문서를 바탕으로 3단계 분석을 수행한 후 TC 골격을 열거하라.
 
 ## 테스트 시나리오
 
@@ -24,12 +24,11 @@
 각 제약에 동등 분할 / 경계값 분석 / 예외 검증 / 상태 전이 / 인증 검증 / 결정 테이블 중
 적합한 기법을 `techniques`에 명시하라.
 
-**3단계 — TC 작성**
-`analysis`의 각 `test_point`를 TC로 변환하라.
-각 TC에 `technique` 필드로 어떤 기법 근거인지 명시하라.
+**3단계 — TC 열거**
+`analysis`의 각 `test_point`를 TC 1개로 열거하라.
+각 TC는 골격만 정한다 — **given/when/then 과 value 는 작성하지 마라** (후속 통합 단계가 문서+코드베이스+DB를 보고 함께 생성한다).
+각 TC에 정할 것: `name`, `technique`(기법 근거), `intent`(normal/expects_existing/expects_absent/expects_validation_error/boundary/auth 중 하나), `tags`, `api`, `req_id`, `depends_on`.
 TC 유형별 최소 개수를 반드시 충족하라: normal 2+, edge_case 2+, boundary 1+, auth 1+ (총 최소 6개).
-given/when/then은 완전한 한국어 문장으로 작성하라.
-values에는 위 "검색된 문서"에서 추론 가능한 값은 구체적으로 쓰고, 문서에 없어서 알 수 없는 값은 `{설명}` 형식으로 표기하라 (예: `{생년월일 YYYY-MM-DD}`, `{Bearer 토큰}`).
-각 TC에 `sources` 필드로 해당 TC 작성에 사용한 문서명을 기재하라. 코드베이스를 스캔했으면 `"codebase"` 포함, 현재처럼 문서만 있으면 문서명만 기재한다.
+각 TC에 `sources` 필드로 해당 TC를 도출한 문서명을 기재하라. (이 단계는 코드베이스를 보지 않으므로 `"codebase"` 는 포함하지 않는다.)
 
 JSON만 출력하라. 마크다운 코드블록이나 설명 텍스트를 포함하지 마라.

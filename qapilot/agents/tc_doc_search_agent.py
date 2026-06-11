@@ -1,7 +1,11 @@
-"""문서 검색 기반 TC 생성 Agent.
+"""문서 검색 기반 TC 열거 Agent.
 
-TS 정보와 Qdrant 검색 결과를 기반으로 given/when/then 포함 TC를 생성한다.
-3단계 분석(제약 추출 → 기법 결정 → TC 작성) 결과를 analysis 필드로 함께 반환한다.
+TS 정보와 Qdrant 검색 결과를 기반으로 TC 골격(skeleton)만 열거한다.
+3단계 분석(제약 추출 → 기법 결정 → TC 열거) 결과를 analysis 필드로 함께 반환한다.
+
+given/when/then/value 는 여기서 만들지 않는다 — 후속 통합 단계
+(TVFromCodebaseAgent)가 문서+코드베이스+DB 를 한 컨텍스트에서 보고 함께 생성한다.
+본 단계는 "어떤 TC가 있어야 하는가"(name/intent/technique/tags/api/req_id)만 정한다.
 코드베이스는 사용하지 않는다.
 """
 
@@ -68,7 +72,11 @@ def _extract_json(text: str) -> str:
 
 
 class TCFromDocsAgent(BaseAgent):
-    """TS 정보 + 검색된 문서 chunk로 제약 분석 후 TC (given/when/then)를 생성한다."""
+    """TS 정보 + 검색된 문서 chunk로 제약 분석 후 TC 골격(skeleton)을 열거한다.
+
+    출력 TC 는 name/intent/technique/tags/api/req_id/depends_on 만 가진다.
+    given/when/then/value 는 채우지 않는다 (통합 단계가 담당).
+    """
 
     agent_name = "tc_doc_search"
     use_deep_model = True
@@ -124,13 +132,11 @@ class TCFromDocsAgent(BaseAgent):
             if not isinstance(tc, dict) or not tc.get("name"):
                 continue
             sources = tc.get("sources") or []
+            # 골격(skeleton)만 — given/when/then/value 는 통합 단계가 채운다.
             valid.append({
                 "name": str(tc.get("name", "")),
                 "technique": str(tc.get("technique", "")),
-                "given": str(tc.get("given", "")),
-                "when": str(tc.get("when", "")),
-                "then": str(tc.get("then", "")),
-                "values": tc.get("values") or [],
+                "intent": str(tc.get("intent", "") or "normal"),
                 "tags": tc.get("tags") or ["normal"],
                 "req_id": tc.get("req_id"),
                 "api": tc.get("api"),
