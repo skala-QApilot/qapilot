@@ -4472,6 +4472,17 @@ async def _save_experiment_scenarios(state: PipelineState) -> dict:
         if service_id:
             upsert_scenario_version(service_id, ts_id, ts)
 
+    # RTM 버전 생성 — 구 경로 (_save_scenarios) 에만 wire 되어 있어 prd_only
+    # 경로는 RTM 0건 → 대시보드 RTM 0% (TC 의 req_id 는 존재하는데 링크
+    # 미생성). 동일 graceful 패턴으로 연결.
+    try:
+        _write_initial_rtm_version(state, scenarios=merged_scenarios)
+    except Exception as e:
+        logger.warning(
+            "rtm_version_write_failed",
+            trace_id=state.get("trace_id"), error=str(e),
+        )
+
     return {
         "scenarios": merged_scenarios,
         "saved_scenario_paths": saved_paths,
