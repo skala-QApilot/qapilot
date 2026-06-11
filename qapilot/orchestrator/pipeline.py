@@ -3571,10 +3571,14 @@ def _classify_failure(cc: dict, ui_result: dict | None) -> tuple[str, str]:
     # "화면에 그 문장이 없다" 는 검증 표현력 한계 — 제품 결함 신호가 아니다
     # (run feb0dc5e 축 ③: '자동 로그아웃된다' 류 서술문 fail 이 PRODUCT 로 오염).
     sel = str(failed.get("selector") or "")
-    if sel.count(" ") >= 3 and len(sel) > 15:
+    sel_type = str(failed.get("selector_type") or "")
+    # text-type assert 실패 = then 절 텍스트 매칭 시도가 화면 문구와 불일치 —
+    # 짧은 서술문 ("인증 오류가 발생한다.", 공백 2개) 이 공백 임계를 피해
+    # PRODUCT 로 새던 잔여 (run 254ca267: PRODUCT 71 중 text-fail 19건).
+    if sel_type == "text" or (sel.count(" ") >= 3 and len(sel) > 15):
         return "TEST_DEFECT_UNVERIFIABLE", (
-            f"서술형 then 텍스트 assert 실패 — UI 문구가 아닌 자연어 서술이라 "
-            f"텍스트 매칭으로 검증 불가: {sel[:80]!r}"
+            f"then 텍스트 매칭 assert 실패 — 화면 실제 문구와 불일치 (표현력 한계). "
+            f"then 을 testid/URL 기반 관찰로 구체화 필요: {sel[:80]!r}"
         )
     return "PRODUCT_DEFECT_CANDIDATE", (
         f"상호작용 전부 통과 후 assert 실패 (action={action}) — "
