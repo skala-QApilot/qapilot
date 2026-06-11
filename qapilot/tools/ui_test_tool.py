@@ -125,6 +125,10 @@ class UITestTool(BaseTool):
         # 이슈 #174 (격차 12 D 영역): TC 시작 시 인증 fail-safe 용 test_account.
         # pipeline 의 _test_execution 이 cfg.project.test_account 를 dict 로 넘김.
         test_account: dict[str, Any] | None = params.get("test_account")
+        # navigate step 의 가드 리다이렉트 복구 (_recover_login_redirect) 용 보존.
+        # per-TC 컨텍스트 격리 후 인증 필요 라우트 navigate 가 /login 으로 튕기는
+        # 케이스 (run dcf265f7: TS-004+ 전 TC 가 로그인 화면에서 멈춤).
+        self._test_account = test_account
 
         screenshot_dir: Path | None = None
         if params.get("screenshot_dir") is not None:
@@ -447,6 +451,48 @@ class UITestTool(BaseTool):
         if steps and self._should_auto_navigate(steps):
             await self._try_auto_navigate(page, steps, target_url)
 
+    async def _recover_login_redirect(self, page: Page, intended_full: str) -> None:
+        """navigate 가 SUT 인증 가드에 막혀 /login 으로 리다이렉트된 경우 복구.
+
+        조건: 의도한 URL 이 로그인 페이지가 아닌데 실제 URL 이 로그인 패턴 +
+        test_account 보유. _ensure_authenticated 의 form 휴리스틱으로 로그인 후
+        의도한 URL 로 재네비게이트. 실패는 graceful (후속 step 이 fail 로 보고).
+        """
+        account = getattr(self, "_test_account", None)
+        if not account or not account.get("email") or not account.get("password"):
+            return
+        patterns = ("/login", "/signin", "/sign-in", "/auth/login")
+        if any(p in intended_full.lower() for p in patterns):
+            return  # 로그인 페이지 자체가 목적지 — 복구 대상 아님
+        try:
+            actual = (page.url or "").lower()
+        except Exception:
+            return
+        if not any(p in actual for p in patterns):
+            return  # 리다이렉트 안 됨 (공개 페이지 또는 이미 인증)
+
+        self.logger.info(
+            "ui_navigate_login_redirect_detected",
+            intended=intended_full, actual=page.url,
+        )
+        await self._ensure_authenticated(page, [], intended_full, account)
+        try:
+            still_login = any(p in (page.url or "").lower() for p in patterns)
+        except Exception:
+            return
+        if still_login:
+            return  # 로그인 실패 — graceful (후속 step 이 정직하게 fail)
+        try:
+            await page.goto(intended_full, wait_until="networkidle", timeout=10000)
+        except Exception:
+            try:
+                await page.goto(intended_full)
+            except Exception as e:
+                self.logger.warning(
+                    "ui_login_redirect_renav_failed",
+                    intended=intended_full, error=str(e)[:80],
+                )
+
     def _should_auto_navigate(self, steps: list[ActionStep]) -> bool:
         """auto-navigate 발동 조건 (PR #122 + #197 보강).
 
@@ -680,6 +726,11 @@ class UITestTool(BaseTool):
                 self.logger.warning("ui_navigate_networkidle_timeout",
                                     target=full, error=str(e)[:80])
                 await page.goto(full)
+            # 가드 리다이렉트 복구 — 인증 필요 라우트로 navigate 했는데 SUT 라우터
+            # 가드가 /login 으로 튕긴 경우, test_account 로 로그인 후 원 URL 재시도.
+            # per-TC 컨텍스트 격리 (격차 3 fix) 후 모든 TC 가 비인증 시작이므로
+            # 이 복구가 인증 선행조건 (fixture/beforeEach 패턴) 의 실행 layer 다.
+            await self._recover_login_redirect(page, full)
             # #248 진단 로그: navigate 후 actual page.url + SPA mount 상태 노출
             try:
                 actual_url = page.url

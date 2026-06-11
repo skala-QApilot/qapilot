@@ -2579,6 +2579,18 @@ async def _test_execution(state: PipelineState) -> dict:
                 "password": test_account_cfg.password,
                 "login_path": getattr(test_account_cfg, "login_path", None),
             }
+    if test_account_dict is None:
+        # env fallback — SaaS 흐름에서 Spring 이 test_account 를 안 보내고
+        # cfg.project 도 빈 경우 (run dcf265f7: 인증 필요 TS 전부 /login 에 멈춤).
+        # 인증 선행조건 (가드 리다이렉트 복구) 이 작동하려면 계정이 필수.
+        env_email = os.environ.get("QAPILOT_TEST_EMAIL")
+        env_pw = os.environ.get("QAPILOT_TEST_PASSWORD") or os.environ.get("TEST_PASSWORD")
+        if env_email and env_pw:
+            test_account_dict = {"email": env_email, "password": env_pw, "login_path": None}
+            logger.info(
+                "test_account_env_fallback",
+                trace_id=trace_id, email_masked=env_email[:3] + "***",
+            )
 
     results_root = _qapilot_path(state, "results", trace_id)
 
@@ -2593,6 +2605,13 @@ async def _test_execution(state: PipelineState) -> dict:
             execution_items = generated_codes or action_mappings
             action_mapping_by_tc = {
                 str(am.get("tc_id")): am for am in action_mappings if am.get("tc_id")
+            }
+            # tc_id → then 절 (email 유니크화의 negative-의도 제외 판단용)
+            tc_then_by_id: dict[str, str] = {
+                str(tc.get("tc_id")): str(tc.get("then") or "")
+                for sc in scenarios
+                for tc in (sc.get("test_cases") or [])
+                if tc.get("tc_id")
             }
 
             for item in execution_items:
@@ -2641,6 +2660,14 @@ async def _test_execution(state: PipelineState) -> dict:
                     else:
                         exec_mapping = item
 
+                    # run 간 데이터 격리 — TV 의 정적 email 값은 첫 run 이 SUT 에
+                    # 가입시키는 순간 소진되어 다음 run 부터 409 (run dcf265f7:
+                    # TS-001-TC-04 가 이전 run 의 가입 데이터로 fail). positive 의도
+                    # signup TC 의 email 에 run suffix 를 붙여 매 run 신규 보장.
+                    _uniquify_signup_email_for_run(
+                        exec_mapping, tc_then_by_id.get(str(tc_id), ""), trace_id,
+                    )
+
                     ui_res = await _run_ui_with_trace(
                         page=page,
                         tc_id=tc_id,
@@ -2653,6 +2680,27 @@ async def _test_execution(state: PipelineState) -> dict:
                         ToolInput=ToolInput,
                         test_account=test_account_dict,
                     )
+                    # 공허한 pass 차단 — 생성 코드의 MANUAL_REVIEW(자동화 불가) step
+                    # 은 매핑 변환 시 증발한다. 남은 step (navigate/wait 뿐일 수 있음)
+                    # 만 통과하고 pass 로 보고하면 검증 없는 가짜 pass (run dcf265f7:
+                    # TS-003-TC-02 가 wait 1 step 만으로 pass). skip 으로 강등.
+                    if isinstance(item, dict) and item.get("code"):
+                        dropped = (
+                            str(item["code"]).count("QAPILOT_MANUAL_REVIEW")
+                            + str(item["code"]).count("test.skip(")
+                        )
+                        if dropped and ui_res["ui_result"].get("status") == "pass":
+                            ui_res["ui_result"]["status"] = "skip"
+                            ui_res["ui_result"]["manual_review_steps"] = dropped
+                            ui_res["ui_result"]["error"] = (
+                                f"MANUAL_REVIEW: 자동화 불가 step {dropped}건 증발 — "
+                                "실행된 step 만으로는 검증 미완 (pass 아님)"
+                            )
+                            logger.warning(
+                                "tc_vacuous_pass_downgraded",
+                                trace_id=trace_id, tc_id=tc_id, dropped_steps=dropped,
+                            )
+
                     ui_results.append(ui_res["ui_result"])
                     api_results.append(ui_res["api_result"])
 
@@ -3660,6 +3708,42 @@ async def _ts_generate_prd_only(state: PipelineState) -> dict:
 
     agent_logs = list(state.get("agent_logs") or []) + [output.metadata.model_dump()]
     return {"ts_list": ts_list, "agent_logs": agent_logs}
+
+
+def _uniquify_signup_email_for_run(
+    exec_mapping: dict, tc_then: str, trace_id: str
+) -> None:
+    """positive 의도 signup TC 의 email 값에 run suffix 부여 — run 간 데이터 격리.
+
+    TV 가 시나리오 생성 시점에 만든 정적 email 은 첫 run 에서 SUT 에 가입되는
+    순간 소진 → 이후 run 은 전부 409. negative(중복/오류 의도) TC 는 제외
+    (의도적 기존 값 재사용 보존). email+suffix@domain 은 RFC 유효 주소.
+    """
+    from qapilot.agents.action_mapper_agent import _NEGATIVE_OUTCOME_HINTS
+
+    then_l = (tc_then or "").lower()
+    if any(h in then_l for h in _NEGATIVE_OUTCOME_HINTS):
+        return
+    steps = exec_mapping.get("steps") or []
+    if not any("signup" in str(s.get("api_endpoint") or "").lower() for s in steps):
+        return
+    suffix = (trace_id or "").replace("-", "")[:8]
+    if not suffix:
+        return
+    for s in steps:
+        if str(s.get("action") or "") != "fill":
+            continue
+        ident = f"{s.get('target_name') or ''} {s.get('selector') or ''}".lower()
+        val = str(s.get("value") or "")
+        if "email" in ident and "@" in val and f"+{suffix}@" not in val:
+            local, _, domain = val.partition("@")
+            s["value"] = f"{local}+{suffix}@{domain}"
+            logger.info(
+                "signup_email_uniquified",
+                trace_id=trace_id,
+                tc_id=exec_mapping.get("tc_id"),
+                value=s["value"],
+            )
 
 
 def _build_frontend_grounding(routes_idx: Any, selectors_idx: Any) -> str:
