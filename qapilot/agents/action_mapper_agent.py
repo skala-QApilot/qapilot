@@ -477,9 +477,17 @@ class ActionMapperAgent(BaseAgent):
         if not frontend_dom:
             return []
 
-        # TC.api 기반 가점용 — batch 의 첫 TC api (per-TC 분할 후 batch = TC 1개).
+        # TC.api 기반 가점용. batch 는 TS slice (test_cases 안에 TC) — per-TC 분할
+        # (#129) 후 test_cases 는 1개. TS dict 에서 api 를 읽으면 항상 None 이라
+        # api 보너스가 죽는다 (v3 재생성에서 TS-006 이 여전히 signup 으로 간 원인).
         self._current_tc_api = next(
-            (str(tc.get("api") or "") for tc in batch if tc.get("api")), "",
+            (
+                str(tc.get("api") or "")
+                for item in batch
+                for tc in (item.get("test_cases") or [item] if isinstance(item, dict) else [])
+                if isinstance(tc, dict) and tc.get("api")
+            ),
+            "",
         )
 
         scenario_text = self._scenario_text_for_candidates(batch)
@@ -728,7 +736,10 @@ class ActionMapperAgent(BaseAgent):
         """LLM 이 만든 step intent 를 frontend index 원소로만 resolve 한다."""
         mapping = dict(action_mapping)
         scenario_text = " ".join(str(tc.get(key) or "") for key in ("name", "given", "when", "then"))
-        route_hint = self._route_hint_from_elements(frontend_dom) or self._route_hint_from_tc(tc)
+        # TC 신호 (api segment ↔ 실존 route, 명시 keyword) 를 후보 다수결보다 우선.
+        # 후보 풀이 오염된 경우 (가입→signup 류) 다수결이 오염을 라우트로 승격시킨다
+        # (v3 재생성에서 TS-006 잔존 원인 #2).
+        route_hint = self._route_hint_from_tc(tc) or self._route_hint_from_elements(frontend_dom)
         steps: list[ActionStep] = []
 
         for raw_step in mapping.get("steps") or []:

@@ -70,6 +70,43 @@ class TestRouteHint:
         assert _agent(dom)._route_hint_from_tc(tc) is None
 
 
+class TestCurrentTcApiExtraction:
+    """batch 는 TS slice — 중첩 test_cases 에서 api 를 꺼내야 한다 (v3 재생성
+    잔존 원인 #1: TS dict 에서 읽어 항상 빈 값 → api 보너스 사화)."""
+
+    def test_api_extracted_from_ts_slice(self):
+        agent = _agent()
+        batch = [{"ts_id": "TS-006", "name": "신규 가입 테스트",
+                  "test_cases": [dict(_PLAN_TC)]}]
+        agent._select_frontend_candidates(batch, [
+            {"route": "/orders", "file": "OrderNew.vue", "page": "ordernew",
+             "control_type": "submit", "text": "가입 신청"},
+        ])
+        assert agent._current_tc_api == "POST /api/orders"
+
+
+class TestRouteHintPrecedence:
+    """TC 신호 (api→실존 route) 가 후보 다수결보다 우선 — 오염 풀의 다수결이
+    라우트를 정하면 안 된다 (v3 재생성 잔존 원인 #2)."""
+
+    def test_tc_api_beats_contaminated_pool_majority(self):
+        dom = [
+            {"route": "/signup", "testid": "signup-submit"},
+            {"route": "/signup", "testid": "signup-error"},
+            {"route": "/orders", "testid": "order-new"},
+        ]
+        agent = _agent(dom)
+        mapping = {"tc_id": "TS-006-TC-01", "steps": []}
+        # 오염 풀 (signup 다수) 를 frontend_dom 으로 줘도 route_hint 는 /orders
+        resolved = agent._resolve_mapping_with_frontend(
+            mapping, _PLAN_TC,
+            [{"route": "/signup", "testid": "signup-submit"},
+             {"route": "/signup", "testid": "signup-error"}],
+        )
+        nav = [s for s in resolved.get("steps", []) if s.get("action") == "navigate"]
+        assert all(s.get("value") != "/signup" for s in nav)
+
+
 class TestCandidateScore:
     SIGNUP_EL = {"file": "src/pages/Signup.vue", "page": "signup", "route": "/signup",
                  "control_type": "submit", "text": "가입하기", "testid": "signup-submit"}
