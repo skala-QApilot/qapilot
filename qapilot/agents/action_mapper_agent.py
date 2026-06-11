@@ -65,6 +65,19 @@ _ASSERT_ACTIONS = {
     "assert_value", "assert_enabled", "assert_disabled", "assert_count",
 }
 
+# 격차 1: then 절의 outcome (positive/negative) 분류 키워드.
+# negative = 실패/거부/에러를 기대하는 TC — assert 대상은 error 류 selector 여야 한다.
+_NEGATIVE_OUTCOME_HINTS = (
+    "오류", "실패", "잘못", "거부", "반려", "거절", "이미 존재", "이미 가입", "중복",
+    "유효하지 않", "불가", "에러", "경고", "남아 있", "유지",
+    "error", "fail", "invalid", "missing", "duplicate", "already", "denied",
+    "reject", "conflict", "bad request", "unauthorized", "forbidden",
+    "400", "401", "403", "404", "409", "422",
+)
+# selector(testid/text) 의 방향성 토큰 — outcome 과 일치해야 가점, 불일치 시 감점.
+_POSITIVE_SELECTOR_TOKENS = ("success", "complete", "toast", "confirm", "welcome", "done")
+_NEGATIVE_SELECTOR_TOKENS = ("error", "fail", "invalid", "warning", "alert", "danger")
+
 _SELECTOR_REQUIRED_ACTIONS = {
     "fill", "clear", "click", "dblclick", "hover", "select", "check", "uncheck",
     "press", "upload", "assert", "assert_visible", "assert_hidden", "assert_text",
@@ -731,7 +744,14 @@ class ActionMapperAgent(BaseAgent):
             if intent.get("target_kind"):
                 step["target_kind"] = intent["target_kind"]
             if action in {"assert", "assert_visible"}:
-                step["expected"] = None
+                if resolved is not None:
+                    step["expected"] = None
+                elif not step.get("expected"):
+                    # selector 미해결 assert — then 절 텍스트를 expected 로 보존해
+                    # UITestTool 의 page-wide fuzzy fallback 이 의미 검증을 수행하게 한다.
+                    # (기존: selector/expected 둘 다 None → 검증 대상 자체 소실)
+                    then_text = str(tc.get("then") or "").strip()
+                    step["expected"] = then_text or None
             steps.append(step)
 
         steps = self._ensure_navigate_step(steps, route_hint)
@@ -804,10 +824,16 @@ class ActionMapperAgent(BaseAgent):
             }
 
         if action in _ASSERT_ACTIONS:
+            # 격차 1: then 절 + expected 로 TC outcome (positive/negative) 분류.
+            # negative TC 의 assert 가 success 류 selector 에 매칭되는 격차의 본질 차단.
+            then_text = str(tc.get("then") or "")
+            outcome_basis = " ".join(part for part in (expected, then_text) if part).lower()
+            is_negative = any(h in outcome_basis for h in _NEGATIVE_OUTCOME_HINTS)
             return {
                 "target_name": None,
                 "target_kind": "assertion",
-                "target_text": expected or selector or str(tc.get("then") or "") or None,
+                "target_text": expected or selector or then_text or None,
+                "outcome": "negative" if is_negative else "positive",
             }
 
         return {"target_name": None, "target_kind": None, "target_text": selector or None}
@@ -919,14 +945,36 @@ class ActionMapperAgent(BaseAgent):
         ):
             score += 0.5
         if action in _ASSERT_ACTIONS:
+            outcome = str(intent.get("outcome") or "").strip().lower()
+            testid_l = str(element.get("testid") or "").lower()
+            text_l = str(element.get("text") or "").lower()
             if not bool(element.get("actionable")):
                 score += 0.2
             if control_type.startswith("feedback"):
                 score += 1.2
-            if target_kind == "assertion" and any(token in str(element.get("testid") or "").lower() for token in ("success", "error", "toast", "message", "status")):
+            if target_kind == "assertion" and any(token in testid_l for token in ("success", "error", "toast", "message", "status")):
                 score += 0.7
-            if target_kind == "assertion" and any(token in str(element.get("text") or "").lower() for token in ("완료", "성공", "이동")):
-                score += 0.5
+            # 격차 1: outcome 방향성 분기 — negative TC 의 assert 가 success 류
+            # selector 에 매칭 (또는 그 반대) 되는 것은 감점이 아니라 실격 (0점).
+            # 의미 보너스 (_semantic_bonus) 가 커서 단순 감점으로는 threshold 를
+            # 넘는 경계 케이스가 남는다. 방향이 맞으면 가점.
+            if outcome == "negative":
+                if any(t in testid_l for t in _POSITIVE_SELECTOR_TOKENS):
+                    return 0.0
+                if any(t in testid_l for t in _NEGATIVE_SELECTOR_TOKENS) or any(
+                    t in text_l for t in ("오류", "실패", "에러", "잘못", "유효하지 않")
+                ):
+                    score += 1.0
+            elif outcome == "positive":
+                if any(t in testid_l for t in _NEGATIVE_SELECTOR_TOKENS):
+                    return 0.0
+                if target_kind == "assertion" and any(token in text_l for token in ("완료", "성공", "이동")):
+                    score += 0.5
+                if any(t in testid_l for t in _POSITIVE_SELECTOR_TOKENS):
+                    score += 0.5
+            else:
+                if target_kind == "assertion" and any(token in text_l for token in ("완료", "성공", "이동")):
+                    score += 0.5
 
         if target_kind == "submit":
             if any(token in str(element.get("text") or "").lower() for token in ("가입", "signup")):

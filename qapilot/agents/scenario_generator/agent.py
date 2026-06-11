@@ -973,7 +973,14 @@ class ScenarioGeneratorAgent(BaseAgent):
             basename = file_path.split("/")[-1].replace(".py", "").replace(".ts", "").replace(".js", "")
             prefix = _ROUTER_PREFIX.get(basename, "")
 
-        full = prefix + rel_path if rel_path else prefix
+        # 격차 4: scanner 가 이미 prefix 적용한 path ("/api/auth/signup") 에
+        # 재결합하면 이중 prefix. rel_path 가 이미 prefix 로 시작하면 그대로 사용.
+        if rel_path and prefix and (
+            rel_path == prefix or rel_path.startswith(prefix.rstrip("/") + "/")
+        ):
+            full = rel_path
+        else:
+            full = prefix + rel_path if rel_path else prefix
         return f"{method} {full}"
 
     def _endpoint_paths(self, endpoints: list[dict]) -> set[str]:

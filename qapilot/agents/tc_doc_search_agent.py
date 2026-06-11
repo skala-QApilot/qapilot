@@ -21,6 +21,13 @@ def _format_requirements(requirements: list[str]) -> str:
     return "\n".join(f"- {r}" for r in requirements)
 
 
+def _format_endpoints(endpoints: list[str]) -> str:
+    """코드 스캔으로 확인된 실제 endpoint 목록 — api 환각 차단용."""
+    if not endpoints:
+        return "없음 (코드 스캔 결과 없음 — api 는 null 로 두라)"
+    return "\n".join(f"- {e}" for e in endpoints)
+
+
 def _format_retrieved_docs(docs: list[dict]) -> str:
     if not docs:
         return "검색된 문서 없음"
@@ -81,6 +88,9 @@ class TCFromDocsAgent(BaseAgent):
     ) -> ExecuteResult:
         ts_item: dict = context.get("ts_item") or {}
         retrieved_docs: list[dict] = context.get("retrieved_docs") or []
+        # 격차 4: 코드 스캔으로 확인된 실제 endpoint 목록 ("METHOD /api/path" 문자열).
+        # 이 목록 밖의 api 를 LLM 이 창작하지 못하게 prompt 로 제약한다.
+        endpoints: list[str] = context.get("endpoints") or []
 
         ts_name = ts_item.get("name", "")
         ts_description = ts_item.get("description", "")
@@ -91,6 +101,7 @@ class TCFromDocsAgent(BaseAgent):
             ts_description=ts_description,
             requirements=_format_requirements(requirements),
             retrieved_docs=_format_retrieved_docs(retrieved_docs),
+            endpoints=_format_endpoints(endpoints),
         )
         if last_error:
             user_prompt += f"\n\n[이전 시도 오류: {last_error}. JSON 형식을 확인하라.]"

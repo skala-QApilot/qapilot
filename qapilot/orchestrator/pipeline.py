@@ -2573,10 +2573,6 @@ async def _test_execution(state: PipelineState) -> dict:
 
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(headless=headless)
-        context = await browser.new_context(
-            extra_http_headers={"X-Trace-Id": trace_id}
-        )
-        page = await context.new_page()
 
         try:
             execution_items = generated_codes or action_mappings
@@ -2590,6 +2586,15 @@ async def _test_execution(state: PipelineState) -> dict:
                 tc_dir = results_root / ts_id / tc_id
                 screenshots_dir = tc_dir / "screenshots"
                 tc_dir.mkdir(parents=True, exist_ok=True)
+
+                # TC 간 cookie/session/localStorage 격리 — 컨텍스트를 TC 마다 새로 만든다.
+                # 단일 컨텍스트 공유 시 첫 로그인 성공 TC 이후 auth token 이 남아
+                # SUT 라우터 가드가 /login·/signup → /dashboard 리다이렉트,
+                # 이후 모든 TC 가 locator not found 로 연쇄 fail (run f142978d: 9/11).
+                context = await browser.new_context(
+                    extra_http_headers={"X-Trace-Id": trace_id}
+                )
+                page = await context.new_page()
 
                 # item may be either a GeneratedCode dict or an ActionMapping dict.
                 # Only call the parser when this item looks like generated code (has "code").
@@ -2658,8 +2663,10 @@ async def _test_execution(state: PipelineState) -> dict:
                     db_result=db_res,
                     screenshots_dir=screenshots_dir,
                 )
+
+                # per-TC 컨텍스트 정리. 중간 예외 시 잔여 컨텍스트는 browser.close() 가 정리.
+                await context.close()
         finally:
-            await context.close()
             await browser.close()
 
     # tc_results / scenario_results 집계는 디스크 기반 — 같은 trace_id 로 resume 한 경우
@@ -3089,6 +3096,7 @@ async def _run_db_test_safe(*, tc_id: str, trace_id: str, DBTestTool, ToolInput)
         return {
             "tc_id": tc_id,
             "snapshots": [],
+            "skipped": True,
             "summary": "DBTest skip: QAPILOT_SUT_DB_URL 미설정 (env 사전 점검)",
         }
 
@@ -3102,6 +3110,7 @@ async def _run_db_test_safe(*, tc_id: str, trace_id: str, DBTestTool, ToolInput)
         return {
             "tc_id": tc_id,
             "snapshots": [],
+            "skipped": True,
             "summary": f"DBTest skip: {type(e).__name__}: {e}",
         }
 
@@ -3584,6 +3593,46 @@ async def _ts_generate_prd_only(state: PipelineState) -> dict:
     return {"ts_list": ts_list, "agent_logs": agent_logs}
 
 
+def _validate_tc_apis_against_scan(
+    test_cases: list[dict], endpoint_specs: list[str], trace_id: str
+) -> None:
+    """TC.api 를 코드 스캔 endpoint 카탈로그와 대조 — 환각 endpoint 차단 (격차 4).
+
+    path 파라미터 이름 차이 ({id} vs {order_id}) 는 정규화 후 유일 매칭 시 교정,
+    카탈로그에 없는 api 는 null (없는 endpoint 로 검증하는 것보다 정직).
+    """
+    if not endpoint_specs or not test_cases:
+        return
+
+    valid = set(endpoint_specs)
+
+    def _norm(api: str) -> str:
+        return re.sub(r"\{[^}]*\}", "{}", api.strip())
+
+    norm_map: dict[str, list[str]] = {}
+    for spec in endpoint_specs:
+        norm_map.setdefault(_norm(spec), []).append(spec)
+
+    for tc in test_cases:
+        api = tc.get("api")
+        if not api or str(api).strip().lower() == "null":
+            tc["api"] = None
+            continue
+        api = str(api).strip()
+        if api in valid:
+            tc["api"] = api
+            continue
+        candidates = norm_map.get(_norm(api)) or []
+        if len(candidates) == 1:
+            tc["api"] = candidates[0]
+            continue
+        logger.warning(
+            "tc_api_not_in_codebase",
+            trace_id=trace_id, tc_name=tc.get("name"), api=api,
+        )
+        tc["api"] = None
+
+
 async def _tc_generate_doc_search(state: PipelineState) -> dict:
     """ts_list 중 대상 TS만 문서 검색 → TC 생성 + S3 저장."""
     import time
@@ -3623,6 +3672,17 @@ async def _tc_generate_doc_search(state: PipelineState) -> dict:
     for r in (state.get("requirements") or []):
         if isinstance(r, dict):
             req_content_map[r.get("req_id", "")] = r.get("content", "")
+
+    # 격차 4: codebase_scan_exp 결과에서 실제 endpoint 카탈로그 구성.
+    # PRD 기반 TC 생성 시 LLM 이 SUT 에 없는 endpoint (예: PUT /profile,
+    # PATCH /api/contracts/...) 를 창작하는 환각의 본질 차단 — prompt 제약 + 사후 검증.
+    scan = state.get("scan_result") or {}
+    endpoint_specs: list[str] = sorted({
+        f"{(ep.get('method') or '').upper()} {ep.get('path')}"
+        for f in (scan.get("files") or [])
+        for ep in (f.get("endpoints") or [])
+        if ep.get("method") and ep.get("path")
+    })
 
     agent_logs = list(state.get("agent_logs") or [])
     result_test_cases: dict[int, list] = {}
@@ -3664,12 +3724,17 @@ async def _tc_generate_doc_search(state: PipelineState) -> dict:
         agent = TCFromDocsAgent(trace_id=trace_id)
         output = await agent.run(AgentInput(
             trace_id=trace_id,
-            context={"ts_item": ts_item, "retrieved_docs": retrieved_docs},
+            context={
+                "ts_item": ts_item,
+                "retrieved_docs": retrieved_docs,
+                "endpoints": endpoint_specs,
+            },
             params={},
         ))
         duration = round(time.monotonic() - start, 2)
         test_cases = output.result.get("test_cases") or []
         analysis = output.result.get("analysis") or []
+        _validate_tc_apis_against_scan(test_cases, endpoint_specs, trace_id)
         result_test_cases[idx] = test_cases
 
         if service_id:
@@ -3849,6 +3914,16 @@ async def _tv_generate_codebase_aware(state: PipelineState) -> dict:
                         files=[s["file"] for s in source_snippets],
                     )
 
+            # 같은 TS 의 이전 TC 들이 이미 사용한 값 — unique 필드 (email 등) 재사용 방지.
+            # 격차 2: TV agent 가 TC 단위 호출이라 sibling 값을 못 봐 test@test.com 등이
+            # TS 안에서 중복 생성 → SUT unique constraint 위반 → positive TC api fail.
+            same_ts_values: list[dict] = [
+                {"tc_id": prev.get("tc_id"), "field": v.get("field"), "value": v.get("value")}
+                for prev in updated_tcs
+                for v in (prev.get("values") or [])
+                if v.get("field") and v.get("value")
+            ]
+
             start = time.monotonic()
             try:
                 agent = TVFromCodebaseAgent(trace_id=trace_id)
@@ -3862,6 +3937,7 @@ async def _tv_generate_codebase_aware(state: PipelineState) -> dict:
                         "patterns": patterns,
                         "db_snapshot": db_snapshot,
                         "source_snippets": source_snippets,
+                        "same_ts_values": same_ts_values,
                     },
                     params={},
                 ))
