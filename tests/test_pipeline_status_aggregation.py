@@ -39,7 +39,12 @@ def test_aggregate_tc_db_error_marks_failed():
     assert P._aggregate_tc_results(ui, api, db) == {"TC-001": "failed"}
 
 
-def test_aggregate_tc_skip_and_fallback_used_count_as_pass():
+def test_aggregate_tc_skip_separated_fallback_used_counts_as_pass():
+    """ui skip = 검증 안 됨 → skipped 분리 (passed 로 세면 false-positive).
+
+    fallback_used 는 실제로 검증을 수행한 것이라 passed 유지.
+    (구버전: skip 도 passed — 2026-06-11 false-pass 채널 봉인으로 변경)
+    """
     ui = [
         {"tc_id": "TC-001", "status": "skip"},
         {"tc_id": "TC-002", "status": "fallback_used"},
@@ -50,7 +55,7 @@ def test_aggregate_tc_skip_and_fallback_used_count_as_pass():
     ]
     db = [{"tc_id": "TC-001"}, {"tc_id": "TC-002"}]
     assert P._aggregate_tc_results(ui, api, db) == {
-        "TC-001": "passed",
+        "TC-001": "skipped",
         "TC-002": "passed",
     }
 

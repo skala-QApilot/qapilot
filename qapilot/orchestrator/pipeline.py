@@ -2210,6 +2210,20 @@ async def _code_generate(state: PipelineState) -> dict:
     action_mappings = state.get("action_mappings") or []
     agent_logs = state.get("agent_logs", [])
 
+    # SUT 의 기존 테스트 패턴 (sut_tests-patterns metadata-index) — 이 앱에서
+    # 통하는 셀렉터/인증 셋업/대기 패턴의 few-shot 근거. 코드 생성이 테스트 작성
+    # 노하우 0 으로 추측하던 격차의 보강 (옵션 2 소비처 확장).
+    sut_test_patterns = None
+    try:
+        trace_meta = load_trace(state.get("trace_id") or "") or {}
+        cg_service_id = trace_meta.get("service_id")
+        if cg_service_id:
+            from qapilot.shared.scan_storage import load_metadata_index
+            sut_test_patterns = load_metadata_index(cg_service_id, "sut_tests", "patterns")
+    except Exception as e:
+        logger.warning("code_generate_patterns_load_failed",
+                       trace_id=state.get("trace_id"), error=str(e))
+
     try:
         agent = CodeGeneratorAgent(trace_id=state.get("trace_id"))
         result = await agent.run(
@@ -2220,6 +2234,7 @@ async def _code_generate(state: PipelineState) -> dict:
                     "scenarios": state.get("scenarios", []),
                     "frontend_dom": state.get("frontend_dom") or [],
                     "qapilot_dir": state.get("qapilot_dir"),
+                    "sut_test_patterns": sut_test_patterns,
                 },
                 params={},
             )
@@ -2798,10 +2813,12 @@ def _load_all_tc_results_from_disk(
 def _aggregate_tc_results(
     ui_results: list[dict], api_results: list[dict], db_results: list[dict]
 ) -> dict[str, str]:
-    """TC 별 종합 status 도출 — `passed` / `failed`.
+    """TC 별 종합 status 도출 — `passed` / `failed` / `skipped`.
 
-    판정 기준: UI 가 pass/skip/fallback_used 이고, API error_calls 0, DB error 없음 → passed.
-    하나라도 위반 → failed. spec §6 의 results/{trace}/{ts}/{tc}/*.json 과 정합.
+    판정 기준: UI 가 pass/fallback_used 이고, API error_calls 0, DB error 없음 → passed.
+    UI fail 또는 API/DB error → failed. UI skip 은 **검증 안 됨** — passed 로 세면
+    false-positive 라 `skipped` 로 분리 (Spring ScenarioStatusAggregator 도 pass/fail
+    외 상태는 미측정 처리). spec §6 의 results/{trace}/{ts}/{tc}/*.json 과 정합.
     """
     ui_map: dict[str, Any] = {str(r["tc_id"]): r for r in ui_results if r.get("tc_id") is not None}
     api_map: dict[str, Any] = {str(r["tc_id"]): r for r in api_results if r.get("tc_id") is not None}
@@ -2814,11 +2831,15 @@ def _aggregate_tc_results(
         db = db_map.get(tc_id) or {}
 
         ui_status = ui.get("status", "")
-        ui_ok = ui_status in ("pass", "skip", "fallback_used")
         api_ok = int(api.get("error_calls") or 0) == 0
         db_ok = not db.get("error")
 
-        tc_results[tc_id] = "passed" if (ui_ok and api_ok and db_ok) else "failed"
+        if ui_status == "skip":
+            tc_results[tc_id] = "skipped"
+        elif ui_status in ("pass", "fallback_used") and api_ok and db_ok:
+            tc_results[tc_id] = "passed"
+        else:
+            tc_results[tc_id] = "failed"
     return tc_results
 
 
@@ -2828,7 +2849,8 @@ def _aggregate_scenario_results(
     """TS 별 status 도출 — 모든 TC passed → passed, 하나라도 failed → failed, TC 없으면 미수록.
 
     Scenario 에 속한 TC 중 실행된 것만 봄. 실행 안 된 TC 는 무시
-    (selective 실행 시나리오 보존).
+    (selective 실행 시나리오 보존). skipped TC 는 측정에서 제외 —
+    전부 skipped 인 TS 는 미수록 (passed 로 잡으면 false-positive).
     """
     scenario_results: dict[str, str] = {}
     for ts in scenarios or []:
@@ -2836,11 +2858,14 @@ def _aggregate_scenario_results(
         if not ts_id:
             continue
         ts_tc_ids = [tc.get("tc_id") for tc in (ts.get("test_cases") or []) if tc.get("tc_id")]
-        ran = [tc_id for tc_id in ts_tc_ids if tc_id in tc_results]
-        if not ran:
+        measured = [
+            tc_id for tc_id in ts_tc_ids
+            if tc_results.get(tc_id) in ("passed", "failed")
+        ]
+        if not measured:
             continue
         scenario_results[ts_id] = (
-            "failed" if any(tc_results[tc_id] == "failed" for tc_id in ran) else "passed"
+            "failed" if any(tc_results[tc_id] == "failed" for tc_id in measured) else "passed"
         )
     return scenario_results
 
@@ -3593,6 +3618,47 @@ async def _ts_generate_prd_only(state: PipelineState) -> dict:
     return {"ts_list": ts_list, "agent_logs": agent_logs}
 
 
+def _build_frontend_grounding(routes_idx: Any, selectors_idx: Any) -> str:
+    """frontend 메타데이터 → TC 생성용 화면 grounding 요약 (오라클 아님 — 실재 확인용).
+
+    - 라우트 목록 + 인증 가드/리다이렉트 (given 절의 전제 조건 grounding)
+    - 라우트별 피드백 요소 (error/success/toast 류 testid) — then 절을
+      "관찰 가능한 결과" 로 구체화할 근거.
+    """
+    lines: list[str] = []
+    route_items = (routes_idx or {}).get("routes") or []
+    if route_items:
+        lines.append("[실재하는 화면 라우트]")
+        for r in route_items:
+            path = r.get("path") or ""
+            if not path:
+                continue
+            notes: list[str] = []
+            if r.get("guards"):
+                notes.append("인증 필요")
+            if r.get("redirects_when_authed"):
+                notes.append(f"로그인 상태면 {r['redirects_when_authed']} 로 리다이렉트")
+            suffix = f" ({', '.join(notes)})" if notes else ""
+            lines.append(f"- {path}{suffix}")
+
+    by_route = (selectors_idx or {}).get("by_route") or {}
+    feedback_tokens = ("error", "success", "toast", "message", "status", "alert")
+    fb_lines: list[str] = []
+    for route, groups in by_route.items():
+        testids = [
+            el.get("testid") for el in (groups.get("outputs") or [])
+            if el.get("testid") and any(t in el["testid"].lower() for t in feedback_tokens)
+        ]
+        if testids:
+            fb_lines.append(f"- {route}: {', '.join(sorted(set(testids)))}")
+    if fb_lines:
+        lines.append("")
+        lines.append("[라우트별 관찰 가능한 피드백 요소 (data-testid)]")
+        lines.extend(sorted(fb_lines))
+
+    return "\n".join(lines)
+
+
 def _validate_tc_apis_against_scan(
     test_cases: list[dict], endpoint_specs: list[str], trace_id: str
 ) -> None:
@@ -3684,6 +3750,18 @@ async def _tc_generate_doc_search(state: PipelineState) -> dict:
         if ep.get("method") and ep.get("path")
     })
 
+    # 화면 grounding (라우트 + 피드백 요소) — then 절을 관찰 가능한 결과로
+    # 구체화할 근거. 기대값 오라클이 아니라 실재 확인용 (prompt 에 원칙 명시).
+    frontend_grounding = ""
+    if service_id:
+        try:
+            from qapilot.shared.scan_storage import load_metadata_index
+            routes_idx = load_metadata_index(service_id, "frontend", "routes")
+            selectors_idx = load_metadata_index(service_id, "frontend", "selectors")
+            frontend_grounding = _build_frontend_grounding(routes_idx, selectors_idx)
+        except Exception as e:
+            logger.warning("tc_frontend_grounding_load_failed", trace_id=trace_id, error=str(e))
+
     agent_logs = list(state.get("agent_logs") or [])
     result_test_cases: dict[int, list] = {}
 
@@ -3728,6 +3806,7 @@ async def _tc_generate_doc_search(state: PipelineState) -> dict:
                 "ts_item": ts_item,
                 "retrieved_docs": retrieved_docs,
                 "endpoints": endpoint_specs,
+                "frontend_grounding": frontend_grounding,
             },
             params={},
         ))

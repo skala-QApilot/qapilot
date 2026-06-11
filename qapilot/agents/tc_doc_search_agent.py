@@ -91,6 +91,8 @@ class TCFromDocsAgent(BaseAgent):
         # 격차 4: 코드 스캔으로 확인된 실제 endpoint 목록 ("METHOD /api/path" 문자열).
         # 이 목록 밖의 api 를 LLM 이 창작하지 못하게 prompt 로 제약한다.
         endpoints: list[str] = context.get("endpoints") or []
+        # 화면 grounding (라우트 + 피드백 요소 요약 문자열) — then 절 구체화 근거.
+        frontend_grounding: str = context.get("frontend_grounding") or ""
 
         ts_name = ts_item.get("name", "")
         ts_description = ts_item.get("description", "")
@@ -102,6 +104,7 @@ class TCFromDocsAgent(BaseAgent):
             requirements=_format_requirements(requirements),
             retrieved_docs=_format_retrieved_docs(retrieved_docs),
             endpoints=_format_endpoints(endpoints),
+            frontend_grounding=frontend_grounding or "없음 (frontend 스캔 결과 없음)",
         )
         if last_error:
             user_prompt += f"\n\n[이전 시도 오류: {last_error}. JSON 형식을 확인하라.]"
@@ -135,7 +138,7 @@ class TCFromDocsAgent(BaseAgent):
             if not isinstance(tc, dict) or not tc.get("name"):
                 continue
             sources = tc.get("sources") or []
-            valid.append({
+            parsed = {
                 "name": str(tc.get("name", "")),
                 "technique": str(tc.get("technique", "")),
                 "given": str(tc.get("given", "")),
@@ -146,8 +149,14 @@ class TCFromDocsAgent(BaseAgent):
                 "req_id": tc.get("req_id"),
                 "api": tc.get("api"),
                 "sources": sources,
-                "doc_verified": "codebase" in sources,
+                # 문서 근거 유무 — True 면 then 절이 문서(PRD/정책서) 오라클 기반,
+                # False 면 잠정(provisional) TC. (기존 `"codebase" in sources` 는
+                # 의미가 반대로 박혀 전 TC false 로 죽어 있던 필드)
+                "doc_verified": bool([s for s in sources if s != "codebase"]),
                 "depends_on": tc.get("depends_on") or [],
-            })
+            }
+            if tc.get("mismatch_note"):
+                parsed["mismatch_note"] = str(tc["mismatch_note"])
+            valid.append(parsed)
 
         return valid, analysis, confidence

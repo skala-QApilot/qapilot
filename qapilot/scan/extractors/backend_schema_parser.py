@@ -453,12 +453,19 @@ def _process_class(
 
     if is_sqla:
         cols = _extract_sqla_columns(class_node, source)
+        explicit_table = _extract_table_name(class_node, source)
+        # declarative base 자체 (`class Base(DeclarativeBase): pass`) 는 테이블이
+        # 아니다 — __tablename__ 도 column 도 없으면 skip. 이걸 db_model 로 내보내면
+        # pick_table_for_tc fallback 이 "base" 를 선택해 DB 스냅샷 404 가 난다
+        # (trace 44a15469: 95/132 TC 가 table="base" 404).
+        if explicit_table is None and not cols:
+            return
         for c in cols:
             c.extracted_from = ExtractedFrom(
                 file=relative_file, line_start=c.extracted_from.line_start,
                 line_end=c.extracted_from.line_end, commit_sha=commit_sha,
             )
-        table_name = _extract_table_name(class_node, source) or class_name.lower()
+        table_name = explicit_table or class_name.lower()
         db_models[class_name] = DbModel(
             extracted_from=ExtractedFrom(
                 file=relative_file, line_start=class_node.start_point[0] + 1,

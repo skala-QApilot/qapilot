@@ -61,6 +61,8 @@ class CodeGeneratorAgent(BaseAgent):
         scenarios = context.get("scenarios") or params.get("scenarios") or []
         # source of truth 는 ActionMapping. CodeGenerator 단계에서는 frontend.json 재매핑 금지.
         frontend_dom: list[dict] = []
+        # SUT 기존 테스트 패턴 — LLM fallback 경로의 few-shot (셀렉터/셋업/대기 노하우).
+        self._sut_patterns_text = self._format_sut_patterns(context.get("sut_test_patterns"))
 
         if not action_mappings:
             return ExecuteResult(result={"generated_codes": [], "failed_tcs": []}, confidence=1.0)
@@ -179,6 +181,7 @@ class CodeGeneratorAgent(BaseAgent):
                     scenarios=json.dumps(scenarios_for_prompt, ensure_ascii=False),
                     action_mappings=json.dumps([action_mapping], ensure_ascii=False),
                     frontend_dom=self._format_frontend_dom(frontend_dom),
+                    sut_test_patterns=getattr(self, "_sut_patterns_text", "없음"),
                 ),
                 last_error,
             )
@@ -205,6 +208,25 @@ class CodeGeneratorAgent(BaseAgent):
         code_obj["syntax_valid"] = self._validate_syntax(code_obj.get("code", ""))
         code_obj.setdefault("self_fix_count", 0)
         return code_obj
+
+    @staticmethod
+    def _format_sut_patterns(patterns_idx: Any) -> str:
+        """sut_tests-patterns metadata-index → LLM prompt 용 compact 텍스트.
+
+        snippet 상위 5개, 각 600자 cap — 이 앱에서 실제로 통하는 fixture/
+        셀렉터/대기 패턴의 few-shot 근거.
+        """
+        items = (patterns_idx or {}).get("patterns") or []
+        if not items:
+            return "없음"
+        parts: list[str] = []
+        for p in items[:5]:
+            purpose = p.get("purpose") or p.get("pattern_kind") or ""
+            snippet = (p.get("snippet") or "")[:600]
+            if not snippet:
+                continue
+            parts.append(f"### {purpose} ({p.get('file', '')})\n```\n{snippet}\n```")
+        return "\n\n".join(parts) if parts else "없음"
 
     def _load_frontend_dom(self, context: dict[str, Any]) -> list[dict]:
         ctx_dom = context.get("frontend_dom")
@@ -280,7 +302,11 @@ class CodeGeneratorAgent(BaseAgent):
 
         locator = self._locator_expr(selector_type, selector)
         if not locator:
-            return f"test.skip(true, {json.dumps(f'missing selector for action: {action}', ensure_ascii=False)});"
+            # test.skip 은 CI 에서 통과로 보여 "테스트했다고 착각" 하게 만든다 —
+            # 명시적 fail (수동 검토 태깅). 셀렉터 미해결은 검증 불가 사실의 보고가 정답.
+            return (
+                f"throw new Error({json.dumps(f'QAPILOT_MANUAL_REVIEW: missing selector for action: {action}', ensure_ascii=False)});"
+            )
 
         if action == "fill":
             return f"await {locator}.fill({self._js_value(self._sanitize_fill_value(selector, value))});"
@@ -319,7 +345,7 @@ class CodeGeneratorAgent(BaseAgent):
 
         return [
             f"// TODO: unsupported action {json.dumps(action, ensure_ascii=False)}",
-            f"test.skip(true, {json.dumps(f'unsupported action: {action}', ensure_ascii=False)});",
+            f"throw new Error({json.dumps(f'QAPILOT_MANUAL_REVIEW: unsupported action: {action}', ensure_ascii=False)});",
         ]
 
     def _locator_expr(self, selector_type: Any, selector: Any) -> str | None:

@@ -889,7 +889,10 @@ class UITestTool(BaseTool):
                         if r > best_ratio:
                             best_ratio = r
                             best_line = line
-                    if best_ratio >= 0.6:
+                    # 임계 0.75 — 0.6 은 무관한 문장도 통과시키는 false-pass 채널
+                    # (e2e trace 40fce3fa 의 가짜 PASS 패턴). substring 매칭은 위에서
+                    # 이미 처리되므로 여기는 보수적으로.
+                    if best_ratio >= 0.75:
                         self.logger.info(
                             "ui_assert_pagewide_fuzzy_match",
                             target=target_text[:80],

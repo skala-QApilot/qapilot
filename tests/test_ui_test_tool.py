@@ -616,10 +616,14 @@ async def test_optionC_assert_substring_match_in_page_text_recovers(tool, mock_p
 
 @pytest.mark.asyncio
 async def test_optionC_assert_fuzzy_match_above_threshold_recovers(tool, mock_page):
-    """옵션 C: substring 매칭 X 인데 fuzzy ratio 0.6+ 줄 적중 → pass."""
+    """옵션 C: substring 매칭 X 인데 fuzzy ratio 0.75+ 줄 적중 → pass.
+
+    (임계 0.6 → 0.75 상향 — 2026-06-11 false-pass 봉인. 0.6 은 무관 문장도
+    통과시키던 채널.)
+    """
     from playwright.async_api import TimeoutError as PWTimeoutError
     page = mock_page
-    page.evaluate = AsyncMock(return_value="홈\n로그인 완료 — 환영합니다\n메뉴")
+    page.evaluate = AsyncMock(return_value="홈\n로그인이 완료되었습니다!\n메뉴")
     tool.logger = MagicMock()
 
     fake_assertion = MagicMock()
