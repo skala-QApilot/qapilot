@@ -105,3 +105,32 @@ async def test_llm_parse_failure_is_not_silent_pass():
     assert error_code == "CC_PARSE_FAIL"
     assert score == 0.0
     assert "unverified" in summary
+
+
+class TestApiKindIntentAwareLabeling:
+    """api kind 의 의도 인지 라벨링 — 의도된 4xx 를 fail 로 오라벨하던 격차."""
+
+    def test_negative_intent_4xx_is_pass(self):
+        from qapilot.orchestrator.pipeline import _derive_api_status
+        payload = {"error_calls": 1, "calls": [
+            {"method": "POST", "status_code": 409, "url": "http://sut/api/auth/signup"},
+        ]}
+        assert _derive_api_status(payload, intent_negative=True) == "pass"
+
+    def test_negative_intent_5xx_still_fail(self):
+        from qapilot.orchestrator.pipeline import _derive_api_status
+        payload = {"error_calls": 1, "calls": [
+            {"method": "POST", "status_code": 500, "url": "http://sut/api/orders"},
+        ]}
+        assert _derive_api_status(payload, intent_negative=True) == "fail"
+
+    def test_positive_intent_4xx_is_fail(self):
+        from qapilot.orchestrator.pipeline import _derive_api_status
+        payload = {"error_calls": 1, "calls": [
+            {"method": "POST", "status_code": 409, "url": "http://sut/api/auth/signup"},
+        ]}
+        assert _derive_api_status(payload, intent_negative=False) == "fail"
+
+    def test_no_errors_pass_regardless(self):
+        from qapilot.orchestrator.pipeline import _derive_api_status
+        assert _derive_api_status({"error_calls": 0, "calls": []}, intent_negative=True) == "pass"

@@ -2811,6 +2811,9 @@ async def _test_execution(state: PipelineState) -> dict:
                         api_result=api_payload,
                         db_result=db_res,
                         screenshots_dir=screenshots_dir,
+                        intent_negative=_is_negative_intent_then(
+                            tc_then_by_id.get(str(tc_id), "")
+                        ),
                     )
                 except Exception as e:
                     logger.warning(
@@ -2840,17 +2843,30 @@ async def _test_execution(state: PipelineState) -> dict:
     }
 
 
-def _derive_api_status(payload: dict | None) -> str | None:
-    """api kind 의 tc_results.status 도출 (#227).
+def _derive_api_status(payload: dict | None, intent_negative: bool = False) -> str | None:
+    """api kind 의 tc_results.status 도출 (#227 + 의도 인지 라벨링).
 
-    APITraceResult schema 에 status 키가 없어 자동 추출 None — error_calls 기반 명시 분류.
+    APITraceResult schema 에 status 키가 없어 자동 추출 None — error_calls 기반 분류.
+    negative 의도 TC 의 4xx 는 '의도된 거부' 라 fail 오라벨이었다 (run 9590382a:
+    TS-001-TC-05 의 의도된 409 가 api fail 로 표시). 의도 인지:
+    - negative + 4xx 만 존재 (5xx 없음) → pass (의도 도달)
+    - 5xx 는 의도와 무관한 서버 오류 — 항상 fail
     """
     if not isinstance(payload, dict):
         return None
     try:
-        return "pass" if int(payload.get("error_calls", 0)) == 0 else "fail"
+        error_calls = int(payload.get("error_calls", 0))
     except (TypeError, ValueError):
         return None
+    if error_calls == 0:
+        return "pass"
+    if intent_negative:
+        has_5xx = any(
+            (c.get("status_code") or 0) >= 500
+            for c in (payload.get("calls") or [])
+        )
+        return "fail" if has_5xx else "pass"
+    return "fail"
 
 
 def _derive_db_status(payload: dict | None) -> str | None:
@@ -2867,6 +2883,14 @@ def _derive_db_status(payload: dict | None) -> str | None:
     return "pass"
 
 
+def _is_negative_intent_then(then: str) -> bool:
+    """then 절이 거부/오류를 기대하는지 — api kind 의 의도 인지 라벨링용."""
+    from qapilot.agents.action_mapper_agent import _NEGATIVE_OUTCOME_HINTS
+
+    t = (then or "").lower()
+    return any(h in t for h in _NEGATIVE_OUTCOME_HINTS)
+
+
 def _mirror_tc_results_and_artifacts(
     *,
     trace_id: str,
@@ -2876,6 +2900,7 @@ def _mirror_tc_results_and_artifacts(
     api_result: dict,
     db_result: dict,
     screenshots_dir: Path,
+    intent_negative: bool = False,
 ) -> None:
     """ui/api/db 결과 → tc_results UPSERT, 스크린샷 PNG → S3 + tc_artifacts.
 
@@ -2888,7 +2913,7 @@ def _mirror_tc_results_and_artifacts(
     # upsert_tc_result 의 자동 추출이 None → DB status 컬럼 null 저장됨. 명시적 도출 (#227).
     upsert_tc_result(
         run_id=trace_id, ts_id=ts_id, tc_id=tc_id, kind="api", payload=api_result,
-        status=_derive_api_status(api_result),
+        status=_derive_api_status(api_result, intent_negative=intent_negative),
     )
     upsert_tc_result(
         run_id=trace_id, ts_id=ts_id, tc_id=tc_id, kind="db", payload=db_result,
