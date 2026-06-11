@@ -773,12 +773,19 @@ class ActionMapperAgent(BaseAgent):
             if action in {"assert", "assert_visible"}:
                 if resolved is not None:
                     step["expected"] = None
-                elif not step.get("expected"):
-                    # selector 미해결 assert — then 절 텍스트를 expected 로 보존해
-                    # UITestTool 의 page-wide fuzzy fallback 이 의미 검증을 수행하게 한다.
-                    # (기존: selector/expected 둘 다 None → 검증 대상 자체 소실)
+                else:
                     then_text = str(tc.get("then") or "").strip()
-                    step["expected"] = then_text or None
+                    if intent.get("expects_absence") and then_text:
+                        # absence 의도 (포함되지 않는다 류): LLM 이 expected 에
+                        # grounding 의 화면 문구 (empty-state) 를 써둔 경우 then 으로
+                        # 강제 — 그래야 codegen 의 absence 가드가 작동한다
+                        # (run d20fc18f: TS-004-TC-02 가 'getByText(없습니다)' 로
+                        # 강등되어 데이터 존재 시 영구 fail 하던 잔여 구멍).
+                        step["expected"] = then_text
+                    elif not step.get("expected"):
+                        # selector 미해결 assert — then 절 텍스트를 expected 로 보존해
+                        # UITestTool 의 page-wide fuzzy fallback 이 의미 검증을 수행하게 한다.
+                        step["expected"] = then_text or None
             steps.append(step)
 
         steps = self._ensure_navigate_step(steps, route_hint)

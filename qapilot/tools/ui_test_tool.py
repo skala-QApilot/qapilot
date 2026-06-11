@@ -240,6 +240,11 @@ class UITestTool(BaseTool):
                 "step_no": step_no,
                 "action": action,
                 "status": status,  # type: ignore[typeddict-item]
+                # selector 보존 — Layer 3 분류기가 문장형 텍스트 assert (검증 표현력
+                # 한계) 를 식별하는 입력. 누락 시 전부 PRODUCT 후보로 오염
+                # (run d20fc18f: UNVERIFIABLE 0건 / PRODUCT 11건의 원인).
+                "selector": step.get("selector"),
+                "selector_type": step.get("selector_type"),
                 "screenshot_path": screenshot_path,
                 "console_logs": list(console_logs),
                 "error": error_msg,
