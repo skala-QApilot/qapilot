@@ -31,7 +31,9 @@ logger = get_logger(source="precondition_fixture")
 # path 어딘가에 {param} 이 있으면 1차 리소스 segment 채택
 # (/api/orders/{id}, /api/tier/brands/{code}/issue → orders, tier)
 _PARAM_RESOURCE_RE = re.compile(r"/api/([a-zA-Z_]+)\S*\{")
-_MAX_BODY_REPAIR = 4
+# 중첩 스키마 (list[Model]) 는 단계적으로 드러난다:
+# {} → missing items → [] → too_short → [{}] → missing items.0.plan_id → 값
+_MAX_BODY_REPAIR = 6
 _TIMEOUT = httpx.Timeout(10.0)
 
 
@@ -110,16 +112,86 @@ async def _resolve_ref_ids(
 
 
 def _missing_fields_from_422(payload: Any) -> list[tuple[str, str]]:
-    """FastAPI 422 detail → [(field, err_type)]. body 밖 loc 은 무시."""
-    out: list[tuple[str, str]] = []
+    """FastAPI 422 detail → [(leaf_field, err_type)]. (호환용 — 평면 뷰)"""
+    return [
+        (str(loc[-1]), err_type)
+        for loc, err_type, _ in _field_errors_from_422(payload)
+    ]
+
+
+def _field_errors_from_422(payload: Any) -> list[tuple[list, str, dict]]:
+    """FastAPI 422 detail → [(body 이후 loc 경로, err_type, ctx)].
+
+    중첩 스키마 (list[Model]) 의 loc=["body","items",0,"plan_id"] 까지 보존.
+    """
+    out: list[tuple[list, str, dict]] = []
     detail = (payload or {}).get("detail") if isinstance(payload, dict) else None
     for item in detail or []:
         if not isinstance(item, dict):
             continue
-        loc = item.get("loc") or []
+        loc = list(item.get("loc") or [])
         if len(loc) >= 2 and loc[0] == "body":
-            out.append((str(loc[-1]), str(item.get("type") or "")))
+            out.append((loc[1:], str(item.get("type") or ""), item.get("ctx") or {}))
     return out
+
+
+def _guess_typed_value(field: str, err_type: str, ctx: dict, ref_ids: dict[str, Any]) -> Any:
+    """err_type/ctx 우선 타입 휴리스틱 (중첩 경로 leaf 용)."""
+    if "list" in err_type:
+        return []
+    if "dict" in err_type or "model" in err_type:
+        return {}
+    expected = str(ctx.get("expected") or "")
+    if expected:
+        # Literal/enum: ctx.expected = "'NONE', '12' or '24'" → 첫 허용값
+        m = re.search(r"'([^']+)'", expected)
+        if m:
+            return m.group(1)
+    return _guess_field_value(field, err_type, ref_ids)
+
+
+def _apply_field_error(
+    body: dict, loc_path: list, err_type: str, ctx: dict, ref_ids: dict[str, Any]
+) -> None:
+    """loc 경로를 따라 body 를 패치 — 중간 컨테이너 (dict/list) 자동 생성.
+
+    too_short (min_length) 는 리스트에 빈 객체 추가 — 다음 422 가 그 객체의
+    필수 필드를 알려준다 (자가치유 사다리).
+    """
+    target: Any = body
+    for i, key in enumerate(loc_path[:-1]):
+        nxt = loc_path[i + 1]
+        want_list = isinstance(nxt, int)
+        if isinstance(key, int):
+            if not isinstance(target, list):
+                return
+            while len(target) <= key:
+                target.append([] if want_list else {})
+            target = target[key]
+        else:
+            if not isinstance(target, dict):
+                return
+            if key not in target or not isinstance(target[key], (dict, list)):
+                target[key] = [] if want_list else {}
+            target = target[key]
+
+    leaf = loc_path[-1]
+    if "too_short" in err_type:
+        current = target[leaf] if isinstance(target, dict) and leaf in target else None
+        if isinstance(current, list):
+            current.append({})
+        elif isinstance(target, dict):
+            target[leaf] = [{}]
+        return
+    value = _guess_typed_value(str(leaf), err_type, ctx, ref_ids)
+    if isinstance(leaf, int):
+        if isinstance(target, list):
+            while len(target) <= leaf:
+                target.append({})
+            target[leaf] = value
+        return
+    if isinstance(target, dict):
+        target[leaf] = value
 
 
 async def ensure_resource_preconditions(
@@ -188,17 +260,19 @@ async def ensure_resource_preconditions(
                     break
                 if cr.status_code == 422:
                     try:
-                        fields = _missing_fields_from_422(cr.json())
+                        errors = _field_errors_from_422(cr.json())
                     except Exception:
-                        fields = []
-                    if not fields:
+                        errors = []
+                    if not errors:
                         results[res] = "failed:create_422_unparsable"
                         break
-                    ref_ids = await _resolve_ref_ids(
-                        client, base, headers, [f for f, _ in fields],
-                    )
-                    for field, err_type in fields:
-                        body[field] = _guess_field_value(field, err_type, ref_ids)
+                    leaf_names = [
+                        str(loc[-1]) for loc, _, _ in errors
+                        if not isinstance(loc[-1], int)
+                    ]
+                    ref_ids = await _resolve_ref_ids(client, base, headers, leaf_names)
+                    for loc_path, err_type, ctx in errors:
+                        _apply_field_error(body, loc_path, err_type, ctx, ref_ids)
                     continue
                 results[res] = f"failed:create_{cr.status_code}"
                 break

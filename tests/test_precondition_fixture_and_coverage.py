@@ -98,6 +98,70 @@ class TestPreconditionFixtureHelpers:
         assert len(v) == 10 and v[4] == "-"
 
 
+class TestNestedRepair:
+    def test_apply_nested_loc_path(self):
+        from qapilot.shared.precondition_fixture import _apply_field_error
+        body: dict = {}
+        _apply_field_error(body, ["items"], "missing", {}, {})
+        _apply_field_error(body, ["items"], "list_type", {}, {})
+        _apply_field_error(body, ["items"], "too_short", {}, {})
+        assert body["items"] == [{}]
+        _apply_field_error(body, ["items", 0, "plan_id"], "missing", {}, {"plan_id": 5})
+        assert body["items"][0]["plan_id"] == 5
+
+    def test_literal_enum_uses_ctx_expected(self):
+        from qapilot.shared.precondition_fixture import _guess_typed_value
+        v = _guess_typed_value("contract_type", "literal_error",
+                               {"expected": "'NONE', '12' or '24'"}, {})
+        assert v == "NONE"
+
+
+@pytest.mark.asyncio
+async def test_nested_list_model_repair_ladder(monkeypatch):
+    """list[Model] 스키마 (FastAPI 표준 패턴) — {} → items missing → [{}] →
+    items.0.plan_id missing → 생성 성공까지의 사다리."""
+    import httpx
+    import json as _json
+    from qapilot.shared import precondition_fixture as pf
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        p = request.url.path
+        if p.endswith("/api/auth/login"):
+            return httpx.Response(200, json={"token": "tkn"})
+        if request.method == "GET" and p == "/api/orders":
+            return httpx.Response(200, json=[])
+        if request.method == "GET" and p == "/api/plans":
+            return httpx.Response(200, json=[{"id": 3}])
+        if request.method == "POST" and p == "/api/orders":
+            body = _json.loads(request.content or b"{}")
+            items = body.get("items")
+            if items is None:
+                return httpx.Response(422, json={"detail": [
+                    {"loc": ["body", "items"], "type": "missing"}]})
+            if not isinstance(items, list):
+                return httpx.Response(422, json={"detail": [
+                    {"loc": ["body", "items"], "type": "list_type"}]})
+            if len(items) < 1:
+                return httpx.Response(422, json={"detail": [
+                    {"loc": ["body", "items"], "type": "too_short"}]})
+            if "plan_id" not in items[0]:
+                return httpx.Response(422, json={"detail": [
+                    {"loc": ["body", "items", 0, "plan_id"], "type": "missing"}]})
+            return httpx.Response(201, json={"id": 1})
+        return httpx.Response(404)
+
+    transport = httpx.MockTransport(handler)
+    orig_client = httpx.AsyncClient
+    monkeypatch.setattr(pf.httpx, "AsyncClient",
+                        lambda **kw: orig_client(transport=transport, **kw))
+
+    results = await pf.ensure_resource_preconditions(
+        "http://sut", {"email": "a@b.c", "password": "p"},
+        ["PATCH /api/orders/{order_id}/change-plan"], trace_id="t",
+    )
+    assert results == {"orders": "created"}
+
+
 @pytest.mark.asyncio
 async def test_ensure_preconditions_creates_when_empty(monkeypatch):
     """orders 0건 → 422 자가치유 → 생성 성공 흐름 (httpx mock)."""
