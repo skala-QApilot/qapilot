@@ -38,8 +38,10 @@ _FUZZY_MATCH_SHARED_SUBSTRING_BONUS = 0.15
 _FRONTEND_CANDIDATE_FILE_LIMIT = 4
 _FRONTEND_CANDIDATE_ELEMENT_LIMIT = 40
 _SEMANTIC_ALIASES: dict[str, tuple[str, ...]] = {
-    "회원가입": ("signup", "가입", "create account"),
-    "가입": ("signup", "회원가입"),
+    # "가입" 단독 → signup 매핑 금지 — "요금제 가입"/"가족 가입"/"멤버십 가입" 등
+    # 도메인 가입 시나리오가 전부 회원가입 페이지로 오염된다 (run 3b50a65b:
+    # TS-006 신규 요금제 가입이 /signup + signup-submit 으로 매핑). 회원가입만 인정.
+    "회원가입": ("signup", "create account"),
     "로그인": ("login", "signin"),
     "이메일": ("email", "mail"),
     "비밀번호": ("password", "pwd", "pass"),
@@ -475,6 +477,11 @@ class ActionMapperAgent(BaseAgent):
         if not frontend_dom:
             return []
 
+        # TC.api 기반 가점용 — batch 의 첫 TC api (per-TC 분할 후 batch = TC 1개).
+        self._current_tc_api = next(
+            (str(tc.get("api") or "") for tc in batch if tc.get("api")), "",
+        )
+
         scenario_text = self._scenario_text_for_candidates(batch)
         if not scenario_text.strip():
             return frontend_dom[:_FRONTEND_CANDIDATE_ELEMENT_LIMIT]
@@ -547,9 +554,18 @@ class ActionMapperAgent(BaseAgent):
                 if any(alias in control_type for alias in aliases):
                     score += 0.3
 
-        if any(term in scenario_text for term in ("회원가입", "가입")):
+        # "가입" 단독 매칭 금지 (TS-006 오염) — 회원가입 명시 시에만 signup 가점.
+        if "회원가입" in scenario_text:
             if "signup" in file_path or route == "/signup" or page == "signup":
                 score += 2.0
+        # TC.api 기반 가점 — api path segment 가 element 의 route/file/page 와
+        # 일치하면 그 화면이 본 TC 의 무대일 가능성이 높다 (도메인 무관 신호).
+        api_path = str(getattr(self, "_current_tc_api", "") or "")
+        for seg in api_path.lower().split("/"):
+            if seg and seg not in ("api",) and not seg.startswith("{") and len(seg) > 2:
+                if seg in file_path or seg in route or seg in page:
+                    score += 1.5
+                    break
         if any(term in scenario_text for term in ("로그인",)):
             if "login" in file_path or route == "/login" or page == "login":
                 score += 2.0
@@ -829,7 +845,8 @@ class ActionMapperAgent(BaseAgent):
 
         if action in {"click", "dblclick", "hover", "check", "uncheck"}:
             target_text = selector if self._is_meaningful_selector_hint(selector, value) else scenario_text
-            target_kind = "submit" if any(tok in scenario_text.lower() for tok in ("회원가입", "signup", "가입")) else "actionable"
+            # "가입" 단독은 도메인 가입 (요금제/가족/멤버십) 과 구분 불가 — 회원가입만.
+            target_kind = "submit" if any(tok in scenario_text.lower() for tok in ("회원가입", "signup")) else "actionable"
             return {
                 "target_name": self._field_from_hint(selector),
                 "target_kind": target_kind,
@@ -990,12 +1007,16 @@ class ActionMapperAgent(BaseAgent):
                     score += 0.5
 
         if target_kind == "submit":
+            # element 텍스트의 "가입" 은 유지 — 시나리오 쪽 "가입" 오염은 L832
+            # (target_kind 부여) 와 후보 선택에서 이미 차단된다. 여기서 좁히면
+            # 정당한 회원가입 submit ("가입하기" 버튼) 매칭이 깨진다.
             if any(token in str(element.get("text") or "").lower() for token in ("가입", "signup")):
                 score += 0.7
             if any(token in str(element.get("testid") or "").lower() for token in ("signup", "submit")):
                 score += 0.7
 
-        if any(term in scenario_text.lower() for term in ("회원가입", "가입", "signup")) and "signup" in str(element.get("page") or "").lower():
+        # "가입" 단독 → signup 페이지 가점 금지 (TS-006 오염) — 회원가입 명시 시에만.
+        if any(term in scenario_text.lower() for term in ("회원가입", "signup")) and "signup" in str(element.get("page") or "").lower():
             score += 0.4
         return score
 
@@ -1071,8 +1092,28 @@ class ActionMapperAgent(BaseAgent):
         return max(set(routes), key=routes.count)
 
     def _route_hint_from_tc(self, tc: dict[str, Any]) -> str | None:
+        # 1차: TC.api 의 path segment 가 DOM 인덱스에 실존하는 route 와 일치하면
+        # 그 화면이 무대 (도메인 무관 신호 — keyword 보다 우선).
+        api = str(tc.get("api") or "")
+        dom_index = getattr(self, "_frontend_dom_index", None) or []
+        if api and dom_index:
+            known_routes = {
+                str(el.get("route") or "").strip()
+                for el in dom_index if str(el.get("route") or "").strip()
+            }
+            segs = [
+                s for s in api.lower().split(" ")[-1].split("/")
+                if s and s != "api" and not s.startswith("{")
+            ]
+            if segs:
+                for cand in (f"/{segs[0]}", f"/{segs[0]}s"):
+                    if cand in known_routes:
+                        return cand
+
+        # 2차: keyword — "가입" 단독은 요금제/가족/멤버십 가입과 구분 불가 (TS-006
+        # 가 /signup 으로 오염됐던 원인) — 회원가입 명시 시에만 /signup.
         text = " ".join(str(tc.get(key) or "") for key in ("name", "given", "when", "then")).lower()
-        if any(term in text for term in ("회원가입", "가입", "signup")):
+        if any(term in text for term in ("회원가입", "signup")):
             return "/signup"
         if "로그인" in text or "login" in text:
             return "/login"
