@@ -3396,6 +3396,11 @@ async def _cross_check(state: PipelineState) -> dict:
                 # 의도 도달 — ui_failed 기록만 유지하고 has_mismatch 는 agent 판정 따름
                 cc.setdefault("ui_failed", True)
                 cc.setdefault("intent_satisfied", True)
+            # ui skip (검증 미완 — MANUAL_REVIEW 강등 등) 은 cross_check 가 pass 로
+            # 둔갑시키면 안 된다 — UI 가 검증을 안 했으므로 정합성 판정의 전제 부재.
+            # unverified 로 분리 (verdict 차원에서 S/U 로 표시).
+            if (ui_result or {}).get("status") == "skip":
+                cc["ui_skipped"] = True
             # DB / API 검증 부재 표시 — has_mismatch 변경 X (root_cause 호출 안 함)
             if tc_id in db_unverified_tc_ids:
                 cc["db_unverified"] = True
@@ -3427,6 +3432,8 @@ async def _cross_check(state: PipelineState) -> dict:
     def _derive_cc_status(cc: dict) -> str:
         if cc.get("has_mismatch"):
             return "fail"
+        if cc.get("ui_skipped"):
+            return "unverified"  # UI 검증 미완 — pass 둔갑 차단
         if cc.get("db_unverified") or cc.get("api_unverified"):
             return "unverified"
         return "pass"
