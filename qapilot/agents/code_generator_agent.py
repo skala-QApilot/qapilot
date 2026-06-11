@@ -302,6 +302,17 @@ class CodeGeneratorAgent(BaseAgent):
 
         locator = self._locator_expr(selector_type, selector)
         if not locator:
+            # 미해결 assert 는 then 절 텍스트 검증으로 강등 — getByText 로 emit 하면
+            # 실행 변환 (parser) 이 text selector step 으로 복원 → UITestTool 의
+            # chain + page-wide fuzzy (0.75) 가 의미 검증을 수행한다.
+            # (기존: 무조건 MANUAL_REVIEW throw → 실행 변환에서 증발 → 검증 기회
+            # 자체가 소실 — run 544ab04d skip 35건의 주요 성분)
+            if action in {"assert", "assert_visible", "assert_text"}:
+                text = expected or value
+                if isinstance(text, str) and text.strip():
+                    return (
+                        f"await expect(page.getByText({self._js_value(text.strip()[:80])})).toBeVisible();"
+                    )
             # test.skip 은 CI 에서 통과로 보여 "테스트했다고 착각" 하게 만든다 —
             # 명시적 fail (수동 검토 태깅). 셀렉터 미해결은 검증 불가 사실의 보고가 정답.
             return (

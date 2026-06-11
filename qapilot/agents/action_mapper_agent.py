@@ -919,9 +919,27 @@ class ActionMapperAgent(BaseAgent):
     def _frontend_candidates_for_action(
         self, action: str, frontend_dom: list[dict], route_hint: str | None
     ) -> list[dict]:
+        result = self._collect_candidates(action, frontend_dom, route_hint)
+        if not result and route_hint:
+            # route 필터로 전멸 — 무필터 재시도 (skip 35건 분해: login-submit 등
+            # 실존 요소가 route 불일치만으로 MANUAL_REVIEW 로 빠지던 격차).
+            # 방향성 실격·threshold 가 오매칭을 계속 방어한다.
+            result = self._collect_candidates(action, frontend_dom, None)
+        return result
+
+    def _collect_candidates(
+        self, action: str, frontend_dom: list[dict], route_hint: str | None
+    ) -> list[dict]:
         result: list[dict] = []
         for el in frontend_dom:
-            if route_hint and str(el.get("route") or "").strip() not in {"", route_hint}:
+            el_route = str(el.get("route") or "").strip()
+            # "/_components/*" 는 공유 컴포넌트 (sidebar/navbar) — 모든 화면에
+            # 존재하므로 route 필터 면제 (nav-* 셀렉터가 영원히 미해결되던 원인).
+            if (
+                route_hint
+                and el_route not in {"", route_hint}
+                and not el_route.startswith("/_components")
+            ):
                 continue
             actionable = bool(el.get("actionable"))
             control_type = str(el.get("control_type") or "").lower()
@@ -1097,7 +1115,11 @@ class ActionMapperAgent(BaseAgent):
         return False
 
     def _route_hint_from_elements(self, elements: list[dict]) -> str | None:
-        routes = [str(el.get("route") or "").strip() for el in elements if str(el.get("route") or "").strip()]
+        routes = [
+            r for el in elements
+            if (r := str(el.get("route") or "").strip())
+            and not r.startswith("/_components")  # 공유 컴포넌트는 다수결 제외
+        ]
         if not routes:
             return None
         return max(set(routes), key=routes.count)

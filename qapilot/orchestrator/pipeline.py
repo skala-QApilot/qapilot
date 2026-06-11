@@ -2594,6 +2594,33 @@ async def _test_execution(state: PipelineState) -> dict:
 
     results_root = _qapilot_path(state, "results", trace_id)
 
+    # 데이터 사전조건 fixture (Arrange via API) — 선택 TC 들이 참조하는 리소스
+    # (path param 보유 api) 가 SUT 에 0건이면 깊은 흐름 TC 가 전부 '대상 없음'
+    # 으로 퇴화 (run 544ab04d: orders 0건 → 요금제 변경 TS 전멸). 실패는 graceful.
+    if target_url and test_account_dict:
+        try:
+            from qapilot.shared.precondition_fixture import ensure_resource_preconditions
+            tc_apis = [
+                str(tc.get("api"))
+                for sc in scenarios
+                for tc in (sc.get("test_cases") or [])
+                if tc.get("api")
+            ]
+            if tc_apis:
+                fixture_results = await ensure_resource_preconditions(
+                    target_url, test_account_dict, tc_apis, trace_id=trace_id,
+                )
+                if fixture_results:
+                    logger.info(
+                        "precondition_fixture_summary",
+                        trace_id=trace_id, results=fixture_results,
+                    )
+        except Exception as e:
+            logger.warning(
+                "precondition_fixture_error",
+                trace_id=trace_id, error=f"{type(e).__name__}: {e}",
+            )
+
     ui_results: list[dict] = []
     api_results: list[dict] = []
     db_results: list[dict] = []
