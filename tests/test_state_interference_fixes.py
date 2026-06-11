@@ -93,7 +93,7 @@ class TestSentenceAssertClassification:
         ]}
         cat, reason = _classify_failure({}, ui)
         assert cat == "TEST_DEFECT_UNVERIFIABLE"
-        assert "검증 불가" in reason
+        assert "표현력 한계" in reason
 
     def test_short_testid_assert_fail_still_product_candidate(self):
         ui = {"tc_id": "x", "status": "fail", "steps": [
