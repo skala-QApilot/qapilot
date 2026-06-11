@@ -2611,76 +2611,120 @@ async def _test_execution(state: PipelineState) -> dict:
                 )
                 page = await context.new_page()
 
-                # item may be either a GeneratedCode dict or an ActionMapping dict.
-                # Only call the parser when this item looks like generated code (has "code").
-                if generated_codes and isinstance(item, dict) and item.get("code") is not None:
-                    exec_mapping = _action_mapping_from_generated_code(item)
-                    # api_endpoint 힌트는 기존 ActionMapping 의 값을 최대한 유지.
-                    original = action_mapping_by_tc.get(str(tc_id)) or {}
-                    original_steps = list(original.get("steps") or [])
-                    for idx, step in enumerate(exec_mapping.get("steps") or []):
-                        if idx < len(original_steps):
-                            step["api_endpoint"] = original_steps[idx].get("api_endpoint")
-                            # #256 본질 fix — generated_code 가 password 등을 process.env.*
-                            # 로 마스킹. _resolve_js_value 가 환경변수 미설정 시 "" 반환 →
-                            # fill('') → form 빈 채 → POST 0건. e2e trace `87041b5e` 진단
-                            # (ui_fill_cached password value_len=0). 본인 누적 10 PR (D 영역
-                            # race fix) 모두 본질 아니었음 — 진짜 본질은 generated_code 변환.
-                            # ActionMapping 원본 value 가 있고 generated_code 의 value 가
-                            # 빈 채면 원본으로 fallback (password masking 회피).
-                            orig_value = original_steps[idx].get("value")
-                            if orig_value and not step.get("value"):
-                                step["value"] = orig_value
-                else:
-                    exec_mapping = item
+                # per-TC 실패 흡수 준비 — TC 1개의 Tool 타임아웃/예외가 run 전체를
+                # abort 시키면 안 된다 (run eb5145b7: TS-004 의 60s Tool 타임아웃이
+                # pipeline_failed → 나머지 TC 전부 미실행). 예외 시 리스트를 이
+                # 시점으로 되돌리고 failed 결과를 기록 후 다음 TC 로 계속.
+                _ui_len, _api_len, _db_len = len(ui_results), len(api_results), len(db_results)
 
-                ui_res = await _run_ui_with_trace(
-                    page=page,
-                    tc_id=tc_id,
-                    action_mapping=exec_mapping,
-                    target_url=target_url,
-                    screenshots_dir=screenshots_dir,
-                    trace_id=trace_id,
-                    UITestTool=UITestTool,
-                    APITraceTool=APITraceTool,
-                    ToolInput=ToolInput,
-                    test_account=test_account_dict,
-                )
-                ui_results.append(ui_res["ui_result"])
-                api_results.append(ui_res["api_result"])
+                try:
+                    # item may be either a GeneratedCode dict or an ActionMapping dict.
+                    # Only call the parser when this item looks like generated code (has "code").
+                    if generated_codes and isinstance(item, dict) and item.get("code") is not None:
+                        exec_mapping = _action_mapping_from_generated_code(item)
+                        # api_endpoint 힌트는 기존 ActionMapping 의 값을 최대한 유지.
+                        original = action_mapping_by_tc.get(str(tc_id)) or {}
+                        original_steps = list(original.get("steps") or [])
+                        for idx, step in enumerate(exec_mapping.get("steps") or []):
+                            if idx < len(original_steps):
+                                step["api_endpoint"] = original_steps[idx].get("api_endpoint")
+                                # #256 본질 fix — generated_code 가 password 등을 process.env.*
+                                # 로 마스킹. _resolve_js_value 가 환경변수 미설정 시 "" 반환 →
+                                # fill('') → form 빈 채 → POST 0건. e2e trace `87041b5e` 진단
+                                # (ui_fill_cached password value_len=0). 본인 누적 10 PR (D 영역
+                                # race fix) 모두 본질 아니었음 — 진짜 본질은 generated_code 변환.
+                                # ActionMapping 원본 value 가 있고 generated_code 의 value 가
+                                # 빈 채면 원본으로 fallback (password masking 회피).
+                                orig_value = original_steps[idx].get("value")
+                                if orig_value and not step.get("value"):
+                                    step["value"] = orig_value
+                    else:
+                        exec_mapping = item
 
-                db_res = await _run_db_test_safe(
-                    tc_id=tc_id,
-                    trace_id=trace_id,
-                    DBTestTool=DBTestTool,
-                    ToolInput=ToolInput,
-                )
-                db_results.append(db_res)
+                    ui_res = await _run_ui_with_trace(
+                        page=page,
+                        tc_id=tc_id,
+                        action_mapping=exec_mapping,
+                        target_url=target_url,
+                        screenshots_dir=screenshots_dir,
+                        trace_id=trace_id,
+                        UITestTool=UITestTool,
+                        APITraceTool=APITraceTool,
+                        ToolInput=ToolInput,
+                        test_account=test_account_dict,
+                    )
+                    ui_results.append(ui_res["ui_result"])
+                    api_results.append(ui_res["api_result"])
 
-                # L2 디스크 저장 (spec §6.1)
+                    db_res = await _run_db_test_safe(
+                        tc_id=tc_id,
+                        trace_id=trace_id,
+                        DBTestTool=DBTestTool,
+                        ToolInput=ToolInput,
+                    )
+                    db_results.append(db_res)
+
+                    ui_payload = ui_res["ui_result"]
+                    api_payload = ui_res["api_result"]
+                except Exception as e:
+                    # TC 단위 흡수 — Tool 타임아웃(60s)·예상 밖 예외가 run 전체를
+                    # abort 시키던 격차 (run eb5145b7). failed 로 기록하고 다음 TC 계속.
+                    logger.error(
+                        "tc_execution_failed",
+                        trace_id=trace_id, tc_id=tc_id,
+                        error=f"{type(e).__name__}: {e}",
+                    )
+                    del ui_results[_ui_len:]
+                    del api_results[_api_len:]
+                    del db_results[_db_len:]
+                    ui_payload = {
+                        "tc_id": tc_id, "status": "fail", "steps": [],
+                        "total_duration_ms": 0,
+                        "error": f"{type(e).__name__}: {e}",
+                    }
+                    api_payload = {
+                        "tc_id": tc_id, "calls": [], "total_calls": 0, "error_calls": 0,
+                    }
+                    db_res = {
+                        "tc_id": tc_id, "snapshots": [], "skipped": True,
+                        "summary": f"TC 실행 예외로 미수행: {type(e).__name__}",
+                    }
+                    ui_results.append(ui_payload)
+                    api_results.append(api_payload)
+                    db_results.append(db_res)
+
+                # L2 디스크 저장 (spec §6.1) — 예외 흡수 TC 도 failed 로 기록
                 (tc_dir / "ui_result.json").write_text(
-                    json.dumps(ui_res["ui_result"], ensure_ascii=False, indent=2), "utf-8"
+                    json.dumps(ui_payload, ensure_ascii=False, indent=2), "utf-8"
                 )
                 (tc_dir / "api_result.json").write_text(
-                    json.dumps(ui_res["api_result"], ensure_ascii=False, indent=2), "utf-8"
+                    json.dumps(api_payload, ensure_ascii=False, indent=2), "utf-8"
                 )
                 (tc_dir / "db_result.json").write_text(
                     json.dumps(db_res, ensure_ascii=False, indent=2), "utf-8"
                 )
 
                 # L3 DB / S3 mirror — 실패해도 디스크 진실은 보존됨
-                _mirror_tc_results_and_artifacts(
-                    trace_id=trace_id,
-                    ts_id=ts_id,
-                    tc_id=tc_id,
-                    ui_result=ui_res["ui_result"],
-                    api_result=ui_res["api_result"],
-                    db_result=db_res,
-                    screenshots_dir=screenshots_dir,
-                )
+                try:
+                    _mirror_tc_results_and_artifacts(
+                        trace_id=trace_id,
+                        ts_id=ts_id,
+                        tc_id=tc_id,
+                        ui_result=ui_payload,
+                        api_result=api_payload,
+                        db_result=db_res,
+                        screenshots_dir=screenshots_dir,
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "tc_mirror_failed", trace_id=trace_id, tc_id=tc_id, error=str(e),
+                    )
 
-                # per-TC 컨텍스트 정리. 중간 예외 시 잔여 컨텍스트는 browser.close() 가 정리.
-                await context.close()
+                # per-TC 컨텍스트 정리 — 예외 시에도 닫는다 (잔여는 browser.close() 가 정리).
+                try:
+                    await context.close()
+                except Exception:
+                    pass
         finally:
             await browser.close()
 

@@ -734,6 +734,18 @@ class UITestTool(BaseTool):
                 raise ToolExecutionError(
                     ErrorCode.TOOL_UI_ASSERTION_FAIL, "assert_url 에는 expected 필요"
                 )
+            # Playwright to_have_url 은 glob 미지원 — 문자열은 base_url join 후
+            # exact 비교라 "**/dashboard" 가 영원히 불일치 (run eb5145b7:
+            # 로그인 200 + 대시보드 도달인데 assert_url fail). glob 문자가 있으면
+            # wait_for_url (glob 지원, redirect 폴링 포함) 로 검증.
+            if isinstance(expected, str) and any(ch in expected for ch in "*?"):
+                try:
+                    await page.wait_for_url(expected, timeout=10_000)
+                except PWTimeoutError as e:
+                    raise AssertionError(
+                        f"assert_url: URL 이 {expected!r} 와 불일치 (현재: {page.url})"
+                    ) from e
+                return
             await expect(page).to_have_url(expected)
             return
 
