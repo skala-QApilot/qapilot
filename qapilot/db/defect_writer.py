@@ -22,7 +22,7 @@ _logger = get_logger("db.defect_writer")
 # 강등해서라도 기록한다 (전량 유실 < 분류 정밀도 손실).
 _ALLOWED_CATEGORIES = {
     "UI_ERROR", "API_ERROR", "DATA_MISMATCH", "INFRA", "DOMAIN_RULE",
-    "TEST_DEFECT_MAPPING", "ENV_TIMEOUT", "ENV_UNVERIFIED", "PRODUCT_DEFECT_CANDIDATE",
+    "TEST_DEFECT_MAPPING", "TEST_DEFECT_UNVERIFIABLE", "ENV_TIMEOUT", "ENV_UNVERIFIED", "PRODUCT_DEFECT_CANDIDATE",
 }
 
 # cross_check error_code 의 prefix → defects.category 매핑.

@@ -310,9 +310,16 @@ class CodeGeneratorAgent(BaseAgent):
             if action in {"assert", "assert_visible", "assert_text"}:
                 text = expected or value
                 if isinstance(text, str) and text.strip():
-                    return (
-                        f"await expect(page.getByText({self._js_value(text.strip()[:80])})).toBeVisible();"
+                    # 부정-존재 (absence) 기대 ("포함되지 않는다" 류) 는 존재 검증
+                    # (getByText visible) 으로 표현 불가 — 강등하면 영구 fail
+                    # (run feb0dc5e 축 ②). MANUAL_REVIEW 유지가 정직.
+                    absence = any(
+                        tok in text for tok in ("않는다", "않습니다", "지 않", "없어야")
                     )
+                    if not absence:
+                        return (
+                            f"await expect(page.getByText({self._js_value(text.strip()[:80])})).toBeVisible();"
+                        )
             # test.skip 은 CI 에서 통과로 보여 "테스트했다고 착각" 하게 만든다 —
             # 명시적 fail (수동 검토 태깅). 셀렉터 미해결은 검증 불가 사실의 보고가 정답.
             return (

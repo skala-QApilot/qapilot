@@ -841,6 +841,8 @@ class ActionMapperAgent(BaseAgent):
                     if any(h in outcome_basis for h in _NEGATIVE_OUTCOME_HINTS)
                     else "positive"
                 )
+                if any(t in outcome_basis for t in ("않는다", "않습니다", "지 않", "없어야")):
+                    intent["expects_absence"] = "true"
             return intent
 
         if action in {"fill", "clear", "select", "press", "upload"}:
@@ -875,6 +877,12 @@ class ActionMapperAgent(BaseAgent):
                 "target_kind": "assertion",
                 "target_text": expected or selector or then_text or None,
                 "outcome": "negative" if is_negative else "positive",
+                # 부재 기대 ("포함되지 않는다" 류) — 존재-검증 selector 로 표현 불가
+                "expects_absence": (
+                    "true"
+                    if any(t in outcome_basis for t in ("않는다", "않습니다", "지 않", "없어야"))
+                    else None
+                ),
             }
 
         return {"target_name": None, "target_kind": None, "target_text": selector or None}
@@ -887,6 +895,11 @@ class ActionMapperAgent(BaseAgent):
         route_hint: str | None,
         scenario_text: str,
     ) -> dict[str, str] | None:
+        # 부재 기대 assert 는 존재-검증 (visible) 으로 표현 불가 — 미해결로 두면
+        # then 절이 expected 로 보존되고 codegen 이 MANUAL_REVIEW (정직한 미검증)
+        # 처리한다. fuzzy 가 empty-state 문구를 골라 잡담 fail 내던 격차 차단.
+        if action in _ASSERT_ACTIONS and intent.get("expects_absence"):
+            return None
         candidates = self._frontend_candidates_for_action(action, frontend_dom, route_hint)
         if not candidates:
             return None
@@ -1007,6 +1020,19 @@ class ActionMapperAgent(BaseAgent):
             outcome = str(intent.get("outcome") or "").strip().lower()
             testid_l = str(element.get("testid") or "").lower()
             text_l = str(element.get("text") or "").lower()
+            # empty-state 류 조건부 문구 ("...없습니다") 는 then 이 부재/없음을
+            # 명시할 때만 후보 — "포함되지 않는다" ↔ "요금제가 없습니다" 가
+            # fuzzy 토큰 (요금제+없) 으로 오결합되던 격차 (run feb0dc5e 축 ②,
+            # 스크린샷 실증: 카탈로그 정상 표시 중인데 대시보드 empty-state 를 찾음).
+            target_text_l = str(intent.get("target_text") or "").lower()
+            el_is_empty_state = any(
+                tok in text_l for tok in ("없습니다", "없어요", "비어 있", "비었")
+            )
+            intent_expects_absence = any(
+                tok in target_text_l for tok in ("없", "비어", "않는다", "않습니다", "지 않")
+            )
+            if el_is_empty_state and not intent_expects_absence:
+                return 0.0
             if not bool(element.get("actionable")):
                 score += 0.2
             if control_type.startswith("feedback"):

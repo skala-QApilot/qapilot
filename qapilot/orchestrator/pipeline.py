@@ -2640,6 +2640,13 @@ async def _test_execution(state: PipelineState) -> dict:
                 for tc in (sc.get("test_cases") or [])
                 if tc.get("tc_id")
             }
+            # tc_id → tags (auth-negative 판정용 — run feb0dc5e 축 ①)
+            tc_tags_by_id: dict[str, list] = {
+                str(tc.get("tc_id")): list(tc.get("tags") or [])
+                for sc in scenarios
+                for tc in (sc.get("test_cases") or [])
+                if tc.get("tc_id")
+            }
 
             for item in execution_items:
                 tc_id = item.get("tc_id") or "unknown"
@@ -2695,6 +2702,21 @@ async def _test_execution(state: PipelineState) -> dict:
                         exec_mapping, tc_then_by_id.get(str(tc_id), ""), trace_id,
                     )
 
+                    # auth-negative TC (비인증 → 차단 검증) 는 인증 fail-safe 비활성
+                    # — test_account 미전달로 자동 로그인/리다이렉트 복구 둘 다 차단.
+                    # (run feb0dc5e 축 ①: 자동 로그인이 검증 전제를 파괴해 auth TC
+                    # 전멸하던 부작용)
+                    tc_test_account = test_account_dict
+                    if _is_auth_negative_tc(
+                        tc_then_by_id.get(str(tc_id), ""),
+                        tc_tags_by_id.get(str(tc_id), []),
+                    ):
+                        tc_test_account = None
+                        logger.info(
+                            "auth_failsafe_disabled_for_negative_tc",
+                            trace_id=trace_id, tc_id=tc_id,
+                        )
+
                     ui_res = await _run_ui_with_trace(
                         page=page,
                         tc_id=tc_id,
@@ -2705,7 +2727,7 @@ async def _test_execution(state: PipelineState) -> dict:
                         UITestTool=UITestTool,
                         APITraceTool=APITraceTool,
                         ToolInput=ToolInput,
-                        test_account=test_account_dict,
+                        test_account=tc_test_account,
                     )
                     # 공허한 pass 차단 — 생성 코드의 MANUAL_REVIEW(자동화 불가) step
                     # 은 매핑 변환 시 증발한다. 남은 step (navigate/wait 뿐일 수 있음)
@@ -3480,6 +3502,15 @@ def _classify_failure(cc: dict, ui_result: dict | None) -> tuple[str, str]:
             f"상호작용 step 실패 (action={action}) — 셀렉터/매핑/화면 전제의 "
             f"테스트 측 결함 우선 의심: {ferr[:120]}"
         )
+    # 문장형 텍스트 assert (then 절 서술문을 getByText 로 강등한 케이스) 의 실패는
+    # "화면에 그 문장이 없다" 는 검증 표현력 한계 — 제품 결함 신호가 아니다
+    # (run feb0dc5e 축 ③: '자동 로그아웃된다' 류 서술문 fail 이 PRODUCT 로 오염).
+    sel = str(failed.get("selector") or "")
+    if sel.count(" ") >= 3 and len(sel) > 15:
+        return "TEST_DEFECT_UNVERIFIABLE", (
+            f"서술형 then 텍스트 assert 실패 — UI 문구가 아닌 자연어 서술이라 "
+            f"텍스트 매칭으로 검증 불가: {sel[:80]!r}"
+        )
     return "PRODUCT_DEFECT_CANDIDATE", (
         f"상호작용 전부 통과 후 assert 실패 (action={action}) — "
         "앱 동작이 시나리오 의도와 다름 (제품 결함 후보)"
@@ -3603,6 +3634,11 @@ async def _fix_recommend(state: PipelineState) -> dict:
         "ENV_UNVERIFIED": (
             "검증 환경 부재 — API trace capture / QAPILOT_SUT_DB_URL 설정을 점검하라. "
             "이 TC 의 결과는 미검증 상태이며 pass/fail 판정에 사용하면 안 된다."
+        ),
+        "TEST_DEFECT_UNVERIFIABLE": (
+            "검증 표현력 한계 — then 절이 화면 문구가 아닌 자연어 서술이라 텍스트 "
+            "매칭으로 검증 불가. TC 의 then 을 관찰 가능한 결과 (실제 화면 메시지/"
+            "이동 URL/요소) 로 구체화하거나 수동 검토 대상으로 분류하라."
         ),
     }
 
@@ -3831,6 +3867,30 @@ async def _ts_generate_prd_only(state: PipelineState) -> dict:
 
     agent_logs = list(state.get("agent_logs") or []) + [output.metadata.model_dump()]
     return {"ts_list": ts_list, "agent_logs": agent_logs}
+
+
+def _is_auth_negative_tc(then: str, tags: list) -> bool:
+    """'비인증 접근 → 차단/오류' 를 검증하는 TC 인지 판정 (run feb0dc5e 축 ①).
+
+    이런 TC 에 인증 fail-safe (자동 로그인/리다이렉트 복구) 가 발동하면
+    검증 전제 (비인증 상태) 자체가 파괴된다 — "인증 오류가 발생한다" 가
+    영원히 검증 불가. auth 문맥 + negative/요구 의도 둘 다 충족 시 True.
+    """
+    from qapilot.agents.action_mapper_agent import _NEGATIVE_OUTCOME_HINTS
+
+    t = (then or "").lower()
+    auth_context = (
+        "auth" in (tags or [])
+        or any(k in t for k in ("인증", "로그인", "unauthorized", "401", "토큰"))
+    )
+    if not auth_context:
+        return False
+    auth_texted = any(k in t for k in ("인증", "로그인", "unauthorized", "401", "토큰"))
+    negative = (
+        any(h in t for h in _NEGATIVE_OUTCOME_HINTS)
+        or any(k in t for k in ("요구", "필요", "차단", "로그아웃"))
+    )
+    return auth_texted and negative
 
 
 def _uniquify_signup_email_for_run(
