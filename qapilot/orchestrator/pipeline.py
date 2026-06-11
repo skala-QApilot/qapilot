@@ -3338,18 +3338,31 @@ async def _cross_check(state: PipelineState) -> dict:
     # = pass 가 정답인데 has_mismatch=True 로 잘못 fail. cross_check 가 본문 안
     # 받음. 본 fix 로 scenarios state 에서 추출 + tc_intent 로 context 주입.
     scenarios = state.get("scenarios") or []
+    am_by_tc = {
+        str(am.get("tc_id")): am
+        for am in (state.get("action_mappings") or [])
+        if am.get("tc_id")
+    }
     tc_intent_map: dict[str, dict] = {}
     for sc in scenarios:
         for tc in (sc.get("test_cases") or []):
             tid = tc.get("tc_id")
             if not tid:
                 continue
+            # 입력 완전성 — 매핑의 fill step 수가 TC values 대비 결손이면
+            # "의도한 입력을 만들지 못한 실행" (form prevent 구제 금지의 근거).
+            values_n = len(tc.get("values") or [])
+            am_steps = (am_by_tc.get(str(tid)) or {}).get("steps") or []
+            fill_n = sum(1 for s in am_steps if str(s.get("action") or "") == "fill")
+            inputs_complete = None if values_n == 0 else (fill_n >= max(1, values_n - 1))
             tc_intent_map[str(tid)] = {
                 "name": tc.get("name") or "",
                 "tags": tc.get("tags") or [],
                 "given": tc.get("given") or "",
                 "when": tc.get("when") or "",
                 "then": tc.get("then") or "",
+                "api": tc.get("api"),
+                "inputs_complete": inputs_complete,
             }
 
     for tc_id in ui_map.keys():
@@ -3401,6 +3414,11 @@ async def _cross_check(state: PipelineState) -> dict:
             # unverified 로 분리 (verdict 차원에서 S/U 로 표시).
             if (ui_result or {}).get("status") == "skip":
                 cc["ui_skipped"] = True
+            # 입력 결손 실행 — 의도한 입력을 만들지 못했으므로 pass/fail 양쪽 모두
+            # 무의미 (TS-001-TC-03: fill 1/4 로 email-required 에 막힌 것을
+            # '비밀번호 규칙 검증 통과' 로 구제하던 격차). unverified 처리.
+            if scenario_intent.get("inputs_complete") is False:
+                cc["inputs_incomplete"] = True
             # DB / API 검증 부재 표시 — has_mismatch 변경 X (root_cause 호출 안 함)
             if tc_id in db_unverified_tc_ids:
                 cc["db_unverified"] = True
@@ -3430,6 +3448,10 @@ async def _cross_check(state: PipelineState) -> dict:
     # "unverified" 분리는 e2e false PASS 차단의 본질 fix — DB env 부재 또는 API trace
     # capture 실패 시 묵시 PASS 처리 차단. 사용자가 리포트에서 명시 인식 → 환경 fix.
     def _derive_cc_status(cc: dict) -> str:
+        if cc.get("inputs_incomplete"):
+            return "unverified"  # 입력 결손 실행 — 판정 자체가 무의미
+        if str(cc.get("error_code") or "") == "CC_PARSE_FAIL":
+            return "unverified"  # 정합성 분석 미수행 — 조용한 pass 금지
         if cc.get("has_mismatch"):
             return "fail"
         if cc.get("ui_skipped"):

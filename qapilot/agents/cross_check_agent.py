@@ -156,11 +156,13 @@ class CrossCheckAgent(BaseAgent):
             error_code = parsed.get("error_code", "none")
             summary = parsed.get("summary", "")
         except Exception:
+            # 분석 실패를 조용한 pass (score 1.0) 로 둔갑시키지 않는다 —
+            # CC_PARSE_FAIL 로 표시해 pipeline 이 unverified 처리.
             mismatches = []
-            match_score = 1.0
+            match_score = 0.0
             matched_fields = 0
-            error_code = "none"
-            summary = ""
+            error_code = "CC_PARSE_FAIL"
+            summary = "cross_check LLM 응답 파싱 실패 — 정합성 분석 미수행 (unverified)"
 
         return mismatches, match_score, matched_fields, error_code, summary
 
@@ -216,18 +218,39 @@ class CrossCheckAgent(BaseAgent):
         )
         ui_form_prevent = ui_click_pass and post_count == 0
 
+        # 입력 완전성 가드 (run d20fc18f TS-001-TC-03 실증): 매핑 결손으로 의도한
+        # 입력 (예: 7자 비밀번호) 을 만들지 못한 채 form prevent 가 일어난 경우,
+        # "검증 통과" 구제는 잘못된 인과 — 의도한 규칙은 전혀 검증되지 않았다.
+        inputs_complete = scenario_intent.get("inputs_complete")
         if is_validation_negative:
+            if inputs_complete is False:
+                return False
             return ui_form_prevent or api_4xx_or_5xx
         if is_negative:
             return api_4xx_or_5xx
-        # positive — actual success (POST 2xx or UI success element)
+        # positive — actual success. POST 2xx 는 TC 의 대상 endpoint 와 일치할
+        # 때만 증거로 인정 (run d20fc18f TS-006-TC-05 실증: 자동 로그인 POST 200
+        # 이 '가입 완료' 증거로 둔갑하던 격차).
+        expected_path = self._expected_api_path(scenario_intent.get("api"))
         api_2xx_post = any(
-            (c.get("method") or "").upper() == "POST"
+            (c.get("method") or "").upper() in {"POST", "PUT", "PATCH"}
             and 200 <= (c.get("status_code") or 0) < 300
+            and (not expected_path or expected_path in str(c.get("url") or ""))
             for c in calls
         )
         ui_all_pass = all(s.get("status") == "pass" for s in ui_steps) if ui_steps else False
         return api_2xx_post or ui_all_pass
+
+    @staticmethod
+    def _expected_api_path(api: Any) -> str:
+        """TC.api ("POST /api/orders/{id}/cancel") → URL 대조용 고정 prefix
+        ("/api/orders/"). path param 이전까지만 — 없으면 빈 문자열 (대조 생략)."""
+        s = str(api or "").strip()
+        if " " in s:
+            s = s.split(" ", 1)[1]
+        if not s.startswith("/"):
+            return ""
+        return s.split("{", 1)[0]
 
     async def _execute(
         self,
