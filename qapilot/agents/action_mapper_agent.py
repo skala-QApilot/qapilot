@@ -797,11 +797,24 @@ class ActionMapperAgent(BaseAgent):
         explicit_target_kind = str(step.get("target_kind") or "").strip()
 
         if explicit_target_name or explicit_target_kind:
-            return {
+            intent: dict[str, str | None] = {
                 "target_name": explicit_target_name or None,
                 "target_kind": explicit_target_kind or None,
                 "target_text": expected or selector or None,
             }
+            # 격차 1 보강: LLM 이 target_kind 를 명시한 assert step 도 outcome 분류.
+            # 이 조기 return 이 outcome 을 건너뛰면 레거시 스코어링이 작동해
+            # negative TC 가 다시 success 류 selector 로 일괄 매핑된다
+            # (trace 77bf4ec8: TS-001 전 TC signup-success-toast 재발 원인).
+            if action in _ASSERT_ACTIONS:
+                then_text = str(tc.get("then") or "")
+                outcome_basis = " ".join(p for p in (expected, then_text) if p).lower()
+                intent["outcome"] = (
+                    "negative"
+                    if any(h in outcome_basis for h in _NEGATIVE_OUTCOME_HINTS)
+                    else "positive"
+                )
+            return intent
 
         if action in {"fill", "clear", "select", "press", "upload"}:
             return {

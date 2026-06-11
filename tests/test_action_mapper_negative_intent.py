@@ -65,6 +65,25 @@ class TestInferOutcome:
         intent = agent._infer_step_intent(step, tc, "")
         assert intent["outcome"] == "negative"
 
+    def test_explicit_target_kind_still_classifies_outcome(self):
+        """LLM 이 target_kind 를 명시해 조기 return 을 타는 assert step 도
+        outcome 분류 — trace 77bf4ec8 에서 이 경로가 outcome 을 건너뛰어
+        TS-001 전 TC 가 signup-success-toast 로 재발했던 구멍의 회귀 테스트."""
+        agent = _make_agent()
+        step = {"action": "assert", "selector": "", "expected": "",
+                "target_kind": "assertion"}
+        tc = {"then": "이미 가입된 이메일이라는 오류 메시지가 표시된다"}
+        intent = agent._infer_step_intent(step, tc, "")
+        assert intent["target_kind"] == "assertion"
+        assert intent["outcome"] == "negative"
+
+    def test_explicit_kind_non_assert_has_no_outcome(self):
+        agent = _make_agent()
+        step = {"action": "click", "selector": "x", "target_kind": "submit"}
+        tc = {"then": "오류가 표시된다"}
+        intent = agent._infer_step_intent(step, tc, "")
+        assert "outcome" not in intent
+
 
 class TestResolveDirection:
     def test_negative_tc_resolves_error_selector(self):
