@@ -211,6 +211,17 @@ def test_invalid_email_format_fails(validator, signup_schemas):
     assert any("email 형식 FAIL" in c.detail for c in result.failed_checks)
 
 
+def test_invalid_email_format_passes_when_violation_expected(validator, signup_schemas):
+    """edge_case + 400 같은 음성 테스트는 의도적 형식 위반을 실패로 보지 않는다."""
+    result = validator.validate(
+        tv_field={"name": "email", "value": "not-an-email"},
+        scenario_intent={"expects_format_violation": True}, db_snapshot=None,
+        schemas=signup_schemas, schema_name="SignupRequest",
+    )
+    assert result.valid is True
+    assert any("의도된 음성 테스트" in c.detail for c in result.checks)
+
+
 def test_type_mismatch_fails(validator, signup_schemas):
     """age=int 인데 str 주입."""
     result = validator.validate(

@@ -6,6 +6,8 @@ PRD 요구사항만을 기반으로 테스트 시나리오(Test Scenario, TS) �
 **이 단계에서는 TC(Test Case)를 생성하지 않는다. TS 구조만 출력한다.**
 
 ## 규칙
+- 요구사항 중 `req_type="functional"` 인 항목만 TS 생성 대상으로 사용하라.
+- `req_type="non_functional"` 인 항목은 TS에 포함하지 마라.
 - 제공된 요구사항만 사용하라. 요구사항에 없는 기능을 추가하지 마라.
 - TC는 절대 생성하지 말 것 — TS 구조(name, description, domain_area, requirements)만 출력한다.
 - TS 이름과 설명은 **한국어**로 작성한다.

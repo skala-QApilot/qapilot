@@ -15,7 +15,9 @@ Created: 2026-06-09
 
 from __future__ import annotations
 
+import json
 from functools import lru_cache
+from pathlib import Path
 from typing import Any
 
 from qapilot.db.metadata_reader import get_latest_commit_hash, load_metadata_index_raw
@@ -29,6 +31,68 @@ _logger = get_logger("shared.scan_storage")
 # source = 호출 패턴에 따라 변동 (한 trace 50 파일 가정)
 _METADATA_CACHE_SIZE = 64
 _SOURCE_CACHE_SIZE = 128
+
+
+# ────────────────────────────────────────────────────────────────────────
+# Local mirror helpers
+# ────────────────────────────────────────────────────────────────────────
+
+def _repo_root() -> Path:
+    """워크스페이스 루트(QApilot)를 반환한다."""
+    return Path(__file__).resolve().parents[3]
+
+
+def _local_services_root() -> Path:
+    """qapilot-local/services 루트 경로."""
+    return _repo_root() / "qapilot-local" / "services"
+
+
+def _metadata_local_path(
+    service_id: str,
+    commit_hash: str,
+    kind: str,
+    sub_kind: str,
+) -> Path:
+    return (
+        _local_services_root()
+        / service_id
+        / "metadata-index"
+        / commit_hash
+        / f"{kind}-{sub_kind}.json"
+    )
+
+
+def _find_latest_local_commit(
+    service_id: str,
+    kind: str,
+    sub_kind: str,
+) -> str | None:
+    """로컬 미러에 있는 최신 metadata-index commit 디렉토리명을 찾는다."""
+    base = _local_services_root() / service_id / "metadata-index"
+    if not base.exists():
+        return None
+    candidates = list(base.glob(f"*/{kind}-{sub_kind}.json"))
+    if not candidates:
+        return None
+    latest = max(candidates, key=lambda path: path.stat().st_mtime)
+    return latest.parent.name
+
+
+def _load_local_metadata_index(
+    service_id: str,
+    kind: str,
+    sub_kind: str,
+    commit_hash: str,
+) -> dict | None:
+    """qapilot-local/services/{sid}/metadata-index/... 로컬 미러에서 직접 로드."""
+    path = _metadata_local_path(service_id, commit_hash, kind, sub_kind)
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception as e:
+        _logger.warning("local_metadata_index_parse_failed", path=str(path), error=str(e))
+        return None
 
 
 # ────────────────────────────────────────────────────────────────────────
@@ -58,6 +122,8 @@ def load_metadata_index(
         commit_hash=None 인 호출 = 최신 commit_hash 조회 후 그 hash 기준 cache.
     """
     if commit_hash is None:
+        commit_hash = _find_latest_local_commit(service_id, kind, sub_kind)
+    if commit_hash is None:
         commit_hash = get_latest_commit_hash(service_id, kind, sub_kind)
         if commit_hash is None:
             return None
@@ -68,6 +134,9 @@ def load_metadata_index(
 def _metadata_cached(
     service_id: str, kind: str, sub_kind: str, commit_hash: str,
 ) -> dict | None:
+    local = _load_local_metadata_index(service_id, kind, sub_kind, commit_hash)
+    if local is not None:
+        return local
     return load_metadata_index_raw(service_id, kind, sub_kind, commit_hash)
 
 

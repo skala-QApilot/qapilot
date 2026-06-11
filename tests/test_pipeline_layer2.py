@@ -20,6 +20,12 @@ def _write_json(path: Path, data: Any) -> None:
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def _write_scenario(scenarios_dir: Path, ts: dict) -> None:
+    from qapilot.agents.scenario_generator import repository
+
+    repository.save_scenario(ts, base_dir=scenarios_dir)
+
+
 def _state(
     run_options: dict | None = None,
     trace_id: str = "",
@@ -91,7 +97,7 @@ def test_topo_sort_breaks_cycle_gracefully():
 async def test_load_scenarios_for_test_reads_three_artifact_kinds(tmp_path: Path, monkeypatch):
     monkeypatch.chdir(tmp_path)
 
-    _write_json(tmp_path / ".qapilot" / "scenarios" / "TS-001.json", {
+    _write_scenario(tmp_path / ".qapilot" / "scenarios", {
         "ts_id": "TS-001", "name": "회원가입", "depends_on": [],
         "test_cases": [{"tc_id": "TS-001-TC-01", "tags": ["normal"]}],
     })
@@ -119,7 +125,7 @@ async def test_load_scenarios_for_test_prefers_remote_artifacts(tmp_path: Path, 
     monkeypatch.chdir(tmp_path)
 
     qapilot_dir = tmp_path / ".qapilot"
-    _write_json(qapilot_dir / "scenarios" / "TS-001.json", {
+    _write_scenario(qapilot_dir / "scenarios", {
         "ts_id": "TS-001",
         "name": "회원가입",
         "depends_on": [],
@@ -156,7 +162,7 @@ async def test_load_scenarios_for_test_preserves_explicit_trace_id(tmp_path: Pat
 async def test_load_scenarios_for_test_scenario_ids_filter(tmp_path: Path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     for ts_id in ("TS-001", "TS-002"):
-        _write_json(tmp_path / ".qapilot" / "scenarios" / f"{ts_id}.json", {
+        _write_scenario(tmp_path / ".qapilot" / "scenarios", {
             "ts_id": ts_id,
             "test_cases": [{"tc_id": f"{ts_id}-TC-01", "tags": []}],
         })
@@ -172,7 +178,7 @@ async def test_load_scenarios_for_test_scenario_ids_filter(tmp_path: Path, monke
 @pytest.mark.asyncio
 async def test_load_scenarios_for_test_tags_filter(tmp_path: Path, monkeypatch):
     monkeypatch.chdir(tmp_path)
-    _write_json(tmp_path / ".qapilot" / "scenarios" / "TS-001.json", {
+    _write_scenario(tmp_path / ".qapilot" / "scenarios", {
         "ts_id": "TS-001",
         "test_cases": [
             {"tc_id": "TC-A", "tags": ["smoke"]},

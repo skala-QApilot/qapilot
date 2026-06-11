@@ -57,47 +57,37 @@ def _format_existing_values(values: list[dict]) -> str:
     return _format_dict_compact(values, max_chars=1500)
 
 
-def _format_source_snippets(snippets: list[dict] | None) -> str:
-    """load_source 결과를 LLM prompt 친화 format 으로.
+def _codebase_evidence_refs(filtered: dict[str, Any]) -> list[dict[str, str]]:
+    """필터링된 4영역 메타데이터에서 실제로 매칭된 항목들을 근거 ref 목록으로 변환.
 
-    각 snippet 마다 file path / line range 헤더 + 본문.
-    총 길이 cap (12000 chars) — 너무 큰 경우 truncate.
+    given/when/then/value 의 evidence_refs (provenance) 채우는 데 쓰인다.
+    빈 리스트면 해당 TC 에 코드 근거가 없었다는 뜻 — 호출자가 "미해결" 처리.
     """
-    if not snippets:
-        return "코드베이스 본문 없음 (load_source 결과 비어 있음)"
-    parts: list[str] = []
-    total = 0
-    cap = 12000
-    for s in snippets:
-        file = s.get("file", "?")
-        ls = s.get("line_start")
-        le = s.get("line_end")
-        content = s.get("content") or ""
-        # 헤더 + 본문
-        range_str = f"L{ls}-{le}" if ls and le else "전체"
-        header = f"\n[{file} ({range_str})]"
-        body = content[:6000]  # 단일 snippet 6000자 cap
-        if len(content) > 6000:
-            body = body + "\n... (truncated)"
-        block = header + "\n```\n" + body + "\n```"
-        if total + len(block) > cap:
-            parts.append("\n... (남은 snippet 생략 — token cap)")
-            break
-        parts.append(block)
-        total += len(block)
-    return "\n".join(parts)
+    refs: list[dict[str, str]] = []
+    schemas = filtered.get("schemas") or {}
+    for bucket in ("request_schemas", "response_schemas"):
+        for name in (schemas.get(bucket) or {}):
+            refs.append({"kind": "backend.schemas", "ref": name})
+    for name in (schemas.get("db_models") or {}):
+        refs.append({"kind": "backend.schemas", "ref": name})
+
+    selectors = filtered.get("selectors") or {}
+    for route in (selectors.get("by_route") or {}):
+        refs.append({"kind": "frontend.selectors", "ref": route})
+
+    seen_files: set[str] = set()
+    patterns = filtered.get("patterns") or {}
+    for p in (patterns.get("patterns") or []):
+        file = p.get("file")
+        if file and file not in seen_files:
+            seen_files.add(file)
+            refs.append({"kind": "sut_tests.patterns", "ref": file})
+
+    return refs
 
 
-def _format_db_snapshot(snapshot: dict | None) -> str:
-    if not snapshot:
-        return "DB snapshot 없음"
-    rows = snapshot.get("rows") or []
-    if not rows:
-        return f"테이블 '{snapshot.get('table', '?')}' — 0 rows"
-    return _format_dict_compact(
-        {"table": snapshot.get("table"), "rows": rows[:3], "total_rows": len(rows)},
-        max_chars=1500,
-    )
+def _evidence_ref_strings(refs: list[dict[str, str]]) -> list[str]:
+    return [f"{r['kind']}:{r['ref']}" for r in refs]
 
 
 def _extract_json(text: str) -> str:
@@ -142,24 +132,32 @@ def _extract_json(text: str) -> str:
 _EXISTING_HINTS = ("이미", "존재", "duplicate", "409", "conflict", "있는", "기존")
 # "신규" / "없는" / "new" / "201" / "Created" → expects_absent
 _ABSENT_HINTS = ("신규", "없는", "new", "201", "created", "처음", "최초")
+# "400" / "Bad Request" / "유효하지 않" / "위반" → 의도적 형식 위반 (음성 테스트)
+_FORMAT_VIOLATION_HINTS = (
+    "400", "bad request", "유효하지 않", "형식이 올바르지", "위반", "invalid",
+)
 _PLACEHOLDER_RE = re.compile(r"\{[^{}]+\}")
 
 
 def _infer_scenario_intent(tc: dict) -> dict:
-    """TC 의 then/tags 로 DB 존재성/부재성 추론.
+    """TC 의 then/tags 로 DB 존재성/부재성/형식 위반 의도 추론.
 
-    TVValidator 의 expects_existing_in_db / expects_absent_in_db 에 매핑.
+    TVValidator 의 expects_existing_in_db / expects_absent_in_db /
+    expects_format_violation 에 매핑.
     """
     then_text = (tc.get("then") or "").lower()
     tags = tc.get("tags") or []
     intent: dict[str, Any] = {}
 
-    has_edge = "edge_case" in tags
+    has_edge = "edge_case" in tags or "boundary" in tags
 
     if has_edge and any(h in then_text for h in _EXISTING_HINTS):
         intent["expects_existing_in_db"] = True
     elif any(h in then_text for h in _ABSENT_HINTS):
         intent["expects_absent_in_db"] = True
+
+    if has_edge and any(h in then_text for h in _FORMAT_VIOLATION_HINTS):
+        intent["expects_format_violation"] = True
 
     return intent
 
@@ -170,6 +168,160 @@ def _pick_schema_name(schemas: dict[str, Any]) -> str | None:
     if req:
         return next(iter(req.keys()))
     return None
+
+
+def _request_schema_fields(schemas: dict[str, Any]) -> list[dict[str, Any]]:
+    req = schemas.get("request_schemas") or {}
+    if not req:
+        return []
+    first = next(iter(req.values()))
+    return list(first.get("fields") or [])
+
+
+def _field_name_from_v_model(v_model: str | None) -> str | None:
+    if not v_model:
+        return None
+    parts = [p for p in str(v_model).split(".") if p]
+    return parts[-1] if parts else None
+
+
+def _ui_input_field_names(selectors: dict[str, Any]) -> set[str]:
+    by_route = selectors.get("by_route") or {}
+    names: set[str] = set()
+    for route in by_route.values():
+        for item in route.get("inputs") or []:
+            v_model_name = _field_name_from_v_model(item.get("v_model"))
+            if v_model_name:
+                names.add(v_model_name)
+            testid = str(item.get("testid") or "").strip()
+            if testid:
+                names.add(testid)
+    return names
+
+
+def _selector_meta_by_field(selectors: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    by_route = selectors.get("by_route") or {}
+    out: dict[str, dict[str, Any]] = {}
+    for route in by_route.values():
+        for item in route.get("inputs") or []:
+            names = {
+                n for n in (
+                    _field_name_from_v_model(item.get("v_model")),
+                    str(item.get("testid") or "").strip() or None,
+                ) if n
+            }
+            for name in names:
+                out[name] = item
+    return out
+
+
+def _normalize_ui_value_type(field_type: str) -> str:
+    lowered = (field_type or "string").lower()
+    if "bool" in lowered:
+        return "boolean"
+    if any(tok in lowered for tok in ("int", "integer")):
+        return "integer"
+    if any(tok in lowered for tok in ("float", "double", "decimal", "number")):
+        return "number"
+    if "date" in lowered:
+        return "date"
+    return "string"
+
+
+def _default_ui_value(field_spec: dict[str, Any], selector_meta: dict[str, Any] | None) -> Any:
+    examples = field_spec.get("examples") or []
+    if examples:
+        return examples[0]
+    default = field_spec.get("default")
+    if default is not None:
+        return default
+
+    name = str(field_spec.get("name") or "").lower()
+    field_type = str(field_spec.get("type") or "string")
+    normalized_type = _normalize_ui_value_type(field_type)
+    html_type = str((selector_meta or {}).get("html_type") or "").lower()
+    validators = field_spec.get("validators") or []
+    validator_kinds = {str(v.get("kind") or "").lower() for v in validators if isinstance(v, dict)}
+
+    if "email" in name or "email_format" in validator_kinds or html_type == "email":
+        return "newuser_2026@test.com"
+    if "birth" in name or normalized_type == "date" or html_type == "date":
+        return "2000-01-01"
+    if normalized_type == "boolean" or html_type == "checkbox":
+        return True
+    if "name" in name:
+        return "홍길동"
+    if any(tok in name for tok in ("phone", "mobile", "tel")):
+        return "01012345678"
+    if normalized_type == "integer":
+        return 1
+    if normalized_type == "number":
+        return 1
+    return "테스트값"
+
+
+def _ui_input_values_only(
+    llm_values: list[dict[str, Any]],
+    *,
+    existing_values: list[dict[str, Any]],
+    schemas: dict[str, Any],
+    selectors: dict[str, Any],
+    sensitive_entries: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    request_fields = _request_schema_fields(schemas)
+    if not request_fields:
+        return merge_values_with_sensitive(llm_values, sensitive_entries)
+
+    ui_field_names = _ui_input_field_names(selectors)
+    if ui_field_names:
+        target_fields = [f for f in request_fields if str(f.get("name") or "") in ui_field_names]
+    else:
+        target_fields = request_fields
+
+    target_field_names = {str(f.get("name") or "") for f in target_fields}
+    selector_meta_map = _selector_meta_by_field(selectors)
+    by_field_existing = {
+        str(v.get("field") or ""): v
+        for v in (existing_values or [])
+        if isinstance(v, dict) and v.get("field")
+    }
+    by_field_llm = {
+        str(v.get("field") or ""): v
+        for v in (llm_values or [])
+        if isinstance(v, dict) and v.get("field") in target_field_names
+    }
+    sensitive_by_field = {
+        str(v.get("field") or ""): v
+        for v in (sensitive_entries or [])
+        if isinstance(v, dict) and v.get("field") in target_field_names
+    }
+
+    normalized: list[dict[str, Any]] = []
+    for field_spec in target_fields:
+        name = str(field_spec.get("name") or "")
+        field_type = str(field_spec.get("type") or "string")
+        if name in sensitive_by_field:
+            normalized.append(sensitive_by_field[name])
+            continue
+
+        current = by_field_llm.get(name) or by_field_existing.get(name)
+        if current is not None:
+            normalized.append({**current, "field": name, "type": str(current.get("type") or field_type)})
+            continue
+
+        selector_meta = selector_meta_map.get(name)
+        normalized.append({
+            "field": name,
+            "value": _default_ui_value(field_spec, selector_meta),
+            "type": _normalize_ui_value_type(field_type),
+            "purpose": "필수 UI 입력값 보강",
+            "source": "ui_default",
+            "status": "grounded_code",
+            "evidence_refs": [],
+            "unresolved": False,
+        })
+
+    return normalized
 
 
 # ────────────────────────────────────────────────────────────────────────
@@ -200,6 +352,8 @@ class TVFromCodebaseAgent(BaseAgent):
         db_snapshot = context.get("db_snapshot")  # {"table": ..., "rows": [...]} 또는 None
         # 코드베이스 본문 (load_source 결과) — [{file, line_start, line_end, content}, ...]
         source_snippets: list[dict] = context.get("source_snippets") or []
+        # TC별 재검색(Option A) 문서 chunk — [{content, source, score}, ...]
+        tc_doc_refs: list[dict] = context.get("tc_doc_refs") or []
 
         # ── 1. TC 기반 필터링 ──────────────────────────────────────────
         filtered = filter_metadata_for_tc(
@@ -211,10 +365,16 @@ class TVFromCodebaseAgent(BaseAgent):
         )
 
         # ── 2. sensitive 필드 식별 + LLM 컨텍스트에서 제외 ─────────────
+        request_field_names = {
+            str(f.get("name") or "")
+            for f in _request_schema_fields(filtered["schemas"])
+            if f.get("name")
+        }
         sensitive_names = get_sensitive_field_names(filtered["schemas"])
+        ui_sensitive_names = sensitive_names & request_field_names
         type_hint_map = _build_type_hint_map(filtered["schemas"])
         sensitive_entries = build_sensitive_value_entries(
-            sensitive_names, type_hint_map=type_hint_map,
+            ui_sensitive_names, type_hint_map=type_hint_map,
         )
 
         sanitized_schemas = strip_sensitive_from_schemas(filtered["schemas"])
@@ -234,6 +394,7 @@ class TVFromCodebaseAgent(BaseAgent):
         last_validation: ValidationResult | None = None
         llm_values: list[dict] = []
         resolved_claims: dict[str, str] = {}
+        unverified_claims: list[str] = []
         confidence = 0.5
         unresolved_claims = _collect_unresolved_claims(tc)
 
@@ -254,6 +415,7 @@ class TVFromCodebaseAgent(BaseAgent):
                 patterns=_format_dict_compact(filtered["patterns"], max_chars=1500),
                 db_snapshot=_format_db_snapshot(sanitized_db_snapshot),
                 source_snippets=_format_source_snippets(source_snippets),
+                tc_doc_refs=_format_tc_doc_refs(tc_doc_refs),
                 validation_feedback=feedback,
             )
 
@@ -265,6 +427,7 @@ class TVFromCodebaseAgent(BaseAgent):
             parsed = self._parse(response.content)
             llm_values = parsed["values"]
             resolved_claims = parsed["claims"]
+            unverified_claims = parsed["unverified_claims"]
             confidence = parsed["confidence"]
 
             # 검증 — values 의 각 field 마다 TVValidator 호출
@@ -276,16 +439,26 @@ class TVFromCodebaseAgent(BaseAgent):
                 break
 
         # ── 4. sensitive 필드 placeholder 머지 ─────────────────────────
-        merged_values = merge_values_with_sensitive(llm_values, sensitive_entries)
+        merged_values = _ui_input_values_only(
+            llm_values,
+            existing_values=tc.get("values") or [],
+            schemas=filtered["schemas"],
+            selectors=filtered["selectors"],
+            sensitive_entries=sensitive_entries,
+        )
+
+        values_valid = last_validation.valid if last_validation else False
+        reasons = list(last_validation.reasons) if last_validation and not values_valid else []
+        if unverified_claims:
+            reasons += [f"미확인 주장(then 등): {c}" for c in unverified_claims]
 
         return ExecuteResult(
             result={
                 "values": merged_values,
                 "claims": resolved_claims,
-                "validation_passed": (last_validation.valid if last_validation else False),
-                "validation_reasons": (
-                    last_validation.reasons if last_validation and not last_validation.valid else []
-                ),
+                "unverified_claims": unverified_claims,
+                "validation_passed": values_valid and not unverified_claims,
+                "validation_reasons": reasons,
             },
             confidence=confidence,
         )
@@ -301,10 +474,11 @@ class TVFromCodebaseAgent(BaseAgent):
                 "tv_codebase_aware_parse_error",
                 error=str(e), raw=content[:300],
             )
-            return {"values": [], "claims": {}, "confidence": 0.0}
+            return {"values": [], "claims": {}, "unverified_claims": [], "confidence": 0.0}
 
         raw_values = data.get("values") or []
         raw_claims = data.get("claims") or {}
+        raw_unverified = data.get("unverified_claims") or []
         valid: list[dict] = []
         for v in raw_values:
             if not isinstance(v, dict) or not v.get("field"):
@@ -321,7 +495,13 @@ class TVFromCodebaseAgent(BaseAgent):
             for key in ("given", "when", "then"):
                 if raw_claims.get(key) is not None:
                     claims[key] = str(raw_claims.get(key) or "")
-        return {"values": valid, "claims": claims, "confidence": float(data.get("confidence", 0.7))}
+        unverified_claims = [str(c) for c in raw_unverified if str(c).strip()]
+        return {
+            "values": valid,
+            "claims": claims,
+            "unverified_claims": unverified_claims,
+            "confidence": float(data.get("confidence", 0.7)),
+        }
 
     def _validate_values(
         self,

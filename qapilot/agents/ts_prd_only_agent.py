@@ -14,6 +14,11 @@ from qapilot.agents.base_agent import BaseAgent
 from qapilot.shared.schemas import ExecuteResult, RequirementItem
 
 
+def _functional_requirements(requirements: list[RequirementItem]) -> list[RequirementItem]:
+    """TS 생성 대상은 기능 요구사항만 남긴다."""
+    return [r for r in requirements if r.get("req_type", "functional") == "functional"]
+
+
 def _format_requirements(requirements: list[RequirementItem]) -> str:
     if not requirements:
         return "없음"
@@ -49,6 +54,7 @@ def _extract_json(text: str) -> str:
 
 def _fallback_ts_list(requirements: list[RequirementItem]) -> list[dict]:
     """파싱 실패 시 domain_area 기준으로 TS 목록을 구성한다."""
+    requirements = _functional_requirements(requirements)
     by_domain: dict[str, list[str]] = {}
     for r in requirements:
         domain = r.get("domain_area") or "기타"
@@ -77,7 +83,9 @@ class TSFromPRDAgent(BaseAgent):
         params: dict[str, Any],
         last_error: str | None = None,
     ) -> ExecuteResult:
-        requirements: list[RequirementItem] = context.get("requirements") or []
+        requirements: list[RequirementItem] = _functional_requirements(
+            context.get("requirements") or []
+        )
 
         user_prompt = self.prompts.render(
             requirements=_format_requirements(requirements),

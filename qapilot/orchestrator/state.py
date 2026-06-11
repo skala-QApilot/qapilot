@@ -117,6 +117,7 @@ class PipelineState(TypedDict):
     # ── prd_only_experiment ──
     ts_list: list[dict]            # TSFromPRDAgent 출력
     tc_by_ts_index: dict           # index → list[dict] (TC 목록)
+    tc_provenance_by_index: dict   # index → TCProvenance dict (doc_search 단계에서 채움)
 
     # ── 메타 ──
     agent_logs: list[AgentMeta]

@@ -42,6 +42,11 @@
 `analysis`의 각 `test_point`를 TC로 변환한다. 근거 없는 TC는 작성하지 않는다.
 각 TC에 `technique` 필드로 어떤 기법을 근거로 했는지 명시한다.
 
+**중복 given/when 병합**: 어떤 test_point의 given/when이 이미 작성한 다른 TC의 given/when과 동일하면
+새 TC를 만들지 말고, 그 기존 TC의 `then`에 해당 test_point의 검증 채널(UI/API/DB)을 줄바꿈으로 추가하고
+`tags`/`technique`에도 이 test_point의 유형·기법을 함께 추가한다. `analysis.test_points`에는 원래 항목을
+그대로 유지해 커버리지 추적을 보존한다.
+
 ---
 
 ## 근거 추적 — sources 필드
@@ -90,6 +95,8 @@
   - edge_case: 2개 이상
   - boundary: 1개 이상 (문서에 범위 제약이 있을 때)
   - auth: 1개 이상 (인증이 필요한 엔드포인트일 때)
+  - 이 최소 개수는 TC 개수가 아니라 TC들의 `tags`에 등장하는 유형 커버리지 기준이다.
+    병합으로 TC 개수가 줄어도 tags로 4가지 유형이 모두 커버되면 충족한 것이다.
 - api: `"METHOD /api/path"` 형식. 문서에 없으면 null.
 - req_id: 요구사항 목록에 실제로 나열된 ID만. 없으면 null.
 - depends_on: 선행 실행 필요한 동일 TS 내 TC가 있으면 `"TC-01"` 형식. 없으면 `[]`.

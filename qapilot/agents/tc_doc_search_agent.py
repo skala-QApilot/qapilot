@@ -17,6 +17,7 @@ from qapilot.shared.schemas import ExecuteResult
 _PLACEHOLDER_TOKEN_RE = re.compile(r"\{[^{}]+\}")
 _INLINE_API_RE = re.compile(r"\b(GET|POST|PUT|PATCH|DELETE)\s+(/api/[^\s,\)\]]+)", re.IGNORECASE)
 _API_VALUE_RE = re.compile(r"^\s*(GET|POST|PUT|PATCH|DELETE)\s+(/\S+)\s*$", re.IGNORECASE)
+_WS_RE = re.compile(r"\s+")
 
 
 def _format_requirements(requirements: list[str]) -> str:
@@ -111,6 +112,81 @@ def _align_tc_api_fields(tc: dict[str, Any]) -> dict[str, Any]:
     return normalized
 
 
+def _normalize_text_key(text: str) -> str:
+    return _WS_RE.sub(" ", (text or "").strip().lower())
+
+
+def _merge_then_lines(first: str, second: str) -> str:
+    merged: list[str] = []
+    seen: set[str] = set()
+    for candidate in (first, second):
+        for line in [ln.strip() for ln in str(candidate or "").splitlines() if ln.strip()]:
+            key = _normalize_text_key(line)
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(line)
+    return "\n".join(merged)
+
+
+def _merge_values_by_field(first: list[dict[str, Any]], second: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    merged: dict[str, dict[str, Any]] = {}
+    for value in first or []:
+        field = str(value.get("field") or "")
+        if field:
+            merged[field] = value
+    for value in second or []:
+        field = str(value.get("field") or "")
+        if not field:
+            continue
+        if field not in merged:
+            merged[field] = value
+    return list(merged.values())
+
+
+def _semantic_group_key(tc: dict[str, Any]) -> tuple[str, str, str, str, tuple[str, ...]] | None:
+    tags = tuple(sorted(str(tag) for tag in (tc.get("tags") or [])))
+    if "normal" not in tags:
+        return None
+    given = _normalize_text_key(str(tc.get("given", "") or ""))
+    when = _normalize_text_key(str(tc.get("when", "") or ""))
+    api = _normalize_text_key(str(tc.get("api", "") or ""))
+    req_id = _normalize_text_key(str(tc.get("req_id", "") or ""))
+    if not given or not when:
+        return None
+    return (given, when, api, req_id, tags)
+
+
+def _semantic_consolidate_test_cases(test_cases: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    consolidated: list[dict[str, Any]] = []
+    by_group: dict[tuple[str, str, str, str, tuple[str, ...]], int] = {}
+
+    for tc in test_cases:
+        group_key = _semantic_group_key(tc)
+        if group_key is None:
+            consolidated.append(tc)
+            continue
+
+        existing_idx = by_group.get(group_key)
+        if existing_idx is None:
+            by_group[group_key] = len(consolidated)
+            consolidated.append(tc)
+            continue
+
+        existing = consolidated[existing_idx]
+        merged = dict(existing)
+        merged["then"] = _merge_then_lines(str(existing.get("then", "")), str(tc.get("then", "")))
+        merged["values"] = _merge_values_by_field(existing.get("values") or [], tc.get("values") or [])
+        merged["sources"] = list(dict.fromkeys([*(existing.get("sources") or []), *(tc.get("sources") or [])]))
+        merged["depends_on"] = list(dict.fromkeys([*(existing.get("depends_on") or []), *(tc.get("depends_on") or [])]))
+        if len(str(tc.get("name", ""))) < len(str(existing.get("name", ""))):
+            merged["name"] = tc.get("name")
+        merged.update(_claim_meta("then", merged["then"], merged.get("sources") or []))
+        consolidated[existing_idx] = merged
+
+    return consolidated
+
+
 class TCFromDocsAgent(BaseAgent):
     """TS 정보 + 검색된 문서 chunk로 제약 분석 후 TC (given/when/then)를 생성한다."""
 
@@ -190,7 +266,7 @@ class TCFromDocsAgent(BaseAgent):
                 **_claim_meta("then", then, sources),
             })
 
-        return valid, analysis, confidence
+        return _semantic_consolidate_test_cases(valid), analysis, confidence
 
 
 def _contains_placeholder(text: str) -> bool:

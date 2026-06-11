@@ -14,7 +14,9 @@ from qapilot.agents.tv_codebase_aware_agent import (
     _format_unresolved_claims,
     _infer_scenario_intent,
     _pick_schema_name,
+    _ui_input_values_only,
 )
+from qapilot.shared.sensitive_mask import build_sensitive_value_entries
 
 
 # ────────────────────────────────────────────────────────────────────────
@@ -65,6 +67,18 @@ def test_infer_scenario_intent(then_text, tags, expected_key, expected_value):
 def test_infer_scenario_intent_no_then():
     intent = _infer_scenario_intent({"then": "", "tags": []})
     assert intent == {}
+
+
+@pytest.mark.parametrize("then_text,tags,expected", [
+    ("400 Bad Request — 이메일 형식 오류", ["edge_case"], True),
+    ("API) 400 오류가 반환된다.", ["boundary"], True),
+    ("비밀번호 형식이 올바르지 않으면 오류가 표시된다", ["edge_case"], True),
+    ("201 Created — 신규 가입 성공", ["normal"], False),
+    ("400 Bad Request", ["normal"], False),  # edge_case/boundary 태그 없음
+])
+def test_infer_scenario_intent_format_violation(then_text, tags, expected):
+    intent = _infer_scenario_intent({"then": then_text, "tags": tags})
+    assert intent.get("expects_format_violation", False) is expected
 
 
 # ────────────────────────────────────────────────────────────────────────
@@ -157,3 +171,63 @@ def test_parse_preserves_channel_prefixed_then_claim():
         "DB) users에 사용자 정보가 저장된다."
     )
     assert parsed["confidence"] == 0.91
+
+
+def test_ui_input_values_only_filters_response_and_db_fields_and_keeps_ui_sensitive():
+    schemas = {
+        "request_schemas": {
+            "SignupRequest": {
+                "fields": [
+                    {"name": "email", "type": "EmailStr", "required": True, "validators": [{"kind": "email_format"}]},
+                    {"name": "name", "type": "str", "required": True, "validators": []},
+                    {"name": "password", "type": "str", "required": True, "validators": [{"kind": "min_length", "value": 8}], "sensitive": True},
+                    {"name": "birth_date", "type": "date", "required": True, "validators": []},
+                    {"name": "guardian_consent", "type": "bool", "required": False, "validators": []},
+                ]
+            }
+        },
+        "db_models": {
+            "Customer": {
+                "columns": [
+                    {"name": "password_hash", "type": "str", "sensitive": True},
+                    {"name": "token", "type": "str", "sensitive": True},
+                ]
+            }
+        },
+    }
+    selectors = {
+        "by_route": {
+            "/signup": {
+                "inputs": [
+                    {"testid": "name", "v_model": "form.name", "html_type": "text"},
+                    {"testid": "email", "v_model": "form.email", "html_type": "email"},
+                    {"testid": "password", "v_model": "form.password", "html_type": "password"},
+                    {"testid": "birth_date", "v_model": "form.birth_date", "html_type": "date"},
+                    {"testid": "guardian-consent", "v_model": "form.guardian_consent", "html_type": "checkbox"},
+                ]
+            }
+        }
+    }
+    llm_values = [
+        {"field": "email", "value": "newuser_2026@test.com", "type": "string", "purpose": "이메일", "source": "llm"},
+        {"field": "name", "value": "홍길동", "type": "string", "purpose": "이름", "source": "llm"},
+        {"field": "password_hash", "value": "process.env.TEST_PASSWORD_HASH", "type": "string", "purpose": "해시", "source": "placeholder"},
+        {"field": "token", "value": "process.env.TEST_TOKEN", "type": "string", "purpose": "토큰", "source": "placeholder"},
+    ]
+    sensitive_entries = build_sensitive_value_entries({"password"})
+
+    values = _ui_input_values_only(
+        llm_values,
+        existing_values=[],
+        schemas=schemas,
+        selectors=selectors,
+        sensitive_entries=sensitive_entries,
+    )
+
+    names = [v["field"] for v in values]
+    assert names == ["email", "name", "password", "birth_date", "guardian_consent"]
+    assert "password_hash" not in names
+    assert "token" not in names
+    assert next(v for v in values if v["field"] == "password")["value"] == "process.env.TEST_PASSWORD"
+    assert next(v for v in values if v["field"] == "birth_date")["value"] == "2000-01-01"
+    assert next(v for v in values if v["field"] == "guardian_consent")["value"] is True

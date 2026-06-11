@@ -20,6 +20,7 @@ Created: 2026-05-07
 import json
 import os
 import re
+import shutil
 import uuid as _uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -27,6 +28,7 @@ from typing import Any
 
 from langgraph.graph import END, START, StateGraph
 
+from qapilot.agents.scenario_generator import repository
 from qapilot.db.code_reader import load_codebase_index, load_latest_action_mapping, load_latest_generated_code
 from qapilot.db.code_writer import upsert_action_mapping, upsert_codebase_index, upsert_generated_code
 from qapilot.db.rtm_writer import write_rtm_version
@@ -130,13 +132,13 @@ def build_pipeline() -> StateGraph:
     # ═══════════════════════════════════════════════════
     # prd_only_experiment — PRD-only TS + doc-search TC + codebase-aware TV
     # ═══════════════════════════════════════════════════
-    graph.add_node("doc_import_exp",            _doc_import)
-    graph.add_node("requirement_extract_exp",   _requirement_extract)
-    graph.add_node("codebase_scan_exp",         _codebase_scan)
-    graph.add_node("ts_generate_prd_only",      _ts_generate_prd_only)
-    graph.add_node("tc_generate_doc_search",    _tc_generate_doc_search)
-    graph.add_node("tv_generate_codebase_aware", _tv_generate_codebase_aware)
-    graph.add_node("save_experiment_scenarios", _save_experiment_scenarios)
+    graph.add_node("doc_import_exp", _progress_node("doc_import_exp", _doc_import))
+    graph.add_node("requirement_extract_exp", _progress_node("requirement_extract_exp", _requirement_extract))
+    graph.add_node("codebase_scan_exp", _progress_node("codebase_scan_exp", _codebase_scan))
+    graph.add_node("ts_generate_prd_only", _progress_node("ts_generate_prd_only", _ts_generate_prd_only))
+    graph.add_node("tc_generate_doc_search", _progress_node("tc_generate_doc_search", _tc_generate_doc_search))
+    graph.add_node("tv_generate_codebase_aware", _progress_node("tv_generate_codebase_aware", _tv_generate_codebase_aware))
+    graph.add_node("save_experiment_scenarios", _progress_node("save_experiment_scenarios", _save_experiment_scenarios))
 
     graph.add_edge("doc_import_exp",            "requirement_extract_exp")
     graph.add_edge("requirement_extract_exp",   "codebase_scan_exp")
@@ -502,7 +504,7 @@ def _load_existing_scenarios_full(state: PipelineState) -> list[dict]:
     공통 로딩 경로로 쓰인다. SaaS 서비스처럼 디스크 미사용 환경에서는 DB 폴백.
     """
     try:
-        scenarios = _load_json_files(_qapilot_path(state, "scenarios"))
+        scenarios = repository.load_all_scenarios(base_dir=_qapilot_path(state, "scenarios"))
         if scenarios:
             return scenarios
     except Exception:
@@ -1775,19 +1777,19 @@ async def _save_scenarios(state: PipelineState) -> dict:
                     change_content["deleted_tc_ids"] = deleted_tc_ids
             else:
                 change_content = None
-            path = scenarios_dir / f"{ts_id}.json"
-            path.write_text(
-                json.dumps(ts, ensure_ascii=False, indent=2), encoding="utf-8"
-            )
-            saved_paths.append(str(path))
             is_unchanged = ts.pop("_unchanged", False)
+            changed_set = set(change_tc_ids) if change_tc_ids is not None else None
+            _attach_tc_provenance(ts, trace_id=state.get("trace_id"), source="natural_lang", tc_ids=changed_set)
+            save_result = repository.save_scenario(
+                ts, changed_tc_ids=changed_set, deleted_tc_ids=deleted_tc_ids, base_dir=scenarios_dir
+            )
+            saved_paths.append(str(save_result["metadata_path"]))
             tc_count = len(ts.get("test_cases") or [])
             logger.info("scenario_save_debug", ts_id=ts_id, tc_count=tc_count, unchanged=is_unchanged)
             if service_id:
-                payload = _ensure_payload_dict(ts)
+                payload = save_result["payload"]
                 upsert_scenario_version(service_id, ts_id, payload)
-                _upload_scenario_json_to_s3(service_id, ts_id, payload)
-                mirror_path = _write_scenario_local_mirror(service_id, ts_id, payload)
+                mirror_path = _sync_scenario_outputs(service_id, ts_id, save_result)
                 if mirror_path:
                     local_mirror_paths.append(mirror_path)
                 await _upsert_scenario_index(service_id, payload)
@@ -1829,16 +1831,16 @@ async def _save_scenarios(state: PipelineState) -> dict:
                     change_content["deleted_tc_ids"] = deleted_tc_ids
             else:
                 change_content = None
-            path = scenarios_dir / f"{ts_id}.json"
-            path.write_text(
-                json.dumps(ts, ensure_ascii=False, indent=2), encoding="utf-8"
+            changed_set = set(change_tc_ids) if change_tc_ids is not None else None
+            _attach_tc_provenance(ts, trace_id=state.get("trace_id"), source=trigger, tc_ids=changed_set)
+            save_result = repository.save_scenario(
+                ts, changed_tc_ids=changed_set, deleted_tc_ids=deleted_tc_ids, base_dir=scenarios_dir
             )
-            saved_paths.append(str(path))
+            saved_paths.append(str(save_result["metadata_path"]))
             if service_id:
-                payload = _ensure_payload_dict(ts)
+                payload = save_result["payload"]
                 upsert_scenario_version(service_id, ts_id, payload)
-                _upload_scenario_json_to_s3(service_id, ts_id, payload)
-                mirror_path = _write_scenario_local_mirror(service_id, ts_id, payload)
+                mirror_path = _sync_scenario_outputs(service_id, ts_id, save_result)
                 if mirror_path:
                     local_mirror_paths.append(mirror_path)
                 await _upsert_scenario_index(service_id, payload)
@@ -2123,19 +2125,11 @@ async def _load_scenarios_for_codegen(state: PipelineState) -> dict:
         scenarios = load_latest_scenarios(str(service_id), scenario_ids or None)
 
     if not scenarios and scenarios_dir.exists() and not (explicit_scenario_filter and not scenario_ids):
-        for path in scenarios_dir.glob("*.json"):
-            if path.name == "raw":
-                continue
-            if path.name == "regression":
-                continue
-            ts_id = path.stem
-            if scenario_ids and ts_id not in scenario_ids:
-                continue
-            try:
-                ts = json.loads(path.read_text(encoding="utf-8"))
-                scenarios.append(ts)
-            except Exception:
-                pass
+        all_scenarios = repository.load_all_scenarios(base_dir=scenarios_dir)
+        if scenario_ids:
+            scenarios = [ts for ts in all_scenarios if ts.get("ts_id") in scenario_ids]
+        else:
+            scenarios = all_scenarios
 
     scenarios.sort(key=lambda x: x.get("ts_id", ""))
 
@@ -2430,7 +2424,7 @@ async def _load_scenarios_for_test(state: PipelineState) -> dict:
         scenario_ids = (state.get("run_options") or {}).get("scenario_ids") or None
         scenarios = load_latest_scenarios(str(service_id), scenario_ids)
     if not scenarios:
-        scenarios = _load_json_files(_qapilot_path(state, "scenarios"))
+        scenarios = repository.load_all_scenarios(base_dir=_qapilot_path(state, "scenarios"))
     tc_ids = [
         tc.get("tc_id")
         for s in scenarios
@@ -3551,46 +3545,20 @@ async def _report(state: PipelineState) -> dict:
 
 
 async def _ts_generate_prd_only(state: PipelineState) -> dict:
-    """PRD 요구사항만으로 TS 구조 생성 + S3 저장."""
-    import time
-    from datetime import datetime, timezone
-
+    """PRD 요구사항만으로 TS 구조 생성."""
     from qapilot.agents.ts_prd_only_agent import TSFromPRDAgent
     from qapilot.shared.schemas import AgentInput
 
     trace_id = state["trace_id"]
     requirements = state.get("requirements") or []
 
-    start = time.monotonic()
     agent = TSFromPRDAgent(trace_id=trace_id)
     output = await agent.run(AgentInput(
         trace_id=trace_id,
         context={"requirements": requirements},
         params={},
     ))
-    duration = round(time.monotonic() - start, 2)
     ts_list = output.result.get("ts_list") or []
-
-    trace = load_trace(trace_id) or {}
-    service_id = trace.get("service_id")
-    if service_id:
-        payload = {
-            "trace_id": trace_id,
-            "generated_at": datetime.now(timezone.utc).isoformat(),
-            "source": "prd_only",
-            "ts_list": ts_list,
-            "metrics": {
-                "model": output.metadata.model,
-                "cost_usd": output.metadata.cost_usd,
-                "duration_sec": duration,
-            },
-        }
-        key = f"services/{service_id}/experiments/{trace_id}/ts_generation.json"
-        s3_client.put_bytes(
-            key,
-            json.dumps(payload, ensure_ascii=False, indent=2).encode(),
-            "application/json",
-        )
 
     agent_logs = list(state.get("agent_logs") or []) + [output.metadata.model_dump()]
     return {"ts_list": ts_list, "agent_logs": agent_logs}
@@ -3608,8 +3576,7 @@ async def _tc_generate_doc_search(state: PipelineState) -> dict:
     ts_list = state.get("ts_list") or []
     run_opts = state["run_options"]
     trace_id = state["trace_id"]
-    trace = load_trace(trace_id) or {}
-    service_id = trace.get("service_id")
+    service_id = state.get("service_id") or (load_trace(trace_id) or {}).get("service_id")
 
     # tc_target_ts_ids 의미 구분 (PR #278 부터):
     # - None / 미주입 → 기존 default (처음 2 TS만 — CLI / dev 디버깅 용)
@@ -3638,6 +3605,7 @@ async def _tc_generate_doc_search(state: PipelineState) -> dict:
 
     agent_logs = list(state.get("agent_logs") or [])
     result_test_cases: dict[int, list] = {}
+    provenance_by_index: dict[int, dict] = {}
 
     for idx in target_indices:
         ts_item = ts_list[idx]
@@ -3660,7 +3628,8 @@ async def _tc_generate_doc_search(state: PipelineState) -> dict:
                 },
             ))
             raw_rules = search_result.result.get("rules") or []
-        except Exception:
+        except Exception as e:
+            logger.warning("doc_search_failed", trace_id=trace_id, ts_idx=idx, ts_name=ts_name, error=str(e))
             raw_rules = []
 
         retrieved_docs = [
@@ -3683,37 +3652,29 @@ async def _tc_generate_doc_search(state: PipelineState) -> dict:
         test_cases = output.result.get("test_cases") or []
         analysis = output.result.get("analysis") or []
         result_test_cases[idx] = test_cases
-
-        if service_id:
-            provisional_ts_id = f"TS-{idx + 1:03d}"
-            payload = {
-                "trace_id": trace_id,
-                "ts_id": provisional_ts_id,
-                "ts_name": ts_name,
-                "generated_at": datetime.now(timezone.utc).isoformat(),
-                "source": "doc_search",
-                "analysis": analysis,
-                "test_cases": test_cases,
-                "retrieved_docs": retrieved_docs,
-                "metrics": {
-                    "model": output.metadata.model,
-                    "cost_usd": output.metadata.cost_usd,
-                    "duration_sec": duration,
-                    "doc_search_query": query,
-                    "doc_search_top_k": 5,
-                    "doc_search_results_count": len(retrieved_docs),
-                },
-            }
-            key = f"services/{service_id}/experiments/{trace_id}/tc_generation/{provisional_ts_id}.json"
-            s3_client.put_bytes(
-                key,
-                json.dumps(payload, ensure_ascii=False, indent=2).encode(),
-                "application/json",
-            )
+        provenance_by_index[idx] = {
+            "trace_id": trace_id,
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "source": "doc_search",
+            "analysis": analysis,
+            "metrics": {
+                "model": output.metadata.model,
+                "cost_usd": output.metadata.cost_usd,
+                "duration_sec": duration,
+                "doc_search_query": query,
+                "doc_search_top_k": 5,
+                "doc_search_results_count": len(retrieved_docs),
+            },
+            "retrieved_docs": retrieved_docs,
+        }
 
         agent_logs.append(output.metadata.model_dump())
 
-    return {"tc_by_ts_index": result_test_cases, "agent_logs": agent_logs}
+    return {
+        "tc_by_ts_index": result_test_cases,
+        "tc_provenance_by_index": provenance_by_index,
+        "agent_logs": agent_logs,
+    }
 
 
 async def _tv_generate_codebase_aware(state: PipelineState) -> dict:
@@ -3730,6 +3691,7 @@ async def _tv_generate_codebase_aware(state: PipelineState) -> dict:
 
     조회 실패 / 메타데이터 미존재 시 graceful — TC.values 그대로 보존.
     """
+    import asyncio
     import time
     from datetime import datetime, timezone
 
@@ -3741,7 +3703,8 @@ async def _tv_generate_codebase_aware(state: PipelineState) -> dict:
         pick_table_for_tc,
     )
     from qapilot.shared.scan_storage import load_metadata_index, load_source
-    from qapilot.shared.schemas import AgentInput
+    from qapilot.shared.schemas import AgentInput, ToolInput
+    from qapilot.tools.domain_knowledge import DomainKnowledgeTool
 
     trace_id = state["trace_id"]
     trace = load_trace(trace_id) or {}
@@ -3749,6 +3712,12 @@ async def _tv_generate_codebase_aware(state: PipelineState) -> dict:
     tc_by_index: dict = state.get("tc_by_ts_index") or {}
     if not tc_by_index or not service_id:
         return {}
+
+    # req_id → content 매핑 — TC별 문서 재검색 쿼리 품질 향상 (Option A)
+    req_content_map: dict[str, str] = {}
+    for r in (state.get("requirements") or []):
+        if isinstance(r, dict):
+            req_content_map[r.get("req_id", "")] = r.get("content", "")
 
     # ── 4영역 메타데이터 로드 (LRU cache — 같은 service 호출 1회) ──
     try:
@@ -3779,9 +3748,13 @@ async def _tv_generate_codebase_aware(state: PipelineState) -> dict:
         logger.info("tv_no_commit_sha", trace_id=trace_id,
                     reason="codebase_scan 결과에 git_diff.commit_hash 없음")
 
-    for idx, tcs in tc_by_index.items():
-        updated_tcs: list[dict] = []
-        for tc in tcs:
+    # TC 별 처리는 서로 독립적 (메타데이터 조회/문서 재검색/LLM 호출) — 병렬 실행으로
+    # wall-clock 시간을 줄인다. 토큰/비용은 동일 (호출 횟수 변화 없음).
+    # OpenAI rate limit 보호를 위해 동시 실행 개수만 제한한다.
+    semaphore = asyncio.Semaphore(4)
+
+    async def _process_tc(tc: dict) -> tuple[dict, dict | None]:
+        async with semaphore:
             # schemas.db_models 기반으로 TC 와 가장 관련 깊은 테이블 1개 선택 + DB snapshot 조회
             # (sensitive 컬럼은 TV agent 안에서 strip_sensitive_from_db_snapshot 으로 제거)
             db_snapshot = None
@@ -3861,6 +3834,46 @@ async def _tv_generate_codebase_aware(state: PipelineState) -> dict:
                         files=[s["file"] for s in source_snippets],
                     )
 
+            # ── TC별 좁은 쿼리로 문서 재검색 (Option A) ──
+            # TS-level retrieved_docs(top_k=5) 대신, 이 TC의 api/req_id로 좁힌
+            # 쿼리를 한 번 더 검색해 더 정밀한 문서 근거를 claims/values에 보강한다.
+            tc_doc_refs: list[dict] = []
+            req_id = tc.get("req_id") or ""
+            tc_query = " ".join(
+                p for p in (
+                    str(tc.get("api") or ""),
+                    str(tc.get("name") or ""),
+                    req_content_map.get(req_id, req_id),
+                ) if p
+            ).strip()
+            if tc_query:
+                try:
+                    doc_tool = DomainKnowledgeTool(trace_id=trace_id)
+                    tc_search = await doc_tool.run(ToolInput(
+                        trace_id=trace_id,
+                        params={
+                            "action": "search",
+                            "query": tc_query,
+                            "top_k": 2,
+                            "service_id": service_id,
+                            "score_threshold": 0.6,
+                        },
+                    ))
+                    tc_doc_refs = [
+                        {
+                            "content": r.get("content", "") if isinstance(r, dict) else "",
+                            "source": r.get("source", "") if isinstance(r, dict) else "",
+                            "score": r.get("similarity_score", r.get("score", 0.0)) if isinstance(r, dict) else 0.0,
+                        }
+                        for r in (tc_search.result.get("rules") or [])
+                    ]
+                except Exception as e:
+                    logger.warning(
+                        "tv_doc_search_failed",
+                        trace_id=trace_id, tc_name=tc.get("name"), error=str(e),
+                    )
+                    tc_doc_refs = []
+
             start = time.monotonic()
             try:
                 agent = TVFromCodebaseAgent(trace_id=trace_id)
@@ -3874,6 +3887,7 @@ async def _tv_generate_codebase_aware(state: PipelineState) -> dict:
                         "patterns": patterns,
                         "db_snapshot": db_snapshot,
                         "source_snippets": source_snippets,
+                        "tc_doc_refs": tc_doc_refs,
                     },
                     params={},
                 ))
@@ -3892,17 +3906,26 @@ async def _tv_generate_codebase_aware(state: PipelineState) -> dict:
                             new_tc[claim_key] = resolved_text
                             new_tc[f"{claim_key}_status"] = "grounded_code"
                             new_tc[f"{claim_key}_source"] = "code"
-                            new_tc[f"{claim_key}_evidence_refs"] = [s["file"] for s in source_snippets if s.get("file")]
+                            evidence_refs = [s["file"] for s in source_snippets if s.get("file")]
+                            evidence_refs += [d["source"] for d in tc_doc_refs if d.get("source")]
+                            new_tc[f"{claim_key}_evidence_refs"] = evidence_refs
                             new_tc[f"{claim_key}_unresolved"] = False
                     new_tc["tv_validation_passed"] = validation_passed
                     new_tc["tv_validation_reasons"] = (
                         output.result.get("validation_reasons") or []
                     )
-                    updated_tcs.append(new_tc)
+                    if source_snippets:
+                        new_tc["_codebase_refs"] = source_snippets
+                    if tc_doc_refs:
+                        new_tc["_doc_refs"] = tc_doc_refs
+                    result_tc = new_tc
                 else:
-                    updated_tcs.append(tc)
+                    if source_snippets:
+                        tc["_codebase_refs"] = source_snippets
+                    if tc_doc_refs:
+                        tc["_doc_refs"] = tc_doc_refs
+                    result_tc = tc
 
-                agent_logs.append(output.metadata.model_dump())
                 logger.info(
                     "tv_codebase_aware_done",
                     trace_id=trace_id,
@@ -3911,6 +3934,7 @@ async def _tv_generate_codebase_aware(state: PipelineState) -> dict:
                     validation_passed=validation_passed,
                     duration_sec=duration,
                 )
+                return result_tc, output.metadata.model_dump()
             except Exception as e:
                 logger.warning(
                     "tv_codebase_aware_failed",
@@ -3918,9 +3942,22 @@ async def _tv_generate_codebase_aware(state: PipelineState) -> dict:
                     tc_name=tc.get("name"),
                     error=str(e),
                 )
-                updated_tcs.append(tc)  # graceful — 원본 보존
+                if source_snippets:
+                    tc["_codebase_refs"] = source_snippets
+                if tc_doc_refs:
+                    tc["_doc_refs"] = tc_doc_refs
+                return tc, None  # graceful — 원본 보존
 
-        updated_tc_by_index[idx] = updated_tcs
+    # ── 모든 (idx, tc) 쌍을 평탄화해 동시 실행 — 순서는 gather 결과 순서로 보존 ──
+    flat: list[tuple[int, dict]] = [
+        (idx, tc) for idx, tcs in tc_by_index.items() for tc in tcs
+    ]
+    results = await asyncio.gather(*(_process_tc(tc) for _, tc in flat))
+
+    for (idx, _tc), (result_tc, log_entry) in zip(flat, results):
+        updated_tc_by_index.setdefault(idx, []).append(result_tc)
+        if log_entry is not None:
+            agent_logs.append(log_entry)
 
     return {"tc_by_ts_index": updated_tc_by_index, "agent_logs": agent_logs}
 
@@ -3953,17 +3990,32 @@ def _contains_placeholder_value(value: Any) -> bool:
     return isinstance(value, str) and bool(re.search(r"\{[^{}]+\}", value))
 
 
-def _upload_scenario_json_to_s3(service_id: str | None, ts_id: str, payload: dict) -> None:
-    """최신 scenario JSON 을 S3 `services/{service_id}/scenarios/{ts_id}.json` 에 업로드."""
-    if not (service_id and ts_id):
-        return
-    body = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
-    key = f"services/{service_id}/scenarios/{ts_id}.json"
-    result = s3_client.put_bytes(key, body, "application/json")
-    if result is None:
-        logger.warning("scenario_s3_upload_failed", service_id=service_id, ts_id=ts_id, key=key)
-    else:
-        logger.info("scenario_s3_uploaded", service_id=service_id, ts_id=ts_id, key=key, bytes=result["bytes"])
+def _attach_tc_provenance(
+    ts: dict,
+    *,
+    trace_id: str | None,
+    source: str,
+    tc_ids: set[str] | None = None,
+    analysis: list | None = None,
+    metrics: dict | None = None,
+) -> None:
+    """저장 직전 TC들에 provenance를 채운다.
+
+    `tc_ids`가 None이면 모든 TC, 아니면 해당 tc_id만 대상으로 한다. repository는
+    내용이 실제로 변경되어 새 버전을 쓸 때만 이 provenance를 사용하고, 변경이
+    없으면 기존 버전의 provenance를 그대로 유지한다.
+    """
+    now = datetime.now(timezone.utc).isoformat()
+    for tc in ts.get("test_cases") or []:
+        if tc_ids is not None and tc.get("tc_id") not in tc_ids:
+            continue
+        tc["provenance"] = {
+            "trace_id": trace_id,
+            "generated_at": now,
+            "source": source,
+            "analysis": analysis,
+            "metrics": metrics,
+        }
 
 
 def _repo_root_for_local_mirror() -> Path | None:
@@ -3976,25 +4028,72 @@ def _repo_root_for_local_mirror() -> Path | None:
     return None
 
 
-def _write_scenario_local_mirror(service_id: str | None, ts_id: str, payload: dict) -> str | None:
-    """최종 scenario JSON 을 `qapilot-local/services/{service_id}/scenarios` 에도 저장."""
+def _sync_scenario_outputs(service_id: str | None, ts_id: str, save_result: dict) -> str | None:
+    """`repository.save_scenario()` 결과를 S3 `services/{service_id}/scenarios/...`
+    및 `qapilot-local/services/{service_id}/scenarios/...` 미러에 동기화한다.
+
+    metadata.json, 새로 쓰여진 TC 버전(vN.json/latest.json), total_TS.json을
+    동일한 상대 경로로 업로드/복사한다. `_deleted/`로 옮겨진 TC는 새 위치에
+    업로드하고 기존 위치의 객체/파일을 정리한다.
+
+    반환: 로컬 미러 TS 디렉토리 경로 (repo_root 미해결 시 None).
+    """
     if not (service_id and ts_id):
         return None
+
+    base_prefix = f"services/{service_id}/scenarios"
     repo_root = _repo_root_for_local_mirror()
+    mirror_root = (repo_root / "qapilot-local" / base_prefix) if repo_root else None
     if repo_root is None:
         logger.warning("scenario_local_mirror_root_unresolved", service_id=service_id, ts_id=ts_id)
-        return None
-    target = repo_root / "qapilot-local" / "services" / service_id / "scenarios" / f"{ts_id}.json"
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    logger.info("scenario_local_mirror_written", service_id=service_id, ts_id=ts_id, path=str(target))
-    return str(target)
+
+    def _upload_and_mirror(local_path: Path, rel_path: str) -> None:
+        try:
+            data = local_path.read_bytes()
+        except OSError:
+            return
+        key = f"{base_prefix}/{rel_path}"
+        result = s3_client.put_bytes(key, data, "application/json")
+        if result is None:
+            logger.warning("scenario_s3_upload_failed", service_id=service_id, ts_id=ts_id, key=key)
+        if mirror_root is not None:
+            target = mirror_root / rel_path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(data)
+
+    _upload_and_mirror(save_result["metadata_path"], f"{ts_id}/metadata.json")
+
+    for info in save_result["tc_results"].values():
+        if info.get("new_version") is None:
+            continue
+        folder = info["folder"]
+        version_path: Path = info["version_path"]
+        latest_path: Path = info["latest_path"]
+        _upload_and_mirror(version_path, f"{ts_id}/{folder}/{version_path.name}")
+        _upload_and_mirror(latest_path, f"{ts_id}/{folder}/latest.json")
+
+    for dest in save_result["deleted_paths"]:
+        folder = dest.name
+        for f in dest.glob("*.json"):
+            _upload_and_mirror(f, f"{ts_id}/_deleted/{folder}/{f.name}")
+        old_prefix = f"{base_prefix}/{ts_id}/{folder}/"
+        for key in s3_client.list_objects(old_prefix):
+            s3_client.delete_object(key)
+        if mirror_root is not None:
+            old_dir = mirror_root / ts_id / folder
+            if old_dir.exists():
+                shutil.rmtree(old_dir)
+
+    _upload_and_mirror(save_result["total_ts_path"], "total_TS.json")
+
+    return str(mirror_root / ts_id) if mirror_root is not None else None
 
 
 async def _save_experiment_scenarios(state: PipelineState) -> dict:
-    """ts_list + tc_by_ts_index를 병합해 최종 시나리오 파일로 디스크·DB 저장."""
+    """ts_list + tc_by_ts_index를 병합해 scenarios/ 구조로 디스크·DB 저장."""
     ts_list = state.get("ts_list") or []
     tc_by_index: dict = state.get("tc_by_ts_index") or {}
+    provenance_by_index: dict = state.get("tc_provenance_by_index") or {}
     trace = load_trace(state["trace_id"]) or {}
     service_id = trace.get("service_id")
     trigger = state["run_options"].get("trigger") or "init"
@@ -4007,10 +4106,36 @@ async def _save_experiment_scenarios(state: PipelineState) -> dict:
 
     for i, ts_item in enumerate(ts_list):
         ts_id = f"TS-{i + 1:03d}"
+        base_provenance = provenance_by_index.get(i) or {
+            "trace_id": state["trace_id"],
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "source": "prd_only",
+            "analysis": None,
+            "metrics": None,
+        }
+        retrieved_docs = base_provenance.get("retrieved_docs") or []
+        query = (base_provenance.get("metrics") or {}).get("doc_search_query", "")
+
         test_cases = []
+        all_codebase_refs: list[dict] = []
+        seen_refs: set[tuple] = set()
         for j, tc in enumerate(tc_by_index.get(i, []), start=1):
             tc["tc_id"] = f"{ts_id}-TC-{j:02d}"
+            codebase_refs = tc.pop("_codebase_refs", None) or []
+            doc_refs = tc.pop("_doc_refs", None) or []
+            tc_provenance = dict(base_provenance)
+            if codebase_refs:
+                tc_provenance["codebase_refs"] = codebase_refs
+            if doc_refs:
+                tc_provenance["retrieved_docs"] = doc_refs
+            tc["provenance"] = tc_provenance
             test_cases.append(tc)
+
+            for ref in codebase_refs:
+                key = (ref.get("file"), ref.get("line_start"), ref.get("line_end"))
+                if key not in seen_refs:
+                    seen_refs.add(key)
+                    all_codebase_refs.append(ref)
 
         ts = {
             "ts_id": ts_id,
@@ -4022,15 +4147,19 @@ async def _save_experiment_scenarios(state: PipelineState) -> dict:
             "requirements": ts_item.get("requirements") or [],
             "depends_on": [],
             "test_cases": test_cases,
+            "tc_generation_context": {
+                "query": query,
+                "retrieved_docs": retrieved_docs,
+                "codebase_refs": all_codebase_refs,
+            },
         }
-        path = scenarios_dir / f"{ts_id}.json"
-        path.write_text(json.dumps(ts, ensure_ascii=False, indent=2), encoding="utf-8")
-        saved_paths.append(str(path))
-        merged_scenarios.append(ts)
+        save_result = repository.save_scenario(ts, base_dir=scenarios_dir)
+        saved_paths.append(str(save_result["metadata_path"]))
+        payload = save_result["payload"]
+        merged_scenarios.append(payload)
         if service_id:
-            upsert_scenario_version(service_id, ts_id, ts)
-            _upload_scenario_json_to_s3(service_id, ts_id, ts)
-            mirror_path = _write_scenario_local_mirror(service_id, ts_id, ts)
+            upsert_scenario_version(service_id, ts_id, payload)
+            mirror_path = _sync_scenario_outputs(service_id, ts_id, save_result)
             if mirror_path:
                 local_mirror_paths.append(mirror_path)
 

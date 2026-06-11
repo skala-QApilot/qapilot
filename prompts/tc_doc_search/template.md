@@ -26,8 +26,12 @@
 
 **3단계 — TC 작성**
 `analysis`의 각 `test_point`를 TC로 변환하라.
-각 TC에 `technique` 필드로 어떤 기법 근거인지 명시하라.
+**단, 어떤 test_point의 given/when이 이미 작성한 다른 TC의 given/when과 동일하면 새 TC를 만들지 마라.**
+대신 그 기존 TC의 `then`에 해당 test_point의 검증 채널(UI/API/DB)을 줄바꿈으로 추가하고, `tags`에 그 test_point의 유형도 함께 추가하라.
+이렇게 병합한 경우에도 `analysis`의 `test_points`에는 원래 항목을 그대로 남겨 커버리지 추적이 가능하게 하라.
+각 TC에 `technique` 필드로 어떤 기법 근거인지 명시하라(여러 test_point가 병합됐으면 배열로 모두 적어라).
 TC 유형별 최소 개수를 반드시 충족하라: normal 2+, edge_case 2+, boundary 1+, auth 1+ (총 최소 6개).
+이 최소 개수는 TC 개수가 아니라 TC들의 `tags`에 등장하는 유형 커버리지 기준이다 — 병합으로 TC 개수가 줄어도 tags로 4가지 유형이 모두 커버되면 된다.
  given/when/then은 완전한 한국어 문장으로 작성하되, 문서에 없는 핵심 주장(에러 메시지, 상태 코드, 중복 데이터 값 등)은 지어내지 마라.
  `when` 문장 안에 엔드포인트를 썼다면 `api` 필드는 그 엔드포인트와 정확히 같은 METHOD/path 를 써라.
  `api` 에 router prefix 를 중복해서 붙이지 마라. 예: `PATCH /api/orders/{order_id}/change-plan` 는 가능하지만 `PATCH /api/orders/api/orders/{order_id}/change-plan` 는 금지다.

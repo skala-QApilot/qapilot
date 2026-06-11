@@ -144,6 +144,36 @@ def get_object(key: str) -> bytes | None:
         return None
 
 
+def list_objects(prefix: str) -> list[str]:
+    """S3 ListObjectsV2 (페이지네이션). 반환: prefix로 시작하는 키 목록 (실패/비활성 시 [])."""
+    client, bucket = get_client()
+    if client is None:
+        return []
+    keys: list[str] = []
+    try:
+        paginator = client.get_paginator("list_objects_v2")
+        for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+            for obj in page.get("Contents", []):
+                keys.append(obj["Key"])
+        return keys
+    except Exception as e:
+        _logger.warning("s3_list_failed", prefix=prefix, error=str(e))
+        return []
+
+
+def delete_object(key: str) -> bool:
+    """S3 DELETE. 반환: 성공 여부 (실패/비활성 시 False)."""
+    client, bucket = get_client()
+    if client is None:
+        return False
+    try:
+        client.delete_object(Bucket=bucket, Key=key)
+        return True
+    except Exception as e:
+        _logger.warning("s3_delete_failed", key=key, error=str(e))
+        return False
+
+
 def download(key: str, local_path: str) -> bool:
     """S3 GET → local 파일 저장. 반환: 성공 여부.
 

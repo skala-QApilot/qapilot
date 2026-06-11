@@ -206,13 +206,22 @@ class TVValidator:
                         actual=type(value).__name__,
                     ))
                 # format validators
+                expects_format_violation = bool(
+                    (scenario_intent or {}).get("expects_format_violation"),
+                )
                 for v in field_spec.get("validators", []) or []:
                     v_kind = v.get("kind") if isinstance(v, dict) else None
                     v_params = v.get("value") if isinstance(v, dict) else None
                     if not v_kind:
                         continue
                     ok, detail = _check_format(v_kind, value, params=v_params)
-                    checks.append(ValidationCheck("format", ok, detail))
+                    if expects_format_violation and not ok:
+                        # 음성 테스트(예: edge_case + 400) — 의도적 형식 위반은 실패로 보지 않는다.
+                        checks.append(ValidationCheck(
+                            "format", True, f"{detail} (의도된 음성 테스트 — 위반 허용)",
+                        ))
+                    else:
+                        checks.append(ValidationCheck("format", ok, detail))
 
         # ── 2. DB 존재성 / 부재성 ─────────────────────────────────────────
         if db_snapshot is not None and scenario_intent:

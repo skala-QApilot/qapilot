@@ -5,6 +5,7 @@ mock 으로 DB/S3 격리. cache hit/miss + line range + graceful None + traversa
 
 from __future__ import annotations
 
+import json
 from unittest.mock import patch
 
 import pytest
@@ -75,6 +76,23 @@ def test_metadata_explicit_commit_passes_through(mock_raw):
 
 
 @patch.object(scan_storage, "load_metadata_index_raw")
+def test_metadata_explicit_commit_prefers_local_mirror(mock_raw, tmp_path, monkeypatch):
+    local_root = tmp_path / "services"
+    local_file = local_root / SERVICE_ID / "metadata-index" / COMMIT / "frontend-selectors.json"
+    local_file.parent.mkdir(parents=True, exist_ok=True)
+    local_file.write_text(
+        json.dumps({"kind": "frontend", "sub_kind": "selectors", "source": "local"}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(scan_storage, "_local_services_root", lambda: local_root)
+
+    got = load_metadata_index(SERVICE_ID, "frontend", "selectors", commit_hash=COMMIT)
+
+    assert got == {"kind": "frontend", "sub_kind": "selectors", "source": "local"}
+    mock_raw.assert_not_called()
+
+
+@patch.object(scan_storage, "load_metadata_index_raw")
 @patch.object(scan_storage, "get_latest_commit_hash")
 def test_metadata_commit_none_resolves_latest(mock_latest, mock_raw):
     mock_latest.return_value = "deadbeef" + "0" * 32
@@ -83,6 +101,26 @@ def test_metadata_commit_none_resolves_latest(mock_latest, mock_raw):
     mock_latest.assert_called_once_with(SERVICE_ID, "frontend", "selectors")
     mock_raw.assert_called_once()
     assert mock_raw.call_args[0][3] == "deadbeef" + "0" * 32
+
+
+@patch.object(scan_storage, "get_latest_commit_hash")
+@patch.object(scan_storage, "load_metadata_index_raw")
+def test_metadata_commit_none_prefers_latest_local_mirror(mock_raw, mock_latest, tmp_path, monkeypatch):
+    local_root = tmp_path / "services"
+    older = local_root / SERVICE_ID / "metadata-index" / ("a" * 40) / "frontend-selectors.json"
+    latest = local_root / SERVICE_ID / "metadata-index" / ("b" * 40) / "frontend-selectors.json"
+    older.parent.mkdir(parents=True, exist_ok=True)
+    latest.parent.mkdir(parents=True, exist_ok=True)
+    older.write_text(json.dumps({"version": "older"}), encoding="utf-8")
+    latest.write_text(json.dumps({"version": "latest"}), encoding="utf-8")
+    latest.touch()
+    monkeypatch.setattr(scan_storage, "_local_services_root", lambda: local_root)
+
+    got = load_metadata_index(SERVICE_ID, "frontend", "selectors")
+
+    assert got == {"version": "latest"}
+    mock_latest.assert_not_called()
+    mock_raw.assert_not_called()
 
 
 @patch.object(scan_storage, "load_metadata_index_raw")

@@ -125,3 +125,47 @@ def test_parse_dedupes_duplicated_api_prefix_without_when_inline_endpoint():
 
     assert confidence == 0.75
     assert test_cases[0]["api"] == "POST /api/orders"
+
+
+def test_parse_consolidates_semantically_duplicated_normal_happy_paths():
+    agent = TCFromDocsAgent(trace_id="tc-doc-search-test")
+    payload = {
+        "analysis": [],
+        "confidence": 0.82,
+        "test_cases": [
+            {
+                "name": "유효한 정보로 회원가입이 완료되는지 확인한다",
+                "technique": "동등 분할",
+                "given": "사용자가 회원가입 화면에 접근해 있고, 유효한 이메일 형식과 비밀번호, 이름을 입력할 수 있는 상태이다.",
+                "when": "사용자가 회원가입 화면에서 이메일, 비밀번호, 이름을 입력하고 회원가입을 요청한다.",
+                "then": "UI) 회원가입이 완료된다.",
+                "values": [{"field": "email", "value": "test@example.com", "type": "string", "purpose": "이메일"}],
+                "tags": ["normal"],
+                "api": "POST /api/auth/signup",
+                "req_id": "FR-AUTH-01",
+                "sources": ["PRD_v4.0.md"],
+                "depends_on": [],
+            },
+            {
+                "name": "회원가입 성공 후 로그인 화면으로 이동하는지 확인한다",
+                "technique": "동등 분할",
+                "given": "사용자가 회원가입 화면에 접근해 있고, 유효한 이메일 형식과 비밀번호, 이름을 입력할 수 있는 상태이다.",
+                "when": "사용자가 회원가입 화면에서 이메일, 비밀번호, 이름을 입력하고 회원가입을 요청한다.",
+                "then": "UI) 로그인 화면으로 이동한다.",
+                "values": [{"field": "name", "value": "홍길동", "type": "string", "purpose": "이름"}],
+                "tags": ["normal"],
+                "api": "POST /api/auth/signup",
+                "req_id": "FR-AUTH-01",
+                "sources": ["PRD_v4.0.md"],
+                "depends_on": [],
+            },
+        ],
+    }
+
+    test_cases, _analysis, confidence = agent._parse(json.dumps(payload, ensure_ascii=False))
+
+    assert confidence == 0.82
+    assert len(test_cases) == 1
+    assert test_cases[0]["then"] == "UI) 회원가입이 완료된다.\nUI) 로그인 화면으로 이동한다."
+    fields = [value["field"] for value in test_cases[0]["values"]]
+    assert fields == ["email", "name"]

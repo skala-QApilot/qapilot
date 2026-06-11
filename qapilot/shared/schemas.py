@@ -198,6 +198,30 @@ class TestValue(TypedDict):
     unresolved: NotRequired[bool]
 
 
+class TCProvenance(TypedDict):
+    """TC 버전(vN.json/latest.json)을 생성/수정한 실행에 대한 메타데이터.
+
+    이 버전이 새로 쓰여질 때만 채워지며, 이후 변경되지 않는 TC의
+    버전 파일은 기존 provenance를 그대로 유지한다.
+    """
+
+    trace_id: str | None
+    generated_at: str | None
+    source: str | None  # "init" | "code_change" | "doc_update" | "natural_lang" | "prd_only" | "doc_search"
+    analysis: NotRequired[list[Any] | None]
+    metrics: NotRequired[dict[str, Any] | None]
+    retrieved_docs: NotRequired[list[dict[str, Any]]]  # doc_search 단계에서 검색된 문서 chunk (source/section/content/score)
+    codebase_refs: NotRequired[list[dict[str, Any]]]  # tv_codebase_aware 단계에서 참고한 코드 스니펫 (file/line_start/line_end/content)
+
+
+class TCGenerationContext(TypedDict):
+    """TS의 TC 생성 단계에서 사용된 검색 쿼리·문서·코드 참조 (TS-{id}/metadata.json에 기록)."""
+
+    query: str
+    retrieved_docs: list[dict[str, Any]]
+    codebase_refs: list[dict[str, Any]]
+
+
 class TestCase(TypedDict):
     """테스트 케이스."""
 
@@ -223,6 +247,25 @@ class TestCase(TypedDict):
     given_unresolved: NotRequired[bool]
     when_unresolved: NotRequired[bool]
     then_unresolved: NotRequired[bool]
+    technique: NotRequired[str]
+    sources: NotRequired[list[str]]
+    doc_verified: NotRequired[bool]
+    provenance: NotRequired[TCProvenance]
+
+
+class TSMetadata(TypedDict):
+    """TS-{id}/metadata.json 에 저장되는 TS 구조 정보 (test_cases 제외)."""
+
+    ts_id: str
+    name: str
+    description: str
+    trigger: str
+    affected_files: list[str]
+    domain_rules_used: list[str]
+    requirements: list[str]  # 참조한 PRD 요구사항 번호 (예: ["FR-ORDER-01", "FR-BIL-01"])
+    depends_on: list[str]  # 선행 실행이 필요한 TS ID 목록 (예: ["TS-001"])
+    last_modified_at: NotRequired[str]
+    tc_generation_context: NotRequired[TCGenerationContext]
 
 
 class TestScenario(TypedDict):
@@ -237,6 +280,8 @@ class TestScenario(TypedDict):
     requirements: list[str]  # 참조한 PRD 요구사항 번호 (예: ["FR-ORDER-01", "FR-BIL-01"])
     depends_on: list[str]  # 선행 실행이 필요한 TS ID 목록 (예: ["TS-001"])
     test_cases: list[TestCase]
+    last_modified_at: NotRequired[str]
+    tc_generation_context: NotRequired[TCGenerationContext]
 
 
 # ── 액션 매핑 ──

@@ -1553,8 +1553,10 @@ class ScenarioGeneratorAgent(BaseAgent):
         if qapilot_dir:
             scenarios_dir = Path(qapilot_dir) / "scenarios"
             if scenarios_dir.exists():
-                for p in scenarios_dir.glob("TS-*.json"):
-                    parts = p.stem.split("-")
+                for p in scenarios_dir.iterdir():
+                    if not p.is_dir():
+                        continue
+                    parts = p.name.split("-")
                     if len(parts) == 2 and parts[1].isdigit():
                         existing_nums.add(int(parts[1]))
 
@@ -1581,9 +1583,9 @@ class ScenarioGeneratorAgent(BaseAgent):
 
     def _load_all_scenarios(self) -> list[dict]:
         """서비스의 모든 기존 TS를 로드한다 (DB 우선, qapilot_dir 폴백)."""
-        import json
         from pathlib import Path
         from qapilot.db.scenario_reader import load_latest_scenarios
+        from qapilot.agents.scenario_generator.repository import load_all_scenarios
 
         service_id = getattr(self, "_service_id", None)
         if service_id:
@@ -1596,20 +1598,10 @@ class ScenarioGeneratorAgent(BaseAgent):
             return []
 
         scenarios_dir = Path(qapilot_dir) / "scenarios"
-        if not scenarios_dir.exists():
-            return []
-
-        result = []
-        for p in sorted(scenarios_dir.glob("TS-*.json")):
-            try:
-                result.append(json.loads(p.read_text(encoding="utf-8")))
-            except Exception:
-                pass
-        return result
+        return load_all_scenarios(base_dir=scenarios_dir)
 
     def _load_scenario_file(self, ts_id: str) -> dict | None:
         """기존 시나리오를 DB 우선, 필요 시 qapilot_dir fallback 으로 로드한다."""
-        import json
         from pathlib import Path
         from qapilot.db.scenario_reader import load_latest_scenarios
         from qapilot.agents.scenario_generator.repository import load_scenario
@@ -1621,13 +1613,13 @@ class ScenarioGeneratorAgent(BaseAgent):
                 return rows[0]
         qapilot_dir = getattr(self, "_qapilot_dir_override", None)
         if qapilot_dir:
-            path = Path(qapilot_dir) / "scenarios" / f"{ts_id}.json"
-            if path.exists():
-                return json.loads(path.read_text(encoding="utf-8"))
+            scenarios_dir = Path(qapilot_dir) / "scenarios"
+            ts = load_scenario(ts_id, base_dir=scenarios_dir)
+            if ts is not None:
+                return ts
             # 디스크 없음 → DB 폴백
             try:
                 from qapilot.shared.trace_store import load_trace
-                from qapilot.db.scenario_reader import load_latest_scenarios
                 trace = load_trace(self.trace_id) or {}
                 service_id = trace.get("service_id")
                 if service_id:

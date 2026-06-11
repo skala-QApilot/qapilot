@@ -19,12 +19,15 @@ TC 가 진짜로 실행될 때 통과할 수 있는 값을 만든다.
 4. **관련 테스트 패턴** — SUT 의 기존 테스트 코드 일부 (인증 흐름, 값 형식 참고용)
 5. **DB 실제 데이터 일부** — `expects_existing_in_db` 시나리오 (예: 이미 가입된 이메일)
    - sensitive 컬럼은 **이미 제외**되어 있음
+6. **관련 문서 chunk (선택)** — 이 TC 의 api/req_id 로 재검색한 정책/명세 문서 일부.
+   코드에 없는 정책적 근거(왜 이 제약이 있는지)를 보강하는 용도이며, 코드와 충돌하면 코드가 우선.
 
 ---
 
 ## 무엇을 출력하는가
 
-`values` 배열은 반드시 출력한다. **각 entry 는 schema 의 field 1개에 대응**.
+`values` 배열은 반드시 출력한다. **각 entry 는 실제 UI 에서 사용자가 입력/선택해야 하는 field 1개에 대응**.
+response body 필드, DB 컬럼, 내부 계산값은 넣지 말고, frontend selector + request schema 에 동시에 해당하는 UI 입력 필드만 남겨라.
 추가로 placeholder 를 해소한 `claims` 가 있으면 함께 출력할 수 있다.
 
 ```json
@@ -34,6 +37,7 @@ TC 가 진짜로 실행될 때 통과할 수 있는 값을 만든다.
     "when": "string",
     "then": "string"
   },
+  "unverified_claims": ["string"],
   "values": [
     {
       "field": "string",          // schema 에 정의된 필드 이름
@@ -48,12 +52,26 @@ TC 가 진짜로 실행될 때 통과할 수 있는 값을 만든다.
 ```
 
 ⚠️ `claims` 는 unresolved placeholder 가 실제 코드 근거로 해소될 때만 넣어라. 근거가 없으면 key 를 비워 두거나 생략하라.
+
+### unverified_claims — TC의 `then`/`given`/`when`에 적힌 미확인 확정형 주장
+이미 placeholder(`{...}`) 가 아닌, **구체적인 값으로 확정되어 적혀 있는 주장** 중에서
+입력으로 주어진 `source_snippets`(production 코드) / `tc_doc_refs`(문서) / `schemas` /
+`db_snapshot` 어디에서도 근거를 찾을 수 없는 것이 있으면, 그 문장(또는 핵심 구절)을
+`unverified_claims` 배열에 그대로 적어라.
+- 예: `then`에 "'허위 정보로 가입할 수 없습니다' 오류가 표시된다"라고 적혀 있는데
+  코드/문서 어디에도 그 문구·로직이 없다 → `unverified_claims: ["'허위 정보로 가입할 수 없습니다' 오류가 표시된다"]`
+- 일반적인 HTTP 상태 코드(`200`, `201`, `400`, `404`, `409` 등)나 코드/스키마로 직접 확인되는
+  내용은 포함하지 마라.
+- 근거를 찾았거나 애초에 확정형 주장이 없으면 빈 배열 `[]`을 반환하라.
+- `unverified_claims` 를 발견했다고 해서 TC의 `given/when/then`을 직접 고치지는 마라
+  (TC 자체는 변경하지 않는다는 원칙 유지) — 검증용 플래그로만 보고하라.
 ⚠️ `claims.then` 은 `UI)`, `API)`, `DB)` 접두어를 사용해 필요한 assertion만 적는다.
 ⚠️ 여러 backend 를 구분해야 하면 `API[service-name])` 형식을 사용해도 된다.
 ⚠️ 여러 저장소/스키마를 구분해야 하면 `DB[schema-or-store])` 형식을 사용해도 된다.
 API 응답 검증이 불필요하면 `API)`를 쓰지 말고, DB 변경 검증이 불필요하면 `DB)`를 쓰지 마라.
 ⚠️ **출력에 sensitive 필드 (password / token / secret 등) 절대 포함하지 마라.**
 이런 필드는 시스템이 별도로 placeholder 로 처리한다. 본 응답에 넣으면 무시되고 덮어써진다.
+단, 이 규칙은 "LLM 응답에 직접 쓰지 말라"는 뜻이다. 실제 UI 입력에 필요한 sensitive request 필드는 시스템이 별도 머지한다.
 
 ---
 
@@ -61,6 +79,7 @@ API 응답 검증이 불필요하면 `API)`를 쓰지 말고, DB 변경 검증�
 
 ### 1. schema 의 validators 를 반드시 만족시킨다
 스키마에 `min_length: 8` 이 있으면 8자 이상, `pattern: "^[^@]+@[^@]+$"` 가 있으면 그 정규식에 맞는 값.
+그리고 values 는 **UI 입력 필드만** 남겨라.
 
 ### 2. scenario_intent 에 맞춰서 만든다
 TC 의 tags 와 then 절을 본다:
@@ -89,6 +108,11 @@ SUT 의 기존 테스트 코드 snippet. 거기서 쓰는 값 형식을 따라�
 
 ### 5. 한국어 비즈니스 도메인 추측 금지
 스키마/문서/DB 에 없는 정보는 추측하지 마라. 충분한 정보가 없으면 conservative 한 일반 값.
+
+### 6. UI 입력 completeness
+프론트엔드 selector 상의 input/checkbox/select 와 request schema 가 겹치는 필드는,
+이 TC를 실행하는 데 필요하면 빠뜨리지 말고 값을 채워라.
+반대로 `password_hash`, `token`, `session`, DB primary key, response body 전용 필드는 values 에 넣지 마라.
 
 ---
 
