@@ -28,7 +28,7 @@
 `analysis`의 각 `test_point`를 TC 1개로 열거하라.
 각 TC는 골격만 정한다 — **given/when/then 과 value 는 작성하지 마라** (후속 통합 단계가 문서+코드베이스+DB를 보고 함께 생성한다).
 각 TC에 정할 것: `name`, `technique`(기법 근거), `intent`(normal/expects_existing/expects_absent/expects_validation_error/boundary/auth 중 하나), `tags`, `api`, `req_id`, `depends_on`.
-TC 유형별 최소 개수를 반드시 충족하라: normal 2+, edge_case 2+, boundary 1+, auth 1+ (총 최소 6개).
+**TS 1개당 최대 5개**까지만 열거하라 (반복 실험용 상한). 유형 다양성을 우선하되(normal 1개 이상 + edge_case/boundary/auth 중 중요한 것부터), 5개를 넘기지 마라.
 각 TC에 `sources` 필드로 해당 TC를 도출한 문서명을 기재하라. (이 단계는 코드베이스를 보지 않으므로 `"codebase"` 는 포함하지 않는다.)
 
 JSON만 출력하라. 마크다운 코드블록이나 설명 텍스트를 포함하지 마라.

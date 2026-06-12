@@ -136,7 +136,7 @@ def test_should_auto_navigate_empty_steps():
 # ── C. chain timeout 단축 — 회귀 (상수 값 자체) ──
 
 
-def test_chain_timeout_constants_v2():
-    """#197 후속 — chain timeout 단축 v2."""
-    assert _CHAIN_PRIMARY_TIMEOUT_MS == 5_000
-    assert _CHAIN_FALLBACK_TIMEOUT_MS == 3_000
+def test_chain_timeout_constants_v3():
+    """chain timeout 단축 v3 (반복 실험 속도용) — 1s / 0.5s."""
+    assert _CHAIN_PRIMARY_TIMEOUT_MS == 1_000
+    assert _CHAIN_FALLBACK_TIMEOUT_MS == 500

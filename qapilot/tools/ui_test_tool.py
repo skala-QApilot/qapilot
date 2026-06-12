@@ -76,8 +76,12 @@ _GET_BY_METHODS = {  # noqa: F841 — spec §4.5.3 매핑표 참조용 (의미 �
 #   후 다음 step skip → ui_result.json 저장 → 다음 TC 진행 보장. ActionMapper 환각으로
 #   selector chain 이 모두 fail 하는 케이스도 trace abort 안 됨.
 # - LLM 추론 selector 가 대부분 1~2 attempt 안에 적중하므로 5s 1차도 충분 (e2e 통계).
-_CHAIN_PRIMARY_TIMEOUT_MS = 5_000
-_CHAIN_FALLBACK_TIMEOUT_MS = 3_000
+# - v3 (반복 실험 속도용): 1s / 0.5s 로 추가 단축. 단언은 wait_for_load_state
+#   (networkidle) 뒤에 와서 진짜 요소는 이미 DOM 에 있고, 실패의 대부분은 부재
+#   요소(플로우 미수행)라 대기는 헛비용. timeout=0 은 Playwright 에서 "무한 대기"
+#   라 금지 — 부재 요소가 BaseTool 60s 까지 멈춰버림. 양수 소값이 정답.
+_CHAIN_PRIMARY_TIMEOUT_MS = 1_000
+_CHAIN_FALLBACK_TIMEOUT_MS = 500
 
 # 이슈 #121 (옵션 C): auto-navigate 의 api_endpoint 파싱 패턴.
 # 형식 예: "POST /login" / "GET /plans/{id}" / "/signup".
@@ -1334,10 +1338,14 @@ class UITestTool(BaseTool):
                 ("get_by_text", page.get_by_text(selector)),
             ]
         if selector_type == "testid":
+            # testid 는 단일 canonical locator 로 충분 (이슈 #111 체인 축소).
+            # get_by_test_id 가 이미 설정된 testIdAttribute 로 해석되며, 기존의
+            # 두 추가 변형은 (1) [data-testid] = get_by_test_id 와 동일 쿼리(중복),
+            # (2) [data-test-id] = 다른 컨벤션 SUT 전용 추정 — 둘 다 적중하면
+            # 1차에서 이미 적중. 부재 요소엔 실패 단언마다 +6s 헛대기만 누적.
+            # 컨벤션이 다른 SUT 는 Playwright testIdAttribute 설정으로 처리.
             return [
                 ("get_by_test_id", page.get_by_test_id(selector)),
-                ("locator[data-testid]", page.locator(f'[data-testid="{selector}"]')),
-                ("locator[data-test-id]", page.locator(f'[data-test-id="{selector}"]')),
             ]
         if selector_type == "role":
             if ":" in selector:

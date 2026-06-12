@@ -65,18 +65,16 @@ def test_chain_placeholder_type_has_3_entries(mock_page_with_distinct_locators):
     assert [c[0] for c in chain] == ["get_by_placeholder", "get_by_label", "get_by_text"]
 
 
-def test_chain_testid_type_has_3_entries(mock_page_with_distinct_locators):
-    """testid 타입: get_by_test_id + data-testid/data-test-id css 직접 시도."""
+def test_chain_testid_type_single_entry(mock_page_with_distinct_locators):
+    """testid 타입: 단일 get_by_test_id (체인 축소 — 중복/dead 변형 제거)."""
     tool = _make_tool()
     page = mock_page_with_distinct_locators
     chain = tool._build_locator_chain(page, {
         "selector": "email", "selector_type": "testid", "action": "fill",
     })
     labels = [c[0] for c in chain]
-    assert labels == ["get_by_test_id", "locator[data-testid]", "locator[data-test-id]"]
-    # css fallback 호출 인자 검증
-    page.locator.assert_any_call('[data-testid="email"]')
-    page.locator.assert_any_call('[data-test-id="email"]')
+    assert labels == ["get_by_test_id"]
+    page.get_by_test_id.assert_any_call("email")
 
 
 def test_chain_role_type_falls_back_to_text(mock_page_with_distinct_locators):

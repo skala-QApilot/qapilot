@@ -145,4 +145,10 @@ class TCFromDocsAgent(BaseAgent):
                 "depends_on": tc.get("depends_on") or [],
             })
 
+        # TS 1개당 TC 상한 (반복 실험 속도용). 프롬프트 max 와 정합 — LLM 이
+        # 초과 열거해도 앞에서부터 5개로 잘라낸다 (다양성은 프롬프트가 우선 보장).
+        _MAX_TC_PER_TS = 5
+        if len(valid) > _MAX_TC_PER_TS:
+            valid = valid[:_MAX_TC_PER_TS]
+
         return valid, analysis, confidence
