@@ -2909,6 +2909,76 @@ async def _test_execution(state: PipelineState) -> dict:
                     api_results.append(api_payload)
                     db_results.append(db_res)
 
+                # ── api-mode 폴백 (run 04d5f79e U 해부): UI 가 검증을 못 끝낸 TC
+                # (MANUAL_REVIEW skip 강등 / step 0 빈 매핑 / 타임아웃 예외 흡수) 는
+                # tc.api 가 있으면 API 직접 검증으로 측정 가능화 — U 6건 중 4건
+                # (TS-011-TC-05, TS-014-TC-01/02, TS-015-TC-04) + TS-006 steps=0
+                # 군집이 대상. 실제 호출이 성사된 경우에만 채택 (정직성 게이트).
+                _ui_unmeasured = (
+                    ui_payload.get("status") == "skip"
+                    or (ui_payload.get("status") == "fail"
+                        and not (ui_payload.get("steps") or []))
+                )
+                if (
+                    _ui_unmeasured
+                    and ui_payload.get("verify_mode") != "api"
+                    and (tc_by_id.get(str(tc_id)) or {}).get("api")
+                ):
+                    from qapilot.tools.api_exec_tool import (
+                        _db_contract as _db_contract_fb,
+                        execute_api_verification as _exec_api_fb,
+                    )
+                    _fb_meta = tc_by_id.get(str(tc_id)) or {}
+                    _fb_then = tc_then_by_id.get(str(tc_id), "")
+                    _fb_intent_neg = _is_negative_intent_then(_fb_then)
+                    _fb_auth_neg = _is_auth_negative_tc(
+                        _fb_then, tc_tags_by_id.get(str(tc_id), []))
+                    _fb_table = None
+                    if _db_contract_fb(_fb_then) and exec_schemas:
+                        try:
+                            from qapilot.shared.metadata_filters import pick_table_for_tc
+                            _fb_table = pick_table_for_tc(_fb_meta, exec_schemas)
+                        except Exception:
+                            _fb_table = None
+                    try:
+                        _fb_out = await _exec_api_fb(
+                            tc=_fb_meta, base_url=target_url,
+                            test_account=test_account_dict,
+                            intent_negative=_fb_intent_neg,
+                            auth_negative=_fb_auth_neg, trace_id=trace_id,
+                            db_table=_fb_table, snapshot_fetch=_fresh_snapshot,
+                        )
+                    except Exception as e:
+                        _fb_out = {"calls": [], "reason": f"{type(e).__name__}: {e}"}
+                    if _fb_out.get("calls"):
+                        _orig = str(ui_payload.get("error") or "UI step 0")[:60]
+                        logger.info(
+                            "api_mode_fallback",
+                            trace_id=trace_id, tc_id=tc_id,
+                            verdict=_fb_out.get("verdict"),
+                            reason=_fb_out.get("reason"), ui_reason=_orig,
+                            db_observation=_fb_out.get("db_observation"),
+                        )
+                        ui_payload = {
+                            "tc_id": tc_id, "verify_mode": "api", "status": None,
+                            "steps": [], "total_duration_ms": 0,
+                            "summary": (
+                                f"UI 미측정({_orig}) → API-mode 폴백: "
+                                f"{_fb_out.get('reason', '')}"
+                            ),
+                        }
+                        api_payload = {
+                            "tc_id": tc_id, "verify_mode": "api",
+                            "calls": _fb_out.get("calls") or [],
+                            "total_calls": _fb_out.get("total_calls", 0),
+                            "error_calls": _fb_out.get("error_calls", 0),
+                            "verdict": _fb_out.get("verdict"),
+                        }
+                        if _fb_out.get("db_observation"):
+                            api_payload["db_observation"] = _fb_out["db_observation"]
+                        ui_results[-1] = ui_payload
+                        api_results[-1] = api_payload
+
                 # L2 디스크 저장 (spec §6.1) — 예외 흡수 TC 도 failed 로 기록
                 (tc_dir / "ui_result.json").write_text(
                     json.dumps(ui_payload, ensure_ascii=False, indent=2), "utf-8"
@@ -3011,6 +3081,30 @@ _API_CONTRACT_HINTS = (
     "응답 코드", "응답코드", "bcrypt", "해시", "로그에", "메모리에",
     "직렬화", "json 응답", "응답 본문",
 )
+
+
+def _derive_cc_status(cc: dict) -> str:
+    """cross_check kind 의 status 도출 — has_mismatch → fail, 검증 부재 → unverified.
+
+    "unverified" 분리는 e2e false PASS 차단의 본질 fix — DB env 부재 또는 API trace
+    capture 실패 시 묵시 PASS 처리 차단. 사용자가 리포트에서 명시 인식 → 환경 fix.
+    """
+    # api-mode: exec 판정이 최종 — 게이트류 (inputs/skip/unverified) 는
+    # UI 실행 전제의 플래그라 api-mode 에 부적용 (run 04d5f79e: 부재-긍정
+    # then 오분류 구제 5건 차단).
+    if cc.get("api_exec_verdict") in ("pass", "fail"):
+        return str(cc["api_exec_verdict"])
+    if cc.get("inputs_incomplete"):
+        return "unverified"  # 입력 결손 실행 — 판정 자체가 무의미
+    if str(cc.get("error_code") or "") == "CC_PARSE_FAIL":
+        return "unverified"  # 정합성 분석 미수행 — 조용한 pass 금지
+    if cc.get("has_mismatch"):
+        return "fail"
+    if cc.get("ui_skipped"):
+        return "unverified"  # UI 검증 미완 — pass 둔갑 차단
+    if cc.get("db_unverified") or cc.get("api_unverified"):
+        return "unverified"
+    return "pass"
 
 
 def _decide_verify_mode(
@@ -3599,6 +3693,18 @@ async def _cross_check(state: PipelineState) -> dict:
                     "tc_id": tc_id, "match_score": 0.0, "matched_fields": 0,
                     "mismatched_fields": 0, "mismatches": [], "has_mismatch": False,
                 }
+            # api-mode TC 의 verdict 단일 진실 = exec 판정 (run 04d5f79e 감사).
+            # cc 의 의도 재추론이 부재-긍정 then ("위약금이 부과되지 않는다",
+            # "로그에 기록되지 않는다") 을 negative 로 오분류해 404/409 를
+            # '기대된 거부' 로 구제 — family 라우터 미배선 (진짜 결함) 검출
+            # 5건을 pass 로 둔갑시켰다. exec 는 이미 의도-인지 판정이므로
+            # cc 재추론은 정보 손실만 낳는다.
+            if (ui_result or {}).get("verify_mode") == "api":
+                exec_verdict = (api_trace or {}).get("verdict")
+                if exec_verdict in ("pass", "fail"):
+                    cc["api_exec_verdict"] = exec_verdict
+                    cc["has_mismatch"] = exec_verdict == "fail"
+                    cc["intent_satisfied"] = exec_verdict == "pass"
             # UI 단계 fail 인 TC 는 Layer 3 진입 위해 has_mismatch 강제 True.
             # #259 본질 보강: 시나리오 의도 negative + outcome 도달 시 ui_failed 라도
             # 강제 fail 처리하지 않음 (cross_check agent 의 판정 우선). 단순 ui_failed
@@ -3641,7 +3747,7 @@ async def _cross_check(state: PipelineState) -> dict:
                 any_mismatch = True
         except Exception as e:
             # CrossCheck 실패 — UI fail TC 는 mismatch 신호 보존, 그 외는 False
-            cross_check_results.append({
+            _cc_fallback = {
                 "tc_id": tc_id, "match_score": 0.0, "matched_fields": 0,
                 "mismatched_fields": 0, "mismatches": [],
                 "has_mismatch": tc_id in ui_failed_tc_ids,
@@ -3651,23 +3757,14 @@ async def _cross_check(state: PipelineState) -> dict:
                 "error_code": "",
                 "summary": "",
                 "error": f"CrossCheck skip: {type(e).__name__}: {e}",
-            })
-
-    # status 도출: has_mismatch → "fail", 검증 부재 → "unverified", 정상 → "pass".
-    # "unverified" 분리는 e2e false PASS 차단의 본질 fix — DB env 부재 또는 API trace
-    # capture 실패 시 묵시 PASS 처리 차단. 사용자가 리포트에서 명시 인식 → 환경 fix.
-    def _derive_cc_status(cc: dict) -> str:
-        if cc.get("inputs_incomplete"):
-            return "unverified"  # 입력 결손 실행 — 판정 자체가 무의미
-        if str(cc.get("error_code") or "") == "CC_PARSE_FAIL":
-            return "unverified"  # 정합성 분석 미수행 — 조용한 pass 금지
-        if cc.get("has_mismatch"):
-            return "fail"
-        if cc.get("ui_skipped"):
-            return "unverified"  # UI 검증 미완 — pass 둔갑 차단
-        if cc.get("db_unverified") or cc.get("api_unverified"):
-            return "unverified"
-        return "pass"
+            }
+            # api-mode 는 cc 실패와 무관하게 exec 판정이 진실
+            if (ui_result or {}).get("verify_mode") == "api" and (
+                (api_trace or {}).get("verdict") in ("pass", "fail")
+            ):
+                _cc_fallback["api_exec_verdict"] = api_trace["verdict"]
+                _cc_fallback["has_mismatch"] = api_trace["verdict"] == "fail"
+            cross_check_results.append(_cc_fallback)
 
     # tc_id ("TS-001-TC-05") → ts_id ("TS-001") 도출. upsert_tc_result 는
     # ts_id 빈 값 시 skip — 격차: cross_check kind tc_results 가 DB 에 0건 저장됐던 원인.
