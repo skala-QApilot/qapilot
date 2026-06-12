@@ -2647,6 +2647,13 @@ async def _test_execution(state: PipelineState) -> dict:
                 for tc in (sc.get("test_cases") or [])
                 if tc.get("tc_id")
             }
+            # tc_id → 원본 TC (api-mode 실행이 values/api 필요)
+            tc_by_id: dict[str, dict] = {
+                str(tc.get("tc_id")): tc
+                for sc in scenarios
+                for tc in (sc.get("test_cases") or [])
+                if tc.get("tc_id")
+            }
 
             for item in execution_items:
                 tc_id = item.get("tc_id") or "unknown"
@@ -2654,6 +2661,81 @@ async def _test_execution(state: PipelineState) -> dict:
                 tc_dir = results_root / ts_id / tc_id
                 screenshots_dir = tc_dir / "screenshots"
                 tc_dir.mkdir(parents=True, exist_ok=True)
+
+                # ── P1 검증 모드 이원화: API-계약형 / UI 무대 부재 TC 는 API 직접 검증 ──
+                _tc_meta = tc_by_id.get(str(tc_id)) or {}
+                verify_mode = _decide_verify_mode(
+                    tc_then_by_id.get(str(tc_id), ""),
+                    tc_tags_by_id.get(str(tc_id), []),
+                    _tc_meta.get("api"),
+                    action_mapping_by_tc.get(str(tc_id)),
+                    item.get("code") if isinstance(item, dict) else None,
+                )
+                if verify_mode == "api":
+                    intent_neg = _is_negative_intent_then(tc_then_by_id.get(str(tc_id), ""))
+                    auth_neg = _is_auth_negative_tc(
+                        tc_then_by_id.get(str(tc_id), ""),
+                        tc_tags_by_id.get(str(tc_id), []),
+                    )
+                    from qapilot.tools.api_exec_tool import execute_api_verification
+                    try:
+                        exec_out = await execute_api_verification(
+                            tc=_tc_meta if _tc_meta else {"tc_id": tc_id},
+                            base_url=target_url,
+                            test_account=test_account_dict,
+                            intent_negative=intent_neg,
+                            auth_negative=auth_neg,
+                            trace_id=trace_id,
+                        )
+                    except Exception as e:
+                        exec_out = {
+                            "tc_id": tc_id, "verify_mode": "api", "calls": [],
+                            "total_calls": 0, "error_calls": 0,
+                            "verdict": "fail", "reason": f"{type(e).__name__}: {e}",
+                        }
+                    logger.info(
+                        "api_mode_verified",
+                        trace_id=trace_id, tc_id=tc_id,
+                        verdict=exec_out.get("verdict"), reason=exec_out.get("reason"),
+                    )
+                    # ui kind 는 status 없음 (UI 미수행 — skip 과 구분: S 카운트
+                    # 오염 금지, RunReader 의 skip 보호와도 무관). verdict 는
+                    # api kind (의도-인지 라벨링) + cross_check 가 만든다.
+                    ui_payload = {
+                        "tc_id": tc_id, "verify_mode": "api", "status": None,
+                        "steps": [], "total_duration_ms": 0,
+                        "summary": f"API-mode 검증: {exec_out.get('reason', '')}",
+                    }
+                    api_payload = {
+                        "tc_id": tc_id, "verify_mode": "api",
+                        "calls": exec_out.get("calls") or [],
+                        "total_calls": exec_out.get("total_calls", 0),
+                        "error_calls": exec_out.get("error_calls", 0),
+                        "verdict": exec_out.get("verdict"),
+                    }
+                    db_res = await _run_db_test_safe(
+                        tc_id=tc_id, trace_id=trace_id,
+                        DBTestTool=DBTestTool, ToolInput=ToolInput,
+                    )
+                    ui_results.append(ui_payload)
+                    api_results.append(api_payload)
+                    db_results.append(db_res)
+                    (tc_dir / "ui_result.json").write_text(
+                        json.dumps(ui_payload, ensure_ascii=False, indent=2), "utf-8")
+                    (tc_dir / "api_result.json").write_text(
+                        json.dumps(api_payload, ensure_ascii=False, indent=2), "utf-8")
+                    (tc_dir / "db_result.json").write_text(
+                        json.dumps(db_res, ensure_ascii=False, indent=2), "utf-8")
+                    try:
+                        _mirror_tc_results_and_artifacts(
+                            trace_id=trace_id, ts_id=ts_id, tc_id=tc_id,
+                            ui_result=ui_payload, api_result=api_payload,
+                            db_result=db_res, screenshots_dir=screenshots_dir,
+                            intent_negative=intent_neg,
+                        )
+                    except Exception as e:
+                        logger.warning("tc_mirror_failed", trace_id=trace_id, tc_id=tc_id, error=str(e))
+                    continue
 
                 # TC 간 cookie/session/localStorage 격리 — 컨텍스트를 TC 마다 새로 만든다.
                 # 단일 컨텍스트 공유 시 첫 로그인 성공 TC 이후 auth token 이 남아
@@ -2854,6 +2936,9 @@ def _derive_api_status(payload: dict | None, intent_negative: bool = False) -> s
     """
     if not isinstance(payload, dict):
         return None
+    # api-mode (P1): 실행기 verdict 가 정밀 판정 (헤더 계약/명시 코드 포함)
+    if payload.get("verify_mode") == "api" and payload.get("verdict") in ("pass", "fail"):
+        return str(payload["verdict"])
     try:
         error_calls = int(payload.get("error_calls", 0))
     except (TypeError, ValueError):
@@ -2881,6 +2966,41 @@ def _derive_db_status(payload: dict | None) -> str | None:
     if summary.lower().startswith("dbtest skip") or summary.lower().startswith("skip"):
         return "skip"
     return "pass"
+
+
+# API-계약형 then — UI 가 아니라 API 응답이 검증 대상인 표현들 (P1 모드 이원화)
+_API_CONTRACT_HINTS = (
+    "헤더", "header", "x-trace", "상태코드", "상태 코드", "status code",
+    "응답 코드", "응답코드", "bcrypt", "해시", "로그에", "메모리에",
+    "직렬화", "json 응답", "응답 본문",
+)
+
+
+def _decide_verify_mode(
+    tc_then: str, tc_tags: list, tc_api: str | None,
+    original_mapping: dict | None, generated_code: str | None,
+) -> str:
+    """TC 의 검증 수단 결정 — "ui" | "api" (P1, run 254ca267 해부 기반).
+
+    api 조건 (보수적 — UI 무대가 실재하면 UI 유지):
+    ① then 이 API-계약형 (헤더/상태코드/해시 류) — UI assert 가 수단 오류
+    ② 매핑에 해결된 (selector 보유) assert 가 0 + 코드에 MANUAL_REVIEW 존재
+       — UI 무대 자체가 없어 실행해도 검증 불가 (S 로 빠지던 군집)
+    어느 쪽이든 tc.api 가 있어야 api-mode 가능.
+    """
+    if not tc_api:
+        return "ui"
+    then_l = (tc_then or "").lower()
+    if any(k in then_l for k in _API_CONTRACT_HINTS):
+        return "api"
+    steps = (original_mapping or {}).get("steps") or []
+    resolved_asserts = sum(
+        1 for s in steps
+        if str(s.get("action") or "").startswith("assert") and s.get("selector")
+    )
+    if resolved_asserts == 0 and "QAPILOT_MANUAL_REVIEW" in str(generated_code or ""):
+        return "api"
+    return "ui"
 
 
 def _is_negative_intent_then(then: str) -> bool:
@@ -2999,6 +3119,13 @@ def _aggregate_tc_results(
         ui_status = ui.get("status", "")
         api_ok = int(api.get("error_calls") or 0) == 0
         db_ok = not db.get("error")
+
+        # api-mode (P1): UI 미수행 — api 실행 verdict 가 축 (의도-인지)
+        if ui.get("verify_mode") == "api":
+            tc_results[tc_id] = (
+                "passed" if api.get("verdict") == "pass" and db_ok else "failed"
+            )
+            continue
 
         if ui_status == "skip":
             tc_results[tc_id] = "skipped"
@@ -3453,7 +3580,11 @@ async def _cross_check(state: PipelineState) -> dict:
             # 입력 결손 실행 — 의도한 입력을 만들지 못했으므로 pass/fail 양쪽 모두
             # 무의미 (TS-001-TC-03: fill 1/4 로 email-required 에 막힌 것을
             # '비밀번호 규칙 검증 통과' 로 구제하던 격차). unverified 처리.
-            if scenario_intent.get("inputs_complete") is False:
+            # api-mode 는 fill 무관 (P1) — 게이트 제외.
+            if (
+                scenario_intent.get("inputs_complete") is False
+                and (ui_result or {}).get("verify_mode") != "api"
+            ):
                 cc["inputs_incomplete"] = True
             # DB / API 검증 부재 표시 — has_mismatch 변경 X (root_cause 호출 안 함)
             if tc_id in db_unverified_tc_ids:
