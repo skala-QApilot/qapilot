@@ -541,8 +541,9 @@ class UITestTool(BaseTool):
         try:
             # SPA (Vite/Next/CRA 등) 가 client-side hydrate 끝나야 selector 가 잡히므로
             # default "load" 가 아닌 "networkidle" 까지 대기. 초기 XHR/fetch 끝날 때까지 기다린다.
-            # 일부 사이트가 long-poll/SSE 로 networkidle 못 만족할 수 있어 15s timeout 으로 cap.
-            await page.goto(full_url, wait_until="networkidle", timeout=15000)
+            # 정상 SUT는 1~2s 내 반환되므로 8s 면 충분 — 일부 사이트가 long-poll/SSE 로
+            # networkidle 못 만족하는 경우의 worst-case cap (실패해도 except 에서 graceful 처리).
+            await page.goto(full_url, wait_until="networkidle", timeout=8000)
         except Exception as e:
             self.logger.warning(
                 "ui_auto_navigate_failed",
@@ -1119,8 +1120,15 @@ class UITestTool(BaseTool):
             # input 에 placeholder/data-testid 기반 추정 값 재주입 + reactive
             # event dispatch. PR #251 의 100ms wait 와 함께 race 본질 흡수.
             try:
+                # locator.evaluate()는 element 가 DOM에 attach 될 때까지 대기하며,
+                # timeout 미지정 시 Playwright 기본값(30s)이 적용된다. chain의 각 attempt를
+                # 5s/3s로 설계했는데 이 probe가 매 attempt마다 30s씩 추가로 먹어
+                # text selector_type(4-entry chain) 기준 4×30s≈120s가 누적되어
+                # BaseTool 의 120s 타임아웃을 그대로 소진하는 문제(#261)가 있었다.
+                # element 존재 여부만 빠르게 확인하면 되므로 1s로 제한한다.
                 tag_type = await locator.evaluate(
-                    """el => el ? `${el.tagName}/${el.type || ''}` : ''"""
+                    """el => el ? `${el.tagName}/${el.type || ''}` : ''""",
+                    timeout=1000,
                 )
                 if isinstance(tag_type, str) and tag_type.startswith("BUTTON/submit"):
                     form_state = await locator.evaluate(
@@ -1139,7 +1147,8 @@ class UITestTool(BaseTool):
                                 total_inputs: inputs.length,
                                 empty_required: empty_required,
                             };
-                        }"""
+                        }""",
+                        timeout=1000,
                     )
                     # #253 진단 강화 — cache_keys 함께 log 로 cache 의 actual content 노출
                     cache = getattr(self, "_fill_history", {})

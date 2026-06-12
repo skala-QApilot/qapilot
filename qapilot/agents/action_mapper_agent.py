@@ -1408,7 +1408,12 @@ class ActionMapperAgent(BaseAgent):
             if intent.get("target_kind"):
                 step["target_kind"] = intent["target_kind"]
             step = self._downgrade_self_referential_assert_text(step, mapping.get("tc_id"))
-            if action in {"assert", "assert_visible"}:
+            if action == "assert":
+                # 범용 assert(주로 API 응답/비즈니스 로직 검증)는 DOM selector가
+                # 없는 경우가 많아 LLM이 만든 expected는 버리고, TC의 then(검증 항목
+                # 자체)을 expected로 채워 대시보드에 "뭘 검증하는지"가 보이게 한다.
+                step["expected"] = str(tc.get("then") or "").strip() or None
+            elif action == "assert_visible":
                 step["expected"] = None
             steps.append(step)
 

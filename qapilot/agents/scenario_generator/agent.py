@@ -973,7 +973,13 @@ class ScenarioGeneratorAgent(BaseAgent):
             basename = file_path.split("/")[-1].replace(".py", "").replace(".ts", "").replace(".js", "")
             prefix = _ROUTER_PREFIX.get(basename, "")
 
-        full = prefix + rel_path if rel_path else prefix
+        # endpoints.json의 path는 라우터에 따라 절대 경로("/api/auth/signup")이거나
+        # prefix 기준 상대 경로("/join")일 수 있다 — 이미 절대 경로면 그대로 사용해
+        # "/api/auth/api/auth/signup"처럼 prefix가 중복되는 것을 막는다.
+        if rel_path.startswith("/api/"):
+            full = rel_path
+        else:
+            full = prefix + rel_path if rel_path else prefix
         return f"{method} {full}"
 
     def _endpoint_paths(self, endpoints: list[dict]) -> set[str]:

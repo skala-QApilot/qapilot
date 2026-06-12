@@ -12,7 +12,12 @@ import time
 from abc import ABC, abstractmethod
 from typing import Any
 
-from qapilot.shared.config import QApilotConfig, load_config
+from qapilot.shared.config import (
+    QApilotConfig,
+    class_name_to_snake,
+    load_config,
+    resolve_agent_config,
+)
 from qapilot.shared.errors import ErrorCode, ToolExecutionError
 from qapilot.shared.logger import get_logger
 from qapilot.shared.schemas import ToolInput, ToolOutput
@@ -30,6 +35,10 @@ class BaseTool(ABC):
         self.trace_id = trace_id
         self._config = config or load_config()
         self.logger = get_logger(source=self.__class__.__name__, trace_id=trace_id)
+        # agent.overrides.<tool_name>.timeout_sec 로 Tool별 타임아웃을 오버라이드할 수 있다
+        # (예: UITestTool 처럼 브라우저 step 누적 시간이 글로벌 기본값을 넘는 경우).
+        tool_name = class_name_to_snake(self.__class__.__name__)
+        self._timeout_sec = resolve_agent_config(tool_name, self._config).timeout_sec
 
     async def run(self, input: ToolInput) -> ToolOutput:
         """Tool 실행 하네스.
@@ -45,13 +54,13 @@ class BaseTool(ABC):
         try:
             result = await asyncio.wait_for(
                 self._execute(input.params),
-                timeout=self._config.agent.timeout_sec,
+                timeout=self._timeout_sec,
             )
         except asyncio.TimeoutError:
             self.logger.error("tool_timeout")
             raise ToolExecutionError(
                 ErrorCode.TOOL_001,
-                f"Tool 타임아웃: {self._config.agent.timeout_sec}초 초과",
+                f"Tool 타임아웃: {self._timeout_sec}초 초과",
             )
         except ToolExecutionError:
             raise

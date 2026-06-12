@@ -118,7 +118,7 @@ async def test_try_auto_navigate_calls_page_goto_on_inferred_route(mock_page):
     await tool._try_auto_navigate(page, steps, "http://localhost:3000")
 
     # PR #122 정합: SPA hydrate 보장을 위해 networkidle + 15s timeout 사용.
-    page.goto.assert_awaited_once_with("http://localhost:3000/login", wait_until="networkidle", timeout=15000)
+    page.goto.assert_awaited_once_with("http://localhost:3000/login", wait_until="networkidle", timeout=8000)
     info_calls = [c for c in tool.logger.info.call_args_list if c.args and c.args[0] == "ui_auto_navigate"]
     assert len(info_calls) == 1
     assert info_calls[0].kwargs["route"] == "/login"
@@ -132,7 +132,7 @@ async def test_try_auto_navigate_strips_trailing_slash_from_target_url(mock_page
     page = mock_page
     steps = [{"action": "fill", "api_endpoint": "POST /login"}]
     await tool._try_auto_navigate(page, steps, "http://localhost:3000/")
-    page.goto.assert_awaited_once_with("http://localhost:3000/login", wait_until="networkidle", timeout=15000)
+    page.goto.assert_awaited_once_with("http://localhost:3000/login", wait_until="networkidle", timeout=8000)
 
 
 @pytest.mark.asyncio
@@ -265,7 +265,7 @@ async def test_try_auto_navigate_accepts_https_target_url(mock_page):
 
     await tool._try_auto_navigate(page, steps, "https://staging.example.com")
 
-    page.goto.assert_awaited_once_with("https://staging.example.com/login", wait_until="networkidle", timeout=15000)
+    page.goto.assert_awaited_once_with("https://staging.example.com/login", wait_until="networkidle", timeout=8000)
 
 
 # ── 이슈 #147: AUTO_NAVIGATE / TARGET_UNREACHABLE 메타 코드 발행 검증 ─────

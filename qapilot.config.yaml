@@ -19,6 +19,11 @@ llm:
 agent:
   timeout_sec: 60
   max_retry: 3
+  overrides:
+    # UI 시나리오 실행은 여러 step(각 networkidle 대기 최대 15s 포함)을 누적 실행하므로
+    # 글로벌 기본값(60s)으로는 부족해 tool_timeout(TOOL_001)이 자주 발생한다.
+    uitest_tool:
+      timeout_sec: 120
 
 test:
   page_load_timeout_sec: 30
