@@ -699,7 +699,12 @@ class ActionMapperAgent(BaseAgent):
         """LLM 이 만든 step intent 를 frontend index 원소로만 resolve 한다."""
         mapping = dict(action_mapping)
         scenario_text = " ".join(str(tc.get(key) or "") for key in ("name", "given", "when", "then"))
-        route_hint = self._route_hint_from_elements(frontend_dom) or self._route_hint_from_tc(tc)
+        # api 엔드포인트 기반 route 우선(일반적). 옛 signup/login 키워드 하드코딩(SUT-fitting) 제거됨.
+        # api 가 있는데 매칭 실패면 route 강제 안 함(None) — 잘못된 페이지로 몰지 않도록.
+        # api 자체가 없을 때만 후보 요소 최빈 route 로 폴백.
+        route_hint = self._route_hint_from_tc(tc, frontend_dom)
+        if route_hint is None and not str(tc.get("api") or "").strip():
+            route_hint = self._route_hint_from_elements(frontend_dom)
         steps: list[ActionStep] = []
 
         for raw_step in mapping.get("steps") or []:
@@ -923,10 +928,33 @@ class ActionMapperAgent(BaseAgent):
                 score += 0.2
             if control_type.startswith("feedback"):
                 score += 1.2
-            if target_kind == "assertion" and any(token in str(element.get("testid") or "").lower() for token in ("success", "error", "toast", "message", "status")):
-                score += 0.7
-            if target_kind == "assertion" and any(token in str(element.get("text") or "").lower() for token in ("완료", "성공", "이동")):
-                score += 0.5
+            if target_kind == "assertion":
+                # 피드백/결과 요소면 가산
+                if any(token in str(element.get("testid") or "").lower() for token in ("success", "error", "toast", "message", "status", "alert")):
+                    score += 0.5
+                # then(target_text)의 긍정/부정 의도에 맞춰 요소 선호 — 항상 success 가산하던
+                # SUT-fitting 편향 제거. negative then → error 요소, success then → success 요소.
+                el_signal = (str(element.get("testid") or "") + " " + str(element.get("text") or "")).lower()
+                el_error = any(t in el_signal for t in ("error", "오류", "실패", "fail", "invalid", "danger", "경고"))
+                el_success = any(t in el_signal for t in ("success", "완료", "성공", "toast", "done"))
+                then_negative = any(t in target_text for t in (
+                    "오류", "실패", "에러", "거부", "불가", "차단", "invalid", "error", "fail",
+                    "400", "401", "403", "404", "409", "422", "4xx", "5xx",
+                ))
+                then_success = any(t in target_text for t in (
+                    "성공", "완료", "생성", "등록", "201", "이동", "저장",
+                ))
+                if then_negative:
+                    if el_error:
+                        score += 0.9
+                    if el_success:
+                        score -= 0.6
+                elif then_success:
+                    if el_success:
+                        score += 0.9
+                    if el_error:
+                        score -= 0.4
+                # 그 외(조회/표시 등) — success/error 편향 없이 target_text 매칭에 맡김
 
         if target_kind == "submit":
             if any(token in str(element.get("text") or "").lower() for token in ("가입", "signup")):
@@ -1009,12 +1037,28 @@ class ActionMapperAgent(BaseAgent):
             return None
         return max(set(routes), key=routes.count)
 
-    def _route_hint_from_tc(self, tc: dict[str, Any]) -> str | None:
-        text = " ".join(str(tc.get(key) or "") for key in ("name", "given", "when", "then")).lower()
-        if any(term in text for term in ("회원가입", "가입", "signup")):
-            return "/signup"
-        if "로그인" in text or "login" in text:
-            return "/login"
+    def _route_hint_from_tc(self, tc: dict[str, Any], frontend_dom: list[dict]) -> str | None:
+        """TC 의 api 엔드포인트를 실제 frontend route 에 매칭해 route 힌트 도출.
+
+        하드코딩된 라우트 키워드(signup/login) 없이, api 경로 세그먼트를 frontend index 의
+        실제 route 와 매칭한다 — 어느 SUT 든 일반 적용.
+        예: 'POST /api/auth/login' → '/login', 'GET /api/orders' → '/orders'.
+        매칭 실패 시 None (route 강제 안 함 → 후속 resolve 가 전체 element 에서 의도 매칭).
+        """
+        routes = {str(el.get("route") or "").strip() for el in frontend_dom if str(el.get("route") or "").strip()}
+        api = str(tc.get("api") or "")
+        if not routes or not api:
+            return None
+        path = api.split()[-1]  # 'POST /api/auth/login' → '/api/auth/login'
+        segs = [s for s in re.split(r"[/{}]", path) if s and s.lower() != "api"]
+        for seg in reversed(segs):  # 뒤쪽(구체적) 세그먼트 우선
+            seg_l = seg.lower()
+            for r in routes:  # exact route 우선
+                if r.lower().strip("/") == seg_l:
+                    return r
+            for r in routes:  # 부분 포함
+                if seg_l and seg_l in r.lower():
+                    return r
         return None
 
     def _normalize_selector_via_index(

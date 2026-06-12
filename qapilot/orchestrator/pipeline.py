@@ -2583,6 +2583,14 @@ async def _test_execution(state: PipelineState) -> dict:
             action_mapping_by_tc = {
                 str(am.get("tc_id")): am for am in action_mappings if am.get("tc_id")
             }
+            # tc_id → depends_on (TC간 상태 격리에서 의존 체인 예외 판정용)
+            tc_depends_map = {
+                str(tc.get("tc_id")): {str(d) for d in (tc.get("depends_on") or [])}
+                for ts in (scenarios or [])
+                for tc in (ts.get("test_cases") or [])
+                if tc.get("tc_id")
+            }
+            prev_tc_id: str | None = None
 
             for item in execution_items:
                 tc_id = item.get("tc_id") or "unknown"
@@ -2590,6 +2598,25 @@ async def _test_execution(state: PipelineState) -> dict:
                 tc_dir = results_root / ts_id / tc_id
                 screenshots_dir = tc_dir / "screenshots"
                 tc_dir.mkdir(parents=True, exist_ok=True)
+
+                # TC간 상태 격리 — 시작 전 브라우저 상태(localStorage 토큰·쿠키) 리셋.
+                # 누수된 로그인 토큰이 /login → /dashboard 리다이렉트를 유발해 로그인 TC 가
+                # 실패하고, 인증 필요 TC 는 _ensure_authenticated fixture 가 TC 마다 재로그인한다.
+                # 단 직전 TC 에 depends_on 한 경우(연속 의존 체인)는 선행 상태를 이어받아야 하므로 제외.
+                depends_on_prev = prev_tc_id is not None and prev_tc_id in tc_depends_map.get(str(tc_id), set())
+                if not depends_on_prev:
+                    try:
+                        await page.evaluate(
+                            "() => { try { localStorage.clear(); sessionStorage.clear(); } catch (e) {} }"
+                        )
+                    except Exception:
+                        pass  # 첫 TC 등 about:blank 상태 — 지울 것 없음
+                    try:
+                        await context.clear_cookies()
+                        await page.goto("about:blank")
+                    except Exception as e:
+                        logger.warning("tc_state_reset_failed", tc_id=tc_id, error=str(e))
+                prev_tc_id = str(tc_id)
 
                 # item may be either a GeneratedCode dict or an ActionMapping dict.
                 # Only call the parser when this item looks like generated code (has "code").
@@ -2614,20 +2641,35 @@ async def _test_execution(state: PipelineState) -> dict:
                 else:
                     exec_mapping = item
 
-                ui_res = await _run_ui_with_trace(
-                    page=page,
-                    tc_id=tc_id,
-                    action_mapping=exec_mapping,
-                    target_url=target_url,
-                    screenshots_dir=screenshots_dir,
-                    trace_id=trace_id,
-                    UITestTool=UITestTool,
-                    APITraceTool=APITraceTool,
-                    ToolInput=ToolInput,
-                    test_account=test_account_dict,
-                )
-                ui_results.append(ui_res["ui_result"])
-                api_results.append(ui_res["api_result"])
+                # per-TC 안전 실행 — 한 TC 의 UI 실행 실패(빈 steps·셀렉터 미해결·타임아웃 등)가
+                # run 전체를 중단시키지 않도록 격리. 실패 TC 는 failed 로 기록 후 계속.
+                try:
+                    ui_res = await _run_ui_with_trace(
+                        page=page,
+                        tc_id=tc_id,
+                        action_mapping=exec_mapping,
+                        target_url=target_url,
+                        screenshots_dir=screenshots_dir,
+                        trace_id=trace_id,
+                        UITestTool=UITestTool,
+                        APITraceTool=APITraceTool,
+                        ToolInput=ToolInput,
+                        test_account=test_account_dict,
+                    )
+                    ui_results.append(ui_res["ui_result"])
+                    api_results.append(ui_res["api_result"])
+                except Exception as e:
+                    logger.warning("ui_execution_failed", trace_id=trace_id, tc_id=tc_id, error=str(e))
+                    ui_results.append({
+                        "tc_id": tc_id,
+                        "status": "fail",
+                        "steps": [],
+                        "total_duration_ms": 0,
+                        "error": f"{type(e).__name__}: {e}",
+                    })
+                    api_results.append({
+                        "tc_id": tc_id, "calls": [], "total_calls": 0, "error_calls": 0,
+                    })
 
                 db_res = await _run_db_test_safe(
                     tc_id=tc_id,
