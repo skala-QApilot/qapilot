@@ -194,6 +194,17 @@ def _jsonpath_lite(data: Any, path: str) -> list[Any]:
     return vals
 
 
+def _is_tautological_predicate(pred: dict | None) -> bool:
+    """항진 predicate — 어떤 값이든 통과해 무검증 observe 가 되는 경우.
+
+    run 84c0e1eb 생성 검수 실증: then 'is_current=true' 인데 LLM 이
+    {"in": [true, false]} 를 생성 — 약한 pass 재발 경로라 폐기 대상."""
+    if not isinstance(pred, dict):
+        return False
+    in_vals = {str(x).lower() for x in (pred.get("in") or [])}
+    return {"true", "false"} <= in_vals
+
+
 def _eval_predicate(values: list[Any], pred: dict | None) -> bool:
     """값 목록에 대한 predicate — 하나라도 충족하면 True (any-match)."""
     if not values:
@@ -608,6 +619,7 @@ async def execute_api_verification(
         api_observes = [
             o for o in (tc.get("observe") or [])
             if isinstance(o, dict) and o.get("kind") in _API_OBSERVE_KINDS
+            and not _is_tautological_predicate(o.get("predicate"))
         ]
         if api_observes:
             obs_results: list[tuple[bool, str]] = []

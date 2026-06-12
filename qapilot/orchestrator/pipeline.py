@@ -4417,9 +4417,17 @@ def _validate_tc_observe_against_scan(
             continue
         kept: list[dict] = []
         for o in observes:
-            if not isinstance(o, dict) or o.get("kind") != "db_field":
-                if isinstance(o, dict):
-                    kept.append(o)
+            if not isinstance(o, dict):
+                continue
+            # 항진 predicate (어떤 값이든 통과) — 무검증 observe 폐기
+            from qapilot.tools.api_exec_tool import _is_tautological_predicate
+            if _is_tautological_predicate(o.get("predicate")):
+                logger.warning("tc_observe_tautological_predicate",
+                               trace_id=trace_id, tc_name=tc.get("name"),
+                               kind=o.get("kind"))
+                continue
+            if o.get("kind") != "db_field":
+                kept.append(o)
                 continue
             table = str(o.get("table") or "").lower()
             cols = tables.get(table)

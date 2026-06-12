@@ -211,3 +211,50 @@ class TestModeDecisionWithObserve:
             {"steps": [{"action": "assert", "selector": "x", "selector_type": "testid"}]},
             "await expect(...)", tc_observe=[],
         ) == "ui"
+
+
+class TestTautologyGuard:
+    def test_in_true_false_is_tautology(self):
+        from qapilot.tools.api_exec_tool import _is_tautological_predicate
+        assert _is_tautological_predicate({"in": [True, False]}) is True
+        assert _is_tautological_predicate({"in": ["true", "false"]}) is True
+        assert _is_tautological_predicate({"in": [True]}) is False
+        assert _is_tautological_predicate({"eq": "True"}) is False
+        assert _is_tautological_predicate(None) is False
+
+    @pytest.mark.asyncio
+    async def test_tautological_observe_excluded_at_execution(self, monkeypatch):
+        # run 84c0e1eb 실증: {"in":[true,false]} 만 보유한 TC 는 observe 경로
+        # 대신 휴리스틱 폴백 — 무검증 pass 차단
+        import httpx
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path.endswith("/login"):
+                return httpx.Response(200, json={"token": "t"})
+            return httpx.Response(200, json=[{"is_current": False}])
+
+        from qapilot.tools import api_exec_tool as aet
+        orig = httpx.AsyncClient
+        monkeypatch.setattr(
+            aet.httpx, "AsyncClient",
+            lambda **kw: orig(transport=httpx.MockTransport(handler), **kw))
+        out = await aet.execute_api_verification(
+            tc={"tc_id": "T9", "api": "GET /api/billing/payment-methods",
+                "then": "현재 등록된 수단에 is_current=true로 표시된다.",
+                "observe": [{"kind": "response_body", "path": "$[*].is_current",
+                             "predicate": {"in": [True, False]}}],
+                "values": []},
+            base_url="http://sut", test_account={"email": "a", "password": "b"},
+            intent_negative=False, auth_negative=False,
+        )
+        assert "observe_results" not in out  # 항진 제외 → 휴리스틱 폴백
+
+    def test_validator_drops_tautology(self):
+        tcs = [{"name": "x", "observe": [
+            {"kind": "response_body", "path": "$[*].is_current",
+             "predicate": {"in": [True, False]}},
+            {"kind": "http_status", "expected": [200]},
+        ]}]
+        _validate_tc_observe_against_scan(
+            tcs, {"db_models": {"M": {"table_name": "t", "columns": [{"name": "c"}]}}}, "t")
+        assert [o["kind"] for o in tcs[0]["observe"]] == ["http_status"]
