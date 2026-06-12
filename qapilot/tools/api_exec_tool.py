@@ -521,25 +521,47 @@ async def execute_api_verification(
         # 비실존 id 를 쓰고 arrange/전용리소스도 금지.
         # 'not found' 기대는 그 자체가 negative 의미 — intent_negative 게이트를
         # 걸면 "'Order not found' 메시지가 반환된다" (오류/실패 단어 없음) 가
-        # 누락된다 (run a5eca9eb: TS-008/010 군집 미전환 원인).
+        # 누락된다 (run a5eca9eb). 결핍 신호는 then 과 observe 의 메시지
+        # predicate 양쪽에서 찾는다 (run 203261f9: TS-010 은 then 이 '거부된다'
+        # 뿐이고 'Benefit not found' 는 observe 에만 있음).
+        _missing_texts = [then.lower()]
+        for _o in (tc.get("observe") or []):
+            if isinstance(_o, dict) and _o.get("kind") == "response_body":
+                for _v in (_o.get("predicate") or {}).values():
+                    _missing_texts.append(str(_v).lower())
         expects_missing = any(
-            k in then.lower() for k in ("not found", "존재하지 않", "찾을 수 없", "404")
+            k in t for t in _missing_texts
+            for k in ("not found", "존재하지 않", "찾을 수 없", "404")
         )
+        missing_params: set[str] = set()
         if expects_missing and params:
-            # 'X not found' 의 X 가 path param 자원과 일치할 때만 비실존 id 가
-            # 옳다 — 'Contract not found' 의 결핍 대상은 응답 자원 (contract)
-            # 이지 path 의 order 가 아니므로, 비실존 order id 를 넣으면 SUT 가
-            # 다른 분기 ('Order not found') 를 탄다 (run a5eca9eb TS-017-TC-04
-            # 회귀 실증). 주체 불명 (한국어 서술 등) 은 기존대로 비실존 id.
-            m = re.search(r"([a-z]+)\s+not\s+found", then.lower())
-            if m:
-                param_stems = {p.lower().removesuffix("_id") for p in params}
-                if m.group(1) not in param_stems:
-                    expects_missing = False
+            # 'X not found' 의 X 와 일치하는 param 만 비실존 id — 'Contract
+            # not found' 의 결핍 대상은 응답 자원이지 path 의 order 가 아니다
+            # (run a5eca9eb TS-017-TC-04). 부분 일치 허용 — 'benefit' ↔
+            # tier_benefit_id (run 203261f9 TS-025-TC-02 역회귀 실증).
+            subject = None
+            for t in _missing_texts:
+                m = re.search(r"([a-z]+)\s+not\s+found", t)
+                if m:
+                    subject = m.group(1)
+                    break
+            if subject:
+                missing_params = {
+                    p for p in params
+                    if subject in p.lower() or p.lower().removesuffix("_id") in subject
+                }
+                if not missing_params:
+                    expects_missing = False  # 결핍 대상이 응답 자원 — 실존 id 유지
+            else:
+                missing_params = set(params)  # 주체 불명 — 전 param 비실존
         if params and expects_missing:
+            real_params = [p for p in params if p not in missing_params]
+            if real_params:
+                ref_ids = await _resolve_ref_ids(client, base, headers, real_params)
             for p in params:
-                ref_ids[p.lower()] = 999_999_999
-                path = path.replace("{" + p + "}", "999999999")
+                rid = 999_999_999 if p in missing_params else ref_ids.get(p.lower(), 1)
+                ref_ids[p.lower()] = rid
+                path = path.replace("{" + p + "}", str(rid))
         elif params:
             ref_ids = await _resolve_ref_ids(client, base, headers, params)
             if destructive and not auth_negative and headers:
@@ -613,7 +635,38 @@ async def execute_api_verification(
         # 없는 주문). SUT 에서 유효 후보를 조회해 값만 바꿔 재시도 — 검증
         # 의도 (then) 는 그대로, 값 선택만 상태-인지로.
         grounded: list[str] = []
-        # expects_missing (비실존 자원 → 404 가 기대 결과) 는 접지 재시도가
+        # expects_missing 인데 400 (404 아님) — 결핍-param 이 아니라 real-param
+        # 의 전제 미충족 (예: non-confirmed order 라 결핍 검사까지 못 감).
+        # 결핍 param 은 보존한 채 real param 만 다른 실존 id 로 재시도.
+        if expects_missing and resp.status_code == 400 and params:
+            for p in [q for q in params if q not in missing_params]:
+                if resp.status_code == 404:
+                    break
+                field = p if p.endswith("_id") else f"{p}_id"
+                cands = await _candidate_values(
+                    client, base, headers, field, ref_ids.get(p.lower()), "")
+                for cand in cands:
+                    trial_ids = dict(ref_ids)
+                    trial_ids[p.lower()] = cand
+                    trial_path = path_template
+                    for q in params:
+                        trial_path = trial_path.replace(
+                            "{" + q + "}", str(trial_ids.get(q.lower(), 1)))
+                    try:
+                        trial = await client.request(
+                            method, f"{base}{trial_path}", json=body, headers=headers)
+                    except Exception:
+                        continue
+                    if trial.status_code == 404:  # 결핍 분기 도달
+                        resp, url, ref_ids = trial, f"{base}{trial_path}", trial_ids
+                        grounded.append(f"path:{p}={cand}")
+                        break
+            if grounded:
+                logger.info("api_exec_value_grounded", trace_id=trace_id,
+                            tc_id=tc_id, replacements=grounded,
+                            final_status=resp.status_code)
+
+        # expects_missing (비실존 자원 → 404 가 기대 결과) 는 일반 접지 재시도가
         # 의도를 파괴한다 — 404 를 '고치면' 안 된다 (회귀 테스트 실증:
         # 비실존 id 404 수신 후 재시도가 실존 id 400 으로 오염).
         if not intent_negative and not expects_missing:

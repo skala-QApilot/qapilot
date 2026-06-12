@@ -667,3 +667,74 @@ class TestMissingSubjectMatchesParam:
         )
         assert "999999999" in seen["path"]
         assert out["verdict"] == "pass"
+
+    @pytest.mark.asyncio
+    async def test_substring_subject_and_partial_injection(self, monkeypatch):
+        # run 203261f9 역회귀 (TS-025): 'tier benefit not found' ↔ tier_benefit_id
+        # 부분 일치 인정. + TS-010 형태: 결핍 param(benefit)만 비실존, order 는 실존
+        import httpx
+        seen = []
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            p = request.url.path
+            if p.endswith("/login"):
+                return httpx.Response(200, json={"token": "t"})
+            if p == "/api/orders" and request.method == "GET":
+                return httpx.Response(200, json=[{"id": 4}, {"id": 7}])
+            seen.append(p)
+            if "/orders/4/" in p:
+                return httpx.Response(400, json={"detail": "Cannot modify benefits of a non-confirmed order"})
+            if "999999999" in p:
+                return httpx.Response(404, json={"detail": "Benefit not found"})
+            return httpx.Response(200, json={})
+
+        self._patch(monkeypatch, handler)
+        from qapilot.tools import api_exec_tool as aet
+        out = await aet.execute_api_verification(
+            tc={"tc_id": "T4", "api": "POST /api/orders/{order_id}/benefits/{benefit_id}/toggle",
+                "then": "부가서비스 토글이 거부된다.",
+                "observe": [
+                    {"kind": "http_status", "expected": [404]},
+                    {"kind": "response_body", "path": "$.message",
+                     "predicate": {"eq": "Benefit not found"}},
+                ], "values": []},
+            base_url="http://sut", test_account={"email": "a", "password": "b"},
+            intent_negative=True, auth_negative=False,
+        )
+        # 첫 시도: order 4 (CANCELLED) → 400 → real-param(order) 만 7 로 교체
+        # 재시도, 결핍 param(benefit=999999999) 보존 → 404 도달
+        assert out["verdict"] == "pass"
+        assert any("/orders/7/benefits/999999999" in p for p in seen)
+
+    @pytest.mark.asyncio
+    async def test_tier_benefit_substring_match(self, monkeypatch):
+        # 'Tier benefit not found' + param tier_benefit_id — 부분 일치 → 비실존 주입
+        import httpx
+        seen = {}
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            p = request.url.path
+            if p.endswith("/login"):
+                return httpx.Response(200, json={"token": "t"})
+            if request.method == "GET":
+                return httpx.Response(200, json=[{"id": 1}])
+            seen["path"] = p
+            if "999999999" in p:
+                return httpx.Response(404, json={"detail": "Tier benefit not found"})
+            return httpx.Response(400, json={"detail": "활성 회선이 없습니다"})
+
+        self._patch(monkeypatch, handler)
+        from qapilot.tools import api_exec_tool as aet
+        out = await aet.execute_api_verification(
+            tc={"tc_id": "T5", "api": "POST /api/tier/{tier_benefit_id}/toggle",
+                "then": "404 상태 코드와 'Tier benefit not found' 메시지를 받는다.",
+                "observe": [
+                    {"kind": "http_status", "expected": [404]},
+                    {"kind": "response_body", "path": "$.message",
+                     "predicate": {"eq": "Tier benefit not found"}},
+                ], "values": []},
+            base_url="http://sut", test_account={"email": "a", "password": "b"},
+            intent_negative=True, auth_negative=False,
+        )
+        assert "999999999" in seen["path"]
+        assert out["verdict"] == "pass"
