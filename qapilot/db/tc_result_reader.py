@@ -15,6 +15,15 @@ from qapilot.shared.logger import get_logger
 _logger = get_logger("db.tc_result_reader")
 
 
+def _is_uuid(value: str) -> bool:
+    import uuid as _uuid
+    try:
+        _uuid.UUID(str(value))
+        return True
+    except Exception:
+        return False
+
+
 def load_tc_results_by_run(run_id: str) -> list[dict]:
     """run_id 기준 tc_results 를 (ts_id, tc_id) 로 집계해 반환한다.
 
@@ -22,6 +31,10 @@ def load_tc_results_by_run(run_id: str) -> list[dict]:
     """
     pool = get_pool()
     if pool is None or not run_id:
+        return []
+    if not _is_uuid(run_id):
+        # 클라이언트 임시 id (run-retest-* 등) — uuid 컬럼 조회 불가.
+        # 경고 폭주 대신 조용히 빈 응답 (UI mock 잔재 폴링 방어).
         return []
 
     try:
@@ -76,6 +89,8 @@ def load_latest_screenshot_s3_key(run_id: str) -> str | None:
     pool = get_pool()
     if pool is None or not run_id:
         return None
+    if not _is_uuid(run_id):
+        return None  # 클라이언트 임시 id — 경고 폭주 방어
 
     try:
         with pool.connection() as conn, conn.cursor() as cur:
