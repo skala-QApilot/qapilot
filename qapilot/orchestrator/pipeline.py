@@ -2674,7 +2674,29 @@ async def _test_execution(state: PipelineState) -> dict:
             # 파일명 step_1.png → 기존 mirror 가 S3+tc_artifacts 로 업로드.
             _cap_state: dict = {"page": None, "logged_in": False}
 
-            async def _capture_reference(tc_api: str | None, shots_dir: Path) -> None:
+            async def _cap_login_if_needed(page_c) -> None:
+                if _cap_state["logged_in"] or not test_account_dict:
+                    return
+                if "/login" not in page_c.url:
+                    return
+                try:
+                    await page_c.fill("input[type=email]",
+                                      test_account_dict["email"], timeout=1500)
+                    await page_c.fill("input[type=password]",
+                                      test_account_dict["password"], timeout=1500)
+                    await page_c.click("button[type=submit]", timeout=1500)
+                    await page_c.wait_for_load_state("networkidle", timeout=4000)
+                    _cap_state["logged_in"] = True
+                except Exception:
+                    pass
+
+            async def _capture_reference(
+                tc_api: str | None, shots_dir: Path,
+                mapping_steps: list | None = None,
+            ) -> None:
+                """스텝별 참고 화면 — navigate 만 실제 수행 (click/fill 은 부수효과
+                위험이라 미수행, 해당 시점 화면만 촬영). step_{n}.png 로 저장해
+                mirror 가 업로드 → 상세 패널의 스텝별 캡처 버튼이 표시."""
                 if not (target_url and tc_api):
                     return
                 try:
@@ -2682,6 +2704,30 @@ async def _test_execution(state: PipelineState) -> dict:
                         _cap_ctx = await browser.new_context()
                         _cap_state["page"] = await _cap_ctx.new_page()
                     page_c = _cap_state["page"]
+                    shots_dir.mkdir(parents=True, exist_ok=True)
+                    base = target_url.rstrip("/")
+
+                    steps = [s for s in (mapping_steps or []) if isinstance(s, dict)][:6]
+                    if steps:
+                        for s in steps:
+                            step_no = s.get("step_no") or (steps.index(s) + 1)
+                            if str(s.get("action") or "") == "navigate":
+                                route = str(s.get("value") or s.get("selector") or "")
+                                if route.startswith("/"):
+                                    try:
+                                        await page_c.goto(base + route, timeout=5000,
+                                                          wait_until="domcontentloaded")
+                                        await _cap_login_if_needed(page_c)
+                                    except Exception:
+                                        pass
+                            try:
+                                await page_c.screenshot(
+                                    path=str(shots_dir / f"step_{step_no}.png"))
+                            except Exception:
+                                pass
+                        return
+
+                    # 매핑 없음 — api 첫 세그먼트 라우트 휴리스틱으로 1장
                     parts = str(tc_api).split(" ", 1)
                     seg = "/"
                     if len(parts) == 2:
@@ -2689,23 +2735,9 @@ async def _test_execution(state: PipelineState) -> dict:
                                 if s and s != "api" and "{" not in s]
                         if segs:
                             seg = "/" + segs[0]
-                    url = target_url.rstrip("/") + seg
-                    await page_c.goto(url, timeout=5000, wait_until="domcontentloaded")
-                    if (not _cap_state["logged_in"] and test_account_dict
-                            and "/login" in page_c.url):
-                        try:
-                            await page_c.fill("input[type=email]",
-                                              test_account_dict["email"], timeout=1500)
-                            await page_c.fill("input[type=password]",
-                                              test_account_dict["password"], timeout=1500)
-                            await page_c.click("button[type=submit]", timeout=1500)
-                            await page_c.wait_for_load_state("networkidle", timeout=4000)
-                            _cap_state["logged_in"] = True
-                            await page_c.goto(url, timeout=5000,
-                                              wait_until="domcontentloaded")
-                        except Exception:
-                            pass
-                    shots_dir.mkdir(parents=True, exist_ok=True)
+                    await page_c.goto(base + seg, timeout=5000,
+                                      wait_until="domcontentloaded")
+                    await _cap_login_if_needed(page_c)
                     await page_c.screenshot(path=str(shots_dir / "step_1.png"))
                 except Exception:
                     pass
@@ -2806,7 +2838,10 @@ async def _test_execution(state: PipelineState) -> dict:
                     )
                     # 참고 화면 캡처 (step_1.png) — mirror 가 업로드해 상세
                     # 패널에 표시. 검증 증거 아님 (라벨로 구분).
-                    await _capture_reference(_tc_meta.get("api"), screenshots_dir)
+                    await _capture_reference(
+                        _tc_meta.get("api"), screenshots_dir,
+                        mapping_steps=(action_mapping_by_tc.get(str(tc_id)) or {}).get("steps"),
+                    )
                     ui_results.append(ui_payload)
                     api_results.append(api_payload)
                     db_results.append(db_res)
@@ -3031,7 +3066,10 @@ async def _test_execution(state: PipelineState) -> dict:
                             api_payload["db_observation"] = _fb_out["db_observation"]
                         if _fb_out.get("observe_results"):
                             api_payload["observe_results"] = _fb_out["observe_results"]
-                        await _capture_reference(_fb_meta.get("api"), screenshots_dir)
+                        await _capture_reference(
+                            _fb_meta.get("api"), screenshots_dir,
+                            mapping_steps=(action_mapping_by_tc.get(str(tc_id)) or {}).get("steps"),
+                        )
                         ui_results[-1] = ui_payload
                         api_results[-1] = api_payload
 
