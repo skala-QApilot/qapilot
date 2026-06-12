@@ -260,10 +260,23 @@ async def _eval_observe(
         return ok, f"헤더 {name} {'부재' if absent else '존재'} 기대 — 실제 {'존재' if present else '부재'}"
 
     if kind == "response_body":
-        values = _jsonpath_lite(response_body, str(obs.get("path") or ""))
+        path = str(obs.get("path") or "")
+        values = _jsonpath_lite(response_body, path)
+        if not values and not absent:
+            # FastAPI 표준 에러 본문은 $.detail — LLM 이 $.error/$.message 로
+            # 생성한 경우 별칭 평가 (run 1ead19b7: 환각 path 가 status-충족
+            # pass 를 다수 살해)
+            leaf = path.rsplit(".", 1)[-1].lstrip("$[]*")
+            if leaf in ("error", "message", "msg", "errors"):
+                values = _jsonpath_lite(response_body, "$.detail")
         if absent:
             ok = not _eval_predicate(values, obs.get("predicate"))
             return ok, f"body {obs.get('path')} 부재 기대 — 값 {len(values)}건"
+        if not values:
+            # path 미해결 = 응답에 그 필드 자체가 없음 — 값이 틀린 게 아니라
+            # 관찰 명세가 잘못됐을 개연성 (환각 path). 'unresolved:' 접두로
+            # 표시 — 호출자가 verdict 계산에서 제외 (남는 observe 로 판정).
+            return False, f"unresolved: body {obs.get('path')} 응답에 부재 (관찰 명세 결함 후보)"
         ok = _eval_predicate(values, obs.get("predicate"))
         return ok, f"body {obs.get('path')} → {[str(v)[:20] for v in values[:3]]} predicate={'충족' if ok else '미충족'}"
 
@@ -627,18 +640,33 @@ async def execute_api_verification(
                 ok, why = await _eval_observe(
                     o, resp, response_body, body, snapshot_fetch, db_table)
                 obs_results.append((ok, why))
+            # 미해결 path (환각 관찰 명세) 는 verdict 계산에서 제외 — 값이
+            # 틀린 게 아니라 명세가 잘못된 것 (run 1ead19b7: $.error/$.message
+            # 환각이 status-충족 TC 다수를 fail 로 오염). 전부 미해결이면
+            # observe 판정 포기 → 휴리스틱 폴백.
+            effective = [
+                (ok, why) for ok, why in obs_results
+                if not why.startswith("unresolved:")
+            ]
+            unresolved_n = len(obs_results) - len(effective)
             out["observe_results"] = [
-                {"kind": o.get("kind"), "ok": ok, "reason": why}
+                {"kind": o.get("kind"), "ok": ok, "reason": why,
+                 "unresolved": why.startswith("unresolved:")}
                 for o, (ok, why) in zip(api_observes, obs_results)
             ]
-            all_ok = all(ok for ok, _ in obs_results)
-            if resp.status_code >= 500 and not any(
-                o.get("kind") == "http_status" for o in api_observes
-            ):
-                all_ok = False  # 5xx 는 status observe 부재 시에도 결함 신호
-            out["verdict"] = "pass" if all_ok else "fail"
-            out["reason"] = "observe: " + "; ".join(w for _, w in obs_results)[:280]
-            return out
+            if effective:
+                all_ok = all(ok for ok, _ in effective)
+                if resp.status_code >= 500 and not any(
+                    o.get("kind") == "http_status" for o in api_observes
+                ):
+                    all_ok = False  # 5xx 는 status observe 부재 시에도 결함 신호
+                out["verdict"] = "pass" if all_ok else "fail"
+                suffix = f" (미해결 관찰 {unresolved_n}건 제외)" if unresolved_n else ""
+                out["reason"] = ("observe: " + "; ".join(
+                    w for _, w in effective)[:260]) + suffix
+                return out
+            logger.info("api_exec_observe_all_unresolved",
+                        trace_id=trace_id, tc_id=tc_id, count=unresolved_n)
 
         # 판정 ① 헤더 계약형
         header_key = _header_contract(then)

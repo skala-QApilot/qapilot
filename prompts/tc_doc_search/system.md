@@ -87,6 +87,9 @@
 - `path` 는 `$.필드`, `$[0].필드`, `$[*].필드` 형식만.
 - `where` 값에 요청 body 의 값을 참조하려면 `{request.필드명}`.
 - **table/field 는 문서나 스키마 정보에 실재가 확인된 이름만** — 지어내면 검증기가 폐기한다.
+- **response_body 의 path 도 실재 응답 필드만**: 에러 응답 본문은 FastAPI 표준
+  `$.detail` 이다 — `$.error`/`$.message`/`$.data` 같은 필드를 지어내지 마라.
+  성공 응답 필드도 문서에 응답 예시가 없으면 path 를 만들지 말고 http_status 만 써라.
 - 예: then "비밀번호가 bcrypt 해시로 저장된다" →
   `[{"kind":"http_status","expected":[201]}, {"kind":"db_field","table":"customers","where":{"email":"{request.email}"},"field":"password_hash","predicate":{"matches":"^\\$2"}}]`
 

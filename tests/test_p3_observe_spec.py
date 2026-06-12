@@ -258,3 +258,120 @@ class TestTautologyGuard:
         _validate_tc_observe_against_scan(
             tcs, {"db_models": {"M": {"table_name": "t", "columns": [{"name": "c"}]}}}, "t")
         assert [o["kind"] for o in tcs[0]["observe"]] == ["http_status"]
+
+
+class TestUnresolvedPathGuard:
+    """run 1ead19b7 해부: LLM 이 $.error/$.message 등 실재하지 않는 응답
+    필드를 observe 로 생성 — status-충족 TC 다수가 환각 path 로 fail 오염.
+    미해결 path 는 verdict 계산에서 제외, 전부 미해결이면 휴리스틱 폴백."""
+
+    def _patch(self, monkeypatch, handler):
+        import httpx
+
+        from qapilot.tools import api_exec_tool as aet
+        orig = httpx.AsyncClient
+        monkeypatch.setattr(
+            aet.httpx, "AsyncClient",
+            lambda **kw: orig(transport=httpx.MockTransport(handler), **kw))
+
+    @pytest.mark.asyncio
+    async def test_hallucinated_path_excluded_status_decides(self, monkeypatch):
+        # TS-017-TC-04 형태: status 404=404 충족인데 $.error 환각으로 죽던 것
+        import httpx
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path.endswith("/login"):
+                return httpx.Response(200, json={"token": "t"})
+            if request.method == "GET" and request.url.path == "/api/orders":
+                return httpx.Response(200, json=[])
+            return httpx.Response(404, json={"detail": "Not Found"})
+
+        self._patch(monkeypatch, handler)
+        from qapilot.tools import api_exec_tool as aet
+        out = await aet.execute_api_verification(
+            tc={"tc_id": "T1", "api": "GET /api/family",
+                "then": "404 오류가 반환된다.",
+                "observe": [
+                    {"kind": "http_status", "expected": [404]},
+                    {"kind": "response_body", "path": "$.nonexistent_field",
+                     "predicate": {"nonempty": True}},
+                ], "values": []},
+            base_url="http://sut", test_account={"email": "a", "password": "b"},
+            intent_negative=True, auth_negative=False,
+        )
+        assert out["verdict"] == "pass"
+        assert "미해결 관찰 1건 제외" in out["reason"]
+
+    @pytest.mark.asyncio
+    async def test_error_alias_resolves_to_detail(self, monkeypatch):
+        # $.message 환각이 FastAPI 표준 $.detail 로 별칭 평가
+        import httpx
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path.endswith("/login"):
+                return httpx.Response(200, json={"token": "t"})
+            return httpx.Response(409, json={"detail": "이미 가입된 이메일"})
+
+        self._patch(monkeypatch, handler)
+        from qapilot.tools import api_exec_tool as aet
+        out = await aet.execute_api_verification(
+            tc={"tc_id": "T2", "api": "POST /api/auth/signup",
+                "then": "이미 가입된 이메일 오류가 반환된다.",
+                "observe": [
+                    {"kind": "http_status", "expected": [409]},
+                    {"kind": "response_body", "path": "$.message",
+                     "predicate": {"matches": "이미"}},
+                ], "values": [{"field": "email", "value": "x@y.z"}]},
+            base_url="http://sut", test_account={"email": "a", "password": "b"},
+            intent_negative=True, auth_negative=False,
+        )
+        assert out["verdict"] == "pass"
+
+    @pytest.mark.asyncio
+    async def test_all_unresolved_falls_back_to_heuristics(self, monkeypatch):
+        import httpx
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path.endswith("/login"):
+                return httpx.Response(200, json={"token": "t"})
+            return httpx.Response(200, json=[{"id": 1}])
+
+        self._patch(monkeypatch, handler)
+        from qapilot.tools import api_exec_tool as aet
+        out = await aet.execute_api_verification(
+            tc={"tc_id": "T3", "api": "GET /api/plans",
+                "then": "목록이 반환된다.",
+                "observe": [{"kind": "response_body", "path": "$.ghost",
+                             "predicate": {"nonempty": True}}],
+                "values": []},
+            base_url="http://sut", test_account={"email": "a", "password": "b"},
+            intent_negative=False, auth_negative=False,
+        )
+        # 휴리스틱 폴백 (positive 2xx) → pass
+        assert out["verdict"] == "pass"
+        assert not out["reason"].startswith("observe:")
+
+    @pytest.mark.asyncio
+    async def test_present_field_predicate_fail_stays_fail(self, monkeypatch):
+        # 필드가 실재하는데 값이 틀리면 진짜 fail 유지 (환각 면제와 구분)
+        import httpx
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path.endswith("/login"):
+                return httpx.Response(200, json={"token": "t"})
+            return httpx.Response(200, json=[{"is_current": False}])
+
+        self._patch(monkeypatch, handler)
+        from qapilot.tools import api_exec_tool as aet
+        out = await aet.execute_api_verification(
+            tc={"tc_id": "T4", "api": "GET /api/billing/payment-methods",
+                "then": "is_current=true 표시.",
+                "observe": [
+                    {"kind": "http_status", "expected": [200]},
+                    {"kind": "response_body", "path": "$[*].is_current",
+                     "predicate": {"eq": "True"}},
+                ], "values": []},
+            base_url="http://sut", test_account={"email": "a", "password": "b"},
+            intent_negative=False, auth_negative=False,
+        )
+        assert out["verdict"] == "fail"
