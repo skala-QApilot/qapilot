@@ -2615,21 +2615,46 @@ async def _test_execution(state: PipelineState) -> dict:
                             orig_value = original_steps[idx].get("value")
                             if orig_value and not step.get("value"):
                                 step["value"] = orig_value
+                    if not exec_mapping.get("steps"):
+                        # generated code 가 page.* UI 패턴이 아닌 API 호출 위주(예: request.post)로
+                        # 작성되면 _action_mapping_from_generated_code 가 steps 0개를 복원한다.
+                        # 이 경우 UITestTool 이 빈 steps 로 TOOL_001 을 던지므로,
+                        # ActionMapper 원본 ActionMapping 으로 fallback (spec §4.5 LENIENT).
+                        exec_mapping = original or exec_mapping
                 else:
                     exec_mapping = item
 
-                ui_res = await _run_ui_with_trace(
-                    page=page,
-                    tc_id=tc_id,
-                    action_mapping=exec_mapping,
-                    target_url=target_url,
-                    screenshots_dir=screenshots_dir,
-                    trace_id=trace_id,
-                    UITestTool=UITestTool,
-                    APITraceTool=APITraceTool,
-                    ToolInput=ToolInput,
-                    test_account=test_account_dict,
-                )
+                try:
+                    ui_res = await _run_ui_with_trace(
+                        page=page,
+                        tc_id=tc_id,
+                        action_mapping=exec_mapping,
+                        target_url=target_url,
+                        screenshots_dir=screenshots_dir,
+                        trace_id=trace_id,
+                        UITestTool=UITestTool,
+                        APITraceTool=APITraceTool,
+                        ToolInput=ToolInput,
+                        test_account=test_account_dict,
+                    )
+                except ToolExecutionError as e:
+                    # 한 TC 의 Tool 실패(예: steps 비어있음, 120s 타임아웃)가 나머지 TC 실행과
+                    # 전체 run 을 막지 않도록 이 TC 만 "fail" 로 기록하고 계속 진행한다.
+                    logger.error(
+                        "ui_test_tool_error_skipping_tc",
+                        trace_id=trace_id,
+                        tc_id=tc_id,
+                        error=str(e),
+                    )
+                    ui_res = {
+                        "ui_result": {
+                            "tc_id": tc_id,
+                            "status": "fail",
+                            "steps": [],
+                            "total_duration_ms": 0,
+                        },
+                        "api_result": {"tc_id": tc_id, "calls": [], "total_calls": 0, "error_calls": 0},
+                    }
                 ui_results.append(ui_res["ui_result"])
                 api_results.append(ui_res["api_result"])
 
