@@ -148,6 +148,9 @@ class TCFromDocsAgent(BaseAgent):
                 "tags": tc.get("tags") or ["normal"],
                 "req_id": tc.get("req_id"),
                 "api": tc.get("api"),
+                # P3: 기계 검증 명세 — 산문 then 의 닫힌-어휘 환원.
+                # 접지 검증 (실재 테이블/컬럼) 은 저장 단계에서 수행.
+                "observe": [o for o in (tc.get("observe") or []) if isinstance(o, dict)],
                 "sources": sources,
                 # 문서 근거 유무 — True 면 then 절이 문서(PRD/정책서) 오라클 기반,
                 # False 면 잠정(provisional) TC. (기존 `"codebase" in sources` 는

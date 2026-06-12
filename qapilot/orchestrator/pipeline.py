@@ -2692,6 +2692,7 @@ async def _test_execution(state: PipelineState) -> dict:
                     _tc_meta.get("api"),
                     action_mapping_by_tc.get(str(tc_id)),
                     item.get("code") if isinstance(item, dict) else None,
+                    tc_observe=_tc_meta.get("observe"),
                 )
                 if verify_mode == "api":
                     intent_neg = _is_negative_intent_then(tc_then_by_id.get(str(tc_id), ""))
@@ -2704,7 +2705,11 @@ async def _test_execution(state: PipelineState) -> dict:
                         execute_api_verification,
                     )
                     db_table = None
-                    if _db_contract(tc_then_by_id.get(str(tc_id), "")) and exec_schemas:
+                    _needs_db = _db_contract(tc_then_by_id.get(str(tc_id), "")) or any(
+                        isinstance(o, dict) and o.get("kind") == "db_field"
+                        for o in (_tc_meta.get("observe") or [])
+                    )
+                    if _needs_db and exec_schemas:
                         try:
                             from qapilot.shared.metadata_filters import pick_table_for_tc
                             db_table = pick_table_for_tc(_tc_meta, exec_schemas)
@@ -3135,6 +3140,7 @@ def _derive_cc_status(cc: dict) -> str:
 def _decide_verify_mode(
     tc_then: str, tc_tags: list, tc_api: str | None,
     original_mapping: dict | None, generated_code: str | None,
+    tc_observe: list | None = None,
 ) -> str:
     """TC 의 검증 수단 결정 — "ui" | "api" (P1, run 254ca267 해부 기반).
 
@@ -3146,12 +3152,18 @@ def _decide_verify_mode(
     """
     if not tc_api:
         return "ui"
+    # P3: 구조화 observe 가 API-검증형 kind 를 보유하면 api-mode (휴리스틱 불요)
+    from qapilot.tools.api_exec_tool import _API_OBSERVE_KINDS, _db_contract
+    if any(
+        isinstance(o, dict) and o.get("kind") in _API_OBSERVE_KINDS
+        for o in (tc_observe or [])
+    ):
+        return "api"
     then_l = (tc_then or "").lower()
     if any(k in then_l for k in _API_CONTRACT_HINTS):
         return "api"
     # P1.5 DB-계약형 (db에/테이블에 저장 류) — 판정 기준은 api_exec_tool 의
     # _db_contract 단일 소스 (쓰기 동사 동반 요구로 HTML table 표현과 구분).
-    from qapilot.tools.api_exec_tool import _db_contract
     if _db_contract(tc_then):
         return "api"
     steps = (original_mapping or {}).get("steps") or []
@@ -4379,6 +4391,55 @@ def _validate_tc_apis_against_scan(
         tc["api"] = None
 
 
+def _validate_tc_observe_against_scan(
+    test_cases: list[dict], schemas: dict | None, trace_id: str
+) -> None:
+    """TC.observe 의 db_field 를 스키마 인덱스와 대조 — 환각 테이블/컬럼 폐기 (P3).
+
+    실재하지 않는 테이블·컬럼 관찰은 영원히 fail 하는 가짜 계약이 된다.
+    db_field 외 kind (http_*/response_body) 는 실행 시점 검증이라 통과.
+    스키마 인덱스 부재 시 보수적으로 db_field 전부 유지 (드롭이 더 위험).
+    """
+    db_models = (schemas or {}).get("db_models") or {}
+    if not db_models or not test_cases:
+        return
+    tables: dict[str, set[str]] = {}
+    for model in db_models.values():
+        tname = str(model.get("table_name") or "").lower()
+        if not tname or tname in ("base", "declarativebase"):
+            continue
+        cols = {str(c.get("name") or c).lower() for c in (model.get("columns") or [])}
+        tables[tname] = cols
+
+    for tc in test_cases:
+        observes = tc.get("observe") or []
+        if not observes:
+            continue
+        kept: list[dict] = []
+        for o in observes:
+            if not isinstance(o, dict) or o.get("kind") != "db_field":
+                if isinstance(o, dict):
+                    kept.append(o)
+                continue
+            table = str(o.get("table") or "").lower()
+            cols = tables.get(table)
+            if cols is None:
+                logger.warning("tc_observe_table_not_in_schema",
+                               trace_id=trace_id, tc_name=tc.get("name"), table=table)
+                continue
+            field = str(o.get("field") or "").lower()
+            where_keys = [str(k).lower() for k in (o.get("where") or {})]
+            unknown = [c for c in ([field] if field else []) + where_keys
+                       if cols and c not in cols]
+            if unknown:
+                logger.warning("tc_observe_column_not_in_schema",
+                               trace_id=trace_id, tc_name=tc.get("name"),
+                               table=table, columns=unknown)
+                continue
+            kept.append(o)
+        tc["observe"] = kept
+
+
 async def _tc_generate_doc_search(state: PipelineState) -> dict:
     """ts_list 중 대상 TS만 문서 검색 → TC 생성 + S3 저장."""
     import time
@@ -4494,6 +4555,15 @@ async def _tc_generate_doc_search(state: PipelineState) -> dict:
         test_cases = output.result.get("test_cases") or []
         analysis = output.result.get("analysis") or []
         _validate_tc_apis_against_scan(test_cases, endpoint_specs, trace_id)
+        # P3: observe 의 db_field 접지 검증 — 환각 테이블/컬럼 폐기
+        if service_id:
+            try:
+                from qapilot.shared.scan_storage import load_metadata_index
+                _schemas_idx = load_metadata_index(service_id, "backend", "schemas")
+                _validate_tc_observe_against_scan(test_cases, _schemas_idx, trace_id)
+            except Exception as e:
+                logger.info("tc_observe_validation_skipped",
+                            trace_id=trace_id, error=f"{type(e).__name__}: {e}")
         result_test_cases[idx] = test_cases
 
         if service_id:

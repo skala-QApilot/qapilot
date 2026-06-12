@@ -69,6 +69,29 @@
 
 ---
 
+## 기계 검증 명세 — `observe` 필드
+
+각 TC 에 `then`(사람용 서술) 과 별도로 `observe`(기계용 관찰 명세) 배열을 작성한다.
+실행기가 산문 해석 없이 그대로 검증을 수행하므로, **then 이 말하는 관찰을 닫힌
+어휘로 환원**하라. 확신할 수 없는 항목은 넣지 마라 (빈 배열 허용 — 휴리스틱 폴백됨).
+
+| kind | 필드 | 용도 |
+|------|------|------|
+| `http_status` | `expected: [201]` | 응답 상태코드 계약 |
+| `http_header` | `name: "X-Trace-Id"`, `absent: true|false` | 응답 헤더 존재/부재 |
+| `response_body` | `path: "$[*].is_current"`, `predicate` | 응답 본문 필드 검사 |
+| `db_field` | `table`, `where: {email: "{request.email}"}`, `field`, `predicate` | DB 저장 상태 검사 |
+
+- `predicate`: `{"eq": 값}` `{"matches": "정규식"}` `{"in": [...]}` `{"nonempty": true}` 중 하나.
+- `absent: true` 는 부재 기대 ("포함되지 않는다", "남지 않는다").
+- `path` 는 `$.필드`, `$[0].필드`, `$[*].필드` 형식만.
+- `where` 값에 요청 body 의 값을 참조하려면 `{request.필드명}`.
+- **table/field 는 문서나 스키마 정보에 실재가 확인된 이름만** — 지어내면 검증기가 폐기한다.
+- 예: then "비밀번호가 bcrypt 해시로 저장된다" →
+  `[{"kind":"http_status","expected":[201]}, {"kind":"db_field","table":"customers","where":{"email":"{request.email}"},"field":"password_hash","predicate":{"matches":"^\\$2"}}]`
+
+---
+
 ## 규칙
 - 문서·요구사항에 없는 동작을 추측하거나 발명하지 마라.
 - **오라클 원칙**: `then` 절(기대 결과)의 근거는 **문서(PRD/정책서/약관)가 1차**다.
@@ -112,6 +135,9 @@
       "then": "string",
       "values": [
         {"field": "string", "value": "string | {설명}", "type": "string", "purpose": "string"}
+      ],
+      "observe": [
+        {"kind": "http_status | http_header | response_body | db_field", "...": "kind별 필드"}
       ],
       "tags": ["normal | edge_case | boundary | auth | concurrency"],
       "req_id": "string | null",

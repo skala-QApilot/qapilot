@@ -165,6 +165,237 @@ def _build_body(tc: dict) -> dict[str, Any]:
     return body
 
 
+# ── P3 observe 스펙 인터프리터 ────────────────────────────────────────────
+# then(산문) 의 휴리스틱 해석을 대체하는 기계 실행 명세. TC 스키마에
+# observe: [{kind, ...}] 가 있으면 verdict = 전 observe 의 AND — cc 의
+# LLM 재추론/키워드 휴리스틱이 만들던 오분류 클래스 (부재-긍정 등) 를
+# 원천 제거한다. 미보유 TC 는 기존 휴리스틱 폴백 (하위호환).
+_API_OBSERVE_KINDS = ("http_status", "http_header", "response_body", "db_field")
+_JSONPATH_TOKEN_RE = re.compile(r"\.([A-Za-z_][A-Za-z0-9_]*)|\[(\d+|\*)\]")
+
+
+def _jsonpath_lite(data: Any, path: str) -> list[Any]:
+    """최소 jsonpath — $.a.b / $[0].x / $[*].is_current 지원."""
+    vals: list[Any] = [data]
+    for name, idx in _JSONPATH_TOKEN_RE.findall(path or ""):
+        nxt: list[Any] = []
+        for v in vals:
+            if name:
+                if isinstance(v, dict) and name in v:
+                    nxt.append(v[name])
+            elif idx == "*":
+                if isinstance(v, list):
+                    nxt.extend(v)
+            else:
+                i = int(idx)
+                if isinstance(v, list) and i < len(v):
+                    nxt.append(v[i])
+        vals = nxt
+    return vals
+
+
+def _eval_predicate(values: list[Any], pred: dict | None) -> bool:
+    """값 목록에 대한 predicate — 하나라도 충족하면 True (any-match)."""
+    if not values:
+        return False
+    if not pred:
+        return True  # 존재 자체가 조건
+    for v in values:
+        s = str(v)
+        if "eq" in pred and s == str(pred["eq"]):
+            return True
+        if "ne" in pred and s != str(pred["ne"]):
+            return True
+        if "matches" in pred:
+            try:
+                if re.search(str(pred["matches"]), s):
+                    return True
+            except re.error:
+                return False
+        if "in" in pred and any(s == str(x) for x in (pred["in"] or [])):
+            return True
+        if pred.get("nonempty") and s.strip() not in ("", "None", "null"):
+            return True
+        if pred.get("exists"):
+            return True
+    return False
+
+
+def _resolve_where_template(value: Any, request_body: dict | None) -> Any:
+    """where 값의 {request.field} 템플릿 → 실제 요청 값."""
+    s = str(value or "")
+    if s.startswith("{request.") and s.endswith("}"):
+        return (request_body or {}).get(s[9:-1])
+    return value
+
+
+async def _eval_observe(
+    obs: dict, resp: Any, response_body: Any,
+    request_body: dict | None, snapshot_fetch, db_table_hint: str | None,
+) -> tuple[bool, str]:
+    """observe 1건 평가 → (ok, 사유). 평가 불능은 fail (false-pass 금지)."""
+    kind = str(obs.get("kind") or "")
+    absent = bool(obs.get("absent"))
+
+    if kind == "http_status":
+        expected = [int(x) for x in (obs.get("expected") or []) if str(x).isdigit()]
+        ok = resp.status_code in expected if expected else False
+        return ok, f"status {resp.status_code} (기대 {expected})"
+
+    if kind == "http_header":
+        name = str(obs.get("name") or "")
+        present = name in resp.headers
+        ok = (not present) if absent else present
+        return ok, f"헤더 {name} {'부재' if absent else '존재'} 기대 — 실제 {'존재' if present else '부재'}"
+
+    if kind == "response_body":
+        values = _jsonpath_lite(response_body, str(obs.get("path") or ""))
+        if absent:
+            ok = not _eval_predicate(values, obs.get("predicate"))
+            return ok, f"body {obs.get('path')} 부재 기대 — 값 {len(values)}건"
+        ok = _eval_predicate(values, obs.get("predicate"))
+        return ok, f"body {obs.get('path')} → {[str(v)[:20] for v in values[:3]]} predicate={'충족' if ok else '미충족'}"
+
+    if kind == "db_field":
+        table = str(obs.get("table") or db_table_hint or "")
+        if not (snapshot_fetch and table):
+            return False, f"db_field 관찰 불가 (table={table!r}, fetcher={bool(snapshot_fetch)})"
+        try:
+            snapshot = await snapshot_fetch(table)
+        except Exception as e:
+            return False, f"db_field 스냅샷 실패: {type(e).__name__}"
+        rows = [r for r in ((snapshot or {}).get("rows") or []) if isinstance(r, dict)]
+        where = {
+            k: _resolve_where_template(v, request_body)
+            for k, v in (obs.get("where") or {}).items()
+        }
+        matched = [
+            r for r in rows
+            if all(str(r.get(k)) == str(v) for k, v in where.items())
+        ] if where else rows
+        if absent:
+            ok = not matched
+            return ok, f"db {table} row 부재 기대 — 일치 {len(matched)}건"
+        if not matched:
+            return False, f"db {table} 일치 row 없음 (where={where})"
+        field = str(obs.get("field") or "")
+        if not field:
+            return True, f"db {table} row {len(matched)}건 존재"
+        values = [r.get(field) for r in matched]
+        ok = _eval_predicate(values, obs.get("predicate"))
+        return ok, f"db {table}.{field} → {[str(v)[:20] for v in values[:3]]} predicate={'충족' if ok else '미충족'}"
+
+    return False, f"미지원 observe kind: {kind}"
+
+
+# ── P2 상태-인지 값 접지 + 전제 상태 조성 ──────────────────────────────────
+_DATE_VALUE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_DESTRUCTIVE_SEGMENTS = ("cancel", "terminate", "leave", "deactivate")
+_CONFLICT_HINTS = ("이미", "중복", "duplicate", "conflict")
+
+
+def _bump_past_dates(body: dict, intent_negative: bool) -> list[str]:
+    """positive 의도 body 의 과거 날짜 값 → 미래 (+7일).
+
+    TV 는 시나리오 생성 시점의 날짜를 정적으로 저장 — run 시점엔 과거가
+    되어 예약/예정 류 API 가 400 (run 2464603c: TS-008 effective_date
+    2023-10-06). 과거 날짜 거부 검증은 negative 의도라 게이트로 보존."""
+    if intent_negative:
+        return []
+    import datetime as _dt
+    future = (_dt.date.today() + _dt.timedelta(days=7)).isoformat()
+    bumped = []
+    for k, v in list(body.items()):
+        s = str(v or "")
+        if _DATE_VALUE_RE.match(s) and s < _dt.date.today().isoformat():
+            body[k] = future
+            bumped.append(k)
+    return bumped
+
+
+def _rows_from_response(data: Any) -> list[dict]:
+    """GET 응답 → row 리스트 (list 직접 또는 dict 안의 첫 list 값)."""
+    if isinstance(data, list):
+        return [r for r in data if isinstance(r, dict)]
+    if isinstance(data, dict):
+        for v in data.values():
+            if isinstance(v, list):
+                return [r for r in v if isinstance(r, dict)]
+    return []
+
+
+async def _candidate_values(
+    client: httpx.AsyncClient, base: str, headers: dict,
+    field: str, current: Any, url_path: str,
+) -> list[Any]:
+    """body 필드의 대안 값 후보 — SUT 현재 상태 (관련 컬렉션 GET) 에서 조회.
+
+    - plan_id 류: /api/{stem}s 컬렉션의 다른 id
+    - label 류: 요청 경로 복수형 (payment-method → payment-methods) 의 동명 필드
+    """
+    sources: list[str] = []
+    if field.endswith("_id"):
+        sources.append(f"{base}/api/{field[:-3]}s")
+    sources.append(f"{base}{url_path}s")
+    out: list[Any] = []
+    for src in sources:
+        try:
+            r = await client.get(src, headers=headers)
+        except Exception:
+            continue
+        if r.status_code >= 300:
+            continue
+        try:
+            rows = _rows_from_response(r.json())
+        except Exception:
+            continue
+        key = "id" if field.endswith("_id") else field
+        for row in rows:
+            v = row.get(key)
+            if v is not None and str(v) != str(current) and v not in out:
+                out.append(v)
+        if out:
+            break
+    return out[:3]
+
+
+async def _create_dedicated_resource(
+    client: httpx.AsyncClient, base: str, headers: dict, param: str,
+) -> Any | None:
+    """파괴적 TC 전용 리소스 생성 — 공유 데이터 (목록 첫 id) 를 해지/삭제해
+    후속 TC 를 오염시키던 상태 간섭 차단 (run 04d5f79e: TS-009 의 cancel 이
+    order 1 을 실제 해지 → TS-011 toggle 400 연쇄). 422 사다리로 body 자가구성."""
+    stem = param.lower().removesuffix("_id")
+    url = f"{base}/api/{stem}s"
+    body: dict[str, Any] = {}
+    for _ in range(4):
+        try:
+            r = await client.post(url, json=body, headers=headers)
+        except Exception:
+            return None
+        if r.status_code < 300:
+            try:
+                created = r.json()
+            except Exception:
+                return None
+            return (created or {}).get("id") if isinstance(created, dict) else None
+        if r.status_code != 422:
+            return None
+        try:
+            errors = _field_errors_from_422(r.json())
+        except Exception:
+            return None
+        if not errors:
+            return None
+        ref_ids = await _resolve_ref_ids(
+            client, base, headers,
+            [str(loc[-1]) for loc, _, _ in errors if not isinstance(loc[-1], int)],
+        )
+        for loc_path, err_type, ctx in errors:
+            _apply_field_error(body, loc_path, err_type, ctx, ref_ids)
+    return None
+
+
 async def execute_api_verification(
     *,
     tc: dict,
@@ -214,11 +445,25 @@ async def execute_api_verification(
             else:
                 logger.warning("api_exec_login_failed", trace_id=trace_id, tc_id=tc_id)
 
-        # path param 해석 — 실존 데이터 (GET /api/{prefix}s 첫 항목 id)
+        # path param 해석 — 실존 데이터 (GET /api/{prefix}s 첫 항목 id).
+        # 파괴적 endpoint (cancel/terminate/leave/DELETE) 는 전용 리소스를
+        # 생성해 그것을 대상으로 — 공유 리소스 파괴로 인한 TC 간 상태 간섭
+        # 차단 (P2: run 04d5f79e TS-009→TS-011 연쇄 오염).
         ref_ids: dict[str, Any] = {}
         params = _PARAM_RE.findall(path)
+        last_seg = path.rstrip("/").rsplit("/", 1)[-1].lower()
+        destructive = method == "DELETE" or last_seg in _DESTRUCTIVE_SEGMENTS
+        path_template = path
         if params:
             ref_ids = await _resolve_ref_ids(client, base, headers, params)
+            if destructive and not auth_negative and headers:
+                for p in params:
+                    new_id = await _create_dedicated_resource(client, base, headers, p)
+                    if new_id is not None:
+                        ref_ids[p.lower()] = new_id
+                        logger.info("api_exec_dedicated_resource",
+                                    trace_id=trace_id, tc_id=tc_id,
+                                    param=p, resource_id=new_id)
             for p in params:
                 rid = ref_ids.get(p.lower(), 1)
                 path = path.replace("{" + p + "}", str(rid))
@@ -226,7 +471,24 @@ async def execute_api_verification(
         body = _build_body(tc) if method in {"POST", "PUT", "PATCH"} else None
         if body is not None:
             _uniquify_email_in_body(body, path, intent_negative, trace_id)
+            bumped = _bump_past_dates(body, intent_negative)
+            if bumped:
+                logger.info("api_exec_date_bumped", trace_id=trace_id,
+                            tc_id=tc_id, fields=bumped)
         url = f"{base}{path}"
+
+        # 전제 상태 조성 (P2): '이미 ~된/중복' 류 negative 는 같은 호출을 1회
+        # 선행해 충돌 상태에 도달시킨다 (예: 해지 후 재해지 → '이미 해지된
+        # 회선' 오류가 기대 결과. run 04d5f79e: TS-009-TC-03 이 활성 주문을
+        # 해지 '성공' 해버려 fail). 선행 호출 결과는 측정에 불포함.
+        if intent_negative and any(k in then for k in _CONFLICT_HINTS):
+            try:
+                pre = await client.request(method, url, json=body, headers=headers)
+                logger.info("api_exec_conflict_arranged", trace_id=trace_id,
+                            tc_id=tc_id, arrange_status=pre.status_code)
+            except Exception:
+                pass
+
         try:
             resp = await client.request(method, url, json=body, headers=headers)
         except Exception as e:
@@ -259,6 +521,65 @@ async def execute_api_verification(
                 logger.info("api_exec_body_healed", trace_id=trace_id, tc_id=tc_id,
                             attempts=healed_attempts, final_status=resp.status_code)
 
+        # 값 접지 재시도 (P2, positive 한정) — 4xx 의 원인이 'TC 값 vs SUT
+        # 현재 상태' 불일치인 군집 (run 2464603c 실증): 400/409 는 body 값
+        # (허용 목록 외 label, 이미 이용 중인 plan_id), 404 는 path id (계약
+        # 없는 주문). SUT 에서 유효 후보를 조회해 값만 바꿔 재시도 — 검증
+        # 의도 (then) 는 그대로, 값 선택만 상태-인지로.
+        grounded: list[str] = []
+        if not intent_negative:
+            # ① 404 + path param → 컬렉션의 다른 id 후보 순회
+            if resp.status_code == 404 and params:
+                for p in params:
+                    field = p if p.endswith("_id") else f"{p}_id"
+                    cands = await _candidate_values(
+                        client, base, headers, field, ref_ids.get(p.lower()), "")
+                    for cand in cands:
+                        trial_ids = dict(ref_ids)
+                        trial_ids[p.lower()] = cand
+                        trial_path = path_template
+                        for q in params:
+                            trial_path = trial_path.replace(
+                                "{" + q + "}", str(trial_ids.get(q.lower(), 1)))
+                        try:
+                            trial = await client.request(
+                                method, f"{base}{trial_path}", json=body, headers=headers)
+                        except Exception:
+                            continue
+                        if trial.status_code != 404:
+                            resp, url = trial, f"{base}{trial_path}"
+                            ref_ids = trial_ids
+                            grounded.append(f"path:{p}={cand}")
+                            break
+                    if resp.status_code != 404:
+                        break
+            # ② 400/409 + body → 동명 필드의 SUT 실측 값으로 교체
+            if resp.status_code in (400, 409) and body:
+                for field, current in list(body.items()):
+                    if len(grounded) >= 3 or resp.status_code < 400:
+                        break
+                    if "password" in field.lower() or "email" in field.lower():
+                        continue
+                    cands = await _candidate_values(
+                        client, base, headers, field, current,
+                        url[len(base):] if url.startswith(base) else "")
+                    for cand in cands:
+                        trial_body = dict(body)
+                        trial_body[field] = cand
+                        try:
+                            trial = await client.request(
+                                method, url, json=trial_body, headers=headers)
+                        except Exception:
+                            continue
+                        if trial.status_code < 400:
+                            resp, body = trial, trial_body
+                            grounded.append(f"body:{field}={cand}")
+                            break
+            if grounded:
+                logger.info("api_exec_value_grounded", trace_id=trace_id,
+                            tc_id=tc_id, replacements=grounded,
+                            final_status=resp.status_code)
+
         try:
             response_body = resp.json() if resp.content else None
         except Exception:
@@ -279,6 +600,33 @@ async def execute_api_verification(
         out["error_calls"] = 1 if resp.status_code >= 400 else 0
         if healed_attempts:
             out["healed_attempts"] = healed_attempts
+        if not intent_negative and grounded:
+            out["value_grounded"] = grounded
+
+        # 판정 ⓪ observe 스펙 (P3) — 구조화 관찰 명세 보유 시 휴리스틱 해석
+        # 대신 기계 실행. verdict = 전 observe 의 AND.
+        api_observes = [
+            o for o in (tc.get("observe") or [])
+            if isinstance(o, dict) and o.get("kind") in _API_OBSERVE_KINDS
+        ]
+        if api_observes:
+            obs_results: list[tuple[bool, str]] = []
+            for o in api_observes:
+                ok, why = await _eval_observe(
+                    o, resp, response_body, body, snapshot_fetch, db_table)
+                obs_results.append((ok, why))
+            out["observe_results"] = [
+                {"kind": o.get("kind"), "ok": ok, "reason": why}
+                for o, (ok, why) in zip(api_observes, obs_results)
+            ]
+            all_ok = all(ok for ok, _ in obs_results)
+            if resp.status_code >= 500 and not any(
+                o.get("kind") == "http_status" for o in api_observes
+            ):
+                all_ok = False  # 5xx 는 status observe 부재 시에도 결함 신호
+            out["verdict"] = "pass" if all_ok else "fail"
+            out["reason"] = "observe: " + "; ".join(w for _, w in obs_results)[:280]
+            return out
 
         # 판정 ① 헤더 계약형
         header_key = _header_contract(then)
