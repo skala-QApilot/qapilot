@@ -262,13 +262,13 @@ async def _eval_observe(
     if kind == "response_body":
         path = str(obs.get("path") or "")
         values = _jsonpath_lite(response_body, path)
-        if not values and not absent:
-            # FastAPI 표준 에러 본문은 $.detail — LLM 이 $.error/$.message 로
-            # 생성한 경우 별칭 평가 (run 1ead19b7: 환각 path 가 status-충족
-            # pass 를 다수 살해)
-            leaf = path.rsplit(".", 1)[-1].lstrip("$[]*")
-            if leaf in ("error", "message", "msg", "errors"):
-                values = _jsonpath_lite(response_body, "$.detail")
+        # FastAPI 표준 에러 본문은 $.detail — LLM 이 $.error/$.message 로
+        # 생성한 경우 별칭 평가 (run 1ead19b7: 환각 path 가 status-충족
+        # pass 를 다수 살해). absent 기대에도 적용 — "$.error 부재" 의 의도는
+        # '에러 미노출' 이므로 $.detail 로 노출돼도 잡아야 한다 (false-pass 방지).
+        leaf = path.rsplit(".", 1)[-1].lstrip("$[]*")
+        if not values and leaf in ("error", "message", "msg", "errors"):
+            values = _jsonpath_lite(response_body, "$.detail")
         if absent:
             ok = not _eval_predicate(values, obs.get("predicate"))
             return ok, f"body {obs.get('path')} 부재 기대 — 값 {len(values)}건"

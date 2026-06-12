@@ -3167,10 +3167,12 @@ def _decide_verify_mode(
     if _db_contract(tc_then):
         return "api"
     steps = (original_mapping or {}).get("steps") or []
-    if not steps:
+    if original_mapping is not None and not steps:
         # 빈 매핑 — UI 로 검증할 것이 없다. 기존엔 UI 시도 → 60s 타임아웃 →
         # api 폴백이었음 (run 1ead19b7: UITestTool 438s 의 다수). 선제 라우팅
         # 은 같은 verdict 를 타임아웃 없이 만든다.
+        # 단 mapping=None (아티팩트 미로드) 은 제외 — generated_code 의 step
+        # 으로 UI 실행이 가능할 수 있는 경로라 기존 판단 로직에 맡긴다.
         return "api"
     resolved_asserts = sum(
         1 for s in steps

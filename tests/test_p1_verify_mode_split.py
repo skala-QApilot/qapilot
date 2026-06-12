@@ -190,3 +190,18 @@ class TestApiModeAggregation:
         payload = {"verify_mode": "api", "verdict": "pass",
                    "error_calls": 1, "calls": [{"status_code": 401}]}
         assert _derive_api_status(payload, intent_negative=False) == "pass"
+
+
+class TestEmptyMappingPreemptiveApi:
+    def test_empty_mapping_routes_api(self):
+        assert _decide_verify_mode(
+            "목록이 표시된다.", ["normal"], "GET /api/plans",
+            {"steps": []}, "code without manual review",
+        ) == "api"
+
+    def test_none_mapping_keeps_legacy_path(self):
+        # 매핑 미로드 (None) — generated_code step 으로 UI 실행 가능성 보존
+        assert _decide_verify_mode(
+            "목록이 표시된다.", ["normal"], "GET /api/plans",
+            None, "await page.click(...)",
+        ) == "ui"

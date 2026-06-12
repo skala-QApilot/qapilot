@@ -375,3 +375,58 @@ class TestUnresolvedPathGuard:
             intent_negative=False, auth_negative=False,
         )
         assert out["verdict"] == "fail"
+
+
+class TestAbsentErrorAlias:
+    @pytest.mark.asyncio
+    async def test_absent_error_catches_detail_exposure(self, monkeypatch):
+        # "$.error 부재" 기대의 의도는 '에러 미노출' — $.detail 로 노출돼도 fail
+        import httpx
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path.endswith("/login"):
+                return httpx.Response(200, json={"token": "t"})
+            return httpx.Response(200, json={"detail": "내부 오류 정보 노출"})
+
+        from qapilot.tools import api_exec_tool as aet
+        orig = httpx.AsyncClient
+        monkeypatch.setattr(
+            aet.httpx, "AsyncClient",
+            lambda **kw: orig(transport=httpx.MockTransport(handler), **kw))
+        out = await aet.execute_api_verification(
+            tc={"tc_id": "T1", "api": "GET /api/plans",
+                "then": "에러 메시지가 노출되지 않는다.",
+                "observe": [
+                    {"kind": "http_status", "expected": [200]},
+                    {"kind": "response_body", "path": "$.error", "absent": True},
+                ], "values": []},
+            base_url="http://sut", test_account={"email": "a", "password": "b"},
+            intent_negative=False, auth_negative=False,
+        )
+        assert out["verdict"] == "fail"
+
+    @pytest.mark.asyncio
+    async def test_absent_error_passes_when_clean(self, monkeypatch):
+        import httpx
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path.endswith("/login"):
+                return httpx.Response(200, json={"token": "t"})
+            return httpx.Response(200, json=[{"id": 1}])
+
+        from qapilot.tools import api_exec_tool as aet
+        orig = httpx.AsyncClient
+        monkeypatch.setattr(
+            aet.httpx, "AsyncClient",
+            lambda **kw: orig(transport=httpx.MockTransport(handler), **kw))
+        out = await aet.execute_api_verification(
+            tc={"tc_id": "T2", "api": "GET /api/plans",
+                "then": "에러 메시지가 노출되지 않는다.",
+                "observe": [
+                    {"kind": "http_status", "expected": [200]},
+                    {"kind": "response_body", "path": "$.error", "absent": True},
+                ], "values": []},
+            base_url="http://sut", test_account={"email": "a", "password": "b"},
+            intent_negative=False, auth_negative=False,
+        )
+        assert out["verdict"] == "pass"
