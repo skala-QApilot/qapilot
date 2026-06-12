@@ -519,7 +519,10 @@ async def execute_api_verification(
         # (run cfcfe52f: 'Order not found' 기대인데 resolver 가 실존 주문을
         # 넣어 400 'already cancelled' 수신 — TS-008/010/025 군집 6건).
         # 비실존 id 를 쓰고 arrange/전용리소스도 금지.
-        expects_missing = intent_negative and any(
+        # 'not found' 기대는 그 자체가 negative 의미 — intent_negative 게이트를
+        # 걸면 "'Order not found' 메시지가 반환된다" (오류/실패 단어 없음) 가
+        # 누락된다 (run a5eca9eb: TS-008/010 군집 미전환 원인).
+        expects_missing = any(
             k in then.lower() for k in ("not found", "존재하지 않", "찾을 수 없", "404")
         )
         if expects_missing and params:

@@ -633,3 +633,37 @@ class TestMissingSubjectMatchesParam:
         )
         assert "999999999" in seen["path"]
         assert out["verdict"] == "pass"
+
+    @pytest.mark.asyncio
+    async def test_not_found_without_error_word_still_triggers(self, monkeypatch):
+        # "'Order not found' 메시지가 반환된다" — 오류/실패 단어가 없어
+        # intent_negative=False 여도 비실존-id 로직은 발동해야 (run a5eca9eb)
+        import httpx
+        seen = {}
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            p = request.url.path
+            if p.endswith("/login"):
+                return httpx.Response(200, json={"token": "t"})
+            if p == "/api/orders" and request.method == "GET":
+                return httpx.Response(200, json=[{"id": 7}])
+            seen["path"] = p
+            if "999999999" in p:
+                return httpx.Response(404, json={"detail": "Order not found"})
+            return httpx.Response(400, json={"detail": "Order is already cancelled"})
+
+        self._patch(monkeypatch, handler)
+        from qapilot.tools import api_exec_tool as aet
+        out = await aet.execute_api_verification(
+            tc={"tc_id": "T3", "api": "PATCH /api/orders/{order_id}/cancel",
+                "then": "'Order not found' 메시지가 반환된다.",
+                "observe": [
+                    {"kind": "http_status", "expected": [404]},
+                    {"kind": "response_body", "path": "$.message",
+                     "predicate": {"eq": "Order not found"}},
+                ], "values": []},
+            base_url="http://sut", test_account={"email": "a", "password": "b"},
+            intent_negative=False, auth_negative=False,
+        )
+        assert "999999999" in seen["path"]
+        assert out["verdict"] == "pass"
