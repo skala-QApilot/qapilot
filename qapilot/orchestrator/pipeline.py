@@ -2167,15 +2167,19 @@ async def _action_mapping(state: PipelineState) -> dict:
     from qapilot.agents.action_mapper_agent import ActionMapperAgent
     from qapilot.shared.schemas import AgentInput
 
+    scan_result = state.get("scan_result") or {}
+    commit_sha = (scan_result.get("git_diff") or {}).get("commit_hash") or ""
     agent = ActionMapperAgent(trace_id=state.get("trace_id"))
     result = await agent.run(
         AgentInput(
             trace_id=state.get("trace_id") or "",
             context={
                 "scenarios": state.get("scenarios") or [],
-                "scan_result": state.get("scan_result"),
+                "scan_result": scan_result,
                 "frontend_dom": state.get("frontend_dom") or [],
                 "qapilot_dir": state.get("qapilot_dir"),
+                "service_id": state.get("service_id") or "",
+                "commit_sha": commit_sha,
             },
             params={},
         )
@@ -3590,6 +3594,47 @@ async def _ts_generate_prd_only(state: PipelineState) -> dict:
     return {"ts_list": ts_list, "agent_logs": agent_logs}
 
 
+def _load_available_apis(qapilot_dir: str | None) -> list[str]:
+    """codebase-index/endpoints.json에서 'METHOD /path' 형태의 유효 API 목록을 만든다.
+
+    TCFromDocsAgent가 api 필드를 실제 존재하는 엔드포인트 중에서만 고르도록
+    grounding하는 데 사용한다 (health 엔드포인트는 테스트 대상에서 제외).
+    """
+    from qapilot.agents.scenario_generator.agent import _ROUTER_PREFIX
+
+    if not qapilot_dir:
+        return []
+    path = Path(qapilot_dir) / "codebase-index" / "endpoints.json"
+    if not path.exists():
+        return []
+    try:
+        endpoints = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+
+    apis: list[str] = []
+    for ep in endpoints:
+        rel_path = ep.get("path", "")
+        if rel_path.endswith("/health"):
+            continue
+        method = ep.get("method", "?")
+        file_path = ep.get("file", "")
+        if "contracts" in file_path:
+            prefix = _ROUTER_PREFIX.get("contracts", "")
+        else:
+            basename = file_path.split("/")[-1].replace(".py", "").replace(".ts", "").replace(".js", "")
+            prefix = _ROUTER_PREFIX.get(basename, "")
+        # endpoints.json의 path는 라우터에 따라 절대 경로("/api/auth/signup")이거나
+        # prefix 기준 상대 경로("/join")일 수 있다 — 이미 절대 경로면 그대로 사용해
+        # "/api/auth/api/auth/signup"처럼 prefix가 중복되는 것을 막는다.
+        if rel_path.startswith("/api/"):
+            full = rel_path
+        else:
+            full = prefix + rel_path if rel_path else prefix
+        apis.append(f"{method} {full}")
+    return apis
+
+
 async def _tc_generate_doc_search(state: PipelineState) -> dict:
     """ts_list 중 대상 TS만 문서 검색 → TC 골격 생성 (S3 저장은 _save_experiment_scenarios 에서)."""
     import time
@@ -3600,6 +3645,7 @@ async def _tc_generate_doc_search(state: PipelineState) -> dict:
 
     ts_list = state.get("ts_list") or []
     run_opts = state["run_options"]
+    available_apis = _load_available_apis(state.get("qapilot_dir"))
     trace_id = state["trace_id"]
     trace = load_trace(trace_id) or {}
     service_id = trace.get("service_id")
@@ -3685,7 +3731,11 @@ async def _tc_generate_doc_search(state: PipelineState) -> dict:
         agent = TCFromDocsAgent(trace_id=trace_id)
         output = await agent.run(AgentInput(
             trace_id=trace_id,
-            context={"ts_item": ts_item, "retrieved_docs": retrieved_docs},
+            context={
+                "ts_item": ts_item,
+                "retrieved_docs": retrieved_docs,
+                "available_apis": available_apis,
+            },
             params={},
         ))
         duration = round(time.monotonic() - start, 2)

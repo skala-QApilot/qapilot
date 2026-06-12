@@ -246,6 +246,7 @@ class ActionMapping(TypedDict):
     tc_id: str
     steps: list[ActionStep]
     selector_confidence: float
+    mapping_context: NotRequired[dict[str, Any]]
 
 
 # ── 코드 생성 ──

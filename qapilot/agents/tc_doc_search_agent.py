@@ -25,6 +25,42 @@ def _format_requirements(requirements: list[str]) -> str:
     return "\n".join(f"- {r}" for r in requirements)
 
 
+def _format_available_apis(apis: list[str]) -> str:
+    if not apis:
+        return "없음 (api는 null로 두어라)"
+    return "\n".join(f"- {a}" for a in apis)
+
+
+def _normalize_api(api: Any, valid_apis: set[str] | None) -> str | None:
+    """LLM이 반환한 api 값을 valid_apis 안의 값으로 정규화한다.
+
+    정확히 일치하지 않아도 경로 파라미터(예: /api/orders/123 -> /api/orders/{order_id})를
+    채워 넣은 값이면 매칭한다. valid_apis가 주어졌는데 매칭 실패 시 None
+    (hallucination 방지 — 존재하지 않는 경로를 그대로 두지 않는다).
+    valid_apis가 None이면 grounding 정보 없이 호출된 것으로 보고 원본 값을 그대로 둔다.
+    """
+    if not isinstance(api, str) or not api.strip() or api == "null":
+        return None
+    api = api.strip()
+    if valid_apis is None:
+        return api
+    if not valid_apis:
+        return None
+    if api in valid_apis:
+        return api
+    if " " not in api:
+        return None
+    method, path = api.split(" ", 1)
+    for valid in valid_apis:
+        v_method, v_path = valid.split(" ", 1)
+        if v_method != method:
+            continue
+        pattern = re.sub(r"\{[^}]+\}", r"[^/]+", v_path)
+        if re.fullmatch(pattern, path):
+            return valid
+    return None
+
+
 def _format_retrieved_docs(docs: list[dict]) -> str:
     if not docs:
         return "검색된 문서 없음"
@@ -89,6 +125,7 @@ class TCFromDocsAgent(BaseAgent):
     ) -> ExecuteResult:
         ts_item: dict = context.get("ts_item") or {}
         retrieved_docs: list[dict] = context.get("retrieved_docs") or []
+        available_apis: list[str] = context.get("available_apis") or []
 
         ts_name = ts_item.get("name", "")
         ts_description = ts_item.get("description", "")
@@ -99,6 +136,7 @@ class TCFromDocsAgent(BaseAgent):
             ts_description=ts_description,
             requirements=_format_requirements(requirements),
             retrieved_docs=_format_retrieved_docs(retrieved_docs),
+            available_apis=_format_available_apis(available_apis),
         )
         if last_error:
             user_prompt += f"\n\n[이전 시도 오류: {last_error}. JSON 형식을 확인하라.]"
@@ -109,13 +147,13 @@ class TCFromDocsAgent(BaseAgent):
             json_mode=True,
         )
 
-        test_cases, analysis, confidence = self._parse(response.content)
+        test_cases, analysis, confidence = self._parse(response.content, set(available_apis))
         return ExecuteResult(
             result={"test_cases": test_cases, "analysis": analysis},
             confidence=confidence,
         )
 
-    def _parse(self, content: str) -> tuple[list[dict], list[dict], float]:
+    def _parse(self, content: str, valid_apis: set[str] | None = None) -> tuple[list[dict], list[dict], float]:
         try:
             cleaned = _extract_json(content)
             data = json.loads(cleaned)
@@ -139,7 +177,7 @@ class TCFromDocsAgent(BaseAgent):
                 "intent": str(tc.get("intent", "") or "normal"),
                 "tags": tc.get("tags") or ["normal"],
                 "req_id": tc.get("req_id"),
-                "api": tc.get("api"),
+                "api": _normalize_api(tc.get("api"), valid_apis),
                 "sources": sources,
                 "doc_verified": "codebase" in sources,
                 "depends_on": tc.get("depends_on") or [],

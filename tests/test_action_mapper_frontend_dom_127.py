@@ -1,7 +1,7 @@
 """이슈 #127 — ActionMapperAgent 의 frontend DOM 인덱스 컨텍스트 주입 검증.
 
-`_load_frontend_dom` 의 context 우선 + 디스크 fallback / `_format_frontend_dom` 의
-프롬프트 변환 / `_call_batch` 가 frontend_dom 인자를 LLM 호출에 포함하는지 검증.
+`_load_frontend_dom` 의 context 우선 + DB/S3 mirror fallback / `_format_frontend_dom`
+의 프롬프트 변환 / `_call_batch` 가 frontend_dom 인자를 LLM 호출에 포함하는지 검증.
 """
 from __future__ import annotations
 
@@ -49,46 +49,39 @@ def test_load_frontend_dom_from_context_priority(mock_llm_client):
     assert result == ctx_dom
 
 
-def test_load_frontend_dom_from_disk_fallback(mock_llm_client, tmp_path: Path, monkeypatch):
-    """context 없음 → 디스크 (.qapilot/codebase-index/frontend.json) 로드."""
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / ".qapilot" / "codebase-index").mkdir(parents=True)
-    (tmp_path / ".qapilot" / "codebase-index" / "frontend.json").write_text(
-        json.dumps({"version": 1, "element_count": 1, "elements": [
-            {"tag": "label", "text": "이메일", "id": "email", "file": "x.vue"}
-        ]}),
-        encoding="utf-8",
-    )
-
+def test_load_frontend_dom_from_db_mirror_fallback(mock_llm_client):
+    """context 없음 → DB/S3 mirror payload 로드."""
     agent = _make_agent(mock_llm_client)
-    result = agent._load_frontend_dom({})
+    with patch("qapilot.db.code_reader.load_codebase_index", return_value={
+        "elements": [{"tag": "label", "text": "이메일", "id": "email", "file": "x.vue"}]
+    }):
+        result = agent._load_frontend_dom({"service_id": "svc-a"})
     assert len(result) == 1
     assert result[0]["text"] == "이메일"
 
 
-def test_load_frontend_dom_returns_empty_when_no_source(mock_llm_client, tmp_path: Path, monkeypatch):
-    """context 와 디스크 모두 없음 → 빈 list."""
-    monkeypatch.chdir(tmp_path)
+def test_load_frontend_dom_returns_empty_when_no_source(mock_llm_client):
+    """context 와 mirror 모두 없음 → 빈 list."""
     agent = _make_agent(mock_llm_client)
     result = agent._load_frontend_dom({})
     assert result == []
 
 
-def test_load_frontend_dom_from_qapilot_dir_runtime_cache(mock_llm_client, tmp_path: Path):
-    """context.qapilot_dir 우선 fallback — 서비스별 runtime cache 경로 사용."""
-    qapilot_dir = tmp_path / ".qapilot" / "svc-a"
-    (qapilot_dir / "codebase-index").mkdir(parents=True)
-    (qapilot_dir / "codebase-index" / "frontend.json").write_text(
-        json.dumps({"version": 1, "element_count": 1, "elements": [
-            {"tag": "button", "text": "가입하기", "testid": "signup-submit", "file": "Signup.vue"}
-        ]}),
-        encoding="utf-8",
-    )
-
+def test_load_metadata_bundle_uses_mirror_only(mock_llm_client):
     agent = _make_agent(mock_llm_client)
-    result = agent._load_frontend_dom({"qapilot_dir": str(qapilot_dir)})
-    assert len(result) == 1
-    assert result[0]["testid"] == "signup-submit"
+    with patch("qapilot.shared.scan_storage.load_metadata_index", side_effect=[
+        {"kind": "frontend", "sub_kind": "selectors", "service_id": "svc-a", "commit_sha": "abc123", "by_route": {"/signup": {"inputs": [], "buttons": [], "outputs": [], "dynamic": []}}},
+        {"kind": "frontend", "sub_kind": "routes", "service_id": "svc-a", "commit_sha": "abc123", "routes": []},
+        {"kind": "backend", "sub_kind": "schemas", "service_id": "svc-a", "commit_sha": "abc123", "request_schemas": {}, "response_schemas": {}, "db_models": {}},
+    ]):
+        bundle = agent._load_metadata_bundle({
+            "service_id": "svc-a",
+            "commit_sha": "abc123",
+        })
+
+    assert bundle["commit_sha"] == "abc123"
+    assert bundle["selectors"] is not None
+    assert "/signup" in bundle["selectors"]["by_route"]
 
 
 # ── _format_frontend_dom ────────────────────────────────────────────────────
@@ -119,7 +112,7 @@ def test_format_frontend_dom_empty_returns_placeholder(mock_llm_client):
     agent = _make_agent(mock_llm_client)
     out = agent._format_frontend_dom([])
     assert "인덱스 없음" in out
-    assert "qapilot init" in out  # hint
+    assert "mirror" in out  # hint
 
 
 def test_format_frontend_dom_limits_200(mock_llm_client):
@@ -218,7 +211,65 @@ async def test_call_batch_passes_frontend_dom_to_prompt_render(mock_llm_client):
     agent.prompts.render.assert_called_once()
     kwargs = agent.prompts.render.call_args.kwargs
     assert "frontend_dom" in kwargs
-    assert 'placeholder="이메일"' in kwargs["frontend_dom"]
+
+
+@pytest.mark.asyncio
+async def test_call_single_tc_passes_source_aware_context_to_prompt_render(mock_llm_client):
+    agent = _make_agent(mock_llm_client)
+    agent.llm.chat.return_value = MagicMock(content=json.dumps([{
+        "tc_id": "TS-001-TC-01",
+        "steps": [
+            {"step_no": 1, "action": "click", "selector": "signup-submit", "selector_type": "testid"}
+        ],
+        "selector_confidence": 0.9,
+    }]))
+    agent._metadata_bundle = {
+        "service_id": "svc-a",
+        "qapilot_dir": "",
+        "commit_sha": "",
+        "selectors": {
+            "by_route": {
+                "/signup": {
+                    "inputs": [{"testid": "email", "label": "이메일", "placeholder": "example@email.com", "v_model": "form.email", "validators": [], "extracted_from": {"file": "frontend/src/pages/Signup.vue"}}],
+                    "buttons": [{"testid": "signup-submit", "label": "가입하기", "form_role": "submit", "disabled_when": {"expr": "loading"}}],
+                    "outputs": [],
+                    "dynamic": [],
+                }
+            }
+        },
+        "routes": {
+            "routes": [{"path": "/signup", "component_file": "frontend/src/pages/Signup.vue", "guards": [], "meta": {}}],
+        },
+        "schemas": {
+            "request_schemas": {
+                "SignupRequest": {
+                    "fields": [{"name": "email", "type": "EmailStr", "required": True, "sensitive": False, "validators": []}]
+                }
+            },
+            "response_schemas": {},
+            "db_models": {},
+        },
+    }
+
+    import asyncio
+    sem = asyncio.Semaphore(1)
+    ts = {"ts_id": "TS-001", "test_cases": [{"tc_id": "TS-001-TC-01", "api": "POST /api/auth/signup"}]}
+    tc = ts["test_cases"][0]
+    await agent._call_single_tc(sem, ts, tc, [], [], None)
+
+    kwargs = agent.prompts.render.call_args.kwargs
+    assert "route_context" in kwargs
+    assert "selector_catalog" in kwargs
+    assert "schema_context" in kwargs
+    assert "Signup.vue" in kwargs["route_context"]
+    assert "signup-submit" in kwargs["selector_catalog"]
+    mapping = await agent._call_single_tc(sem, ts, tc, [], [], None)
+    assert mapping is not None
+    assert "mapping_context" in mapping
+    assert mapping["mapping_context"]["route_refs"][0]["path"] == "/signup"
+    assert "SignupRequest" in mapping["mapping_context"]["schema_refs"]["request_schemas"]
+    assert mapping["mapping_context"]["source_status"] == "not_requested"
+    assert mapping["mapping_context"]["source_selection_method"] == "none"
     assert "endpoints" in kwargs
 
 
@@ -245,6 +296,98 @@ async def test_execute_loads_frontend_dom_from_context(mock_llm_client, tmp_path
     # render 호출의 frontend_dom 인자에 "이메일" 포함
     kwargs = agent.prompts.render.call_args.kwargs
     assert "이메일" in kwargs["frontend_dom"]
+
+
+@pytest.mark.asyncio
+async def test_select_and_load_tc_sources_marks_source_missing(mock_llm_client):
+    agent = _make_agent(mock_llm_client)
+    agent._metadata_bundle = {
+        "service_id": "svc-a",
+        "commit_sha": "abc123",
+        "selectors": {
+            "by_route": {
+                "/signup": {
+                    "inputs": [{"testid": "email", "extracted_from": {"file": "frontend/src/pages/Signup.vue"}}],
+                    "buttons": [],
+                    "outputs": [],
+                    "dynamic": [],
+                }
+            }
+        },
+        "routes": {
+            "routes": [{"path": "/signup", "component_file": "frontend/src/pages/Signup.vue", "guards": [], "meta": {}}],
+        },
+        "schemas": {"request_schemas": {}, "response_schemas": {}, "db_models": {}},
+    }
+    tc_context = agent._build_tc_metadata_context({"tc_id": "TC-1", "api": "POST /api/auth/signup"})
+    with patch.object(agent, "_load_source_from_mirror", return_value=None):
+        ctx = await agent._select_and_load_tc_sources(
+            {"tc_id": "TC-1", "api": "POST /api/auth/signup"},
+            tc_context,
+            agent._create_tc_llm(),
+        )
+
+    assert ctx["source_status"] == "missing"
+    assert ctx["sources"] == []
+    assert len(ctx["source_candidates"]) >= 1
+    assert any("reason" in c for c in ctx["source_candidates"])
+    assert ctx["source_selection_method"] in {"deterministic_small_set", "llm_rerank", "deterministic_fallback"}
+
+
+@pytest.mark.asyncio
+async def test_select_and_load_tc_sources_marks_no_candidates_when_no_source_targets(mock_llm_client):
+    agent = _make_agent(mock_llm_client)
+    agent._metadata_bundle = {
+        "service_id": "svc-a",
+        "commit_sha": "abc123",
+        "selectors": {"by_route": {}},
+        "routes": {"routes": []},
+        "schemas": {"request_schemas": {}, "response_schemas": {}, "db_models": {}},
+    }
+    tc_context = agent._build_tc_metadata_context({"tc_id": "TC-1", "api": None})
+    ctx = await agent._select_and_load_tc_sources(
+        {"tc_id": "TC-1", "api": None},
+        tc_context,
+        agent._create_tc_llm(),
+    )
+
+    assert ctx["source_status"] == "no_candidates"
+    assert ctx["sources"] == []
+    assert ctx["source_candidates"] == []
+    assert ctx["source_selection_method"] == "none"
+
+
+@pytest.mark.asyncio
+async def test_rerank_source_targets_with_llm_uses_llm_selection_when_candidate_pool_is_large(mock_llm_client):
+    agent = _make_agent(mock_llm_client)
+    tc = {
+        "tc_id": "TC-1",
+        "api": "GET /api/orders",
+        "name": "활성 요금제 없음 고객의 요청 내역 조회",
+        "when": "사용자가 대시보드 화면을 연다.",
+        "then": "UI) 빈 요청 목록이 표시된다.",
+    }
+    tc_context = {
+        "routes": [{"path": "/dashboard", "component_file": "frontend/src/pages/Dashboard.vue"}],
+        "selectors": {"by_route": {"/dashboard": {"outputs": [{"testid": "dashboard-empty-orders"}]}}},
+        "schemas": {"request_schemas": {}, "response_schemas": {}, "db_models": {}},
+    }
+    candidates = [
+        {"file": "frontend/src/pages/Dashboard.vue", "line_start": None, "line_end": None, "reason": "matched frontend route /dashboard"},
+        {"file": "frontend/src/components/Sidebar.vue", "line_start": None, "line_end": None, "reason": "selector catalog /dashboard buttons exemplar"},
+        {"file": "frontend/src/components/OrdersEmptyState.vue", "line_start": None, "line_end": None, "reason": "selector catalog /dashboard outputs exemplar"},
+        {"file": "backend/app/routers/orders.py", "line_start": None, "line_end": None, "reason": "backend router/schema heuristic from TC.api"},
+    ]
+    llm = agent._create_tc_llm()
+    llm.chat = AsyncMock(return_value=MagicMock(content='{"selected_indices":[1,2],"rationale":["sidebar link is relevant","dashboard empty output is relevant"]}'))
+    selected, method, notes = await agent._rerank_source_targets_with_llm(tc, tc_context, candidates, llm)
+
+    assert method == "llm_rerank"
+    assert [item["file"] for item in selected] == [
+        "frontend/src/components/Sidebar.vue",
+        "frontend/src/components/OrdersEmptyState.vue",
+    ]
+    assert notes == ["sidebar link is relevant", "dashboard empty output is relevant"]
 
 
 @pytest.mark.asyncio

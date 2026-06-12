@@ -454,6 +454,296 @@ def test_resolve_mapping_with_frontend_prefers_success_feedback_for_assert(mock_
     assert resolved["steps"][1]["selector"] == "signup-success-toast"
 
 
+def test_resolve_mapping_with_frontend_route_locked_catalog_blocks_cross_route_selector(mock_llm_client):
+    agent = _make_agent(mock_llm_client)
+    frontend_dom = [
+        {
+            "tag": "div",
+            "text": "가입이 완료되었습니다! 로그인 페이지로 이동합니다.",
+            "placeholder": "",
+            "label": "",
+            "testid": "signup-success-toast",
+            "name": "",
+            "id": "",
+            "file": "Signup.vue",
+            "page": "Signup",
+            "route": "/signup",
+            "actionable": False,
+            "control_type": "feedback_success",
+        },
+        {
+            "tag": "section",
+            "text": "프로필",
+            "placeholder": "",
+            "label": "프로필 카드",
+            "testid": "profile-card",
+            "name": "",
+            "id": "",
+            "file": "Profile.vue",
+            "page": "Profile",
+            "route": "/profile",
+            "actionable": False,
+            "control_type": "label",
+        },
+    ]
+    tc = {
+        "tc_id": "TS-002-TC-01",
+        "name": "프로필 재조회",
+        "given": "사용자가 로그인되어 있다.",
+        "when": "프로필 페이지로 이동한다.",
+        "then": "UI) 프로필 정보가 표시된다.",
+        "values": [],
+    }
+    tc_context = {
+        "selectors": {
+            "by_route": {
+                "/profile": {
+                    "inputs": [],
+                    "buttons": [],
+                    "outputs": [
+                        {
+                            "testid": "profile-card",
+                            "label": "프로필 카드",
+                            "semantic_kind": "summary",
+                            "semantic_purpose": "프로필 정보가 표시된다",
+                            "extracted_from": {"file": "Profile.vue"},
+                        }
+                    ],
+                    "dynamic": [],
+                }
+            }
+        },
+        "routes": [{"path": "/profile", "component_file": "Profile.vue"}],
+    }
+    mapping = {
+        "tc_id": "TS-002-TC-01",
+        "steps": [
+            {
+                "step_no": 1,
+                "action": "assert_visible",
+                "selector": "signup-success-toast",
+                "selector_type": "testid",
+                "value": None,
+                "expected": None,
+                "api_endpoint": None,
+                "target_kind": "assertion",
+            }
+        ],
+        "selector_confidence": 0.8,
+    }
+
+    resolved = agent._resolve_mapping_with_frontend(mapping, tc, frontend_dom, tc_context=tc_context)
+    assert resolved["steps"][0]["action"] == "navigate"
+    assert resolved["steps"][0]["value"] == "/profile"
+    assert resolved["steps"][1]["selector"] == "profile-card"
+    assert resolved["steps"][1]["selector_type"] == "testid"
+
+
+def test_resolve_mapping_with_frontend_rejects_out_of_route_assert_when_no_repair(mock_llm_client):
+    agent = _make_agent(mock_llm_client)
+    frontend_dom = [
+        {
+            "tag": "section",
+            "text": "",
+            "placeholder": "",
+            "label": "프로필 카드",
+            "testid": "profile-card",
+            "name": "",
+            "id": "",
+            "file": "Profile.vue",
+            "page": "Profile",
+            "route": "/profile",
+            "actionable": False,
+            "control_type": "label",
+        },
+    ]
+    tc = {
+        "tc_id": "TS-002-TC-02",
+        "name": "프로필 재조회",
+        "given": "사용자가 로그인되어 있다.",
+        "when": "프로필 페이지로 이동한다.",
+        "then": "",
+        "values": [],
+    }
+    tc_context = {
+        "selectors": {
+            "by_route": {
+                "/profile": {"inputs": [], "buttons": [], "outputs": [{"testid": "profile-card", "label": "프로필 카드"}], "dynamic": []}
+            }
+        },
+        "routes": [{"path": "/profile", "component_file": "Profile.vue"}],
+    }
+    mapping = {
+        "tc_id": "TS-002-TC-02",
+        "steps": [
+            {
+                "step_no": 1,
+                "action": "assert_visible",
+                "selector": "signup-success-toast",
+                "selector_type": "testid",
+                "value": None,
+                "expected": None,
+                "api_endpoint": None,
+            }
+        ],
+        "selector_confidence": 0.8,
+    }
+
+    resolved = agent._resolve_mapping_with_frontend(mapping, tc, frontend_dom, tc_context=tc_context)
+    assert resolved["steps"][1]["selector"] is None
+    assert resolved["steps"][1]["selector_type"] is None
+
+
+def test_resolve_mapping_with_frontend_maps_check_to_guardian_consent_checkbox(mock_llm_client):
+    agent = _make_agent(mock_llm_client)
+    frontend_dom = [
+        {
+            "tag": "input",
+            "text": "",
+            "placeholder": "",
+            "label": "법정대리인 동의",
+            "testid": "guardian-consent",
+            "name": "",
+            "id": "",
+            "file": "Signup.vue",
+            "page": "Signup",
+            "route": "/signup",
+            "actionable": True,
+            "control_type": "checkbox",
+        },
+    ]
+    tc = {
+        "tc_id": "TS-001-TC-01",
+        "name": "미성년자 회원가입",
+        "given": "미성년 사용자가 회원가입한다.",
+        "when": "보호자 동의를 체크하고 회원가입을 요청한다.",
+        "then": "UI) 회원가입이 성공한다.",
+        "values": [
+            {"field": "birth_date", "value": "2010-01-01"},
+            {"field": "guardian_consent", "value": True},
+        ],
+    }
+    mapping = {
+        "tc_id": "TS-001-TC-01",
+        "steps": [
+            {
+                "step_no": 1,
+                "action": "check",
+                "selector": "email",
+                "selector_type": "testid",
+                "value": None,
+                "expected": None,
+                "api_endpoint": None,
+            }
+        ],
+        "selector_confidence": 0.8,
+    }
+
+    resolved = agent._resolve_mapping_with_frontend(mapping, tc, frontend_dom)
+    assert resolved["steps"][0]["action"] == "navigate"
+    assert resolved["steps"][1]["selector"] == "guardian-consent"
+    assert resolved["steps"][1]["selector_type"] == "testid"
+    assert resolved["steps"][1]["target_name"] == "guardian_consent"
+
+
+def test_resolve_mapping_with_frontend_skips_guardian_consent_check_for_adult(mock_llm_client):
+    agent = _make_agent(mock_llm_client)
+    frontend_dom = [
+        {
+            "tag": "input",
+            "text": "",
+            "placeholder": "",
+            "label": "법정대리인 동의",
+            "testid": "guardian-consent",
+            "name": "",
+            "id": "",
+            "file": "Signup.vue",
+            "page": "Signup",
+            "route": "/signup",
+            "actionable": True,
+            "control_type": "checkbox",
+        },
+    ]
+    tc = {
+        "tc_id": "TS-001-TC-02",
+        "name": "성인 회원가입",
+        "given": "성인 사용자가 회원가입한다.",
+        "when": "회원가입을 요청한다.",
+        "then": "UI) 회원가입이 성공한다.",
+        "values": [
+            {"field": "birth_date", "value": "2000-01-01"},
+            {"field": "guardian_consent", "value": True},
+        ],
+    }
+    mapping = {
+        "tc_id": "TS-001-TC-02",
+        "steps": [
+            {
+                "step_no": 1,
+                "action": "check",
+                "selector": "guardian-consent",
+                "selector_type": "testid",
+                "value": None,
+                "expected": None,
+                "api_endpoint": None,
+            }
+        ],
+        "selector_confidence": 0.8,
+    }
+
+    resolved = agent._resolve_mapping_with_frontend(mapping, tc, frontend_dom)
+    assert resolved["steps"] == []
+
+
+def test_resolve_mapping_with_frontend_downgrades_self_referential_assert_text(mock_llm_client):
+    agent = _make_agent(mock_llm_client)
+    frontend_dom = [
+        {
+            "tag": "div",
+            "text": "2026-06-12",
+            "placeholder": "",
+            "label": "가입 일자",
+            "testid": "info-created-at",
+            "name": "",
+            "id": "",
+            "file": "Profile.vue",
+            "page": "Profile",
+            "route": "/profile",
+            "actionable": False,
+            "control_type": "label",
+        },
+    ]
+    tc = {
+        "tc_id": "TS-002-TC-03",
+        "name": "프로필 가입일 확인",
+        "given": "사용자가 프로필 페이지에 있다.",
+        "when": "프로필 정보를 본다.",
+        "then": "UI) 가입 일자가 표시된다.",
+        "values": [],
+    }
+    mapping = {
+        "tc_id": "TS-002-TC-03",
+        "steps": [
+            {
+                "step_no": 1,
+                "action": "assert_text",
+                "selector": "info-created-at",
+                "selector_type": "testid",
+                "value": None,
+                "expected": "info-created-at",
+                "api_endpoint": None,
+            }
+        ],
+        "selector_confidence": 0.8,
+    }
+
+    resolved = agent._resolve_mapping_with_frontend(mapping, tc, frontend_dom)
+    assert resolved["steps"][0]["action"] == "navigate"
+    assert resolved["steps"][1]["action"] == "assert_visible"
+    assert resolved["steps"][1]["selector"] == "info-created-at"
+    assert resolved["steps"][1]["expected"] is None
+
+
 def test_resolve_mapping_with_frontend_prepends_navigate_from_route_hint(mock_llm_client):
     agent = _make_agent(mock_llm_client)
     frontend_dom = [

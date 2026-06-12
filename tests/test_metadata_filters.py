@@ -75,19 +75,19 @@ def test_filter_schemas_signup(signup_schemas):
     assert "Order" not in result["db_models"]
 
 
-def test_filter_schemas_no_api_returns_all_db_models(signup_schemas):
-    """api 없으면 request/response 는 빈 dict, db_models 만 전체."""
+def test_filter_schemas_no_api_returns_empty_models(signup_schemas):
+    """api 없으면 관련 schema/model 을 추정하지 않고 비운다."""
     result = filter_schemas_by_api(signup_schemas, None)
     assert result["request_schemas"] == {}
     assert result["response_schemas"] == {}
-    assert result["db_models"] == signup_schemas["db_models"]
+    assert result["db_models"] == {}
 
 
-def test_filter_schemas_no_match_returns_all_db_models(signup_schemas):
-    """매칭 schema 0건 → db_models 전체 fallback."""
+def test_filter_schemas_no_match_returns_empty_models(signup_schemas):
+    """매칭 schema 0건 → db_models 전체 fallback 금지."""
     result = filter_schemas_by_api(signup_schemas, "GET /api/foo/bar")
     assert result["request_schemas"] == {}
-    assert result["db_models"] == signup_schemas["db_models"]
+    assert result["db_models"] == {}
 
 
 def test_filter_schemas_empty_input():
@@ -220,7 +220,7 @@ def test_filter_metadata_full_pipeline(signup_schemas, signup_selectors, auth_pa
 
 
 def test_filter_metadata_no_tc_data():
-    """tc 가 api / req_id 둘 다 없으면 빈 결과 (db_models 만)."""
+    """tc 가 api / req_id 둘 다 없으면 빈 결과."""
     tc: dict = {"name": "x"}
     result = filter_metadata_for_tc(
         tc,
@@ -228,7 +228,7 @@ def test_filter_metadata_no_tc_data():
         schemas={"db_models": {"Customer": {}}},
     )
     assert result["selectors"]["by_route"] == {}
-    assert result["schemas"]["db_models"] == {"Customer": {}}
+    assert result["schemas"]["db_models"] == {}
 
 
 # ────────────────────────────────────────────────────────────────────────
@@ -276,7 +276,7 @@ def test_pick_table_exact_match():
 
 
 def test_pick_table_partial_table_name():
-    """table_name 안에 last segment 가 포함된 경우."""
+    """관련 schema/model 근거가 없으면 추정하지 않는다."""
     schemas = {
         "request_schemas": {},
         "db_models": {
@@ -286,11 +286,7 @@ def test_pick_table_partial_table_name():
     table = pick_table_for_tc(
         {"api": "GET /api/orders"}, schemas,
     )
-    # "orders" 의 last segment 가 "order_history" 안에 부분 포함 X — fallback 으로 첫 번째
-    # 단 _last_segment("/api/orders") = "orders"
-    # "orders" in "order_history" = False (실제 'order' 포함이지만 'orders' 는 False)
-    # → fallback 으로 db_models 의 첫 번째 = "order_history"
-    assert table == "order_history"
+    assert table is None
 
 
 def test_pick_table_no_schemas():
@@ -304,11 +300,9 @@ def test_pick_table_no_db_models():
 
 
 def test_pick_table_no_api(signup_schemas_with_db):
-    """api 없으면 filter fallback 의 첫 번째 db_model."""
+    """api 없으면 관련 테이블을 추정하지 않는다."""
     table = pick_table_for_tc({"name": "x"}, signup_schemas_with_db)
-    # filter_schemas_by_api 가 api None 시 db_models 전체 그대로 반환
-    # → 첫 번째 (dict 순서 — Customer)
-    assert table == "customers"
+    assert table is None
 
 
 # ────────────────────────────────────────────────────────────────────────

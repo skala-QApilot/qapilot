@@ -11,8 +11,8 @@ project:
     password: Passw0rd!
 
 llm:
-  default_model: "gpt-5.4-mini"
-  deep_model: "gpt-5.4-mini"
+  default_model: "gpt-4o-mini"
+  deep_model: "gpt-4o"
   monthly_budget_usd: 500
   max_tokens_per_task: 400000
 

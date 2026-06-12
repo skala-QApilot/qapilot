@@ -779,17 +779,6 @@ class UITestTool(BaseTool):
                 return
             except (PWTimeoutError, AssertionError) as e:
                 last_error = e
-                next_label = chain[attempt + 1][0] if attempt + 1 < len(chain) else None
-                self.logger.warning(
-                    "ui_fallback_chain_retry",
-                    action=action,
-                    selector_type=step.get("selector_type"),
-                    selector=step.get("selector"),
-                    tried=label,
-                    attempt=attempt + 1,
-                    next=next_label,
-                    error=str(e).splitlines()[0] if str(e) else type(e).__name__,
-                )
                 continue
             except ToolExecutionError:
                 # 명시적 ToolExecutionError (예: upload value 누락) 는 chain 의미 없음 — 즉시 raise

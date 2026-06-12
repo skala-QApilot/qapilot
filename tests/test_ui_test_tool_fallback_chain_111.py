@@ -132,7 +132,7 @@ def test_chain_selector_none_falls_back_with_3_entries(mock_page_with_distinct_l
 
 @pytest.mark.asyncio
 async def test_first_attempt_success_no_retry_no_warning(mock_page_with_distinct_locators):
-    """1차 시도 성공 → 2~N차 미발화, retry log 없음."""
+    """1차 시도 성공 → 2~N차 미발화, retry warning 없음."""
     tool = _make_tool()
     page = mock_page_with_distinct_locators
     step = {"selector": "이메일", "selector_type": "text", "action": "click"}
@@ -158,7 +158,7 @@ async def test_first_attempt_success_no_retry_no_warning(mock_page_with_distinct
 
 @pytest.mark.asyncio
 async def test_first_fails_second_succeeds_emits_success_log(mock_page_with_distinct_locators):
-    """1차 PWTimeoutError → 2차 적중 → success log + retry warning 1건."""
+    """1차 PWTimeoutError → 2차 적중 → success log 1건."""
     tool = _make_tool()
     page = mock_page_with_distinct_locators
 
@@ -178,11 +178,7 @@ async def test_first_fails_second_succeeds_emits_success_log(mock_page_with_dist
     page.get_by_test_id.return_value.click.assert_not_called()
 
     # 로깅 검증
-    retry_calls = [c for c in tool.logger.warning.call_args_list if c.args and c.args[0] == "ui_fallback_chain_retry"]
     success_calls = [c for c in tool.logger.info.call_args_list if c.args and c.args[0] == "ui_fallback_chain_success"]
-    assert len(retry_calls) == 1
-    assert retry_calls[0].kwargs["tried"] == "get_by_text"
-    assert retry_calls[0].kwargs["next"] == "get_by_label"
     assert len(success_calls) == 1
     assert success_calls[0].kwargs["matched_at"] == "get_by_label"
     assert success_calls[0].kwargs["attempt"] == 2

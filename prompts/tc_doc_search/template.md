@@ -11,6 +11,10 @@
 
 {{retrieved_docs}}
 
+## 사용 가능한 API 목록
+
+{{available_apis}}
+
 ## 지시사항
 
 아래 3단계를 순서대로 수행하고 결과를 JSON 하나로 출력하라.
@@ -28,6 +32,8 @@
 `analysis`의 각 `test_point`를 TC 1개로 열거하라.
 각 TC는 골격만 정한다 — **given/when/then 과 value 는 작성하지 마라** (후속 통합 단계가 문서+코드베이스+DB를 보고 함께 생성한다).
 각 TC에 정할 것: `name`, `technique`(기법 근거), `intent`(normal/expects_existing/expects_absent/expects_validation_error/boundary/auth 중 하나), `tags`, `api`, `req_id`, `depends_on`.
+`api`는 반드시 위 "사용 가능한 API 목록"에 있는 값 중 하나를 그대로 사용하라 (경로 파라미터는 `{param}` 형태 그대로 둔다).
+TC가 특정 API 호출을 수반하지 않는 순수 UI 동작이거나, 목록에서 적합한 API를 찾을 수 없으면 `api`를 `null`로 둬라. 목록에 없는 경로를 새로 만들어내지 마라.
 TC 유형별 최소 개수를 반드시 충족하라: normal 2+, edge_case 2+, boundary 1+, auth 1+ (총 최소 6개).
 각 TC에 `sources` 필드로 해당 TC를 도출한 문서명을 기재하라. (이 단계는 코드베이스를 보지 않으므로 `"codebase"` 는 포함하지 않는다.)
 

@@ -67,19 +67,11 @@ def filter_schemas_by_api(
 
     _, path = _parse_api(api)
     if not path:
-        return {
-            "request_schemas": {},
-            "response_schemas": {},
-            "db_models": schemas.get("db_models") or {},
-        }
+        return {"request_schemas": {}, "response_schemas": {}, "db_models": {}}
 
     key = _last_segment(path).lower()
     if not key:
-        return {
-            "request_schemas": {},
-            "response_schemas": {},
-            "db_models": schemas.get("db_models") or {},
-        }
+        return {"request_schemas": {}, "response_schemas": {}, "db_models": {}}
 
     req = {
         name: spec
@@ -94,7 +86,7 @@ def filter_schemas_by_api(
     # 매칭된 schema 가 0건이면 db_models 만으로 fallback (TC 가 read-only 일 수도)
     db = schemas.get("db_models") or {}
     if not req and not resp:
-        return {"request_schemas": {}, "response_schemas": {}, "db_models": db}
+        return {"request_schemas": {}, "response_schemas": {}, "db_models": {}}
 
     # 매칭된 schema 의 field 이름으로 db_models 도 필터링 (정확도 ↑)
     used_field_names: set[str] = set()
@@ -104,7 +96,7 @@ def filter_schemas_by_api(
     relevant_db = {
         name: model for name, model in db.items()
         if any(col.get("name") in used_field_names for col in model.get("columns") or [])
-    } or db
+    }
     return {"request_schemas": req, "response_schemas": resp, "db_models": relevant_db}
 
 

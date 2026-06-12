@@ -10,6 +10,7 @@ Created: 2026-05-07
 from __future__ import annotations
 
 import asyncio
+from datetime import date
 import difflib
 import json
 import re
@@ -121,6 +122,7 @@ class ActionMapperAgent(BaseAgent):
     # 이슈 #129 Step B — _normalize_selector_fields 가 _execute 외 직접 호출되는 경우 (단위
     # 테스트 등) 의 AttributeError 방지. 정상 흐름에서는 _execute 진입 시 갱신.
     _frontend_dom_index: list[dict] = []
+    _metadata_bundle: dict[str, Any] = {}
 
     async def _execute(
         self,
@@ -150,6 +152,7 @@ class ActionMapperAgent(BaseAgent):
         frontend_dom = self._load_frontend_dom(context)
         # 이슈 #129 Step B: _normalize_selector_fields 가 instance state 로 접근.
         self._frontend_dom_index = frontend_dom
+        self._metadata_bundle = self._load_metadata_bundle(context)
 
         # 이슈 #129 Step A: TC-별 LLM 호출 분할 — 이전 batch 호출의 token 한계로 인한
         # 부분 잘림 (trace `a86603b9` 의 78→21 누락) 해결. spec §4.5.1 의 ActionMapper
@@ -286,6 +289,10 @@ class ActionMapperAgent(BaseAgent):
             scenarios=self._format_scenarios(batch),
             endpoints=self._format_endpoints(endpoints),
             frontend_dom=self._format_frontend_dom(frontend_candidates),
+            route_context="",
+            selector_catalog="",
+            schema_context="",
+            source_context="",
         )
         user_prompt = self.with_correction_hint(user_prompt, last_error)
         response = await self.llm.chat(
@@ -338,12 +345,18 @@ class ActionMapperAgent(BaseAgent):
 
         # 이슈 #140: TC 마다 새 LLMClient — 누적 정책 충돌 해결
         tc_llm = self._create_tc_llm()
+        tc_context = self._build_tc_metadata_context(tc)
 
         async with sem:
+            tc_context = await self._select_and_load_tc_sources(tc, tc_context, tc_llm)
             user_prompt = self.prompts.render(
                 scenarios=self._format_scenarios(batch),
                 endpoints=self._format_endpoints(endpoints),
                 frontend_dom=self._format_frontend_dom(frontend_candidates),
+                route_context=self._format_route_context(tc_context.get("routes")),
+                selector_catalog=self._format_selector_catalog(tc_context.get("selectors")),
+                schema_context=self._format_schema_context(tc_context.get("schemas")),
+                source_context=self._format_source_context(tc_context.get("sources")),
             )
             user_prompt = self.with_correction_hint(user_prompt, last_error)
             response = await tc_llm.chat(
@@ -360,46 +373,693 @@ class ActionMapperAgent(BaseAgent):
         if not mappings:
             return None
         # 단일 TC 입력 — 응답도 단일 mapping. 다중 시 첫 항목.
-        return self._resolve_mapping_with_frontend(mappings[0], tc, frontend_candidates)
+        resolved = self._resolve_mapping_with_frontend(
+            mappings[0],
+            tc,
+            frontend_candidates,
+            tc_context=tc_context,
+        )
+        resolved["mapping_context"] = self._build_mapping_context_refs(tc_context)
+        return resolved
+
+    def _build_tc_metadata_context(self, tc: dict[str, Any]) -> dict[str, Any]:
+        from qapilot.shared.metadata_filters import (
+            filter_schemas_by_api,
+            filter_selectors_by_route,
+        )
+
+        bundle = getattr(self, "_metadata_bundle", {}) or {}
+        selectors = filter_selectors_by_route(bundle.get("selectors"), tc.get("api"))
+        schemas = filter_schemas_by_api(bundle.get("schemas"), tc.get("api"))
+        routes = self._filter_routes_for_tc(bundle.get("routes"), selectors, tc.get("api"))
+        return {
+            "selectors": selectors,
+            "schemas": schemas,
+            "routes": routes,
+            "service_id": str(bundle.get("service_id") or ""),
+            "commit_sha": str(bundle.get("commit_sha") or ""),
+        }
+
+    async def _select_and_load_tc_sources(
+        self,
+        tc: dict[str, Any],
+        tc_context: dict[str, Any],
+        tc_llm: LLMClient,
+    ) -> dict[str, Any]:
+        from qapilot.shared.metadata_filters import pick_source_files_for_tc
+
+        service_id = str(tc_context.get("service_id") or "")
+        commit_sha = str(tc_context.get("commit_sha") or "")
+        selectors = tc_context.get("selectors")
+        schemas = tc_context.get("schemas")
+        routes = tc_context.get("routes") or []
+
+        sources: list[dict[str, Any]] = []
+        source_candidates: list[dict[str, Any]] = []
+        source_status = "not_requested"
+        source_selection_method = "none"
+        source_selection_notes: list[str] = []
+
+        # 디버그: no_candidates 원인 추적 — commit_sha 유무 + tc.api 파싱 결과를
+        # 분기 진입 전에 항상 남긴다 (이전엔 deterministic_candidates 가 있을 때만 로그).
+        self.logger.info(
+            "action_mapping_source_select_entry",
+            tc_id=tc.get("tc_id"),
+            api=tc.get("api"),
+            service_id=service_id,
+            commit_sha_present=bool(commit_sha),
+            routes_count=len(routes),
+            selectors_by_route=list((selectors or {}).get("by_route") or {}),
+            schemas_request=list((schemas or {}).get("request_schemas") or {}),
+            schemas_db_models=list((schemas or {}).get("db_models") or {}),
+        )
+
+        if commit_sha:
+            deterministic_candidates = self._pick_source_targets_for_action_mapping(
+                tc,
+                routes=routes,
+                selectors=selectors,
+                schemas=schemas,
+            )
+            self.logger.info(
+                "action_mapping_source_candidates_built",
+                tc_id=tc.get("tc_id"),
+                api=tc.get("api"),
+                candidate_count=len(deterministic_candidates),
+                candidates=deterministic_candidates,
+            )
+            source_candidates.extend(deterministic_candidates)
+            selected_targets, selection_method, selection_notes = await self._rerank_source_targets_with_llm(
+                tc,
+                tc_context,
+                deterministic_candidates,
+                tc_llm,
+            )
+            source_selection_method = selection_method
+            source_selection_notes = selection_notes
+            source_status = "missing" if selected_targets else "no_candidates"
+
+            if deterministic_candidates:
+                self.logger.info(
+                    "action_mapping_source_targets_selected",
+                    tc_id=tc.get("tc_id"),
+                    api=tc.get("api"),
+                    candidates=deterministic_candidates,
+                    selection_method=selection_method,
+                )
+
+            for target in selected_targets:
+                file_path = target.get("file")
+                line_start = target.get("line_start")
+                line_end = target.get("line_end")
+                content = self._load_source_from_mirror(
+                    service_id=service_id,
+                    commit_sha=commit_sha,
+                    file_path=file_path,
+                    line_start=line_start,
+                    line_end=line_end,
+                )
+                if not content:
+                    self.logger.info(
+                        "action_mapping_source_candidate_missing",
+                        tc_id=tc.get("tc_id"),
+                        api=tc.get("api"),
+                        file=file_path,
+                        line_start=line_start,
+                        line_end=line_end,
+                        reason=target.get("reason"),
+                        source="s3_mirror",
+                    )
+                    continue
+                sources.append({
+                    "file": file_path,
+                    "line_start": line_start,
+                    "line_end": line_end,
+                    "content": content,
+                })
+
+            if not any("/routers/" in str(s.get("file") or "") for s in sources):
+                fallback_targets = [
+                    {
+                        "file": file_path,
+                        "line_start": line_start,
+                        "line_end": line_end,
+                        "reason": "backend router/schema fallback from pick_source_files_for_tc",
+                    }
+                    for file_path, line_start, line_end in pick_source_files_for_tc(tc, schemas=schemas)
+                ]
+                for target in fallback_targets:
+                    if not any(
+                        c.get("file") == target.get("file")
+                        and c.get("line_start") == target.get("line_start")
+                        and c.get("line_end") == target.get("line_end")
+                        for c in source_candidates
+                    ):
+                        source_candidates.append(target)
+                if fallback_targets:
+                    self.logger.info(
+                        "action_mapping_source_targets_fallback_selected",
+                        tc_id=tc.get("tc_id"),
+                        api=tc.get("api"),
+                        candidates=fallback_targets,
+                    )
+                for target in fallback_targets:
+                    file_path = target.get("file")
+                    line_start = target.get("line_start")
+                    line_end = target.get("line_end")
+                    content = self._load_source_from_mirror(
+                        service_id=service_id,
+                        commit_sha=commit_sha,
+                        file_path=file_path,
+                        line_start=line_start,
+                        line_end=line_end,
+                    )
+                    if not content:
+                        self.logger.info(
+                            "action_mapping_source_candidate_missing",
+                            tc_id=tc.get("tc_id"),
+                            api=tc.get("api"),
+                            file=file_path,
+                            line_start=line_start,
+                            line_end=line_end,
+                            reason=target.get("reason"),
+                            source="s3_mirror",
+                        )
+                        continue
+                    sources.append({
+                        "file": file_path,
+                        "line_start": line_start,
+                        "line_end": line_end,
+                        "content": content,
+                    })
+            if sources:
+                source_status = "loaded"
+
+        self.logger.info(
+            "action_mapping_source_select_result",
+            tc_id=tc.get("tc_id"),
+            api=tc.get("api"),
+            source_status=source_status,
+            source_selection_method=source_selection_method,
+            source_candidates_count=len(source_candidates),
+            sources_count=len(sources),
+        )
+
+        return {
+            **tc_context,
+            "sources": self._dedupe_source_snippets(sources),
+            "source_candidates": source_candidates[:6],
+            "source_status": source_status,
+            "source_selection_method": source_selection_method,
+            "source_selection_notes": source_selection_notes[:3],
+        }
+
+    def _load_metadata_bundle(self, context: dict[str, Any]) -> dict[str, Any]:
+        """action mapping 용 메타데이터 번들 로드.
+
+        정책:
+        - qapilot_dir / 로컬 디스크는 읽지 않는다.
+        - metadata / source 는 service_id 기준 DB/S3 mirror 만 사용한다.
+        """
+        service_id = str(context.get("service_id") or "").strip()
+        commit_sha = str(context.get("commit_sha") or "").strip()
+
+        bundle: dict[str, Any] = {
+            "service_id": service_id,
+            "commit_sha": commit_sha,
+            "selectors": None,
+            "routes": None,
+            "schemas": None,
+        }
+
+        for kind, sub_kind in (
+            ("frontend", "selectors"),
+            ("frontend", "routes"),
+            ("backend", "schemas"),
+        ):
+            payload = self._load_metadata_index_from_mirror(
+                service_id=service_id,
+                kind=kind,
+                sub_kind=sub_kind,
+                commit_sha=commit_sha or None,
+            )
+            if payload:
+                bundle[sub_kind] = payload
+                bundle["commit_sha"] = bundle.get("commit_sha") or str(payload.get("commit_sha") or "")
+
+        return bundle
+
+    def _load_metadata_index_from_mirror(
+        self,
+        *,
+        service_id: str,
+        kind: str,
+        sub_kind: str,
+        commit_sha: str | None,
+    ) -> dict[str, Any] | None:
+        if not service_id:
+            return None
+
+        try:
+            from qapilot.shared.scan_storage import load_metadata_index
+
+            return load_metadata_index(service_id, kind, sub_kind, commit_hash=commit_sha)
+        except Exception:
+            return None
+
+    def _load_source_from_mirror(
+        self,
+        *,
+        service_id: str,
+        commit_sha: str,
+        file_path: str,
+        line_start: int | None = None,
+        line_end: int | None = None,
+    ) -> str | None:
+        if not (service_id and commit_sha and file_path):
+            return None
+
+        try:
+            from qapilot.shared.scan_storage import load_source
+
+            return load_source(
+                service_id,
+                commit_sha,
+                file_path,
+                line_start=line_start,
+                line_end=line_end,
+            )
+        except Exception:
+            return None
+
+    def _build_tc_code_context(self, tc: dict[str, Any]) -> dict[str, Any]:
+        return self._build_tc_metadata_context(tc)
+
+    async def _rerank_source_targets_with_llm(
+        self,
+        tc: dict[str, Any],
+        tc_context: dict[str, Any],
+        candidates: list[dict[str, Any]],
+        tc_llm: LLMClient,
+    ) -> tuple[list[dict[str, Any]], str, list[str]]:
+        if not candidates:
+            return [], "none", []
+        if len(candidates) <= 2:
+            return candidates[:2], "deterministic_small_set", [
+                "후보 수가 적어 deterministic 후보를 그대로 사용"
+            ]
+
+        prompt = self._build_source_candidate_rerank_prompt(tc, tc_context, candidates)
+        try:
+            response = await tc_llm.chat(
+                system_prompt=(
+                    "You rank source file candidates for action mapping grounding. "
+                    "Choose up to 3 candidates only from the provided list. "
+                    "Never invent files. Return JSON object only."
+                ),
+                user_prompt=prompt,
+            )
+            selected, notes = self._parse_source_candidate_rerank_response(response.content, candidates)
+            if selected:
+                self.logger.info(
+                    "action_mapping_source_targets_reranked",
+                    tc_id=tc.get("tc_id"),
+                    api=tc.get("api"),
+                    selected=selected,
+                    notes=notes,
+                )
+                return selected, "llm_rerank", notes
+        except Exception as exc:
+            self.logger.warning(
+                "action_mapping_source_rerank_failed",
+                tc_id=tc.get("tc_id"),
+                api=tc.get("api"),
+                error=str(exc),
+            )
+
+        return candidates[:3], "deterministic_fallback", [
+            "LLM 재랭크 실패 또는 무효 응답으로 deterministic 상위 후보를 사용"
+        ]
+
+    def _build_source_candidate_rerank_prompt(
+        self,
+        tc: dict[str, Any],
+        tc_context: dict[str, Any],
+        candidates: list[dict[str, Any]],
+    ) -> str:
+        route_lines = [
+            f"- path={route.get('path')} component={route.get('component_file') or route.get('component_name') or ''}"
+            for route in (tc_context.get("routes") or [])[:3]
+        ]
+        schema_names = list((tc_context.get("schemas") or {}).get("request_schemas", {}).keys())[:3]
+        selector_routes = list(((tc_context.get("selectors") or {}).get("by_route") or {}).keys())[:3]
+        candidate_lines = []
+        for idx, candidate in enumerate(candidates):
+            line_range = ""
+            if candidate.get("line_start") is not None and candidate.get("line_end") is not None:
+                line_range = f":{candidate.get('line_start')}-{candidate.get('line_end')}"
+            candidate_lines.append(
+                f"{idx}. {candidate.get('file')}{line_range} | reason={candidate.get('reason')}"
+            )
+        return "\n".join([
+            "# TC",
+            json.dumps({
+                "tc_id": tc.get("tc_id"),
+                "name": tc.get("name"),
+                "given": tc.get("given"),
+                "when": tc.get("when"),
+                "then": tc.get("then"),
+                "api": tc.get("api"),
+            }, ensure_ascii=False),
+            "# Related Routes",
+            "\n".join(route_lines) or "(none)",
+            "# Related Selector Routes",
+            "\n".join(f"- {route}" for route in selector_routes) or "(none)",
+            "# Related Schemas",
+            "\n".join(f"- {name}" for name in schema_names) or "(none)",
+            "# Candidate Sources",
+            "\n".join(candidate_lines),
+            "# Instruction",
+            (
+                "Select up to 3 candidates that are most directly useful for grounding the TC. "
+                "Prefer route component files, selector extracted_from files, and API handler/schema files. "
+                "Do not invent indices. Return JSON only: "
+                '{"selected_indices":[0,1],"rationale":["...","..."]}'
+            ),
+        ])
+
+    def _parse_source_candidate_rerank_response(
+        self,
+        content: str,
+        candidates: list[dict[str, Any]],
+    ) -> tuple[list[dict[str, Any]], list[str]]:
+        payload = json.loads((content or "").strip())
+        indices = payload.get("selected_indices") or []
+        rationales = payload.get("rationale") or []
+        selected: list[dict[str, Any]] = []
+        seen: set[int] = set()
+        for raw_idx in indices[:3]:
+            try:
+                idx = int(raw_idx)
+            except (TypeError, ValueError):
+                continue
+            if idx < 0 or idx >= len(candidates) or idx in seen:
+                continue
+            seen.add(idx)
+            selected.append(candidates[idx])
+        return selected, [str(item) for item in rationales[:3]]
+
+    def _filter_routes_for_tc(
+        self,
+        routes_index: dict[str, Any] | None,
+        selectors: dict[str, Any] | None,
+        api: str | None,
+    ) -> list[dict[str, Any]]:
+        if not routes_index:
+            return []
+
+        route_records = list(routes_index.get("routes") or [])
+        if not route_records:
+            return []
+
+        selected_routes = set((selectors or {}).get("by_route", {}).keys())
+        if selected_routes:
+            matched = [r for r in route_records if str(r.get("path") or "") in selected_routes]
+            if matched:
+                return matched
+
+        _, path = self._parse_api_for_context(api)
+        key = self._last_segment_for_context(path)
+        if not key:
+            return []
+
+        matched = [
+            r for r in route_records
+            if self._last_segment_for_context(str(r.get("path") or "")).lower() == key
+        ]
+        if matched:
+            return matched
+
+        if any(term in (path or "").lower() for term in ("signup", "login", "auth")):
+            return [
+                r for r in route_records
+                if any(term in str(r.get("path") or "").lower() for term in ("signup", "login"))
+            ]
+        return []
+
+    def _pick_source_targets_for_action_mapping(
+        self,
+        tc: dict[str, Any],
+        *,
+        routes: list[dict[str, Any]],
+        selectors: dict[str, Any] | None,
+        schemas: dict[str, Any] | None,
+    ) -> list[dict[str, Any]]:
+        from qapilot.shared.metadata_filters import pick_source_files_for_tc
+
+        out: list[dict[str, Any]] = []
+        seen: set[tuple[str, int | None, int | None]] = set()
+
+        def _add(
+            file_path: str | None,
+            line_start: int | None = None,
+            line_end: int | None = None,
+            *,
+            reason: str,
+        ) -> None:
+            key = (str(file_path or ""), line_start, line_end)
+            if not file_path or key in seen:
+                return
+            seen.add(key)
+            out.append({
+                "file": str(file_path),
+                "line_start": line_start,
+                "line_end": line_end,
+                "reason": reason,
+            })
+
+        for route in routes[:1]:
+            _add(
+                route.get("component_file"),
+                None,
+                None,
+                reason=f"matched frontend route {route.get('path')}",
+            )
+
+        for route_path, route_data in list(((selectors or {}).get("by_route") or {}).items()):
+            for group_key in ("inputs", "buttons", "outputs", "dynamic"):
+                group = list(route_data.get(group_key) or [])
+                for record in group[:1]:
+                    extracted = record.get("extracted_from") or {}
+                    _add(
+                        extracted.get("file"),
+                        None,
+                        None,
+                        reason=f"selector catalog {route_path} {group_key} exemplar",
+                    )
+
+        for item in pick_source_files_for_tc(tc, schemas=schemas):
+            _add(
+                item[0],
+                item[1],
+                item[2],
+                reason="backend router/schema heuristic from TC.api",
+            )
+
+        return out[:4]
+
+    def _dedupe_source_snippets(self, sources: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        seen: set[tuple[str, int | None, int | None]] = set()
+        out: list[dict[str, Any]] = []
+        for snippet in sources:
+            key = (
+                str(snippet.get("file") or ""),
+                snippet.get("line_start"),
+                snippet.get("line_end"),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(snippet)
+        return out[:4]
+
+    def _format_route_context(self, routes: list[dict[str, Any]] | None) -> str:
+        if not routes:
+            return "관련 route 정보 없음"
+        lines: list[str] = []
+        for route in routes[:3]:
+            guards = [g.get("name") for g in (route.get("guards") or []) if g.get("name")]
+            lines.append(
+                f"- path={route.get('path')} component={route.get('component_file') or route.get('component_name') or ''} "
+                f"guards={guards or []} meta={route.get('meta') or {}}"
+            )
+        return "\n".join(lines)
+
+    def _format_selector_catalog(self, selectors: dict[str, Any] | None) -> str:
+        by_route = (selectors or {}).get("by_route") or {}
+        if not by_route:
+            return "관련 selector 카탈로그 없음"
+        lines: list[str] = []
+        for route, route_data in list(by_route.items())[:2]:
+            lines.append(f"[route] {route}")
+            for item in list(route_data.get("inputs") or [])[:8]:
+                lines.append(
+                    f"- input testid={item.get('testid')} label={item.get('label')} "
+                    f"placeholder={item.get('placeholder')} v_model={item.get('v_model')} "
+                    f"validators={item.get('validators') or []}"
+                )
+            for item in list(route_data.get("buttons") or [])[:4]:
+                disabled = ((item.get("disabled_when") or {}).get("expr") if isinstance(item.get("disabled_when"), dict) else None)
+                lines.append(
+                    f"- button testid={item.get('testid')} label={item.get('label')} "
+                    f"role={item.get('form_role')} disabled_when={disabled}"
+                )
+            for item in list(route_data.get("outputs") or [])[:4]:
+                lines.append(
+                    f"- output testid={item.get('testid')} kind={item.get('semantic_kind')} "
+                    f"purpose={item.get('semantic_purpose')} v_if={item.get('v_if')}"
+                )
+            for item in list(route_data.get("dynamic") or [])[:4]:
+                lines.append(
+                    f"- dynamic testid={item.get('testid')} purpose={item.get('semantic_purpose')} v_if={item.get('v_if')}"
+                )
+        return "\n".join(lines)
+
+    def _format_schema_context(self, schemas: dict[str, Any] | None) -> str:
+        if not schemas:
+            return "관련 backend schema 없음"
+        lines: list[str] = []
+        for name, spec in list((schemas.get("request_schemas") or {}).items())[:2]:
+            lines.append(f"[request_schema] {name}")
+            for field in spec.get("fields") or []:
+                validators = [
+                    f"{v.get('kind')}({v.get('value')})" if v.get("value") is not None else str(v.get("kind"))
+                    for v in (field.get("validators") or [])
+                ]
+                lines.append(
+                    f"- {field.get('name')} type={field.get('type')} required={field.get('required')} "
+                    f"sensitive={field.get('sensitive')} validators={validators}"
+                )
+        for name, spec in list((schemas.get("response_schemas") or {}).items())[:2]:
+            lines.append(f"[response_schema] {name}")
+            for status in spec.get("status_codes") or []:
+                lines.append(
+                    f"- status={status.get('code')} desc={status.get('description')} "
+                    f"handler={status.get('extracted_from_handler')}"
+                )
+        return "\n".join(lines) if lines else "관련 backend schema 없음"
+
+    def _format_source_context(self, sources: list[dict[str, Any]] | None) -> str:
+        if not sources:
+            return "관련 원본 소스 없음"
+        lines: list[str] = []
+        for snippet in sources[:4]:
+            file_path = snippet.get("file") or ""
+            line_start = snippet.get("line_start")
+            line_end = snippet.get("line_end")
+            header = f"[source] {file_path}"
+            if line_start and line_end:
+                header += f":{line_start}-{line_end}"
+            lines.append(header)
+            lines.append(str(snippet.get("content") or "").strip())
+        return "\n".join(lines)
+
+    def _build_mapping_context_refs(self, tc_context: dict[str, Any]) -> dict[str, Any]:
+        routes = tc_context.get("routes") or []
+        selectors = (tc_context.get("selectors") or {}).get("by_route") or {}
+        schemas = tc_context.get("schemas") or {}
+        sources = tc_context.get("sources") or []
+        source_candidates = tc_context.get("source_candidates") or []
+        source_status = tc_context.get("source_status") or "not_requested"
+        source_selection_method = tc_context.get("source_selection_method") or "none"
+        source_selection_notes = tc_context.get("source_selection_notes") or []
+
+        return {
+            "route_refs": [
+                {
+                    "path": route.get("path"),
+                    "component_file": route.get("component_file"),
+                    "component_name": route.get("component_name"),
+                }
+                for route in routes[:3]
+            ],
+            "selector_route_refs": [
+                {
+                    "route": route_path,
+                    "input_count": len((route_data or {}).get("inputs") or []),
+                    "button_count": len((route_data or {}).get("buttons") or []),
+                    "output_count": len((route_data or {}).get("outputs") or []),
+                    "dynamic_count": len((route_data or {}).get("dynamic") or []),
+                }
+                for route_path, route_data in list(selectors.items())[:3]
+            ],
+            "schema_refs": {
+                "request_schemas": list((schemas.get("request_schemas") or {}).keys())[:5],
+                "response_schemas": list((schemas.get("response_schemas") or {}).keys())[:5],
+                "db_models": list((schemas.get("db_models") or {}).keys())[:5],
+            },
+            "source_refs": [
+                {
+                    "file": snippet.get("file"),
+                    "line_start": snippet.get("line_start"),
+                    "line_end": snippet.get("line_end"),
+                }
+                for snippet in sources[:5]
+            ],
+            "source_status": source_status,
+            "source_selection_method": source_selection_method,
+            "source_selection_notes": [str(item) for item in source_selection_notes[:3]],
+            "source_candidates": [
+                {
+                    "file": candidate.get("file"),
+                    "line_start": candidate.get("line_start"),
+                    "line_end": candidate.get("line_end"),
+                    "reason": candidate.get("reason"),
+                }
+                for candidate in source_candidates[:6]
+            ],
+        }
+
+    def _slice_source_lines(
+        self,
+        text: str,
+        line_start: int | None,
+        line_end: int | None,
+    ) -> str:
+        if line_start is None and line_end is None:
+            return text
+        lines = text.splitlines(keepends=True)
+        start_idx = max(0, (line_start or 1) - 1)
+        end_idx = len(lines) if line_end is None else min(len(lines), line_end)
+        return "".join(lines[start_idx:end_idx])
+
+    def _parse_api_for_context(self, api: str | None) -> tuple[str | None, str | None]:
+        m = re.match(r"^\s*(GET|POST|PUT|PATCH|DELETE)\s+(/\S+)\s*$", str(api or ""), re.IGNORECASE)
+        if not m:
+            return None, None
+        return m.group(1).upper(), m.group(2)
+
+    def _last_segment_for_context(self, path: str | None) -> str:
+        parts = [p for p in str(path or "").split("/") if p]
+        return parts[-1] if parts else ""
 
     def _load_frontend_dom(self, context: dict[str, Any]) -> list[dict]:
-        """frontend DOM 인덱스 로드 — context 우선, 없으면 qapilot_dir/DB/S3 순 fallback.
+        """frontend DOM 인덱스 로드 — context 우선, 없으면 DB/S3 mirror fallback.
 
-        우선순위:
+        정책:
         1) context["frontend_dom"] 직접 주입
-        2) context["frontend_index_path"]
-        3) context["qapilot_dir"]/codebase-index/frontend.json
-        4) DB 메타 + S3 mirror (service_id / commit_hash 제공 시)
-        5) 레거시 CWD `.qapilot/codebase-index/frontend.json`
+        2) DB 메타 + S3 mirror (service_id / commit_hash 제공 시)
+        3) 그 외 빈 list
         """
-        from pathlib import Path
 
         from qapilot.db.code_reader import load_codebase_index
-        from qapilot.tools.frontend_dom_scanner import load_frontend_index
 
         # 1) context 우선 (테스트/외부 caller 가 직접 전달 가능)
         ctx_dom = context.get("frontend_dom")
         if isinstance(ctx_dom, list):
             return ctx_dom
 
-        # 2) 명시 경로
-        index_path = context.get("frontend_index_path")
-        if index_path:
-            elements = load_frontend_index(Path(str(index_path)))
-            if elements:
-                return elements
-
-        # 3) qapilot_dir 기준 디스크 fallback
-        qapilot_dir = context.get("qapilot_dir")
-        if qapilot_dir:
-            elements = load_frontend_index(
-                Path(str(qapilot_dir)) / "codebase-index" / "frontend.json"
-            )
-            if elements:
-                self.logger.info("frontend_dom_index_loaded", element_count=len(elements))
-                return elements
-
-        # 4) DB+S3 mirror fallback
+        # 2) DB+S3 mirror fallback
         service_id = context.get("service_id")
         if service_id:
             payload = load_codebase_index(
@@ -417,19 +1077,11 @@ class ActionMapperAgent(BaseAgent):
                     )
                     return elements
 
-        # 5) 레거시 CWD fallback
-        elements = load_frontend_index(Path(".qapilot") / "codebase-index" / "frontend.json")
-        if elements:
-            self.logger.info(
-                "frontend_dom_index_loaded",
-                element_count=len(elements),
-            )
-        else:
-            self.logger.debug(
-                "frontend_dom_index_empty",
-                hint="qapilot init 또는 rescan 으로 .qapilot/codebase-index/frontend.json 생성 권장",
-            )
-        return elements
+        self.logger.debug(
+            "frontend_dom_index_empty",
+            hint="service_id mirror 에 frontend index 가 없음",
+        )
+        return []
 
     def _format_frontend_dom(self, elements: list[dict]) -> str:
         """frontend DOM element list 를 프롬프트용 문자열로 변환.
@@ -438,7 +1090,7 @@ class ActionMapperAgent(BaseAgent):
         를 한 줄씩 표기. 최대 200 elements 제한 (LLM 토큰 폭증 방지).
         """
         if not elements:
-            return "인덱스 없음 (qapilot init/rescan 으로 .qapilot/codebase-index/frontend.json 생성 시 활용 가능)"
+            return "인덱스 없음 (service_id mirror 에 frontend index 없음)"
 
         lines: list[str] = []
         for el in elements[:200]:
@@ -694,12 +1346,22 @@ class ActionMapperAgent(BaseAgent):
         return None, None
 
     def _resolve_mapping_with_frontend(
-        self, action_mapping: ActionMapping, tc: dict[str, Any], frontend_dom: list[dict]
+        self,
+        action_mapping: ActionMapping,
+        tc: dict[str, Any],
+        frontend_dom: list[dict],
+        *,
+        tc_context: dict[str, Any] | None = None,
     ) -> ActionMapping:
         """LLM 이 만든 step intent 를 frontend index 원소로만 resolve 한다."""
         mapping = dict(action_mapping)
         scenario_text = " ".join(str(tc.get(key) or "") for key in ("name", "given", "when", "then"))
-        route_hint = self._route_hint_from_elements(frontend_dom) or self._route_hint_from_tc(tc)
+        route_hint = (
+            self._route_hint_from_tc_context(tc_context)
+            or self._route_hint_from_elements(frontend_dom)
+            or self._route_hint_from_tc(tc)
+        )
+        candidate_dom = self._route_scoped_frontend_dom(frontend_dom, tc_context, route_hint)
         steps: list[ActionStep] = []
 
         for raw_step in mapping.get("steps") or []:
@@ -712,7 +1374,22 @@ class ActionMapperAgent(BaseAgent):
                 continue
 
             intent = self._infer_step_intent(step, tc, scenario_text)
-            resolved = self._resolve_selector_from_intent(action, intent, frontend_dom, route_hint, scenario_text)
+            if self._should_skip_toggle_step(action, intent, tc):
+                self.logger.info(
+                    "action_mapping_toggle_step_skipped",
+                    tc_id=mapping.get("tc_id"),
+                    step_no=step.get("step_no"),
+                    action=action,
+                    target_name=intent.get("target_name"),
+                )
+                continue
+            resolved = self._resolve_selector_from_intent(
+                action,
+                intent,
+                candidate_dom,
+                route_hint,
+                scenario_text,
+            )
             if resolved is None:
                 self.logger.warning(
                     "action_mapping_selector_unresolved",
@@ -730,13 +1407,147 @@ class ActionMapperAgent(BaseAgent):
                 step["target_name"] = intent["target_name"]
             if intent.get("target_kind"):
                 step["target_kind"] = intent["target_kind"]
+            step = self._downgrade_self_referential_assert_text(step, mapping.get("tc_id"))
             if action in {"assert", "assert_visible"}:
                 step["expected"] = None
             steps.append(step)
 
+        steps = self._repair_assert_steps(
+            steps,
+            tc,
+            candidate_dom,
+            route_hint,
+            scenario_text,
+            mapping.get("tc_id"),
+        )
         steps = self._ensure_navigate_step(steps, route_hint)
         mapping["steps"] = steps
         return mapping
+
+    def _downgrade_self_referential_assert_text(
+        self,
+        step: ActionStep,
+        tc_id: str | None,
+    ) -> ActionStep:
+        action = str(step.get("action") or "").strip().lower()
+        selector = str(step.get("selector") or "").strip()
+        expected = str(step.get("expected") or "").strip()
+        if action != "assert_text" or not selector or not expected:
+            return step
+        if selector != expected:
+            return step
+
+        updated = dict(step)
+        updated["action"] = "assert_visible"
+        updated["expected"] = None
+        self.logger.info(
+            "action_mapping_assert_text_downgraded",
+            tc_id=tc_id,
+            step_no=step.get("step_no"),
+            selector=selector,
+        )
+        return updated
+
+    def _route_hint_from_tc_context(self, tc_context: dict[str, Any] | None) -> str | None:
+        selectors = ((tc_context or {}).get("selectors") or {}).get("by_route") or {}
+        if len(selectors) == 1:
+            return next(iter(selectors.keys()))
+        routes = list((tc_context or {}).get("routes") or [])
+        if len(routes) == 1:
+            route_path = str(routes[0].get("path") or "").strip()
+            if route_path:
+                return route_path
+        return None
+
+    def _route_scoped_frontend_dom(
+        self,
+        frontend_dom: list[dict],
+        tc_context: dict[str, Any] | None,
+        route_hint: str | None,
+    ) -> list[dict]:
+        catalog_elements = self._catalog_elements_from_tc_context(tc_context)
+        route_dom = list(frontend_dom or [])
+        if route_hint:
+            route_dom = [
+                el for el in route_dom
+                if str(el.get("route") or "").strip() in {"", route_hint}
+            ]
+
+        catalog_testids = {
+            str(el.get("testid") or "").strip()
+            for el in catalog_elements
+            if str(el.get("testid") or "").strip()
+        }
+        if catalog_testids:
+            strict_route_dom = [
+                el for el in route_dom
+                if str(el.get("testid") or "").strip() in catalog_testids
+            ]
+            if strict_route_dom:
+                route_dom = strict_route_dom
+
+        combined: list[dict] = []
+        seen: set[tuple[str, str, str, str]] = set()
+        for el in catalog_elements + route_dom:
+            key = (
+                str(el.get("route") or ""),
+                str(el.get("testid") or ""),
+                str(el.get("label") or ""),
+                str(el.get("placeholder") or ""),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            combined.append(el)
+        return combined or route_dom or catalog_elements or list(frontend_dom or [])
+
+    def _catalog_elements_from_tc_context(self, tc_context: dict[str, Any] | None) -> list[dict]:
+        selectors = ((tc_context or {}).get("selectors") or {}).get("by_route") or {}
+        out: list[dict] = []
+
+        def _append(route_path: str, record: dict[str, Any], *, group: str) -> None:
+            extracted = record.get("extracted_from") or {}
+            semantic_purpose = str(record.get("semantic_purpose") or "").strip()
+            semantic_kind = str(record.get("semantic_kind") or "").strip()
+            text = str(record.get("text") or "").strip()
+            label = str(record.get("label") or "").strip()
+            placeholder = str(record.get("placeholder") or "").strip()
+            testid = str(record.get("testid") or "").strip()
+            file_path = extracted.get("file")
+            if group == "inputs":
+                control_type = "form_input"
+                actionable = True
+            elif group == "buttons":
+                role = str(record.get("form_role") or "").strip().lower()
+                control_type = "submit" if role == "submit" else "button"
+                actionable = True
+            elif group == "dynamic":
+                control_type = "feedback_dynamic"
+                actionable = False
+            else:
+                control_type = f"feedback_{semantic_kind}" if semantic_kind else "label"
+                actionable = False
+            out.append({
+                "tag": "div",
+                "text": text or semantic_purpose,
+                "placeholder": placeholder,
+                "label": label or semantic_purpose,
+                "testid": testid,
+                "name": str(record.get("name") or "").strip(),
+                "id": str(record.get("id") or "").strip(),
+                "file": file_path,
+                "page": "",
+                "route": route_path,
+                "actionable": actionable,
+                "control_type": control_type,
+                "dynamic_testid_pattern": str(record.get("dynamic_testid_pattern") or "").strip(),
+            })
+
+        for route_path, route_data in selectors.items():
+            for group in ("inputs", "buttons", "outputs", "dynamic"):
+                for record in list((route_data or {}).get(group) or []):
+                    _append(route_path, record, group=group)
+        return out
 
     def _ensure_navigate_step(
         self, steps: list[ActionStep], route_hint: str | None
@@ -773,6 +1584,7 @@ class ActionMapperAgent(BaseAgent):
         selector = str(step.get("selector") or "").strip()
         value = step.get("value")
         expected = str(step.get("expected") or "").strip()
+        tc_then = str(tc.get("then") or "").strip()
         explicit_target_name = str(step.get("target_name") or "").strip()
         explicit_target_kind = str(step.get("target_kind") or "").strip()
 
@@ -796,9 +1608,17 @@ class ActionMapperAgent(BaseAgent):
 
         if action in {"click", "dblclick", "hover", "check", "uncheck"}:
             target_text = selector if self._is_meaningful_selector_hint(selector, value) else scenario_text
-            target_kind = "submit" if any(tok in scenario_text.lower() for tok in ("회원가입", "signup", "가입")) else "actionable"
+            target_name = (
+                self._boolean_field_from_tc(tc, action, selector, scenario_text)
+                or self._field_from_hint(selector)
+            )
+            target_kind = (
+                "checkbox"
+                if action in {"check", "uncheck"}
+                else ("submit" if any(tok in scenario_text.lower() for tok in ("회원가입", "signup", "가입")) else "actionable")
+            )
             return {
-                "target_name": self._field_from_hint(selector),
+                "target_name": target_name,
                 "target_kind": target_kind,
                 "target_text": target_text or None,
             }
@@ -807,7 +1627,7 @@ class ActionMapperAgent(BaseAgent):
             return {
                 "target_name": None,
                 "target_kind": "assertion",
-                "target_text": expected or selector or str(tc.get("then") or "") or None,
+                "target_text": expected or tc_then or selector or None,
             }
 
         return {"target_name": None, "target_kind": None, "target_text": selector or None}
@@ -819,8 +1639,18 @@ class ActionMapperAgent(BaseAgent):
         frontend_dom: list[dict],
         route_hint: str | None,
         scenario_text: str,
+        min_score: float | None = None,
     ) -> dict[str, str] | None:
         candidates = self._frontend_candidates_for_action(action, frontend_dom, route_hint)
+        target_kind = str(intent.get("target_kind") or "").strip().lower()
+        if action in {"click", "dblclick", "hover"} and target_kind == "submit":
+            submit_candidates = [
+                el for el in candidates
+                if str(el.get("control_type") or "").lower() in {"submit", "button"}
+                or str(el.get("tag") or "").lower() == "button"
+            ]
+            if submit_candidates:
+                candidates = submit_candidates
         if not candidates:
             return None
 
@@ -840,14 +1670,125 @@ class ActionMapperAgent(BaseAgent):
         if best_el is None:
             return None
 
-        threshold = 0.8 if action in _ASSERT_ACTIONS else 0.7
+        threshold = min_score if min_score is not None else (0.8 if action in _ASSERT_ACTIONS else 0.7)
         if best_score < threshold:
             return None
+        target_text = str(intent.get("target_text") or "").strip().lower()
+        if action in _ASSERT_ACTIONS and target_text:
+            if not self._assertion_text_matches_element(target_text, best_el):
+                return None
 
         selector, selector_type = self._preferred_selector_for_action(action, best_el)
         if not selector or not selector_type:
             return None
         return {"selector": selector, "selector_type": selector_type}
+
+    def _assertion_text_matches_element(self, target_text: str, element: dict[str, Any]) -> bool:
+        expanded_target = self._expand_aliases(target_text)
+        for key in ("text", "label", "placeholder", "testid", "id", "name"):
+            candidate = str(element.get(key) or "").strip().lower()
+            if not candidate:
+                continue
+            expanded_candidate = self._expand_aliases(candidate)
+            score = difflib.SequenceMatcher(None, expanded_target, expanded_candidate).ratio()
+            if target_text == candidate:
+                return True
+            if target_text in candidate or candidate in target_text:
+                score += _FUZZY_MATCH_SUBSTRING_BONUS
+            score += self._semantic_bonus(target_text, candidate)
+            if score >= 0.55:
+                return True
+        return False
+
+    def _repair_assert_steps(
+        self,
+        steps: list[ActionStep],
+        tc: dict[str, Any],
+        frontend_dom: list[dict],
+        route_hint: str | None,
+        scenario_text: str,
+        tc_id: str | None,
+    ) -> list[ActionStep]:
+        if not frontend_dom:
+            return steps
+
+        repaired: list[ActionStep] = []
+        for step in steps:
+            action = str(step.get("action") or "")
+            if action not in _ASSERT_ACTIONS:
+                repaired.append(step)
+                continue
+
+            selector = str(step.get("selector") or "").strip()
+            selector_type = str(step.get("selector_type") or "").strip()
+            in_route_catalog = self._selector_exists_in_candidates(selector, selector_type, frontend_dom)
+            if in_route_catalog:
+                repaired.append(step)
+                continue
+
+            repair_text = (
+                str(tc.get("then") or "").strip()
+                or str(step.get("expected") or "").strip()
+            )
+            repair_intent = {
+                "target_name": str(step.get("target_name") or "").strip() or None,
+                "target_kind": "assertion",
+                "target_text": repair_text or None,
+            }
+            resolved = None
+            if repair_text:
+                resolved = self._resolve_selector_from_intent(
+                    action,
+                    repair_intent,
+                    frontend_dom,
+                    route_hint,
+                    scenario_text,
+                    min_score=0.35,
+                )
+            updated = dict(step)
+            if resolved is not None:
+                updated["selector"] = resolved["selector"]
+                updated["selector_type"] = resolved["selector_type"]
+                self.logger.info(
+                    "action_mapping_assert_selector_repaired",
+                    tc_id=tc_id,
+                    step_no=step.get("step_no"),
+                    original_selector=selector or None,
+                    repaired_selector=resolved["selector"],
+                    route_hint=route_hint,
+                )
+            else:
+                updated["selector"] = None
+                updated["selector_type"] = None
+                self.logger.warning(
+                    "action_mapping_assert_selector_rejected",
+                    tc_id=tc_id,
+                    step_no=step.get("step_no"),
+                    original_selector=selector or None,
+                    route_hint=route_hint,
+                )
+            repaired.append(updated)
+        return repaired
+
+    def _selector_exists_in_candidates(
+        self,
+        selector: str,
+        selector_type: str,
+        frontend_dom: list[dict],
+    ) -> bool:
+        if not selector:
+            return False
+        normalized_type = selector_type.strip().lower()
+        for el in frontend_dom:
+            for key in ("testid", "text", "label", "placeholder", "id", "name", "dynamic_testid_pattern"):
+                value = str(el.get(key) or "").strip()
+                if not value:
+                    continue
+                if normalized_type == key and value == selector:
+                    return True
+                if value == selector:
+                    return True
+        return False
 
     def _frontend_candidates_for_action(
         self, action: str, frontend_dom: list[dict], route_hint: str | None
@@ -918,6 +1859,8 @@ class ActionMapperAgent(BaseAgent):
             control_type in {"button", "submit", "link", "checkbox", "radio"} or tag in {"button", "a", "input"}
         ):
             score += 0.5
+        if target_kind == "checkbox" and control_type in {"checkbox", "radio"}:
+            score += 1.2
         if action in _ASSERT_ACTIONS:
             if not bool(element.get("actionable")):
                 score += 0.2
@@ -929,6 +1872,10 @@ class ActionMapperAgent(BaseAgent):
                 score += 0.5
 
         if target_kind == "submit":
+            if control_type in {"submit", "button"}:
+                score += 1.2
+            if control_type in {"form_input", "textarea", "select"}:
+                score -= 0.6
             if any(token in str(element.get("text") or "").lower() for token in ("가입", "signup")):
                 score += 0.7
             if any(token in str(element.get("testid") or "").lower() for token in ("signup", "submit")):
@@ -961,6 +1908,90 @@ class ActionMapperAgent(BaseAgent):
             if str(item.get("value") or "").strip() == target:
                 return self._canonical_field_name(str(item.get("field") or ""))
         return None
+
+    def _boolean_field_from_tc(
+        self,
+        tc: dict[str, Any],
+        action: str,
+        selector_hint: str,
+        scenario_text: str,
+    ) -> str | None:
+        desired = True if action == "check" else False if action == "uncheck" else None
+        hinted_field = self._field_from_hint(selector_hint) or self._field_from_hint(scenario_text)
+        matching_bool_fields: list[str] = []
+        fallback_bool_fields: list[str] = []
+
+        for item in tc.get("values") or []:
+            field_name = self._canonical_field_name(str(item.get("field") or ""))
+            bool_value = self._coerce_bool(item.get("value"))
+            if not field_name or bool_value is None:
+                continue
+            fallback_bool_fields.append(field_name)
+            if desired is None or bool_value == desired:
+                matching_bool_fields.append(field_name)
+
+        if hinted_field and hinted_field in matching_bool_fields:
+            return hinted_field
+        if hinted_field and hinted_field in fallback_bool_fields:
+            return hinted_field
+        if len(matching_bool_fields) == 1:
+            return matching_bool_fields[0]
+        if hinted_field:
+            return hinted_field
+        return None
+
+    def _coerce_bool(self, value: Any) -> bool | None:
+        if isinstance(value, bool):
+            return value
+        lowered = str(value).strip().lower()
+        if lowered in {"true", "1", "yes", "y", "checked"}:
+            return True
+        if lowered in {"false", "0", "no", "n", "unchecked"}:
+            return False
+        return None
+
+    def _should_skip_toggle_step(
+        self,
+        action: str,
+        intent: dict[str, str | None],
+        tc: dict[str, Any],
+    ) -> bool:
+        if action not in {"check", "uncheck"}:
+            return False
+        target_name = str(intent.get("target_name") or "").strip().lower()
+        if not target_name:
+            return False
+
+        desired = True if action == "check" else False
+        for item in tc.get("values") or []:
+            field_name = self._canonical_field_name(str(item.get("field") or ""))
+            if field_name != target_name:
+                continue
+            actual = self._coerce_bool(item.get("value"))
+            if actual is not None and actual != desired:
+                return True
+
+        if target_name == "guardian_consent":
+            is_minor = self._is_minor_from_tc(tc)
+            if is_minor is False:
+                return True
+        return False
+
+    def _is_minor_from_tc(self, tc: dict[str, Any]) -> bool | None:
+        birth_date_value: str | None = None
+        for item in tc.get("values") or []:
+            if self._canonical_field_name(str(item.get("field") or "")) == "birth_date":
+                birth_date_value = str(item.get("value") or "").strip()
+                break
+        if not birth_date_value or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", birth_date_value):
+            return None
+        try:
+            birth = date.fromisoformat(birth_date_value)
+        except ValueError:
+            return None
+        today = date.today()
+        age = today.year - birth.year - ((today.month, today.day) < (birth.month, birth.day))
+        return age < 19
 
     def _field_from_hint(self, hint: str) -> str | None:
         lowered = hint.strip().lower()
