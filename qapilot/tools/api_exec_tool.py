@@ -24,7 +24,12 @@ from typing import Any
 import httpx
 
 from qapilot.shared.logger import get_logger
-from qapilot.shared.precondition_fixture import _login, _resolve_ref_ids
+from qapilot.shared.precondition_fixture import (
+    _apply_field_error,
+    _field_errors_from_422,
+    _login,
+    _resolve_ref_ids,
+)
 
 logger = get_logger(source="api_exec")
 
@@ -131,6 +136,23 @@ def _resolve_env_value(value: str) -> str:
     return s
 
 
+def _uniquify_email_in_body(body: dict, path: str, intent_negative: bool, trace_id: str) -> None:
+    """positive 의도 signup body 의 email 에 run suffix — run 간 데이터 격리.
+
+    UI 경로의 _uniquify_signup_email_for_run 과 동형 (api-mode body 판).
+    negative (중복 의도) 는 기존 값 보존."""
+    if intent_negative or "signup" not in (path or "").lower():
+        return
+    suffix = (trace_id or "").replace("-", "")[:8]
+    if not suffix:
+        return
+    for k, v in list(body.items()):
+        s = str(v or "")
+        if "email" in k.lower() and "@" in s and f"+{suffix}@" not in s:
+            local, _, domain = s.partition("@")
+            body[k] = f"{local}+{suffix}@{domain}"
+
+
 def _build_body(tc: dict) -> dict[str, Any]:
     """TC values → request body. '{설명}' placeholder/빈 값은 제외."""
     body: dict[str, Any] = {}
@@ -193,6 +215,7 @@ async def execute_api_verification(
                 logger.warning("api_exec_login_failed", trace_id=trace_id, tc_id=tc_id)
 
         # path param 해석 — 실존 데이터 (GET /api/{prefix}s 첫 항목 id)
+        ref_ids: dict[str, Any] = {}
         params = _PARAM_RE.findall(path)
         if params:
             ref_ids = await _resolve_ref_ids(client, base, headers, params)
@@ -201,6 +224,8 @@ async def execute_api_verification(
                 path = path.replace("{" + p + "}", str(rid))
 
         body = _build_body(tc) if method in {"POST", "PUT", "PATCH"} else None
+        if body is not None:
+            _uniquify_email_in_body(body, path, intent_negative, trace_id)
         url = f"{base}{path}"
         try:
             resp = await client.request(method, url, json=body, headers=headers)
@@ -208,6 +233,31 @@ async def execute_api_verification(
             out["reason"] = f"호출 실패: {type(e).__name__}: {e}"
             logger.warning("api_exec_request_failed", trace_id=trace_id, tc_id=tc_id, error=str(e)[:120])
             return out
+
+        # 422 자가치유 사다리 (positive 의도 한정) — TC values 의 필수 필드 누락은
+        # 검증 대상이 아니라 요청 구성 결함이다 (run 04d5f79e: scheduled-change 가
+        # new_plan_id/effective_date 중 하나만 보유 → 422). negative 의도는 4xx
+        # 자체가 기대 결과라 치유 금지 (false-pass 채널 방지).
+        healed_attempts = 0
+        if not intent_negative and method in {"POST", "PUT", "PATCH"}:
+            while resp.status_code == 422 and healed_attempts < 3:
+                try:
+                    errors = _field_errors_from_422(resp.json())
+                except Exception:
+                    errors = []
+                if not errors or body is None:
+                    break
+                for loc_path, err_type, ctx in errors:
+                    _apply_field_error(body, loc_path, err_type, ctx, ref_ids)
+                healed_attempts += 1
+                try:
+                    resp = await client.request(method, url, json=body, headers=headers)
+                except Exception as e:
+                    out["reason"] = f"치유 재시도 호출 실패: {type(e).__name__}: {e}"
+                    return out
+            if healed_attempts:
+                logger.info("api_exec_body_healed", trace_id=trace_id, tc_id=tc_id,
+                            attempts=healed_attempts, final_status=resp.status_code)
 
         try:
             response_body = resp.json() if resp.content else None
@@ -227,6 +277,8 @@ async def execute_api_verification(
         out["calls"] = [call]
         out["total_calls"] = 1
         out["error_calls"] = 1 if resp.status_code >= 400 else 0
+        if healed_attempts:
+            out["healed_attempts"] = healed_attempts
 
         # 판정 ① 헤더 계약형
         header_key = _header_contract(then)
