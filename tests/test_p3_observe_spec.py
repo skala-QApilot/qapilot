@@ -554,3 +554,82 @@ class TestStatusClassMatchAndMissingPremise:
         )
         assert out["verdict"] == "pass"
         assert out.get("value_grounded")
+
+
+class TestMissingSubjectMatchesParam:
+    """run a5eca9eb 회귀 (TS-017-TC-04): 'Contract not found' 기대 TC 에
+    비실존 order id 를 주입 → SUT 가 'Order not found' 분기를 탐.
+    결핍 주체가 path param 자원과 일치할 때만 비실존 id 가 옳다."""
+
+    def _patch(self, monkeypatch, handler):
+        import httpx
+
+        from qapilot.tools import api_exec_tool as aet
+        orig = httpx.AsyncClient
+        monkeypatch.setattr(
+            aet.httpx, "AsyncClient",
+            lambda **kw: orig(transport=httpx.MockTransport(handler), **kw))
+
+    @pytest.mark.asyncio
+    async def test_response_resource_missing_uses_real_id(self, monkeypatch):
+        # 'Contract not found' + param order_id — 주체 불일치 → 실존 id 유지
+        import httpx
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            p = request.url.path
+            if p.endswith("/login"):
+                return httpx.Response(200, json={"token": "t"})
+            if p == "/api/orders" and request.method == "GET":
+                return httpx.Response(200, json=[{"id": 7}])
+            if p == "/api/contracts/7":
+                return httpx.Response(404, json={"detail": "Contract not found"})
+            if "999999999" in p:
+                return httpx.Response(404, json={"detail": "Order not found"})
+            return httpx.Response(404, json={"detail": "Order not found"})
+
+        self._patch(monkeypatch, handler)
+        from qapilot.tools import api_exec_tool as aet
+        out = await aet.execute_api_verification(
+            tc={"tc_id": "T1", "api": "GET /api/contracts/{order_id}",
+                "then": "404 'Contract not found' 에러가 발생한다.",
+                "observe": [
+                    {"kind": "http_status", "expected": [404]},
+                    {"kind": "response_body", "path": "$.error",
+                     "predicate": {"eq": "Contract not found"}},
+                ], "values": []},
+            base_url="http://sut", test_account={"email": "a", "password": "b"},
+            intent_negative=True, auth_negative=False,
+        )
+        assert out["verdict"] == "pass"
+        assert "/api/contracts/7" in out["calls"][0]["url"]
+
+    @pytest.mark.asyncio
+    async def test_param_resource_missing_uses_nonexistent_id(self, monkeypatch):
+        # 'Order not found' + param order_id — 주체 일치 → 비실존 id 유지
+        import httpx
+        seen = {}
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            p = request.url.path
+            if p.endswith("/login"):
+                return httpx.Response(200, json={"token": "t"})
+            if p == "/api/orders" and request.method == "GET":
+                return httpx.Response(200, json=[{"id": 7}])
+            seen["path"] = p
+            return httpx.Response(404, json={"detail": "Order not found"})
+
+        self._patch(monkeypatch, handler)
+        from qapilot.tools import api_exec_tool as aet
+        out = await aet.execute_api_verification(
+            tc={"tc_id": "T2", "api": "PATCH /api/orders/{order_id}/cancel",
+                "then": "'Order not found' 메시지가 반환된다.",
+                "observe": [
+                    {"kind": "http_status", "expected": [404]},
+                    {"kind": "response_body", "path": "$.message",
+                     "predicate": {"eq": "Order not found"}},
+                ], "values": []},
+            base_url="http://sut", test_account={"email": "a", "password": "b"},
+            intent_negative=True, auth_negative=False,
+        )
+        assert "999999999" in seen["path"]
+        assert out["verdict"] == "pass"

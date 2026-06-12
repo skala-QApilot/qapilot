@@ -522,6 +522,17 @@ async def execute_api_verification(
         expects_missing = intent_negative and any(
             k in then.lower() for k in ("not found", "존재하지 않", "찾을 수 없", "404")
         )
+        if expects_missing and params:
+            # 'X not found' 의 X 가 path param 자원과 일치할 때만 비실존 id 가
+            # 옳다 — 'Contract not found' 의 결핍 대상은 응답 자원 (contract)
+            # 이지 path 의 order 가 아니므로, 비실존 order id 를 넣으면 SUT 가
+            # 다른 분기 ('Order not found') 를 탄다 (run a5eca9eb TS-017-TC-04
+            # 회귀 실증). 주체 불명 (한국어 서술 등) 은 기존대로 비실존 id.
+            m = re.search(r"([a-z]+)\s+not\s+found", then.lower())
+            if m:
+                param_stems = {p.lower().removesuffix("_id") for p in params}
+                if m.group(1) not in param_stems:
+                    expects_missing = False
         if params and expects_missing:
             for p in params:
                 ref_ids[p.lower()] = 999_999_999
