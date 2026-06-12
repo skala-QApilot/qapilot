@@ -3167,6 +3167,11 @@ def _decide_verify_mode(
     if _db_contract(tc_then):
         return "api"
     steps = (original_mapping or {}).get("steps") or []
+    if not steps:
+        # 빈 매핑 — UI 로 검증할 것이 없다. 기존엔 UI 시도 → 60s 타임아웃 →
+        # api 폴백이었음 (run 1ead19b7: UITestTool 438s 의 다수). 선제 라우팅
+        # 은 같은 verdict 를 타임아웃 없이 만든다.
+        return "api"
     resolved_asserts = sum(
         1 for s in steps
         if str(s.get("action") or "").startswith("assert") and s.get("selector")
@@ -3707,6 +3712,30 @@ async def _cross_check(state: PipelineState) -> dict:
         db_result = db_map.get(tc_id, {})
         scenario_intent = tc_intent_map.get(str(tc_id)) or {}
 
+        # api-mode: exec 판정이 최종이라 cc LLM (summary 생성) 의 부가가치가
+        # 없다 — agent 호출 생략 (run 1ead19b7: cc 335s 중 api-mode 105 TC
+        # ≈ 300s 가 summary 용 LLM). verdict 경로는 기존과 동일
+        # (api_exec_verdict → _derive_cc_status / has_mismatch → Layer 3).
+        if (ui_result or {}).get("verify_mode") == "api" and (
+            (api_trace or {}).get("verdict") in ("pass", "fail")
+        ):
+            _v = api_trace["verdict"]
+            cross_check_results.append({
+                "tc_id": tc_id,
+                "match_score": 1.0 if _v == "pass" else 0.0,
+                "matched_fields": 1 if _v == "pass" else 0,
+                "mismatched_fields": 0 if _v == "pass" else 1,
+                "mismatches": [],
+                "has_mismatch": _v == "fail",
+                "api_exec_verdict": _v,
+                "intent_satisfied": _v == "pass",
+                "error_code": "",
+                "summary": str((ui_result or {}).get("summary") or ""),
+            })
+            if _v == "fail":
+                any_mismatch = True
+            continue
+
         agent = CrossCheckAgent(trace_id=trace_id)
         try:
             output = await agent.run(
@@ -3914,6 +3943,57 @@ async def _root_cause(state: PipelineState) -> dict:
     # agent_logs 누적 append — Layer 3 cost 집계 (#232).
     agent_logs = state.get("agent_logs", [])
 
+    # service_id 1회 해석 (병렬 task 들이 공유)
+    _svc_id = state.get("service_id") or (load_trace(state["trace_id"]) or {}).get("service_id")
+
+    async def _run_rc_llm(cc: dict, tc_id: str) -> tuple[dict, dict | None]:
+        """PRODUCT 후보 1건의 LLM 추론 — (rc_item, agent_log)."""
+        try:
+            agent = RootCauseAgent(trace_id=trace_id)
+            output = await agent.run(
+                AgentInput(
+                    trace_id=trace_id,
+                    context={
+                        # SaaS 흐름에서 RootCauseAgent 가 codebase-index 로드하려면
+                        # state.qapilot_dir 가 필요 (#245, #248 — service_id 동형).
+                        "qapilot_dir": state.get("qapilot_dir"),
+                        "service_id": _svc_id,
+                        # 실측 실행 컨텍스트 — fail step/error (run 04d5f79e:
+                        # context_not_found 68건 = 더미 파일만 찾던 격차)
+                        "runtime_context": _build_runtime_context(
+                            ui_by_tc.get(str(tc_id))
+                        ),
+                    },
+                    params={
+                        "tc_id": tc_id,
+                        "error_code": cc.get("error_code") or "",
+                        "summary": cc.get("summary") or "",
+                        "mismatches": cc.get("mismatches") or [],
+                        "has_mismatch": True,
+                    },
+                )
+            )
+            root_causes = output.result.get("root_causes") or []
+            # 단일 또는 list — list 첫 번째를 결과로. 분류 category 보존.
+            if isinstance(root_causes, list) and root_causes:
+                rc_item = dict(root_causes[0])
+            elif isinstance(root_causes, dict):
+                rc_item = dict(root_causes)
+            else:
+                rc_item = {"tc_id": tc_id, "candidates": []}
+            rc_item.setdefault("category", "PRODUCT_DEFECT_CANDIDATE")
+            return rc_item, output.metadata.model_dump()
+        except Exception as e:
+            return {
+                "tc_id": tc_id,
+                "candidates": [],
+                "error": f"RootCause skip: {type(e).__name__}: {e}",
+            }, None
+
+    # 1차: 결정적 분류 — PRODUCT 후보는 placeholder 로 자리 확보 후
+    # 병렬 LLM (run 1ead19b7: 순차 85호출 1048s = run 의 42% — TC 간 독립이라
+    # 병렬화는 verdict 에 영향 없음. 세마포어 6 으로 rate limit 보호).
+    llm_jobs: list[tuple[int, dict, str]] = []
     for cc in cross_check_results:
         if not cc.get("has_mismatch"):
             continue
@@ -3932,55 +4012,24 @@ async def _root_cause(state: PipelineState) -> dict:
                 "candidates": [{"cause": reason, "confidence": 1.0, "category": category}],
             })
             continue
+        root_cause_results.append({})  # placeholder — 순서 보존
+        llm_jobs.append((len(root_cause_results) - 1, cc, tc_id))
 
-        try:
-            agent = RootCauseAgent(trace_id=trace_id)
-            output = await agent.run(
-                AgentInput(
-                    trace_id=trace_id,
-                    context={
-                        # SaaS 흐름에서 RootCauseAgent 가 codebase-index 로드하려면
-                        # state.qapilot_dir 가 필요. cfg.project.repo_path 는 None →
-                        # fallback Path(".") = qapilot 디렉토리에서 .qapilot/codebase-index
-                        # 찾기 실패 → `codebase_index_empty` warning. 본 fix.
-                        # service_id (#245, #248): state.service_id 가 LangGraph state
-                        # propagation 에서 누락되는 격차 (PipelineState schema 추가 +
-                        # load_trace fallback). 다른 노드 (line 1254/1548) 와 동일 패턴.
-                        "qapilot_dir": state.get("qapilot_dir"),
-                        "service_id": state.get("service_id")
-                            or (load_trace(state["trace_id"]) or {}).get("service_id"),
-                        # 실측 실행 컨텍스트 — fail step/error (run 04d5f79e:
-                        # context_not_found 68건 = 더미 파일만 찾던 격차)
-                        "runtime_context": _build_runtime_context(
-                            ui_by_tc.get(str(tc_id))
-                        ),
-                    },
-                    params={
-                        "tc_id": tc_id,
-                        "error_code": cc.get("error_code") or "",
-                        "summary": cc.get("summary") or "",
-                        "mismatches": cc.get("mismatches") or [],
-                        "has_mismatch": True,
-                    },
-                )
-            )
-            agent_logs = agent_logs + [output.metadata.model_dump()]
-            root_causes = output.result.get("root_causes") or []
-            # 단일 또는 list — list 첫 번째를 결과로. 분류 category 보존.
-            if isinstance(root_causes, list) and root_causes:
-                rc_item = dict(root_causes[0])
-            elif isinstance(root_causes, dict):
-                rc_item = dict(root_causes)
-            else:
-                rc_item = {"tc_id": tc_id, "candidates": []}
-            rc_item.setdefault("category", "PRODUCT_DEFECT_CANDIDATE")
-            root_cause_results.append(rc_item)
-        except Exception as e:
-            root_cause_results.append({
-                "tc_id": tc_id,
-                "candidates": [],
-                "error": f"RootCause skip: {type(e).__name__}: {e}",
-            })
+    if llm_jobs:
+        import asyncio as _asyncio
+        sem = _asyncio.Semaphore(6)
+
+        async def _bounded(cc: dict, tc_id: str):
+            async with sem:
+                return await _run_rc_llm(cc, tc_id)
+
+        gathered = await _asyncio.gather(
+            *[_bounded(cc, tc_id) for _, cc, tc_id in llm_jobs]
+        )
+        for (idx, _, _), (rc_item, log) in zip(llm_jobs, gathered):
+            root_cause_results[idx] = rc_item
+            if log:
+                agent_logs = agent_logs + [log]
 
     return {"root_cause_results": root_cause_results, "agent_logs": agent_logs}
 
@@ -4023,6 +4072,7 @@ async def _fix_recommend(state: PipelineState) -> dict:
         ),
     }
 
+    _fix_llm_jobs: list[tuple[int, str, list]] = []
     for rc in root_cause_results:
         tc_id = rc.get("tc_id", "unknown")
         candidates = rc.get("candidates") or []
@@ -4036,37 +4086,55 @@ async def _fix_recommend(state: PipelineState) -> dict:
             })
             continue
 
-        try:
-            agent = FixRecommenderAgent(trace_id=trace_id)
-            output = await agent.run(
-                AgentInput(
-                    trace_id=trace_id,
-                    context={
-                        # FixRecommender 가 codebase-index fallback 사용 시 필요 (#244, #248)
-                        "qapilot_dir": state.get("qapilot_dir"),
-                        "service_id": state.get("service_id")
-                            or (load_trace(state["trace_id"]) or {}).get("service_id"),
-                    },
-                    params={
-                        "tc_id": tc_id,
-                        "candidates": candidates,
-                    },
+        fix_results.append({})  # placeholder — 순서 보존, 병렬 후 채움
+        _fix_llm_jobs.append((len(fix_results) - 1, tc_id, candidates))
+
+    # PRODUCT 후보 병렬 LLM (root_cause 와 동형 — TC 간 독립, 세마포어 6)
+    if _fix_llm_jobs:
+        import asyncio as _asyncio
+        _svc_id = state.get("service_id") or (load_trace(state["trace_id"]) or {}).get("service_id")
+        sem = _asyncio.Semaphore(6)
+
+        async def _run_fix(tc_id: str, candidates: list) -> tuple[dict, dict | None]:
+            try:
+                agent = FixRecommenderAgent(trace_id=trace_id)
+                output = await agent.run(
+                    AgentInput(
+                        trace_id=trace_id,
+                        context={
+                            # codebase-index fallback 사용 시 필요 (#244, #248)
+                            "qapilot_dir": state.get("qapilot_dir"),
+                            "service_id": _svc_id,
+                        },
+                        params={"tc_id": tc_id, "candidates": candidates},
+                    )
                 )
-            )
-            agent_logs = agent_logs + [output.metadata.model_dump()]
-            fr_list = output.result.get("fix_results") or []
-            if isinstance(fr_list, list) and fr_list:
-                fix_results.append(dict(fr_list[0]))
-            elif isinstance(fr_list, dict):
-                fix_results.append(dict(fr_list))
-            else:
-                fix_results.append({"tc_id": tc_id, "suggestions": []})
-        except Exception as e:
-            fix_results.append({
-                "tc_id": tc_id,
-                "suggestions": [],
-                "error": f"FixRecommender skip: {type(e).__name__}: {e}",
-            })
+                fr_list = output.result.get("fix_results") or []
+                if isinstance(fr_list, list) and fr_list:
+                    item = dict(fr_list[0])
+                elif isinstance(fr_list, dict):
+                    item = dict(fr_list)
+                else:
+                    item = {"tc_id": tc_id, "suggestions": []}
+                return item, output.metadata.model_dump()
+            except Exception as e:
+                return {
+                    "tc_id": tc_id,
+                    "suggestions": [],
+                    "error": f"FixRecommender skip: {type(e).__name__}: {e}",
+                }, None
+
+        async def _bounded_fix(tc_id: str, candidates: list):
+            async with sem:
+                return await _run_fix(tc_id, candidates)
+
+        gathered = await _asyncio.gather(
+            *[_bounded_fix(t, c) for _, t, c in _fix_llm_jobs]
+        )
+        for (idx, _, _), (item, log) in zip(_fix_llm_jobs, gathered):
+            fix_results[idx] = item
+            if log:
+                agent_logs = agent_logs + [log]
 
     return {"fix_results": fix_results, "agent_logs": agent_logs}
 
@@ -4514,7 +4582,21 @@ async def _tc_generate_doc_search(state: PipelineState) -> dict:
     agent_logs = list(state.get("agent_logs") or [])
     result_test_cases: dict[int, list] = {}
 
-    for idx in target_indices:
+    # P3 접지용 스키마 인덱스 — 병렬 task 공유 (1회 로드)
+    _schemas_idx = None
+    if service_id:
+        try:
+            from qapilot.shared.scan_storage import load_metadata_index
+            _schemas_idx = load_metadata_index(service_id, "backend", "schemas")
+        except Exception as e:
+            logger.info("tc_observe_validation_skipped",
+                        trace_id=trace_id, error=f"{type(e).__name__}: {e}")
+
+    async def _gen_one_ts(idx: int) -> None:
+        """TS 1개의 문서검색→TC생성→검증→S3 — TS 간 완전 독립이라 병렬 안전.
+
+        run 84c0e1eb 병목: 25 TS 순차 330s. seed 고정이라 병렬화해도
+        TS별 출력은 동일 (결정성 유지). 세마포어 5 로 rate limit 보호."""
         ts_item = ts_list[idx]
         ts_name = ts_item.get("name", "")
         domain_area = ts_item.get("domain_area", "")
@@ -4564,14 +4646,8 @@ async def _tc_generate_doc_search(state: PipelineState) -> dict:
         analysis = output.result.get("analysis") or []
         _validate_tc_apis_against_scan(test_cases, endpoint_specs, trace_id)
         # P3: observe 의 db_field 접지 검증 — 환각 테이블/컬럼 폐기
-        if service_id:
-            try:
-                from qapilot.shared.scan_storage import load_metadata_index
-                _schemas_idx = load_metadata_index(service_id, "backend", "schemas")
-                _validate_tc_observe_against_scan(test_cases, _schemas_idx, trace_id)
-            except Exception as e:
-                logger.info("tc_observe_validation_skipped",
-                            trace_id=trace_id, error=f"{type(e).__name__}: {e}")
+        if _schemas_idx is not None:
+            _validate_tc_observe_against_scan(test_cases, _schemas_idx, trace_id)
         result_test_cases[idx] = test_cases
 
         if service_id:
@@ -4602,6 +4678,15 @@ async def _tc_generate_doc_search(state: PipelineState) -> dict:
             )
 
         agent_logs.append(output.metadata.model_dump())
+
+    import asyncio as _asyncio
+    _sem = _asyncio.Semaphore(5)
+
+    async def _bounded_gen(idx: int) -> None:
+        async with _sem:
+            await _gen_one_ts(idx)
+
+    await _asyncio.gather(*[_bounded_gen(i) for i in target_indices])
 
     return {"tc_by_ts_index": result_test_cases, "agent_logs": agent_logs}
 
@@ -4669,7 +4754,9 @@ async def _tv_generate_codebase_aware(state: PipelineState) -> dict:
         logger.info("tv_no_commit_sha", trace_id=trace_id,
                     reason="codebase_scan 결과에 git_diff.commit_hash 없음")
 
-    for idx, tcs in tc_by_index.items():
+    async def _tv_one_group(idx, tcs) -> None:
+        # TS 그룹 1개의 TV 채움 — 그룹 간 독립이라 병렬 안전 (run 84c0e1eb
+        # 병목: 120 TC 순차 279s). seed 고정으로 TC별 출력 결정성 유지.
         updated_tcs: list[dict] = []
         for tc in tcs:
             # schemas.db_models 기반으로 TC 와 가장 관련 깊은 테이블 1개 선택 + DB snapshot 조회
@@ -4812,6 +4899,15 @@ async def _tv_generate_codebase_aware(state: PipelineState) -> dict:
                 updated_tcs.append(tc)  # graceful — 원본 보존
 
         updated_tc_by_index[idx] = updated_tcs
+
+    import asyncio as _asyncio
+    _tv_sem = _asyncio.Semaphore(5)
+
+    async def _bounded_tv(idx, tcs) -> None:
+        async with _tv_sem:
+            await _tv_one_group(idx, tcs)
+
+    await _asyncio.gather(*[_bounded_tv(i, t) for i, t in tc_by_index.items()])
 
     return {"tc_by_ts_index": updated_tc_by_index, "agent_logs": agent_logs}
 

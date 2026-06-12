@@ -136,7 +136,8 @@ def test_should_auto_navigate_empty_steps():
 # ── C. chain timeout 단축 — 회귀 (상수 값 자체) ──
 
 
-def test_chain_timeout_constants_v2():
-    """#197 후속 — chain timeout 단축 v2."""
-    assert _CHAIN_PRIMARY_TIMEOUT_MS == 5_000
-    assert _CHAIN_FALLBACK_TIMEOUT_MS == 3_000
+def test_chain_timeout_constants_v3():
+    """#197 후속 v3 (run 1ead19b7 병목) — navigate 가 load state 를 기다린 뒤라
+    3.5s 안에 안 나타나는 요소는 사실상 부재. 절감은 부재(fail 운명) 케이스에만."""
+    assert _CHAIN_PRIMARY_TIMEOUT_MS == 3_500
+    assert _CHAIN_FALLBACK_TIMEOUT_MS == 1_500

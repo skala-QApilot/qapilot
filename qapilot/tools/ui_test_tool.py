@@ -76,8 +76,13 @@ _GET_BY_METHODS = {  # noqa: F841 — spec §4.5.3 매핑표 참조용 (의미 �
 #   후 다음 step skip → ui_result.json 저장 → 다음 TC 진행 보장. ActionMapper 환각으로
 #   selector chain 이 모두 fail 하는 케이스도 trace abort 안 됨.
 # - LLM 추론 selector 가 대부분 1~2 attempt 안에 적중하므로 5s 1차도 충분 (e2e 통계).
-_CHAIN_PRIMARY_TIMEOUT_MS = 5_000
-_CHAIN_FALLBACK_TIMEOUT_MS = 3_000
+#
+# 2026-06-12 v3 (run 1ead19b7 병목 분석): 1 × 3.5s + N × 1.5s = 8s (4 attempt).
+# navigate 가 별도로 load state 를 기다린 뒤라, SPA 렌더 완료 후 3.5s 안에 안
+# 나타나는 요소는 사실상 부재 (fail 운명) — 절감은 부재 케이스에서만 발생해
+# verdict 불변. ui_fallback_chain_retry 303건 × 구간 단축 = run 수 분 절약.
+_CHAIN_PRIMARY_TIMEOUT_MS = 3_500
+_CHAIN_FALLBACK_TIMEOUT_MS = 1_500
 
 # 이슈 #121 (옵션 C): auto-navigate 의 api_endpoint 파싱 패턴.
 # 형식 예: "POST /login" / "GET /plans/{id}" / "/signup".
