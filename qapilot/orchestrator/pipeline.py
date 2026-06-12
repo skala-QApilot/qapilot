@@ -2755,6 +2755,9 @@ async def _test_execution(state: PipelineState) -> dict:
                     }
                     if exec_out.get("db_observation"):
                         api_payload["db_observation"] = exec_out["db_observation"]
+                    if exec_out.get("observe_results"):
+                        # UI 상세 패널이 observe 사유를 표시 (api-mode 스크린샷 대체)
+                        api_payload["observe_results"] = exec_out["observe_results"]
                     db_res = await _run_db_test_safe(
                         tc_id=tc_id, trace_id=trace_id,
                         DBTestTool=DBTestTool, ToolInput=ToolInput,
@@ -2981,6 +2984,8 @@ async def _test_execution(state: PipelineState) -> dict:
                         }
                         if _fb_out.get("db_observation"):
                             api_payload["db_observation"] = _fb_out["db_observation"]
+                        if _fb_out.get("observe_results"):
+                            api_payload["observe_results"] = _fb_out["observe_results"]
                         ui_results[-1] = ui_payload
                         api_results[-1] = api_payload
 
