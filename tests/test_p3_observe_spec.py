@@ -738,3 +738,39 @@ class TestMissingSubjectMatchesParam:
         )
         assert "999999999" in seen["path"]
         assert out["verdict"] == "pass"
+
+    @pytest.mark.asyncio
+    async def test_polluted_pool_creates_fresh_resource(self, monkeypatch):
+        # run b3c98e44: 누적 해지로 전 주문 non-confirmed — 후보 순회 실패 시
+        # 전용 리소스 생성으로 신선한 전제 확보 → 결핍 분기 (404) 도달
+        import httpx
+        seen = []
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            p = request.url.path
+            if p.endswith("/login"):
+                return httpx.Response(200, json={"token": "t"})
+            if p == "/api/orders" and request.method == "GET":
+                return httpx.Response(200, json=[{"id": 4}, {"id": 5}])
+            if p == "/api/orders" and request.method == "POST":
+                return httpx.Response(201, json={"id": 88})
+            seen.append(p)
+            if "/orders/88/" in p and "999999999" in p:
+                return httpx.Response(404, json={"detail": "Benefit not found"})
+            return httpx.Response(400, json={"detail": "Cannot modify benefits of a non-confirmed order"})
+
+        self._patch(monkeypatch, handler)
+        from qapilot.tools import api_exec_tool as aet
+        out = await aet.execute_api_verification(
+            tc={"tc_id": "T6", "api": "POST /api/orders/{order_id}/benefits/{benefit_id}/toggle",
+                "then": "부가서비스 토글이 거부된다.",
+                "observe": [
+                    {"kind": "http_status", "expected": [404]},
+                    {"kind": "response_body", "path": "$.message",
+                     "predicate": {"eq": "Benefit not found"}},
+                ], "values": []},
+            base_url="http://sut", test_account={"email": "a", "password": "b"},
+            intent_negative=True, auth_negative=False,
+        )
+        assert out["verdict"] == "pass"
+        assert any("/orders/88/benefits/999999999" in p for p in seen)

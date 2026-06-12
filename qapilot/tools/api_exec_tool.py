@@ -661,6 +661,26 @@ async def execute_api_verification(
                         resp, url, ref_ids = trial, f"{base}{trial_path}", trial_ids
                         grounded.append(f"path:{p}={cand}")
                         break
+                if resp.status_code != 404:
+                    # 기존 후보 전부 전제 미충족 (누적 run 의 해지 테스트로
+                    # 풀 오염 — run b3c98e44: 전 주문 non-confirmed) —
+                    # 전용 리소스를 새로 만들어 신선한 전제 확보
+                    new_id = await _create_dedicated_resource(client, base, headers, p)
+                    if new_id is not None:
+                        trial_ids = dict(ref_ids)
+                        trial_ids[p.lower()] = new_id
+                        trial_path = path_template
+                        for q in params:
+                            trial_path = trial_path.replace(
+                                "{" + q + "}", str(trial_ids.get(q.lower(), 1)))
+                        try:
+                            trial = await client.request(
+                                method, f"{base}{trial_path}", json=body, headers=headers)
+                            if trial.status_code == 404:
+                                resp, url, ref_ids = trial, f"{base}{trial_path}", trial_ids
+                                grounded.append(f"path:{p}=created:{new_id}")
+                        except Exception:
+                            pass
             if grounded:
                 logger.info("api_exec_value_grounded", trace_id=trace_id,
                             tc_id=tc_id, replacements=grounded,
