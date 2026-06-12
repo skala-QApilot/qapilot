@@ -2668,6 +2668,48 @@ async def _test_execution(state: PipelineState) -> dict:
                 logger.info("api_mode_db_schemas_unavailable",
                             trace_id=trace_id, error=f"{type(e).__name__}: {e}")
 
+            # ── api-mode 참고 화면 캡처 — 검증 증거가 아니라 보고/확인용 부가물
+            # (검증은 API 응답이 수행). 공유 컨텍스트 1개 재사용: 첫 캡처에서
+            # 로그인 화면이면 1회 로그인해 세션 유지. 실패는 전부 무시.
+            # 파일명 step_1.png → 기존 mirror 가 S3+tc_artifacts 로 업로드.
+            _cap_state: dict = {"page": None, "logged_in": False}
+
+            async def _capture_reference(tc_api: str | None, shots_dir: Path) -> None:
+                if not (target_url and tc_api):
+                    return
+                try:
+                    if _cap_state["page"] is None:
+                        _cap_ctx = await browser.new_context()
+                        _cap_state["page"] = await _cap_ctx.new_page()
+                    page_c = _cap_state["page"]
+                    parts = str(tc_api).split(" ", 1)
+                    seg = "/"
+                    if len(parts) == 2:
+                        segs = [s for s in parts[1].split("/")
+                                if s and s != "api" and "{" not in s]
+                        if segs:
+                            seg = "/" + segs[0]
+                    url = target_url.rstrip("/") + seg
+                    await page_c.goto(url, timeout=5000, wait_until="domcontentloaded")
+                    if (not _cap_state["logged_in"] and test_account_dict
+                            and "/login" in page_c.url):
+                        try:
+                            await page_c.fill("input[type=email]",
+                                              test_account_dict["email"], timeout=1500)
+                            await page_c.fill("input[type=password]",
+                                              test_account_dict["password"], timeout=1500)
+                            await page_c.click("button[type=submit]", timeout=1500)
+                            await page_c.wait_for_load_state("networkidle", timeout=4000)
+                            _cap_state["logged_in"] = True
+                            await page_c.goto(url, timeout=5000,
+                                              wait_until="domcontentloaded")
+                        except Exception:
+                            pass
+                    shots_dir.mkdir(parents=True, exist_ok=True)
+                    await page_c.screenshot(path=str(shots_dir / "step_1.png"))
+                except Exception:
+                    pass
+
             async def _fresh_snapshot(table: str) -> dict | None:
                 try:
                     return await DBTestTool(trace_id=trace_id)._get_snapshot(table)  # noqa: SLF001
@@ -2762,6 +2804,9 @@ async def _test_execution(state: PipelineState) -> dict:
                         tc_id=tc_id, trace_id=trace_id,
                         DBTestTool=DBTestTool, ToolInput=ToolInput,
                     )
+                    # 참고 화면 캡처 (step_1.png) — mirror 가 업로드해 상세
+                    # 패널에 표시. 검증 증거 아님 (라벨로 구분).
+                    await _capture_reference(_tc_meta.get("api"), screenshots_dir)
                     ui_results.append(ui_payload)
                     api_results.append(api_payload)
                     db_results.append(db_res)
@@ -2986,6 +3031,7 @@ async def _test_execution(state: PipelineState) -> dict:
                             api_payload["db_observation"] = _fb_out["db_observation"]
                         if _fb_out.get("observe_results"):
                             api_payload["observe_results"] = _fb_out["observe_results"]
+                        await _capture_reference(_fb_meta.get("api"), screenshots_dir)
                         ui_results[-1] = ui_payload
                         api_results[-1] = api_payload
 
