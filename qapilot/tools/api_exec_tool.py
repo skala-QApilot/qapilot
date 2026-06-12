@@ -360,6 +360,13 @@ def _bump_past_dates(body: dict, intent_negative: bool) -> list[str]:
     future = (_dt.date.today() + _dt.timedelta(days=7)).isoformat()
     bumped = []
     for k, v in list(body.items()):
+        # 과거가 정상인 필드 (생년월일/가입일 류) 는 범프 금지 — run cfcfe52f
+        # 자기-결함: birth_date 2000-01-01 을 미래로 범프 → '미성년자 동의
+        # 필요' 400 으로 signup 군집 전멸 (TS-001/005). 범프는 미래-효력
+        # 필드 (effective/scheduled 류) 가 과거로 낡은 경우만 정당.
+        kl = k.lower()
+        if any(t in kl for t in ("birth", "dob", "생년", "created", "joined", "registered")):
+            continue
         s = str(v or "")
         if _DATE_VALUE_RE.match(s) and s < _dt.date.today().isoformat():
             body[k] = future

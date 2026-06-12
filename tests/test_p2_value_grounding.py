@@ -206,3 +206,12 @@ class TestStateArrangement:
         )
         assert out["verdict"] == "pass"
         assert out["calls"][0]["status_code"] == 400
+
+
+class TestDateBumpBirthGuard:
+    def test_birth_date_never_bumped(self):
+        # run cfcfe52f 자기-결함 회귀 고정: birth_date 범프 → '미성년자' 400
+        body = {"birth_date": "2000-01-01", "effective_date": "2023-10-06"}
+        bumped = _bump_past_dates(body, intent_negative=False)
+        assert bumped == ["effective_date"]
+        assert body["birth_date"] == "2000-01-01"
