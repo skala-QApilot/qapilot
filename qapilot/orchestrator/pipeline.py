@@ -2655,6 +2655,28 @@ async def _test_execution(state: PipelineState) -> dict:
                 if tc.get("tc_id")
             }
 
+            # ── P1.5 DB 관찰 축: DB-계약형 then 의 api-mode 가 Act 직후 신선
+            # 스냅샷을 보도록 캐시 우회 fetcher + 테이블 선택용 schemas 준비.
+            # 어느 쪽이든 실패는 graceful — db_table=None 이면 status 폴백.
+            exec_schemas = None
+            try:
+                _svc = (load_trace(trace_id) or {}).get("service_id")
+                if _svc:
+                    from qapilot.shared.scan_storage import load_metadata_index
+                    exec_schemas = load_metadata_index(str(_svc), "backend", "schemas")
+            except Exception as e:
+                logger.info("api_mode_db_schemas_unavailable",
+                            trace_id=trace_id, error=f"{type(e).__name__}: {e}")
+
+            async def _fresh_snapshot(table: str) -> dict | None:
+                try:
+                    return await DBTestTool(trace_id=trace_id)._get_snapshot(table)  # noqa: SLF001
+                except Exception as e:
+                    logger.warning("api_mode_db_snapshot_failed",
+                                   trace_id=trace_id, table=table,
+                                   error=f"{type(e).__name__}: {e}"[:160])
+                    return None
+
             for item in execution_items:
                 tc_id = item.get("tc_id") or "unknown"
                 ts_id = _ts_id_of_tc(tc_id, scenarios)
@@ -2677,7 +2699,17 @@ async def _test_execution(state: PipelineState) -> dict:
                         tc_then_by_id.get(str(tc_id), ""),
                         tc_tags_by_id.get(str(tc_id), []),
                     )
-                    from qapilot.tools.api_exec_tool import execute_api_verification
+                    from qapilot.tools.api_exec_tool import (
+                        _db_contract,
+                        execute_api_verification,
+                    )
+                    db_table = None
+                    if _db_contract(tc_then_by_id.get(str(tc_id), "")) and exec_schemas:
+                        try:
+                            from qapilot.shared.metadata_filters import pick_table_for_tc
+                            db_table = pick_table_for_tc(_tc_meta, exec_schemas)
+                        except Exception:
+                            db_table = None
                     try:
                         exec_out = await execute_api_verification(
                             tc=_tc_meta if _tc_meta else {"tc_id": tc_id},
@@ -2686,6 +2718,8 @@ async def _test_execution(state: PipelineState) -> dict:
                             intent_negative=intent_neg,
                             auth_negative=auth_neg,
                             trace_id=trace_id,
+                            db_table=db_table,
+                            snapshot_fetch=_fresh_snapshot,
                         )
                     except Exception as e:
                         exec_out = {
@@ -2697,6 +2731,7 @@ async def _test_execution(state: PipelineState) -> dict:
                         "api_mode_verified",
                         trace_id=trace_id, tc_id=tc_id,
                         verdict=exec_out.get("verdict"), reason=exec_out.get("reason"),
+                        db_observation=exec_out.get("db_observation"),
                     )
                     # ui kind 는 status 없음 (UI 미수행 — skip 과 구분: S 카운트
                     # 오염 금지, RunReader 의 skip 보호와도 무관). verdict 는
@@ -2713,6 +2748,8 @@ async def _test_execution(state: PipelineState) -> dict:
                         "error_calls": exec_out.get("error_calls", 0),
                         "verdict": exec_out.get("verdict"),
                     }
+                    if exec_out.get("db_observation"):
+                        api_payload["db_observation"] = exec_out["db_observation"]
                     db_res = await _run_db_test_safe(
                         tc_id=tc_id, trace_id=trace_id,
                         DBTestTool=DBTestTool, ToolInput=ToolInput,
@@ -2992,6 +3029,11 @@ def _decide_verify_mode(
         return "ui"
     then_l = (tc_then or "").lower()
     if any(k in then_l for k in _API_CONTRACT_HINTS):
+        return "api"
+    # P1.5 DB-계약형 (db에/테이블에 저장 류) — 판정 기준은 api_exec_tool 의
+    # _db_contract 단일 소스 (쓰기 동사 동반 요구로 HTML table 표현과 구분).
+    from qapilot.tools.api_exec_tool import _db_contract
+    if _db_contract(tc_then):
         return "api"
     steps = (original_mapping or {}).get("steps") or []
     resolved_asserts = sum(

@@ -35,6 +35,74 @@ _PARAM_RE = re.compile(r"\{([^}/]+)\}")
 # then 이 응답 헤더 계약을 검증하는 경우의 헤더 키 추출 (예: "X-Trace-Id 가 포함")
 _HEADER_KEY_RE = re.compile(r"\b([A-Za-z][A-Za-z0-9]*(?:-[A-Za-z0-9]+)+)\b")
 
+# ── P1.5 DB 관찰 축 ──────────────────────────────────────────────────────
+# then 이 DB 상태로만 검증 가능한 계약인 경우 (API 응답에 해시가 노출되지
+# 않는 게 정상이므로 응답 검사로는 불가). faults 의 expected_observation.db_state
+# 류 (FR-009 결함 검출) 도 이 축이 담당한다.
+_DB_HASH_TOKENS = ("해시", "bcrypt", "hash")
+_DB_PLACE_TOKENS = ("db에", "데이터베이스", "테이블")
+
+
+def _db_contract(then: str) -> str | None:
+    """then 이 DB-계약형이면 검사 종류 반환 — "hash" | "exists" | None.
+
+    "저장된다" 단독은 UI 로도 확인 가능한 표현이라 트리거하지 않는다 —
+    해시류 또는 명시적 DB 어휘 (db에/데이터베이스/테이블) 가 있어야 한다.
+    """
+    t = (then or "").lower()
+    if any(k in t for k in _DB_HASH_TOKENS) and any(k in t for k in ("저장", "암호화", "기록")):
+        return "hash"
+    # "테이블" 은 HTML table 표시 표현과 겹친다 ("목록이 테이블에 표시된다")
+    # — 쓰기 동사가 함께 있어야 DB-계약으로 인정.
+    if any(k in t for k in _DB_PLACE_TOKENS) and any(
+        k in t for k in ("저장", "기록", "생성", "추가", "삽입", "남는다")
+    ):
+        return "exists"
+    return None
+
+
+def _row_matches(row: dict, body: dict | None) -> bool:
+    """Act 요청 body 의 값 (식별자) 과 일치하는 row 인지. password 류는
+    DB 에 평문이 없는 게 정상이라 식별자 자격이 없다."""
+    for k, v in (body or {}).items():
+        if "password" in k.lower():
+            continue
+        rv = row.get(k)
+        if rv is not None and str(rv) == str(v):
+            return True
+    return False
+
+
+def _observe_db(kind: str, snapshot: dict | None, body: dict | None) -> tuple[bool, str]:
+    """DB 스냅샷 관찰 — (ok, 사유). 스냅샷 부재는 검증 실패 (false-pass 금지)."""
+    rows = [r for r in ((snapshot or {}).get("rows") or []) if isinstance(r, dict)]
+    if not rows:
+        return False, "DB 관찰 실패: 스냅샷 빈 상태/조회 불가"
+
+    if kind == "hash":
+        # Act 가 409 (이미 존재) 여도 기존 row 의 저장 형식 관찰은 유효한
+        # 계약 검증이다 — 식별자 일치 row 우선, 없으면 전체 row.
+        targets = [r for r in rows if _row_matches(r, body)] or rows
+        cols = [c for c in targets[0] if "hash" in c.lower() or "password" in c.lower()]
+        if not cols:
+            return False, "DB 관찰 실패: hash/password 컬럼 부재"
+        col = cols[0]
+        vals = [r.get(col) for r in targets if r.get(col)]
+        if not vals:
+            return False, f"DB 관찰 실패: {col} 값 전부 빈 상태"
+        bad = [v for v in vals if not str(v).startswith("$2")]
+        if bad:
+            return False, f"DB 관찰: {col} {len(bad)}/{len(vals)}건이 비-bcrypt (평문 의심)"
+        return True, f"DB 관찰: {col} {len(vals)}건 전부 bcrypt($2) 형식"
+
+    # exists — Act 에서 쓴 식별자 값과 일치하는 row 존재 확인
+    if not body:
+        return False, "DB 관찰 실패: 대조할 요청 식별자 없음 (body 없는 요청)"
+    matched = [r for r in rows if _row_matches(r, body)]
+    if matched:
+        return True, f"DB 관찰: 요청 값 일치 row {len(matched)}건 존재"
+    return False, "DB 관찰: 요청 값 일치 row 미발견"
+
 
 def _expected_statuses(then: str, intent_negative: bool) -> set[int]:
     """then 절에서 기대 상태코드 집합 도출. 명시 코드 우선, 없으면 의도 기반."""
@@ -83,6 +151,8 @@ async def execute_api_verification(
     intent_negative: bool,
     auth_negative: bool,
     trace_id: str = "",
+    db_table: str | None = None,
+    snapshot_fetch=None,
 ) -> dict:
     """단일 TC 의 API-mode 검증. 반환: api_result 호환 dict + verdict.
 
@@ -171,7 +241,32 @@ async def execute_api_verification(
             )
             return out
 
-        # 판정 ② 상태코드 계약
+        # 판정 ② DB-계약형 (P1.5) — Act via API, Assert via DB 스냅샷.
+        # 스냅샷은 호출자 주입 fetcher (캐시 우회 — Act 직후 신선 상태 필수).
+        db_kind = _db_contract(then)
+        if db_kind and snapshot_fetch and db_table:
+            snapshot = None
+            try:
+                snapshot = await snapshot_fetch(db_table)
+            except Exception as e:
+                logger.warning("api_exec_db_snapshot_failed",
+                               trace_id=trace_id, tc_id=tc_id, table=db_table,
+                               error=str(e)[:120])
+            ok, obs_reason = _observe_db(db_kind, snapshot, body)
+            if db_kind == "exists":
+                # 생성 계약은 Act 자체의 성공이 전제 — 5xx/기대 외 status 면 fail
+                ok = ok and resp.status_code in _expected_statuses(then, intent_negative)
+            if resp.status_code >= 500:
+                ok = False
+            out["verdict"] = "pass" if ok else "fail"
+            out["reason"] = f"{obs_reason} (status {resp.status_code})"
+            out["db_observation"] = {"kind": db_kind, "table": db_table, "ok": ok}
+            return out
+        if db_kind:
+            # 계약은 DB 형인데 관찰 수단 부재 — status 기반으로 폴백하되 표식 남김
+            out["db_observation"] = {"kind": db_kind, "table": db_table, "ok": None}
+
+        # 판정 ③ 상태코드 계약
         expected = _expected_statuses(then, intent_negative)
         ok = resp.status_code in expected
         # 5xx 는 어떤 의도에서도 결함 신호
