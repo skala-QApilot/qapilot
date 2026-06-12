@@ -613,7 +613,10 @@ async def execute_api_verification(
         # 없는 주문). SUT 에서 유효 후보를 조회해 값만 바꿔 재시도 — 검증
         # 의도 (then) 는 그대로, 값 선택만 상태-인지로.
         grounded: list[str] = []
-        if not intent_negative:
+        # expects_missing (비실존 자원 → 404 가 기대 결과) 는 접지 재시도가
+        # 의도를 파괴한다 — 404 를 '고치면' 안 된다 (회귀 테스트 실증:
+        # 비실존 id 404 수신 후 재시도가 실존 id 400 으로 오염).
+        if not intent_negative and not expects_missing:
             # ① 404 + path param → 컬렉션의 다른 id 후보 순회
             if resp.status_code == 404 and params:
                 for p in params:
