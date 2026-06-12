@@ -186,6 +186,7 @@ def build_sensitive_value_entries(
             "purpose": "민감 정보 — 액션매핑 시점에 환경변수에서 가져옴",
             "source": "placeholder",
             "sensitive": True,
+            "evidence": "근거 없음",
         }
 
     Args:
@@ -205,6 +206,7 @@ def build_sensitive_value_entries(
             "purpose": "민감 정보 — 액션매핑 시점에 환경변수에서 가져옴",
             "source": "placeholder",
             "sensitive": True,
+            "evidence": "근거 없음",
         })
     return out
 

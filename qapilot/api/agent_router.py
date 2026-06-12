@@ -15,11 +15,14 @@ from pydantic import BaseModel, Field
 
 from qapilot.api.internal_deps import verify_internal_token
 from qapilot.api.response import fail, ok
+from qapilot.db.code_reader import load_latest_action_mapping
+from qapilot.db.domain_reader import list_latest_domain_documents
 from qapilot.db.tc_result_reader import load_latest_screenshot_s3_key, load_tc_results_by_run
 from qapilot.messaging.redis_pubsub import subscribe_run_events
 from qapilot.orchestrator.runner import run_pipeline
 from qapilot.shared.errors import ErrorCode
 from qapilot.shared.logger import get_logger
+from qapilot.shared.scan_storage import load_source
 from qapilot.shared.schemas import RunOptions
 from qapilot.shared.session_store import new_session_id
 from qapilot.shared.trace_store import (
@@ -369,6 +372,57 @@ async def get_latest_screenshot(trace_id: str) -> Any:
     if not data:
         return Response(status_code=204)
     return Response(content=data, media_type="image/png")
+
+
+@router.get("/services/{service_id}/documents/{filename}")
+async def get_domain_document(service_id: str, filename: str) -> Any:
+    """도메인 문서(PRD 등) 원문을 S3 에서 반환.
+
+    TC.evidence / TS.doc_search.sources 에 적힌 파일명(예: "PRD_v4.0.md")으로
+    `domain_documents` 의 최신 버전을 찾아 S3 본문을 그대로 스트리밍한다.
+    """
+    docs = list_latest_domain_documents(service_id)
+    doc = next((d for d in docs if d.get("filename") == filename), None)
+    if not doc or not doc.get("s3_key"):
+        return fail(ErrorCode.AGENT_API_002, "문서를 찾을 수 없습니다.")
+    data = s3_client.get_object(doc["s3_key"])
+    if data is None:
+        return fail(ErrorCode.AGENT_API_002, "문서를 찾을 수 없습니다.")
+    media_type = doc.get("mime_type") or "application/octet-stream"
+    return Response(content=data, media_type=media_type)
+
+
+@router.get("/services/{service_id}/source")
+async def get_source_code(
+    service_id: str,
+    file: str = Query(..., description="repo root 기준 상대 경로"),
+    commit_sha: str = Query(..., description="40자 git commit SHA"),
+    line_start: int | None = Query(None, ge=1),
+    line_end: int | None = Query(None, ge=1),
+) -> Any:
+    """codebase_ref 의 코드 본문을 S3 (source/{commit_sha}/{file}) 에서 반환."""
+    content = load_source(service_id, commit_sha, file, line_start=line_start, line_end=line_end)
+    if content is None:
+        return fail(ErrorCode.AGENT_API_002, "소스 파일을 찾을 수 없습니다.")
+    return ok({
+        "file": file,
+        "commit_sha": commit_sha,
+        "line_start": line_start,
+        "line_end": line_end,
+        "content": content,
+    })
+
+
+@router.get("/services/{service_id}/test-cases/{tc_id}/action-mapping")
+async def get_action_mapping(service_id: str, tc_id: str) -> Any:
+    """TC 의 최신 action mapping (실행 스텝 시퀀스) 을 반환.
+
+    테스트 실행 화면에서 TC 별 action step 목록 표시 + 실시간 진행 단계 강조에 사용.
+    """
+    mapping = load_latest_action_mapping(service_id, tc_id)
+    if not mapping:
+        return fail(ErrorCode.AGENT_API_002, "action mapping을 찾을 수 없습니다.")
+    return ok({"action_mapping": mapping})
 
 
 @router.post("/runs/{trace_id}/resume")

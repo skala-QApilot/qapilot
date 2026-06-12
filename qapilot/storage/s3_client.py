@@ -144,6 +144,26 @@ def get_object(key: str) -> bytes | None:
         return None
 
 
+def list_objects(prefix: str) -> list[str]:
+    """주어진 prefix 로 시작하는 객체 키 목록 반환.
+
+    tc_generation/{ts_id}/ 아래 기존 v{N}.json 들을 스캔해 다음 버전 번호를
+    계산하는 용도. S3 비활성/실패 시 빈 list (graceful no-op).
+    """
+    client, bucket = get_client()
+    if client is None:
+        return []
+    keys: list[str] = []
+    try:
+        paginator = client.get_paginator("list_objects_v2")
+        for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+            for obj in page.get("Contents", []):
+                keys.append(obj["Key"])
+    except Exception as e:
+        _logger.warning("s3_list_failed", prefix=prefix, error=str(e))
+    return keys
+
+
 def download(key: str, local_path: str) -> bool:
     """S3 GET → local 파일 저장. 반환: 성공 여부.
 

@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import json
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from qapilot.agents.tv_codebase_aware_agent import (
+    NO_EVIDENCE,
+    TVFromCodebaseAgent,
     _build_type_hint_map,
     _extract_json,
     _infer_scenario_intent,
@@ -118,3 +121,48 @@ def test_build_type_hint_map_request_overrides_db():
         "db_models": {"M": {"columns": [{"name": "email", "type": "str"}]}},
     }
     assert _build_type_hint_map(schemas)["email"] == "EmailStr"
+
+
+# ────────────────────────────────────────────────────────────────────────
+# _parse — evidence(근거) 필드
+# ────────────────────────────────────────────────────────────────────────
+
+@pytest.fixture
+def agent():
+    return TVFromCodebaseAgent(trace_id="test-evidence")
+
+
+def test_parse_evidence_present(agent):
+    content = json.dumps({
+        "given": "g", "when": "w", "then": "t",
+        "evidence": {"given": "근거 없음", "when": "PRD_v4.0.md", "then": "app/routers/auth.py:42-60"},
+        "values": [
+            {"field": "email", "value": "a@b.com", "type": "string", "purpose": "p", "source": "llm", "evidence": "PRD_v4.0.md"},
+        ],
+        "confidence": 0.9,
+    })
+    parsed = agent._parse(content)
+    assert parsed["evidence"] == {
+        "given": "근거 없음", "when": "PRD_v4.0.md", "then": "app/routers/auth.py:42-60",
+    }
+    assert parsed["values"][0]["evidence"] == "PRD_v4.0.md"
+
+
+def test_parse_evidence_missing_defaults_to_no_evidence(agent):
+    """evidence 필드가 통째로 없거나 value 별 evidence 가 없으면 '근거 없음'으로 채운다."""
+    content = json.dumps({
+        "given": "g", "when": "w", "then": "t",
+        "values": [
+            {"field": "email", "value": "a@b.com", "type": "string", "purpose": "p", "source": "llm"},
+        ],
+        "confidence": 0.9,
+    })
+    parsed = agent._parse(content)
+    assert parsed["evidence"] == {"given": NO_EVIDENCE, "when": NO_EVIDENCE, "then": NO_EVIDENCE}
+    assert parsed["values"][0]["evidence"] == NO_EVIDENCE
+
+
+def test_parse_error_returns_no_evidence(agent):
+    parsed = agent._parse("not json")
+    assert parsed["evidence"] == {"given": NO_EVIDENCE, "when": NO_EVIDENCE, "then": NO_EVIDENCE}
+    assert parsed["values"] == []

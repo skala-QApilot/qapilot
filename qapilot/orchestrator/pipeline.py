@@ -3591,9 +3591,8 @@ async def _ts_generate_prd_only(state: PipelineState) -> dict:
 
 
 async def _tc_generate_doc_search(state: PipelineState) -> dict:
-    """ts_list 중 대상 TS만 문서 검색 → TC 생성 + S3 저장."""
+    """ts_list 중 대상 TS만 문서 검색 → TC 골격 생성 (S3 저장은 _save_experiment_scenarios 에서)."""
     import time
-    from datetime import datetime, timezone
 
     from qapilot.agents.tc_doc_search_agent import TCFromDocsAgent
     from qapilot.shared.schemas import AgentInput, ToolInput
@@ -3633,6 +3632,7 @@ async def _tc_generate_doc_search(state: PipelineState) -> dict:
     agent_logs = list(state.get("agent_logs") or [])
     result_test_cases: dict[int, list] = {}
     result_docs: dict[int, list] = {}  # 통합 TC 단계에서 재사용할 TS별 검색 문서
+    doc_search_meta: dict[int, dict] = {}  # TS별 문서 검색 근거 (질의/소스) 기록
 
     for idx in target_indices:
         ts_item = ts_list[idx]
@@ -3667,6 +3667,19 @@ async def _tc_generate_doc_search(state: PipelineState) -> dict:
             for r in raw_rules
         ]
         result_docs[idx] = retrieved_docs
+        doc_sources = [
+            {"source": d["source"], "score": d["score"], "content": d.get("content", "")}
+            for d in retrieved_docs if d.get("source")
+        ]
+        doc_search_meta[idx] = {"query": query, "sources": doc_sources}
+        logger.info(
+            "tc_doc_search_done",
+            trace_id=trace_id,
+            ts_index=idx,
+            ts_name=ts_name,
+            query=query,
+            doc_sources=doc_sources,
+        )
 
         start = time.monotonic()
         agent = TCFromDocsAgent(trace_id=trace_id)
@@ -3679,39 +3692,14 @@ async def _tc_generate_doc_search(state: PipelineState) -> dict:
         test_cases = output.result.get("test_cases") or []
         analysis = output.result.get("analysis") or []
         result_test_cases[idx] = test_cases
-
-        if service_id:
-            provisional_ts_id = f"TS-{idx + 1:03d}"
-            payload = {
-                "trace_id": trace_id,
-                "ts_id": provisional_ts_id,
-                "ts_name": ts_name,
-                "generated_at": datetime.now(timezone.utc).isoformat(),
-                "source": "doc_search_enumeration",
-                "analysis": analysis,
-                "test_cases": test_cases,
-                "retrieved_docs": retrieved_docs,
-                "metrics": {
-                    "model": output.metadata.model,
-                    "cost_usd": output.metadata.cost_usd,
-                    "duration_sec": duration,
-                    "doc_search_query": query,
-                    "doc_search_top_k": 5,
-                    "doc_search_results_count": len(retrieved_docs),
-                },
-            }
-            key = f"services/{service_id}/scenario-runs/{trace_id}/tc_generation/{provisional_ts_id}.json"
-            s3_client.put_bytes(
-                key,
-                json.dumps(payload, ensure_ascii=False, indent=2).encode(),
-                "application/json",
-            )
+        doc_search_meta[idx]["analysis"] = analysis
 
         agent_logs.append(output.metadata.model_dump())
 
     return {
         "tc_by_ts_index": result_test_cases,
         "docs_by_ts_index": result_docs,
+        "doc_search_meta_by_index": doc_search_meta,
         "agent_logs": agent_logs,
     }
 
@@ -3896,10 +3884,32 @@ async def _tv_generate_codebase_aware(state: PipelineState) -> dict:
                         new_tc[fld] = val
                 if new_values:
                     new_tc["values"] = new_values
+                # 근거 추적: given/when/then 작성 근거 (문서명/코드 위치/"근거 없음")
+                new_tc["evidence"] = output.result.get("evidence") or {
+                    "given": "근거 없음", "when": "근거 없음", "then": "근거 없음",
+                }
                 new_tc["tv_validation_passed"] = validation_passed
                 new_tc["tv_validation_reasons"] = (
                     output.result.get("validation_reasons") or []
                 )
+
+                # 근거 추적: 이 TC 의 values/gwt 생성에 사용된 코드베이스 식별 정보
+                codebase_ref = {
+                    "service_id": service_id,
+                    "commit_sha": commit_sha or None,
+                    "files": [
+                        {"file": s["file"], "line_start": s["line_start"], "line_end": s["line_end"]}
+                        for s in source_snippets
+                    ],
+                    "table": table_name,
+                }
+                new_tc["codebase_ref"] = codebase_ref
+
+                # 근거 추적: 이 TC 의 prompt 에 실제로 들어간 schemas/selectors/patterns/db_snapshot
+                context_used = output.result.get("context_used")
+                if context_used:
+                    new_tc["tv_context"] = context_used
+
                 updated_tcs.append(new_tc)
 
                 agent_logs.append(output.metadata.model_dump())
@@ -3911,6 +3921,7 @@ async def _tv_generate_codebase_aware(state: PipelineState) -> dict:
                     values_count=len(new_values),
                     validation_passed=validation_passed,
                     duration_sec=duration,
+                    codebase_ref=codebase_ref,
                 )
             except Exception as e:
                 logger.warning(
@@ -3926,10 +3937,32 @@ async def _tv_generate_codebase_aware(state: PipelineState) -> dict:
     return {"tc_by_ts_index": updated_tc_by_index, "agent_logs": agent_logs}
 
 
+def _write_tc_generation_version(service_id: str, trace_id: str, ts_id: str, ts: dict) -> None:
+    """tc_generation/{ts_id}/ 에 버전 파일(vN.json) 기록 + latest.json 갱신.
+
+    upsert_scenario_version (DB scenarios 테이블, MAX(version_number)+1) 과 같은
+    호출 지점에서 같은 스냅샷(ts)을 S3 에도 버전별로 남긴다. 기존 v{N}.json 들을
+    list_objects 로 스캔해 다음 번호를 정한다 (S3 비활성 시 list_objects 가 빈 list
+    → put_bytes 도 graceful no-op).
+    """
+    prefix = f"services/{service_id}/scenario-runs/{trace_id}/tc_generation/{ts_id}/"
+    existing = s3_client.list_objects(prefix)
+    versions = [
+        int(m.group(1))
+        for key in existing
+        if (m := re.match(r"v(\d+)\.json$", key[len(prefix):]))
+    ]
+    next_version = max(versions, default=0) + 1
+    body = json.dumps(ts, ensure_ascii=False, indent=2).encode()
+    s3_client.put_bytes(f"{prefix}v{next_version}.json", body, "application/json")
+    s3_client.put_bytes(f"{prefix}latest.json", body, "application/json")
+
+
 async def _save_experiment_scenarios(state: PipelineState) -> dict:
     """ts_list + tc_by_ts_index를 병합해 최종 시나리오 파일로 디스크·DB 저장."""
     ts_list = state.get("ts_list") or []
     tc_by_index: dict = state.get("tc_by_ts_index") or {}
+    doc_search_meta: dict = state.get("doc_search_meta_by_index") or {}
     trace = load_trace(state["trace_id"]) or {}
     service_id = trace.get("service_id")
     trigger = state["run_options"].get("trigger") or "init"
@@ -3956,6 +3989,8 @@ async def _save_experiment_scenarios(state: PipelineState) -> dict:
             "requirements": ts_item.get("requirements") or [],
             "depends_on": [],
             "test_cases": test_cases,
+            # 근거 추적: 이 TS 의 TC 들을 도출할 때 검색한 문서 (질의/소스)
+            "doc_search": doc_search_meta.get(i) or doc_search_meta.get(str(i)) or {},
         }
         path = scenarios_dir / f"{ts_id}.json"
         path.write_text(json.dumps(ts, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -3963,6 +3998,7 @@ async def _save_experiment_scenarios(state: PipelineState) -> dict:
         merged_scenarios.append(ts)
         if service_id:
             upsert_scenario_version(service_id, ts_id, ts)
+            _write_tc_generation_version(service_id, state["trace_id"], ts_id, ts)
 
     return {
         "scenarios": merged_scenarios,

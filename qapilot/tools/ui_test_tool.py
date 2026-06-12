@@ -32,6 +32,7 @@ from playwright.async_api import Locator, Page
 from playwright.async_api import TimeoutError as PWTimeoutError
 from playwright.async_api import expect
 
+from qapilot.messaging.redis_pubsub import publish_run_event
 from qapilot.shared.errors import ErrorCode, ToolExecutionError
 from qapilot.shared.schemas import ActionStep, UIStepResult, UITestResult
 from qapilot.tools.base_tool import BaseTool
@@ -142,7 +143,7 @@ class UITestTool(BaseTool):
         page.on("console", lambda msg: console_logs.append(f"[{msg.type}] {msg.text}"))
 
         step_results, tc_status, total_duration_ms = await self._run_steps(
-            page, steps, target_url, screenshot_dir, console_logs, test_account
+            page, steps, target_url, screenshot_dir, console_logs, test_account, tc_id=tc_id,
         )
 
         ui_result: UITestResult = {
@@ -168,6 +169,7 @@ class UITestTool(BaseTool):
         screenshot_dir: Path | None,
         console_logs: list[str],
         test_account: dict[str, Any] | None = None,
+        tc_id: str = "unknown",
     ) -> tuple[list[UIStepResult], str, int]:
         """ActionStep 시퀀스를 순차 실행. 실패 시 후속 스텝 skip."""
         step_results: list[UIStepResult] = []
@@ -205,6 +207,15 @@ class UITestTool(BaseTool):
         for idx, step in enumerate(steps):
             step_no = int(step.get("step_no") or idx + 1)
             action = step.get("action", "")
+
+            # 실시간 진행 표시 — 이 스텝 실행을 시작했음을 SSE 로 알린다.
+            # UI 의 "지금 어디 실행 중인지" 강조에 사용. Redis 미설정 시 no-op.
+            publish_run_event(self.trace_id, "tc_step", {
+                "tc_id": tc_id,
+                "step_no": step_no,
+                "total_steps": len(steps),
+                "action": action,
+            })
 
             step_start = time.monotonic()
             status: str = "pass"

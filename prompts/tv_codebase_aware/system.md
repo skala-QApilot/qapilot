@@ -27,25 +27,37 @@ TC 골격(skeleton)을 받아 **given / when / then 과 value 를 한 번에 함
 
 ## 무엇을 출력하는가
 
-given / when / then (완전한 한국어 문장) + `values` 배열. **각 value entry 는 schema 의 field 1개에 대응**.
+given / when / then (완전한 한국어 문장) + `values` 배열 + `evidence`(근거). **각 value entry 는 schema 의 field 1개에 대응**.
 
 ```json
 {
   "given": "string",   // 완전한 한국어 문장
   "when": "string",
   "then": "string",
+  "evidence": {
+    "given": "string",  // given 작성의 근거 — 검색 문서명(예: PRD_v4.0.md) 또는 코드 위치(예: app/routers/auth.py:42-60). 근거가 없으면 정확히 \"근거 없음\"
+    "when": "string",   // when 작성의 근거. 형식 동일
+    "then": "string"    // then 작성의 근거 (예: production 코드의 에러 메시지/상태코드, 또는 검색 문서). 형식 동일
+  },
   "values": [
     {
       "field": "string",          // schema 에 정의된 필드 이름
       "value": "string",          // 실제 값. placeholder({...}) 금지
       "type": "string",           // schema 의 타입
       "purpose": "string",        // 왜 이 값인지 (한 줄)
-      "source": "llm | db | schema_default"  // 값의 출처
+      "source": "llm | db | schema_default",  // 값의 출처
+      "evidence": "string"        // 이 값을 결정한 근거 — 검색 문서명 / 코드 위치 / "스키마: <필드>". 근거가 없으면 정확히 "근거 없음"
     }
   ],
   "confidence": 0.0
 }
 ```
+
+### evidence(근거) 작성 규칙
+- given/when/then 각각, 그리고 values 의 각 항목마다 `evidence` 를 채운다.
+- 근거는 입력으로 받은 **검색 문서**(`source` 파일명) 또는 **코드베이스 본문**(`source_snippets` 의 `[file (Lstart-Lend)]`)에서 가져온다. 스키마 제약(min_length 등)으로 값을 정했다면 `"스키마: <필드명>"` 처럼 명시한다.
+- 위 자료들 중 어디에서도 직접적인 근거를 찾을 수 없고 일반 상식/추측으로 채운 경우, 그 항목의 `evidence` 는 정확히 `"근거 없음"` 으로 쓴다 (다른 표현 금지 — UI 가 이 문자열을 그대로 태그로 사용한다).
+- 근거를 지어내지 마라. 실제로 본 문서명/코드 파일이 아니면 "근거 없음" 으로 쓴다.
 
 ⚠️ **`values` 에 sensitive 필드 (password / token / secret 등) 절대 포함하지 마라.**
 이런 필드는 시스템이 별도로 placeholder 로 처리한다. 본 응답에 넣으면 무시되고 덮어써진다.
@@ -102,10 +114,15 @@ JSON 만 출력한다. 마크다운 코드블록, 설명 텍스트 X.
   "given": "유효한 이메일/비밀번호/이름과 성인 생년월일을 가진 신규 가입 요청이 준비된 상태에서",
   "when": "회원가입 API 를 호출하면",
   "then": "201 Created 와 함께 생성된 회원 정보가 반환된다",
+  "evidence": {
+    "given": "근거 없음",
+    "when": "PRD_v4.0.md",
+    "then": "app/routers/auth.py:42-60"
+  },
   "values": [
-    {"field": "email", "value": "newuser_2026@test.com", "type": "string", "purpose": "유효한 이메일 형식, DB 미존재 — 신규 가입", "source": "llm"},
-    {"field": "name", "value": "테스트유저", "type": "string", "purpose": "name 필드 min_length 1 만족", "source": "llm"},
-    {"field": "birth_date", "value": "2000-01-01", "type": "date", "purpose": "성인 (보호자 동의 불필요)", "source": "llm"}
+    {"field": "email", "value": "newuser_2026@test.com", "type": "string", "purpose": "유효한 이메일 형식, DB 미존재 — 신규 가입", "source": "llm", "evidence": "근거 없음"},
+    {"field": "name", "value": "테스트유저", "type": "string", "purpose": "name 필드 min_length 1 만족", "source": "llm", "evidence": "스키마: name"},
+    {"field": "birth_date", "value": "2000-01-01", "type": "date", "purpose": "성인 (보호자 동의 불필요)", "source": "llm", "evidence": "PRD_v4.0.md"}
   ],
   "confidence": 0.9
 }

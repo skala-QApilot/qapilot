@@ -42,6 +42,9 @@ from qapilot.shared.tv_validator import TVValidator, ValidationResult
 
 _MAX_RETRY = 2
 
+# evidence(근거) 필드의 sentinel — UI 가 이 문자열을 그대로 태그로 사용한다.
+NO_EVIDENCE = "근거 없음"
+
 
 # ────────────────────────────────────────────────────────────────────────
 # format helpers
@@ -299,6 +302,7 @@ class TVFromCodebaseAgent(BaseAgent):
 
             parsed = self._parse(response.content)
             gwt = parsed["gwt"]
+            gwt_evidence = parsed["evidence"]
             llm_values = parsed["values"]
             confidence = parsed["confidence"]
 
@@ -318,11 +322,20 @@ class TVFromCodebaseAgent(BaseAgent):
                 "given": gwt["given"],
                 "when": gwt["when"],
                 "then": gwt["then"],
+                "evidence": gwt_evidence,
                 "values": merged_values,
                 "validation_passed": (last_validation.valid if last_validation else False),
                 "validation_reasons": (
                     last_validation.reasons if last_validation and not last_validation.valid else []
                 ),
+                # 근거 추적: 이 TC 의 prompt 에 실제로 들어간 (필터링·마스킹된) 컨텍스트.
+                # UI 가 "참고한 스키마/셀렉터/패턴/DB 스냅샷"을 그대로 보여줄 수 있도록 보존.
+                "context_used": {
+                    "schemas": sanitized_schemas,
+                    "selectors": filtered["selectors"],
+                    "patterns": filtered["patterns"],
+                    "db_snapshot": sanitized_db_snapshot,
+                },
             },
             confidence=confidence,
         )
@@ -331,6 +344,7 @@ class TVFromCodebaseAgent(BaseAgent):
 
     def _parse(self, content: str) -> dict[str, Any]:
         empty_gwt = {"given": "", "when": "", "then": ""}
+        empty_evidence = {"given": NO_EVIDENCE, "when": NO_EVIDENCE, "then": NO_EVIDENCE}
         try:
             cleaned = _extract_json(content)
             data = json.loads(cleaned)
@@ -339,12 +353,18 @@ class TVFromCodebaseAgent(BaseAgent):
                 "tv_codebase_aware_parse_error",
                 error=str(e), raw=content[:300],
             )
-            return {"gwt": empty_gwt, "values": [], "confidence": 0.0}
+            return {"gwt": empty_gwt, "evidence": empty_evidence, "values": [], "confidence": 0.0}
 
         gwt = {
             "given": str(data.get("given", "") or ""),
             "when": str(data.get("when", "") or ""),
             "then": str(data.get("then", "") or ""),
+        }
+
+        raw_evidence = data.get("evidence") or {}
+        evidence = {
+            fld: str(raw_evidence.get(fld) or "").strip() or NO_EVIDENCE
+            for fld in ("given", "when", "then")
         }
 
         raw_values = data.get("values") or []
@@ -358,8 +378,14 @@ class TVFromCodebaseAgent(BaseAgent):
                 "type": str(v.get("type", "string")),
                 "purpose": str(v.get("purpose", "")),
                 "source": str(v.get("source", "llm")),
+                "evidence": str(v.get("evidence") or "").strip() or NO_EVIDENCE,
             })
-        return {"gwt": gwt, "values": valid, "confidence": float(data.get("confidence", 0.7))}
+        return {
+            "gwt": gwt,
+            "evidence": evidence,
+            "values": valid,
+            "confidence": float(data.get("confidence", 0.7)),
+        }
 
     def _validate_values(
         self,
