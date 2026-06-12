@@ -86,6 +86,10 @@
 - `absent: true` 는 부재 기대 ("포함되지 않는다", "남지 않는다").
 - `path` 는 `$.필드`, `$[0].필드`, `$[*].필드` 형식만.
 - `where` 값에 요청 body 의 값을 참조하려면 `{request.필드명}`.
+- **요청 echo 검증** (보낸 값이 응답에 반영) 의 predicate 값도 `{request.필드명}` 으로
+  써라 — 구체 값 (`"Visa"` 등) 을 지어내면 실행 시 값이 달라 항상 fail 한다.
+- `http_status.expected` 와 메시지 predicate 는 **then/문서에 명시된 것만**. then 에
+  코드·문구가 없으면 expected 는 생략하거나 의도 클래스만 표현하라.
 - **table/field 는 문서나 스키마 정보에 실재가 확인된 이름만** — 지어내면 검증기가 폐기한다.
 - **response_body 의 path 도 실재 응답 필드만**: 에러 응답 본문은 FastAPI 표준
   `$.detail` 이다 — `$.error`/`$.message`/`$.data` 같은 필드를 지어내지 마라.

@@ -430,3 +430,127 @@ class TestAbsentErrorAlias:
             intent_negative=False, auth_negative=False,
         )
         assert out["verdict"] == "pass"
+
+
+class TestStatusClassMatchAndMissingPremise:
+    def _patch(self, monkeypatch, handler):
+        import httpx
+
+        from qapilot.tools import api_exec_tool as aet
+        orig = httpx.AsyncClient
+        monkeypatch.setattr(
+            aet.httpx, "AsyncClient",
+            lambda **kw: orig(transport=httpx.MockTransport(handler), **kw))
+
+    @pytest.mark.asyncio
+    async def test_class_match_when_then_has_no_code(self, monkeypatch):
+        # then '입력 오류가 표시된다' (코드 미명시) + LLM expected [400], 실제 422
+        import httpx
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path.endswith("/login"):
+                return httpx.Response(200, json={"token": "t"})
+            return httpx.Response(422, json={"detail": [{"loc": ["body", "email"], "type": "missing"}]})
+
+        self._patch(monkeypatch, handler)
+        from qapilot.tools import api_exec_tool as aet
+        out = await aet.execute_api_verification(
+            tc={"tc_id": "T1", "api": "POST /api/auth/signup",
+                "then": "입력 오류가 표시된다.",
+                "observe": [{"kind": "http_status", "expected": [400]}],
+                "values": []},
+            base_url="http://sut", test_account={"email": "a", "password": "b"},
+            intent_negative=True, auth_negative=False,
+        )
+        assert out["verdict"] == "pass"
+        assert "클래스 매칭" in out["reason"]
+
+    @pytest.mark.asyncio
+    async def test_explicit_code_in_then_stays_strict(self, monkeypatch):
+        # then 에 '409' 명시 — 404 는 클래스 같아도 fail 유지 (정밀 검증 보존)
+        import httpx
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path.endswith("/login"):
+                return httpx.Response(200, json={"token": "t"})
+            return httpx.Response(404, json={"detail": "nf"})
+
+        self._patch(monkeypatch, handler)
+        from qapilot.tools import api_exec_tool as aet
+        out = await aet.execute_api_verification(
+            tc={"tc_id": "T2", "api": "POST /api/family",
+                "then": "HTTP 409 상태 코드가 반환된다.",
+                "observe": [{"kind": "http_status", "expected": [409]}],
+                "values": []},
+            base_url="http://sut", test_account={"email": "a", "password": "b"},
+            intent_negative=True, auth_negative=False,
+        )
+        assert out["verdict"] == "fail"
+
+    @pytest.mark.asyncio
+    async def test_missing_premise_uses_nonexistent_id(self, monkeypatch):
+        # 'Order not found' 기대 — 실존 id 주입이 전제 파괴하던 군집 (TS-008/010/025)
+        import httpx
+        seen = {}
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            p = request.url.path
+            if p.endswith("/login"):
+                return httpx.Response(200, json={"token": "t"})
+            if p == "/api/orders" and request.method == "GET":
+                return httpx.Response(200, json=[{"id": 1}])
+            seen["path"] = p
+            if "999999999" in p:
+                return httpx.Response(404, json={"detail": "Order not found"})
+            return httpx.Response(400, json={"detail": "Order is already cancelled"})
+
+        self._patch(monkeypatch, handler)
+        from qapilot.tools import api_exec_tool as aet
+        out = await aet.execute_api_verification(
+            tc={"tc_id": "T3", "api": "PATCH /api/orders/{order_id}/cancel",
+                "then": "'Order not found' 메시지가 반환된다.",
+                "observe": [
+                    {"kind": "http_status", "expected": [404]},
+                    {"kind": "response_body", "path": "$.message",
+                     "predicate": {"eq": "Order not found"}},
+                ], "values": []},
+            base_url="http://sut", test_account={"email": "a", "password": "b"},
+            intent_negative=True, auth_negative=False,
+        )
+        assert "999999999" in seen["path"]
+        assert out["verdict"] == "pass"  # 404 + detail 별칭으로 메시지도 충족
+
+    @pytest.mark.asyncio
+    async def test_request_template_predicate_survives_grounding(self, monkeypatch):
+        # predicate {request.label} — P2 값 접지로 label 이 바뀌어도 echo 검증 정합
+        import json as _json
+
+        import httpx
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            p = request.url.path
+            if p.endswith("/login"):
+                return httpx.Response(200, json={"token": "t"})
+            if request.method == "GET" and p.endswith("payment-methods"):
+                return httpx.Response(200, json=[{"label": "신한카드 1234"}])
+            body = _json.loads(request.content or b"{}")
+            if body.get("label") == "Visa":
+                return httpx.Response(400, json={"detail": "존재하지 않는 결제 수단입니다"})
+            return httpx.Response(200, json={"label": body.get("label"), "is_current": True})
+
+        self._patch(monkeypatch, handler)
+        from qapilot.tools import api_exec_tool as aet
+        out = await aet.execute_api_verification(
+            tc={"tc_id": "T4", "api": "PUT /api/billing/payment-method",
+                "then": "결제수단이 성공적으로 변경된다.",
+                "observe": [
+                    {"kind": "http_status", "expected": [200]},
+                    {"kind": "response_body", "path": "$.label",
+                     "predicate": {"eq": "{request.label}"}},
+                ],
+                "values": [{"field": "label", "value": "Visa"}]},
+            base_url="http://sut", test_account={"email": "a", "password": "b"},
+            intent_negative=False, auth_negative=False,
+        )
+        assert out["verdict"] == "pass"
+        assert out.get("value_grounded")

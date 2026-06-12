@@ -240,9 +240,29 @@ def _resolve_where_template(value: Any, request_body: dict | None) -> Any:
     return value
 
 
+def _resolve_pred_templates(pred: dict | None, request_body: dict | None) -> dict | None:
+    """predicate 값의 {request.field} 템플릿 → 실제 요청 값 (값 접지와 정합).
+
+    run cfcfe52f 실증: P2 값 접지가 label 을 SUT 실측 값으로 교체했는데
+    predicate 는 원래 TV 값 (eq 'Visa') 기준이라 어긋남 — 요청 echo 검증은
+    {request.필드} 로 써야 접지 후에도 정합."""
+    if not isinstance(pred, dict):
+        return pred
+    out: dict = {}
+    for k, v in pred.items():
+        if isinstance(v, str):
+            out[k] = _resolve_where_template(v, request_body)
+        elif isinstance(v, list):
+            out[k] = [_resolve_where_template(x, request_body) for x in v]
+        else:
+            out[k] = v
+    return out
+
+
 async def _eval_observe(
     obs: dict, resp: Any, response_body: Any,
     request_body: dict | None, snapshot_fetch, db_table_hint: str | None,
+    then_text: str = "",
 ) -> tuple[bool, str]:
     """observe 1건 평가 → (ok, 사유). 평가 불능은 fail (false-pass 금지)."""
     kind = str(obs.get("kind") or "")
@@ -251,6 +271,15 @@ async def _eval_observe(
     if kind == "http_status":
         expected = [int(x) for x in (obs.get("expected") or []) if str(x).isdigit()]
         ok = resp.status_code in expected if expected else False
+        # then 에 숫자 코드가 명시되지 않은 TC 의 expected 는 LLM 추정값 —
+        # 같은 클래스 (4xx/2xx) 면 then 의 정밀도 수준에서는 충족이다
+        # (run cfcfe52f: '입력 오류가 표시된다' → LLM [400] 발명, 실제 422.
+        # 422 도 '입력 오류' 라는 then 주장의 충족). 코드 명시 TC 는 정밀 유지.
+        if not ok and expected and not re.search(r"\b\d{3}\b", then_text or ""):
+            if resp.status_code // 100 == expected[0] // 100:
+                ok = True
+                return ok, (f"status {resp.status_code} — 클래스 매칭 "
+                            f"(then 코드 미명시, LLM 추정 {expected})")
         return ok, f"status {resp.status_code} (기대 {expected})"
 
     if kind == "http_header":
@@ -277,7 +306,8 @@ async def _eval_observe(
             # 관찰 명세가 잘못됐을 개연성 (환각 path). 'unresolved:' 접두로
             # 표시 — 호출자가 verdict 계산에서 제외 (남는 observe 로 판정).
             return False, f"unresolved: body {obs.get('path')} 응답에 부재 (관찰 명세 결함 후보)"
-        ok = _eval_predicate(values, obs.get("predicate"))
+        pred = _resolve_pred_templates(obs.get("predicate"), request_body)
+        ok = _eval_predicate(values, pred)
         return ok, f"body {obs.get('path')} → {[str(v)[:20] for v in values[:3]]} predicate={'충족' if ok else '미충족'}"
 
     if kind == "db_field":
@@ -306,7 +336,7 @@ async def _eval_observe(
         if not field:
             return True, f"db {table} row {len(matched)}건 존재"
         values = [r.get(field) for r in matched]
-        ok = _eval_predicate(values, obs.get("predicate"))
+        ok = _eval_predicate(values, _resolve_pred_templates(obs.get("predicate"), request_body))
         return ok, f"db {table}.{field} → {[str(v)[:20] for v in values[:3]]} predicate={'충족' if ok else '미충족'}"
 
     return False, f"미지원 observe kind: {kind}"
@@ -478,7 +508,18 @@ async def execute_api_verification(
         last_seg = path.rstrip("/").rsplit("/", 1)[-1].lower()
         destructive = method == "DELETE" or last_seg in _DESTRUCTIVE_SEGMENTS
         path_template = path
-        if params:
+        # '존재하지 않는 리소스 → 404' 기대 TC 는 실존 id 주입이 전제를 파괴
+        # (run cfcfe52f: 'Order not found' 기대인데 resolver 가 실존 주문을
+        # 넣어 400 'already cancelled' 수신 — TS-008/010/025 군집 6건).
+        # 비실존 id 를 쓰고 arrange/전용리소스도 금지.
+        expects_missing = intent_negative and any(
+            k in then.lower() for k in ("not found", "존재하지 않", "찾을 수 없", "404")
+        )
+        if params and expects_missing:
+            for p in params:
+                ref_ids[p.lower()] = 999_999_999
+                path = path.replace("{" + p + "}", "999999999")
+        elif params:
             ref_ids = await _resolve_ref_ids(client, base, headers, params)
             if destructive and not auth_negative and headers:
                 for p in params:
@@ -505,7 +546,7 @@ async def execute_api_verification(
         # 선행해 충돌 상태에 도달시킨다 (예: 해지 후 재해지 → '이미 해지된
         # 회선' 오류가 기대 결과. run 04d5f79e: TS-009-TC-03 이 활성 주문을
         # 해지 '성공' 해버려 fail). 선행 호출 결과는 측정에 불포함.
-        if intent_negative and any(k in then for k in _CONFLICT_HINTS):
+        if intent_negative and not expects_missing and any(k in then for k in _CONFLICT_HINTS):
             try:
                 pre = await client.request(method, url, json=body, headers=headers)
                 logger.info("api_exec_conflict_arranged", trace_id=trace_id,
@@ -638,7 +679,8 @@ async def execute_api_verification(
             obs_results: list[tuple[bool, str]] = []
             for o in api_observes:
                 ok, why = await _eval_observe(
-                    o, resp, response_body, body, snapshot_fetch, db_table)
+                    o, resp, response_body, body, snapshot_fetch, db_table,
+                    then_text=then)
                 obs_results.append((ok, why))
             # 미해결 path (환각 관찰 명세) 는 verdict 계산에서 제외 — 값이
             # 틀린 게 아니라 명세가 잘못된 것 (run 1ead19b7: $.error/$.message
