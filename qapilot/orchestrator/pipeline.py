@@ -3083,6 +3083,31 @@ _API_CONTRACT_HINTS = (
 )
 
 
+def _build_runtime_context(ui_result: dict | None) -> str:
+    """RootCause 용 실측 실행 컨텍스트 — ui fail step + error 요약.
+
+    run 04d5f79e 감사: RootCauseAgent 가 더미 파일 (_load_dummy_context) 만
+    찾다 전 TC context_not_found (68건) — 실행 증거 없이 코드만 보고 추론.
+    """
+    if not isinstance(ui_result, dict):
+        return ""
+    parts: list[str] = []
+    if ui_result.get("verify_mode") == "api":
+        parts.append(f"검증 수단: API 직접 호출. {ui_result.get('summary') or ''}")
+    err = ui_result.get("error")
+    if err:
+        parts.append(f"TC 에러: {str(err)[:300]}")
+    for s in ui_result.get("steps") or []:
+        if s.get("status") != "fail":
+            continue
+        parts.append(
+            f"실패 step {s.get('step_no')}: action={s.get('action')} "
+            f"selector={str(s.get('selector'))[:80]} "
+            f"({s.get('selector_type')}) error={str(s.get('error'))[:200]}"
+        )
+    return "\n".join(parts)
+
+
 def _derive_cc_status(cc: dict) -> str:
     """cross_check kind 의 status 도출 — has_mismatch → fail, 검증 부재 → unverified.
 
@@ -3912,6 +3937,11 @@ async def _root_cause(state: PipelineState) -> dict:
                         "qapilot_dir": state.get("qapilot_dir"),
                         "service_id": state.get("service_id")
                             or (load_trace(state["trace_id"]) or {}).get("service_id"),
+                        # 실측 실행 컨텍스트 — fail step/error (run 04d5f79e:
+                        # context_not_found 68건 = 더미 파일만 찾던 격차)
+                        "runtime_context": _build_runtime_context(
+                            ui_by_tc.get(str(tc_id))
+                        ),
                     },
                     params={
                         "tc_id": tc_id,

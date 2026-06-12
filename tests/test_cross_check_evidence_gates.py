@@ -40,11 +40,32 @@ class TestEndpointMatchedEvidence:
         ui = {"steps": [{"action": "assert", "status": "fail"}]}
         assert _agent()._evaluate_scenario_intent(_POSITIVE_INTENT, ui, api) is True
 
-    def test_no_api_field_keeps_legacy_behavior(self):
+    def test_no_api_field_blocks_api_evidence(self):
+        # run 04d5f79e 2차 감사: api=None TC 가 무관 POST 200 (자동 로그인 등)
+        # 으로 구제되던 구멍 — TS-028 'FCP 1.5초' 성능 TC 3건 false-pass 실증.
+        # api=None 이면 API 증거 사용 불가, UI 전 step pass 만이 구제 근거.
         intent = dict(_POSITIVE_INTENT, api=None)
         api = {"calls": [{"method": "POST", "status_code": 200, "url": "http://sut/x"}]}
         ui = {"steps": [{"action": "assert", "status": "fail"}]}
+        assert _agent()._evaluate_scenario_intent(intent, ui, api) is False
+
+    def test_no_api_field_ui_all_pass_still_rescues(self):
+        intent = dict(_POSITIVE_INTENT, api=None)
+        api = {"calls": []}
+        ui = {"steps": [{"action": "assert", "status": "pass"}]}
         assert _agent()._evaluate_scenario_intent(intent, ui, api) is True
+
+    def test_negative_requires_endpoint_matched_4xx(self):
+        # 무관 4xx (에셋 404) 가 negative 구제 증거로 둔갑 금지
+        intent = {"name": "오류", "tags": ["edge_case"],
+                  "then": "오류가 반환된다.", "api": "POST /api/family"}
+        unrelated = {"calls": [{"method": "GET", "status_code": 404,
+                                "url": "http://sut/assets/x.png"}]}
+        matched = {"calls": [{"method": "POST", "status_code": 409,
+                              "url": "http://sut/api/family"}]}
+        ui = {"steps": []}
+        assert _agent()._evaluate_scenario_intent(intent, ui, unrelated) is False
+        assert _agent()._evaluate_scenario_intent(intent, ui, matched) is True
 
 
 class TestInputsCompletenessGate:

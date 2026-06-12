@@ -208,10 +208,17 @@ class CrossCheckAgent(BaseAgent):
             "빈", "필수", "입력", "형식", "validation", "required",
         ])
 
-        # actual outcome — API 4xx 응답 또는 UI form-level prevent
+        # actual outcome — API 4xx 응답 또는 UI form-level prevent.
+        # 증거 게이트 강화 (run 04d5f79e 2차 감사): API 증거는 TC 대상 endpoint
+        # 와 일치할 때만 인정 — api=None TC 가 무관 호출 (자동 로그인 POST 200,
+        # 에셋 404) 로 구제되던 구멍. TS-028 'FCP 1.5초' 성능 TC 3건 +
+        # TS-017-TC-01 이 무관 증거로 pass 둔갑한 실증.
         calls = api_trace.get("calls") or []
-        api_4xx_or_5xx = any(
-            (c.get("status_code") or 0) >= 400 for c in calls
+        expected_path = self._expected_api_path(scenario_intent.get("api"))
+        api_4xx_or_5xx = bool(expected_path) and any(
+            (c.get("status_code") or 0) >= 400
+            and expected_path in str(c.get("url") or "")
+            for c in calls
         )
         # UI form prevent — submit 후 페이지 변화 0 + POST 0 (validation 막힘)
         post_count = sum(
@@ -237,12 +244,12 @@ class CrossCheckAgent(BaseAgent):
             return api_4xx_or_5xx
         # positive — actual success. POST 2xx 는 TC 의 대상 endpoint 와 일치할
         # 때만 증거로 인정 (run d20fc18f TS-006-TC-05 실증: 자동 로그인 POST 200
-        # 이 '가입 완료' 증거로 둔갑하던 격차).
-        expected_path = self._expected_api_path(scenario_intent.get("api"))
-        api_2xx_post = any(
+        # 이 '가입 완료' 증거로 둔갑하던 격차). api=None 이면 API 증거 사용 불가
+        # — UI 전 step pass 만이 유일한 구제 근거 (run 04d5f79e TS-028 실증).
+        api_2xx_post = bool(expected_path) and any(
             (c.get("method") or "").upper() in {"POST", "PUT", "PATCH"}
             and 200 <= (c.get("status_code") or 0) < 300
-            and (not expected_path or expected_path in str(c.get("url") or ""))
+            and expected_path in str(c.get("url") or "")
             for c in calls
         )
         ui_all_pass = all(s.get("status") == "pass" for s in ui_steps) if ui_steps else False
