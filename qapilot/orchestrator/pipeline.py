@@ -2963,6 +2963,41 @@ async def _test_execution(state: PipelineState) -> dict:
                 )
                 page = await context.new_page()
 
+                # ── 실시간 스트리밍: CDP Screencast 시작 ──────────────────────
+                # 스텝별 스크린샷(disk/S3 업로드)은 그대로 두고, 실행 중 라이브
+                # 화면을 WebSocket 으로 브로드캐스트한다. headless 환경에서도 동작.
+                # 프레임은 stream_store 의 trace_id 구독자 큐로 흘러가고, 구독자가
+                # 없으면 broadcast_frame 이 no-op 이라 비용이 거의 없다.
+                _cdp_session = None
+                if trace_id:
+                    from qapilot.shared.stream_store import broadcast_frame as _broadcast_frame
+
+                    _tid = trace_id  # 클로저 캡처용
+
+                    try:
+                        _cdp_session = await context.new_cdp_session(page)
+
+                        async def _on_screencast_frame(event: dict) -> None:
+                            # event["data"] 는 이미 base64 JPEG 문자열.
+                            try:
+                                _broadcast_frame(_tid, event["data"])
+                                await _cdp_session.send(
+                                    "Page.screencastFrameAck",
+                                    {"sessionId": event["sessionId"]},
+                                )
+                            except Exception:
+                                pass
+
+                        _cdp_session.on("Page.screencastFrame", _on_screencast_frame)
+                        await _cdp_session.send(
+                            "Page.startScreencast",
+                            {"format": "jpeg", "quality": 60, "maxWidth": 1280, "maxHeight": 800},
+                        )
+                        logger.info("screencast_started", trace_id=trace_id, tc_id=tc_id)
+                    except Exception as _sc_err:
+                        _cdp_session = None
+                        logger.warning("screencast_start_failed", trace_id=trace_id, error=str(_sc_err))
+
                 # per-TC 실패 흡수 준비 — TC 1개의 Tool 타임아웃/예외가 run 전체를
                 # abort 시키면 안 된다 (run eb5145b7: TS-004 의 60s Tool 타임아웃이
                 # pipeline_failed → 나머지 TC 전부 미실행). 예외 시 리스트를 이
@@ -3215,6 +3250,13 @@ async def _test_execution(state: PipelineState) -> dict:
                         "tc_mirror_failed", trace_id=trace_id, tc_id=tc_id, error=str(e),
                     )
 
+                # CDP Screencast 정리 — context.close() 전에 명시적으로 중단.
+                if _cdp_session is not None:
+                    try:
+                        await _cdp_session.send("Page.stopScreencast")
+                        await _cdp_session.detach()
+                    except Exception:
+                        pass
                 # per-TC 컨텍스트 정리 — 예외 시에도 닫는다 (잔여는 browser.close() 가 정리).
                 try:
                     await context.close()
