@@ -2694,6 +2694,27 @@ async def _test_execution(state: PipelineState) -> dict:
                 except Exception:
                     pass
 
+            def _is_auth_route(route: str) -> bool:
+                """로그인/회원가입 화면 — 비인증으로 보여줘야 하는 라우트."""
+                p = (route or "").split("?")[0].rstrip("/")
+                return p in ("/login", "/signup")
+
+            async def _cap_logout(page_c) -> None:
+                """공유 캡처 컨텍스트 로그아웃 — auth 페이지를 비인증으로 캡처하기 위해
+                쿠키 + localStorage/sessionStorage(JWT 보관처) 클리어. best-effort.
+                (이미 로그인된 세션이면 /login → /dashboard 리다이렉트로 로그인 폼이
+                안 떴음 — run 5498271b 진단)."""
+                try:
+                    await page_c.context.clear_cookies()
+                except Exception:
+                    pass
+                try:
+                    await page_c.evaluate(
+                        "() => { try { localStorage.clear(); sessionStorage.clear(); } catch (e) {} }")
+                except Exception:
+                    pass
+                _cap_state["logged_in"] = False
+
             async def _ref_fill_field(page_c, step: dict, value: str) -> None:
                 """참고 화면용 fill — 실제 UI 경로(ui_test_tool)와 동일한 selector_type
                 매핑. 입력 타이핑은 mutation 이 아니므로 부작용 없음. best-effort."""
@@ -2769,9 +2790,16 @@ async def _test_execution(state: PipelineState) -> dict:
                             plan = _ref_step_plan(s, rb, intent_negative)
                             try:
                                 if plan["op"] == "navigate":
+                                    # 로그인/회원가입 화면은 비인증으로 — goto 전에
+                                    # 로그아웃(쿠키+localStorage). 그 외 가드 라우트는
+                                    # 로그인 유지 + 필요 시 자동 로그인.
+                                    _auth_page = _is_auth_route(plan["route"])
+                                    if _auth_page:
+                                        await _cap_logout(page_c)
                                     await page_c.goto(base + plan["route"], timeout=5000,
                                                       wait_until="domcontentloaded")
-                                    await _cap_login_if_needed(page_c)
+                                    if not _auth_page:
+                                        await _cap_login_if_needed(page_c)
                                 elif plan["op"] == "fill":
                                     await _ref_fill_field(page_c, s, str(plan["value"]))
                                 elif plan["op"] == "click":
