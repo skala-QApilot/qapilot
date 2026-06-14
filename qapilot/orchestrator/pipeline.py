@@ -2675,6 +2675,10 @@ async def _test_execution(state: PipelineState) -> dict:
             _cap_state: dict = {"page": None, "logged_in": False}
 
             async def _cap_login_if_needed(page_c) -> None:
+                # auth-negative(비인증 접근 거부 검증) TC 는 자동 로그인 금지 —
+                # 로그인된 화면을 찍으면 '인증 통과처럼' 오해 (검증 전제 = 비인증).
+                if _cap_state.get("auth_negative"):
+                    return
                 if _cap_state["logged_in"] or not test_account_dict:
                     return
                 if "/login" not in page_c.url:
@@ -2690,15 +2694,65 @@ async def _test_execution(state: PipelineState) -> dict:
                 except Exception:
                     pass
 
+            async def _ref_fill_field(page_c, step: dict, value: str) -> None:
+                """참고 화면용 fill — 실제 UI 경로(ui_test_tool)와 동일한 selector_type
+                매핑. 입력 타이핑은 mutation 이 아니므로 부작용 없음. best-effort."""
+                sel_type = str(step.get("selector_type") or "").lower()
+                sel = str(step.get("selector") or "")
+                if not sel:
+                    return
+                if sel_type in {"testid", "test_id", "data-testid", "data-test-id"}:
+                    await page_c.get_by_test_id(sel).fill(value, timeout=2000)
+                elif sel_type == "label":
+                    await page_c.get_by_label(sel).fill(value, timeout=2000)
+                elif sel_type == "placeholder":
+                    await page_c.get_by_placeholder(sel).fill(value, timeout=2000)
+                else:
+                    loc = sel if sel.startswith(("#", ".", "[")) else (
+                        f"[data-testid='{sel}'], #{sel}, [name='{sel}']")
+                    await page_c.locator(loc).first.fill(value, timeout=2000)
+
+            async def _ref_click_safe(page_c, step: dict) -> None:
+                """비-mutating click 만 실제 수행 (탭 전환·내비 등). api_endpoint 를
+                가진 터미널 submit 은 호출부에서 미수행 처리됨. best-effort."""
+                sel_type = str(step.get("selector_type") or "").lower()
+                sel = str(step.get("selector") or "")
+                if not sel:
+                    return
+                if sel_type in {"testid", "test_id", "data-testid", "data-test-id"}:
+                    await page_c.get_by_test_id(sel).click(timeout=2000)
+                else:
+                    loc = sel if sel.startswith(("#", ".", "[")) else (
+                        f"[data-testid='{sel}'], #{sel}, [name='{sel}']")
+                    await page_c.locator(loc).first.click(timeout=2000)
+
             async def _capture_reference(
                 tc_api: str | None, shots_dir: Path,
                 mapping_steps: list | None = None,
+                request_body: dict | None = None,
+                response_body: dict | None = None,
+                on_shot=None,
+                intent_negative: bool = False,
+                auth_negative: bool = False,
             ) -> None:
-                """스텝별 참고 화면 — navigate 만 실제 수행 (click/fill 은 부수효과
-                위험이라 미수행, 해당 시점 화면만 촬영). step_{n}.png 로 저장해
-                mirror 가 업로드 → 상세 패널의 스텝별 캡처 버튼이 표시."""
+                """스텝별 참고 화면 — 부작용 없는 범위에서 브라우저를 실제 구동해
+                스텝별로 '다른' 화면을 촬영 (빈폼 → 입력 → 제출직전 → 결과).
+
+                안전성 모델 (방안 A):
+                - navigate / fill: 실제 수행. 입력 타이핑은 mutation 아님 → 안전.
+                  값은 매핑이 아니라 api_payload 의 실제 request_body 로 채워 '제출된
+                  실제 값' 을 보여준다 (process.env.* 마스킹 회피).
+                - 터미널 mutating click (api_endpoint 보유): 미수행 — API 가 이미
+                  동일 부작용을 수행했으므로 중복 실행 차단. '입력 완료된 폼' 화면을
+                  그 스텝으로 촬영한다.
+                - 비-mutating click (api_endpoint 없음): 실제 수행 (안전한 내비/토글).
+                - assert: API 응답이 만든 결과 라우트로 navigate 시도 → 성공 화면.
+                  실패 시 직전(채워진 폼) 화면 유지.
+                전 과정 best-effort — 실패는 무시 (검증 verdict 와 완전 분리).
+                step_{n}.png 로 저장 → mirror 가 S3+tc_artifacts 업로드."""
                 if not (target_url and tc_api):
                     return
+                _cap_state["auth_negative"] = auth_negative
                 try:
                     if _cap_state["page"] is None:
                         _cap_ctx = await browser.new_context()
@@ -2706,39 +2760,58 @@ async def _test_execution(state: PipelineState) -> dict:
                     page_c = _cap_state["page"]
                     shots_dir.mkdir(parents=True, exist_ok=True)
                     base = target_url.rstrip("/")
+                    rb = request_body if isinstance(request_body, dict) else {}
 
-                    steps = [s for s in (mapping_steps or []) if isinstance(s, dict)][:6]
+                    steps = [s for s in (mapping_steps or []) if isinstance(s, dict)]
                     if steps:
                         for s in steps:
                             step_no = s.get("step_no") or (steps.index(s) + 1)
-                            if str(s.get("action") or "") == "navigate":
-                                route = str(s.get("value") or s.get("selector") or "")
-                                if route.startswith("/"):
-                                    try:
-                                        await page_c.goto(base + route, timeout=5000,
-                                                          wait_until="domcontentloaded")
-                                        await _cap_login_if_needed(page_c)
-                                    except Exception:
-                                        pass
+                            plan = _ref_step_plan(s, rb, intent_negative)
                             try:
-                                await page_c.screenshot(
-                                    path=str(shots_dir / f"step_{step_no}.png"))
+                                if plan["op"] == "navigate":
+                                    await page_c.goto(base + plan["route"], timeout=5000,
+                                                      wait_until="domcontentloaded")
+                                    await _cap_login_if_needed(page_c)
+                                elif plan["op"] == "fill":
+                                    await _ref_fill_field(page_c, s, str(plan["value"]))
+                                elif plan["op"] == "click":
+                                    # 비-mutating click 만 (mutating submit 은 plan=noop)
+                                    await _ref_click_safe(page_c, s)
+                                elif plan["op"] == "result":
+                                    # 성공 결과 화면 — 응답 redirect 있으면 그 프론트
+                                    # 라우트, 없으면 SUT 루트 '/'(앱 랜딩: /plans·
+                                    # /dashboard 로 redirect). 폼에 머물지 않고 '액션
+                                    # 후 앱' 화면을 보여줘 step_6(제출 직전 폼) 과 구분.
+                                    # API 세그먼트(/auth)로는 안 감 → 흰 화면 방지.
+                                    seg = _result_route_from(response_body) or "/"
+                                    await page_c.goto(base + seg, timeout=5000,
+                                                      wait_until="domcontentloaded")
+                                    await _cap_login_if_needed(page_c)
+                                # noop (mutating submit / wait / 미지원) → 현재 화면 촬영
                             except Exception:
                                 pass
+                            shot_path = shots_dir / f"step_{step_no}.png"
+                            try:
+                                await page_c.screenshot(path=str(shot_path))
+                            except Exception:
+                                pass
+                            # 증분 라이브 — 이 스텝을 즉시 S3/DB 로 올려 '최신' 으로
+                            # 만들고 짧게 머무름 (실행 중 프리뷰가 스텝별로 넘어감).
+                            if on_shot is not None:
+                                await on_shot(step_no, shot_path)
                         return
 
-                    # 매핑 없음 — api 첫 세그먼트 라우트 휴리스틱으로 1장
-                    parts = str(tc_api).split(" ", 1)
-                    seg = "/"
-                    if len(parts) == 2:
-                        segs = [s for s in parts[1].split("/")
-                                if s and s != "api" and "{" not in s]
-                        if segs:
-                            seg = "/" + segs[0]
+                    # 매핑 없음 — 응답 redirect 있으면 그 프론트 라우트, 없으면 SUT
+                    # 루트 '/'(실존: /plans·/dashboard 로 redirect). /auth 류 API
+                    # 세그먼트로 가지 않는다 (흰 화면 방지).
+                    seg = _result_route_from(response_body) or "/"
                     await page_c.goto(base + seg, timeout=5000,
                                       wait_until="domcontentloaded")
                     await _cap_login_if_needed(page_c)
-                    await page_c.screenshot(path=str(shots_dir / "step_1.png"))
+                    shot_path = shots_dir / "step_1.png"
+                    await page_c.screenshot(path=str(shot_path))
+                    if on_shot is not None:
+                        await on_shot(1, shot_path)
                 except Exception:
                     pass
 
@@ -2815,9 +2888,11 @@ async def _test_execution(state: PipelineState) -> dict:
                     # ui kind 는 status 없음 (UI 미수행 — skip 과 구분: S 카운트
                     # 오염 금지, RunReader 의 skip 보호와도 무관). verdict 는
                     # api kind (의도-인지 라벨링) + cross_check 가 만든다.
+                    _ref_steps = _api_mode_ref_steps(
+                        (action_mapping_by_tc.get(str(tc_id)) or {}).get("steps"))
                     ui_payload = {
                         "tc_id": tc_id, "verify_mode": "api", "status": None,
-                        "steps": [], "total_duration_ms": 0,
+                        "steps": _ref_steps, "total_duration_ms": 0,
                         "summary": f"API-mode 검증: {exec_out.get('reason', '')}",
                     }
                     api_payload = {
@@ -2836,11 +2911,25 @@ async def _test_execution(state: PipelineState) -> dict:
                         tc_id=tc_id, trace_id=trace_id,
                         DBTestTool=DBTestTool, ToolInput=ToolInput,
                     )
-                    # 참고 화면 캡처 (step_1.png) — mirror 가 업로드해 상세
-                    # 패널에 표시. 검증 증거 아님 (라벨로 구분).
+                    # 스텝별 참고 화면 캡처 — 실제 제출값(request_body) 으로 폼을
+                    # 채워 스텝별 화면을 만든다. 라이브 프리뷰가 스텝마다 넘어가도록
+                    # ui row 를 먼저 만들어(id 확보) 캡처가 스텝마다 증분 업로드.
+                    _first_call = (api_payload.get("calls") or [{}])[0]
+                    _live_ui_id = upsert_tc_result(
+                        run_id=trace_id, ts_id=ts_id, tc_id=tc_id, kind="ui",
+                        payload=ui_payload)
                     await _capture_reference(
                         _tc_meta.get("api"), screenshots_dir,
                         mapping_steps=(action_mapping_by_tc.get(str(tc_id)) or {}).get("steps"),
+                        request_body=_first_call.get("request_body")
+                        if isinstance(_first_call, dict) else None,
+                        response_body=_first_call.get("response_body")
+                        if isinstance(_first_call, dict) else None,
+                        on_shot=_make_live_shot(
+                            trace_id=trace_id, ts_id=ts_id, tc_id=tc_id,
+                            ui_result_id=_live_ui_id),
+                        intent_negative=intent_neg,
+                        auth_negative=auth_neg,
                     )
                     ui_results.append(ui_payload)
                     api_results.append(api_payload)
@@ -2852,11 +2941,14 @@ async def _test_execution(state: PipelineState) -> dict:
                     (tc_dir / "db_result.json").write_text(
                         json.dumps(db_res, ensure_ascii=False, indent=2), "utf-8")
                     try:
+                        # 캡처가 증분 업로드했으면(_live_ui_id) mirror 는 screenshots skip
+                        # — 재삽입 시 artifact_count 중복 + created_at 순서 깨짐.
                         _mirror_tc_results_and_artifacts(
                             trace_id=trace_id, ts_id=ts_id, tc_id=tc_id,
                             ui_result=ui_payload, api_result=api_payload,
                             db_result=db_res, screenshots_dir=screenshots_dir,
                             intent_negative=intent_neg,
+                            skip_screenshots=bool(_live_ui_id),
                         )
                     except Exception as e:
                         logger.warning("tc_mirror_failed", trace_id=trace_id, tc_id=tc_id, error=str(e))
@@ -2876,6 +2968,9 @@ async def _test_execution(state: PipelineState) -> dict:
                 # pipeline_failed → 나머지 TC 전부 미실행). 예외 시 리스트를 이
                 # 시점으로 되돌리고 failed 결과를 기록 후 다음 TC 로 계속.
                 _ui_len, _api_len, _db_len = len(ui_results), len(api_results), len(db_results)
+                # api-mode 폴백이 스텝별 증분 캡처를 했으면 True → 아래 공용 mirror 가
+                # screenshots 재삽입을 건너뜀 (ui-mode 경로는 False 유지 → 정상 업로드).
+                _live_skip_shots = False
 
                 try:
                     # item may be either a GeneratedCode dict or an ActionMapping dict.
@@ -3049,7 +3144,9 @@ async def _test_execution(state: PipelineState) -> dict:
                         )
                         ui_payload = {
                             "tc_id": tc_id, "verify_mode": "api", "status": None,
-                            "steps": [], "total_duration_ms": 0,
+                            "steps": _api_mode_ref_steps(
+                                (action_mapping_by_tc.get(str(tc_id)) or {}).get("steps")),
+                            "total_duration_ms": 0,
                             "summary": (
                                 f"UI 미측정({_orig}) → API-mode 폴백: "
                                 f"{_fb_out.get('reason', '')}"
@@ -3066,10 +3163,24 @@ async def _test_execution(state: PipelineState) -> dict:
                             api_payload["db_observation"] = _fb_out["db_observation"]
                         if _fb_out.get("observe_results"):
                             api_payload["observe_results"] = _fb_out["observe_results"]
+                        _fb_first_call = (api_payload.get("calls") or [{}])[0]
+                        _fb_live_ui_id = upsert_tc_result(
+                            run_id=trace_id, ts_id=ts_id, tc_id=tc_id, kind="ui",
+                            payload=ui_payload)
                         await _capture_reference(
                             _fb_meta.get("api"), screenshots_dir,
                             mapping_steps=(action_mapping_by_tc.get(str(tc_id)) or {}).get("steps"),
+                            request_body=_fb_first_call.get("request_body")
+                            if isinstance(_fb_first_call, dict) else None,
+                            response_body=_fb_first_call.get("response_body")
+                            if isinstance(_fb_first_call, dict) else None,
+                            on_shot=_make_live_shot(
+                                trace_id=trace_id, ts_id=ts_id, tc_id=tc_id,
+                                ui_result_id=_fb_live_ui_id),
+                            intent_negative=_fb_intent_neg,
+                            auth_negative=_fb_auth_neg,
                         )
+                        _live_skip_shots = bool(_fb_live_ui_id)
                         ui_results[-1] = ui_payload
                         api_results[-1] = api_payload
 
@@ -3097,6 +3208,7 @@ async def _test_execution(state: PipelineState) -> dict:
                         intent_negative=_is_negative_intent_then(
                             tc_then_by_id.get(str(tc_id), "")
                         ),
+                        skip_screenshots=_live_skip_shots,
                     )
                 except Exception as e:
                     logger.warning(
@@ -3226,6 +3338,119 @@ def _derive_cc_status(cc: dict) -> str:
     return "pass"
 
 
+def _result_route_from(response_body: dict | None) -> str | None:
+    """api-mode 의 assert/결과 화면용 '프론트엔드' 라우트 — 응답이 redirect 류
+    path(반드시 '/' 로 시작하는 프론트 경로)를 줄 때만 사용.
+
+    ⚠️ API 경로 세그먼트(예: POST /api/auth/signup → /auth)를 프론트 라우트로
+    오추출하면 SPA 가 매칭 실패 → 흰 화면이 된다. SUT 프론트 라우트는 /signup·
+    /login·/dashboard 류지 /auth 가 아니다 (run 92269223 의 step_7 흰 화면 +
+    06-02 회귀 _infer_target_route /auth 오추출 의 근본 원인). API 세그먼트
+    휴리스틱은 제거 — redirect 없으면 None → 호출부가 네비를 건너뛴다."""
+    if isinstance(response_body, dict):
+        for k in ("redirect", "redirect_url", "url", "location", "next"):
+            v = response_body.get(k)
+            if isinstance(v, str) and v.startswith("/"):
+                return v
+    return None
+
+
+# 라이브 프리뷰 — 캡처 스텝마다 프레임이 '최신' 으로 잡히도록 머무는 시간(초).
+# 실행 중 프리뷰 폴링(1s)이 각 스텝을 놓치지 않게. 작을수록 빠르게 넘어감.
+_LIVE_SHOT_PACE_S = 0.8
+
+
+def _make_live_shot(*, trace_id: str, ts_id: str, tc_id: str,
+                    ui_result_id: str | None):
+    """캡처 스텝마다 즉시 S3 업로드 + tc_artifact 삽입 → 라이브 프리뷰가 스텝별로
+    전진(빈폼→입력→…→결과). 배치 mirror 와 달리 created_at 이 스텝마다 올라가
+    `load_latest_screenshot_s3_key`(created_at DESC) 가 각 스텝을 차례로 반환.
+
+    ui_result_id 없으면(DB 비활성) None → 캡처는 디스크에만 쓰고 mirror 경로로.
+    """
+    if not ui_result_id:
+        return None
+
+    async def _on_shot(step_no: int, png_path) -> None:
+        try:
+            import asyncio as _asyncio
+            s3_key = (f"runs/{trace_id}/tc/{ts_id}/{tc_id}"
+                      f"/screenshots/{png_path.name}")
+            meta = s3_client.put_file(s3_key, str(png_path), content_type="image/png")
+            if meta:
+                insert_tc_artifact(
+                    tc_result_id=ui_result_id, step_index=step_no, kind="png",
+                    s3_key=s3_key, sha256=meta.get("sha256"),
+                    size_bytes=meta.get("bytes"),
+                )
+            # 이 프레임이 '최신' 으로 잠깐 머물러 프리뷰 폴링이 잡도록.
+            await _asyncio.sleep(_LIVE_SHOT_PACE_S)
+        except Exception:
+            pass
+
+    return _on_shot
+
+
+def _ref_step_plan(step: dict, request_body: dict | None,
+                   intent_negative: bool = False) -> dict:
+    """참고 화면 1 스텝의 수행 계획 — 부작용 안전 모델(방안 A)의 단일 진실.
+
+    순수 함수(브라우저 비의존)라 안전 불변식을 결정적으로 테스트할 수 있다:
+    - navigate/fill 만 실제 동작 (입력 타이핑은 mutation 아님).
+    - 터미널 mutating click (api_endpoint 보유) 은 미수행("noop") — API 가 이미
+      동일 부작용을 수행했으므로 중복 실행 차단.
+    - fill 값은 매핑이 아니라 실제 제출값(request_body) 우선. process.env.* 마스킹은
+      빈 문자열로 대체.
+    - assert(결과) 는 intent 인지: positive 는 결과 앱 화면("result"=/plans 류),
+      negative(거부 기대) 는 "noop" — 폼에 머문다. negative 인데 /plans(성공 앱)로
+      가면 '가입 성공처럼' 오해됨. 폼은 거부 맥락(보호자 동의 필드/잘못된 입력)을
+      그대로 보여주므로 진실에 부합.
+    반환: {"op": "navigate"|"fill"|"click"|"result"|"noop", ...}
+    """
+    action = str(step.get("action") or "").lower()
+    rb = request_body if isinstance(request_body, dict) else {}
+    if action == "navigate":
+        route = str(step.get("value") or step.get("selector") or "")
+        return {"op": "navigate", "route": route} if route.startswith("/") else {"op": "noop"}
+    if action == "fill":
+        key = step.get("target_name") or step.get("selector")
+        if key in rb:
+            val = rb[key]
+        else:
+            raw = step.get("value")
+            val = "" if (isinstance(raw, str) and raw.startswith("process.env.")) else raw
+        return {"op": "fill", "value": val} if val is not None else {"op": "noop"}
+    if action == "click":
+        # 터미널 mutating submit (api_endpoint) 은 미수행 — 부작용 중복 차단.
+        return {"op": "noop"} if step.get("api_endpoint") else {"op": "click"}
+    if action.startswith("assert"):
+        # negative 는 결과 앱 화면 금지 → 폼(거부 맥락) 유지.
+        return {"op": "noop"} if intent_negative else {"op": "result"}
+    return {"op": "noop"}
+
+
+def _api_mode_ref_steps(mapping_steps: list | None) -> list[dict]:
+    """api-mode 의 ui payload steps[] — 매핑 스텝을 참고 화면 레코드로 변환.
+
+    status 는 None: per-step 검증이 아니라 참고 화면이므로 (verdict 의 단일 진실은
+    api/cross_check kind 가 소유). 프론트가 스텝 스트립·캡처 버튼·썸네일을 렌더하는
+    데 필요한 최소 필드 (step_no/action/screenshot_path) 만 채운다."""
+    out: list[dict] = []
+    for s in mapping_steps or []:
+        if not isinstance(s, dict):
+            continue
+        n = s.get("step_no") or (len(out) + 1)
+        out.append({
+            "step_no": n,
+            "action": s.get("action"),
+            "status": None,
+            "screenshot_path": f"step_{n}.png",
+            "target_name": s.get("target_name") or s.get("selector"),
+            "value": s.get("value"),
+        })
+    return out
+
+
 def _decide_verify_mode(
     tc_then: str, tc_tags: list, tc_api: str | None,
     original_mapping: dict | None, generated_code: str | None,
@@ -3290,10 +3515,13 @@ def _mirror_tc_results_and_artifacts(
     db_result: dict,
     screenshots_dir: Path,
     intent_negative: bool = False,
+    skip_screenshots: bool = False,
 ) -> None:
     """ui/api/db 결과 → tc_results UPSERT, 스크린샷 PNG → S3 + tc_artifacts.
 
     DB / S3 미설정/실패 시 모두 graceful — file 기록이 source of truth.
+    skip_screenshots: api-mode 가 캡처 루프에서 스텝마다 증분 업로드/삽입을 이미
+    마친 경우 True — 여기서 재삽입하면 artifact_count 중복 + 라이브 순서 깨짐.
     """
     ui_result_id = upsert_tc_result(
         run_id=trace_id, ts_id=ts_id, tc_id=tc_id, kind="ui", payload=ui_result,
@@ -3310,7 +3538,8 @@ def _mirror_tc_results_and_artifacts(
     )
 
     # 스크린샷은 UI result 에 묶음. tc_result_id 없으면 (DB 비활성) S3 도 skip.
-    if not ui_result_id or not screenshots_dir.exists():
+    # skip_screenshots — 캡처가 증분으로 이미 올림 (api-mode 라이브 프리뷰).
+    if skip_screenshots or not ui_result_id or not screenshots_dir.exists():
         return
 
     for png in sorted(screenshots_dir.glob("step_*.png")):
