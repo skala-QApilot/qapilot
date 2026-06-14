@@ -2824,6 +2824,27 @@ async def _test_execution(state: PipelineState) -> dict:
                                    error=f"{type(e).__name__}: {e}"[:160])
                     return None
 
+            # ── 실시간 스트리밍 뷰어 연결 대기 ───────────────────────────────
+            # 뷰어(WebSocket)가 붙기 전에 테스트가 시작되면 초반 화면(폼 입력 등)이
+            # 스트림에 누락돼 "현재 테스트와 다른 화면"으로 보인다. 구독자가 생길
+            # 때까지 최대 _STREAM_CONNECT_WAIT_SEC 대기한 뒤 테스트를 시작한다.
+            # 뷰어가 없는 실행(CLI/API 트리거 등)은 타임아웃 후 그대로 진행한다.
+            if trace_id:
+                import asyncio as _asyncio
+                from qapilot.shared.stream_store import has_subscribers as _has_subs
+
+                _STREAM_CONNECT_WAIT_SEC = 10.0
+                _stream_waited = 0.0
+                while not _has_subs(trace_id) and _stream_waited < _STREAM_CONNECT_WAIT_SEC:
+                    await _asyncio.sleep(0.2)
+                    _stream_waited += 0.2
+                logger.info(
+                    "stream_viewer_wait_done",
+                    trace_id=trace_id,
+                    connected=_has_subs(trace_id),
+                    waited_sec=round(_stream_waited, 1),
+                )
+
             for item in execution_items:
                 tc_id = item.get("tc_id") or "unknown"
                 ts_id = _ts_id_of_tc(tc_id, scenarios)
