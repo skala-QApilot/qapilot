@@ -2778,6 +2778,35 @@ async def _test_execution(state: PipelineState) -> dict:
                     if _cap_state["page"] is None:
                         _cap_ctx = await browser.new_context()
                         _cap_state["page"] = await _cap_ctx.new_page()
+                        # 실시간 송출 — 캡처 컨텍스트에도 CDP screencast 시작.
+                        # api-mode TC(로그인 등)는 per-TC ui 컨텍스트가 없어 라이브
+                        # 스트림이 없었음 → 캡처 페이지에 screencast 를 켜 동일
+                        # broadcast_frame 경로로 프론트 WS 에 송출.
+                        if trace_id:
+                            try:
+                                from qapilot.shared.stream_store import broadcast_frame as _cap_bf
+                                _cap_cdp = await _cap_ctx.new_cdp_session(_cap_state["page"])
+                                _cap_tid = trace_id
+
+                                async def _on_cap_frame(event: dict) -> None:
+                                    try:
+                                        _cap_bf(_cap_tid, event["data"])
+                                        await _cap_cdp.send(
+                                            "Page.screencastFrameAck",
+                                            {"sessionId": event["sessionId"]})
+                                    except Exception:
+                                        pass
+
+                                _cap_cdp.on("Page.screencastFrame", _on_cap_frame)
+                                await _cap_cdp.send(
+                                    "Page.startScreencast",
+                                    {"format": "jpeg", "quality": 60,
+                                     "maxWidth": 1280, "maxHeight": 800})
+                                _cap_state["cdp"] = _cap_cdp
+                                logger.info("capture_screencast_started", trace_id=trace_id)
+                            except Exception as _cap_sc_err:
+                                logger.warning("capture_screencast_failed",
+                                               trace_id=trace_id, error=str(_cap_sc_err)[:120])
                     page_c = _cap_state["page"]
                     shots_dir.mkdir(parents=True, exist_ok=True)
                     base = target_url.rstrip("/")

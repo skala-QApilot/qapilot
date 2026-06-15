@@ -22,6 +22,7 @@ Created: 2026-05-15
 
 from __future__ import annotations
 
+import asyncio
 import difflib
 import re
 import time
@@ -83,6 +84,11 @@ _GET_BY_METHODS = {  # noqa: F841 — spec §4.5.3 매핑표 참조용 (의미 �
 # verdict 불변. ui_fallback_chain_retry 303건 × 구간 단축 = run 수 분 절약.
 _CHAIN_PRIMARY_TIMEOUT_MS = 3_500
 _CHAIN_FALLBACK_TIMEOUT_MS = 1_500
+
+# 스텝당 wall-clock 상한(초). 미존재 요소의 fallback chain 이 BaseTool 60s 타임아웃
+# 까지 누적되어 TC 하나가 60s 씩 잡아먹던 문제(run 27d3eed4 의 TS-005) 방어.
+# navigate(networkidle 10s + 로그인 복구 ~8s) 가 들어가도록 여유. 초과 시 해당 step fail.
+_STEP_WALL_CAP_S = 25
 
 # 이슈 #121 (옵션 C): auto-navigate 의 api_endpoint 파싱 패턴.
 # 형식 예: "POST /login" / "GET /plans/{id}" / "/signup".
@@ -220,12 +226,14 @@ class UITestTool(BaseTool):
             error_msg: str | None = None
 
             try:
-                await self._run_step(page, step, target_url)
-            except PWTimeoutError as e:
+                # per-step wall cap — 미존재 요소가 60s tool 타임아웃까지 끌지 않도록.
+                await asyncio.wait_for(
+                    self._run_step(page, step, target_url), timeout=_STEP_WALL_CAP_S)
+            except (PWTimeoutError, asyncio.TimeoutError) as e:
                 status = "fail"
                 tc_status = "fail"
                 code = ErrorCode.TOOL_UI_LOCATOR_NOT_FOUND if action in _DOM_ACTIONS else ErrorCode.TOOL_UI_TIMEOUT
-                error_msg = f"{code}: {e}"
+                error_msg = f"{code}: {e or 'step wall-cap 초과'}"
             except AssertionError as e:
                 status, tc_status = "fail", "fail"
                 error_msg = f"{ErrorCode.TOOL_UI_ASSERTION_FAIL}: {e}"
