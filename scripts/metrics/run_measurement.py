@@ -62,6 +62,9 @@ def invoke_qapilot_live(config_name: str, run_idx: int) -> dict:
     return {
         "cross_check_results": state.get("cross_check_results") or [],
         "root_cause_results": state.get("root_cause_results") or [],
+        # fix_results 에 원인 위치(file_path)가 담긴다 — 원인 추론 Top-N 측정에 필요.
+        # (root_cause 후보의 file_path 는 None 인 경우가 많아 fix_results 로 보완)
+        "fix_results": state.get("fix_results") or [],
         "status": state.get("status"),
     }
 
