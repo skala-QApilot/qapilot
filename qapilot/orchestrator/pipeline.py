@@ -5441,6 +5441,28 @@ async def _save_experiment_scenarios(state: PipelineState) -> dict:
             trace_id=state.get("trace_id"), error=str(e),
         )
 
+    # 첫 마일스톤 v1.0 자동 박제 — 구 경로 (_save_scenarios) 에만 wire 되어 있어 prd_only
+    # 경로는 init 트리거에도 scenario_versions 가 비어 v1.0 누락. 동일 graceful 패턴으로 연결.
+    if trigger == "init" and service_id and merged_scenarios:
+        try:
+            from qapilot.db.scenario_version_writer import insert_initial_milestone
+
+            created = insert_initial_milestone(
+                service_id,
+                merged_scenarios,
+                label="v1.0",
+                description="초기 자동 생성",
+            )
+            logger.info(
+                "initial_milestone",
+                trace_id=state.get("trace_id"), created=created, label="v1.0",
+            )
+        except Exception as e:
+            logger.warning(
+                "initial_milestone_failed",
+                trace_id=state.get("trace_id"), error=str(e),
+            )
+
     return {
         "scenarios": merged_scenarios,
         "saved_scenario_paths": saved_paths,
