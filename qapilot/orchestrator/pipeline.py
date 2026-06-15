@@ -3045,20 +3045,40 @@ async def _run_ui_with_trace(
     }
     if test_account:
         ui_params["test_account"] = test_account
-    ui_out = await ui_tool.run(
-        ToolInput(
-            trace_id=trace_id,
-            params=ui_params,
-        )
-    )
 
-    # 이슈 #131 후속: APITraceTool listener cleanup.
-    # 현재 TC 의 UI 조작이 끝났으므로, 다음 TC 에 현재 listener 가 반응하지 않도록 해제.
+    # TC 단위 격리 — 한 TC 의 UITestTool 타임아웃(60초)/실패가 _test_execution
+    # 전체를 죽이지 않도록 여기서 잡아 해당 TC 만 fail 로 기록하고 다음 TC 로 진행한다.
+    # (이전: 예외가 _test_execution 루프를 뚫고 pipeline_failed 로 전체 run 중단)
+    from qapilot.shared.errors import ToolExecutionError
+
     try:
-        page.remove_listener("request", apt._on_request)
-        page.remove_listener("response", apt._on_response)
-    except Exception:
-        pass
+        ui_out = await ui_tool.run(
+            ToolInput(
+                trace_id=trace_id,
+                params=ui_params,
+            )
+        )
+        ui_result = ui_out.result["ui_result"]
+    except ToolExecutionError as e:
+        get_logger(source="orchestrator").warning(
+            "ui_tc_failed_isolated", tc_id=tc_id, error=str(e)
+        )
+        ui_result = {
+            "tc_id": tc_id,
+            "status": "fail",
+            "steps": [],
+            "total_duration_ms": 0,
+            "error": str(e),
+        }
+    finally:
+        # 이슈 #131 후속: APITraceTool listener cleanup.
+        # 현재 TC 의 UI 조작이 끝났으므로, 다음 TC 에 현재 listener 가 반응하지 않도록 해제.
+        # finally 보장 — 타임아웃/실패 시에도 반드시 해제해 다음 TC 오염을 막는다.
+        try:
+            page.remove_listener("request", apt._on_request)
+            page.remove_listener("response", apt._on_response)
+        except Exception:
+            pass
 
     # listener 가 누적한 calls 를 dict 로 강제 변환 (TypedDict 인스턴스 dict-like)
     api_trace_dict = dict(api_trace)
@@ -3069,7 +3089,7 @@ async def _run_ui_with_trace(
     )
 
     return {
-        "ui_result": ui_out.result["ui_result"],
+        "ui_result": ui_result,
         "api_result": api_trace_dict,
     }
 
