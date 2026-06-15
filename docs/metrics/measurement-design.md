@@ -153,9 +153,9 @@ Precision        = 진짜 결함검출 FAIL / 전체 결함검출 FAIL  # clean 
 
 1. ✅ **SUT fault 수정** (mini-bss-lite, 커밋 7f07cdf): RULE-003 penalty 순서 + seed birth_date/미성년 계정. DATA-001/INFRA-001은 측정 제외(결정성 미보장). → affected_scenarios↔TS/golden 매핑·약관 v3.0 통일은 측정 스크립트 단계에서 확정.
 2. ✅ **①장애유형 산출 확장**: `defects.defect_type`(qapilot-server V19, 커밋 0d2637e) + `defect_writer._infer_defect_type`(qapilot, 커밋 0bc8489). 제품 결함에 ①(UI/API/DATA/INFRA/DOMAIN)을 ②와 별도 산출.
-3. ⏳ **전용 측정 SUT + fault-triggering seed** 구성 + QApilot service 등록.
-4. ⏳ **측정 스크립트**: 구성 매트릭스 × N회 실행 → verdict/defect/root_cause 수집 → 정답 대조 → 지표 산출.
-5. ⏳ 1차 측정 → 목표치 재보정 → 본 문서 갱신.
+3. ✅ **전용 측정 SUT 구성** (mini-bss-lite, 커밋 756f8d4): 로컬 docker-compose, ENABLED_FAULTS 플러밍 보강(compose backend + k8s configmap), db 포트 5433. frontend `http://localhost:3000`=Staging URL. → QApilot service 등록은 사용자 진행.
+4. ✅ **측정 스크립트** (`qapilot/scripts/metrics/`, 커밋 fd17386): scoring(§3~4 산식, 단위테스트 11)·ground_truth(golden114+faults7)·sut_control(구성전환)·run_measurement(구성×N→채점→metrics_report.json). `--score-only` 로 SUT 없이 채점 가능.
+5. ⏳ 1차 측정 (QApilot 등록·generate 후 라이브 실행) → 목표치 재보정 → 본 문서 갱신.
 
 ---
 
