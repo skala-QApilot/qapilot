@@ -55,7 +55,8 @@ def bring_up(config_name: str, fresh_volume: bool = True) -> bool:
         _compose(["down", "-v"], faults_env, sut_root)
     else:
         _compose(["down"], faults_env, sut_root)
-    up = _compose(["up", "-d", "--build"], faults_env, sut_root)
+    # 구성 간 코드 변경 없음(env=ENABLED_FAULTS 만 변경) → --build 생략(빠름).
+    up = _compose(["up", "-d"], faults_env, sut_root)
     if up.returncode != 0:
         print(f"[sut] compose up 실패 ({config_name}):\n{up.stderr[-800:]}")
         return False

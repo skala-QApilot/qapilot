@@ -31,12 +31,14 @@ from ground_truth import load_faults, load_golden
 
 # ── QApilot 수집 어댑터 ─────────────────────────────────────────────
 def invoke_qapilot_live(config_name: str, run_idx: int) -> dict:
-    """run_pipeline 직접 호출 → {cross_check_results, root_cause_results, status}.
+    """run_pipeline 직접 호출(command=test, 코드 재생성 없이 기존 generated-code 재사용)
+    → {cross_check_results, root_cause_results, status}.
 
-    service_id/시나리오는 등록된 측정 service 를 사용(환경 의존). 실패 시 빈 결과.
+    등록된 측정 service(config.SERVICE_ID)의 시나리오/코드를 DB 에서 로드하고,
+    staging_url(게이트웨이 8090)·test_account(demo1)·target_root 를 명시 주입한다.
+    결과는 in-memory state 에서 추출 — DB defects 적재(V19) 실패와 무관.
     """
     import asyncio
-    import os
     from qapilot.orchestrator.runner import run_pipeline
 
     options = {
@@ -46,13 +48,16 @@ def invoke_qapilot_live(config_name: str, run_idx: int) -> dict:
     try:
         state = asyncio.run(run_pipeline(
             options,
-            service_id=os.getenv("MEASURE_SERVICE_ID", ""),
+            service_id=config.SERVICE_ID,
             staging_url=config.STAGING_URL,
             test_account=config.TEST_ACCOUNT,
-            qapilot_dir=Path.cwd() / ".qapilot",
+            target_root=config.TARGET_ROOT,
+            qapilot_dir=config.SERVICE_QAPILOT_DIR,
         ))
     except Exception as e:  # noqa: BLE001
+        import traceback
         print(f"[qapilot] 실행 실패 ({config_name} run{run_idx}): {type(e).__name__}: {e}")
+        traceback.print_exc()
         return {"cross_check_results": [], "root_cause_results": [], "status": "error"}
     return {
         "cross_check_results": state.get("cross_check_results") or [],

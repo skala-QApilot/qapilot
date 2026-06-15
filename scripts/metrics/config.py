@@ -18,11 +18,21 @@ GOLDEN_DIR = SUT_ROOT / "golden" / "scenarios"
 FAULTS_DIR = SUT_ROOT / "faults"
 OUT_DIR = Path(os.getenv("MEASURE_OUT_DIR", _QAPILOT_ROOT / ".qapilot" / "metrics"))
 
-# ── SUT 접속 (로컬 docker-compose) ──────────────────────────────────
-STAGING_URL = os.getenv("MEASURE_STAGING_URL", "http://localhost:3000")   # frontend (QApilot 대상)
+# ── 등록된 측정 service (qapilot-server) ────────────────────────────
+SERVICE_ID = os.getenv("MEASURE_SERVICE_ID", "fd235fb4-f26a-4a17-86a8-a9b5688619ab")  # sut-local-01
+TARGET_ROOT = os.getenv("MEASURE_TARGET_ROOT",
+                        "/Users/jkwltx177/skala/last_project/system-under-test")
+SERVICE_QAPILOT_DIR = os.getenv(
+    "MEASURE_QAPILOT_DIR",
+    "/Users/jkwltx177/skala/last_project/system-under-test/.qapilot/sut-local-01")
+
+# ── SUT 접속 (로컬 docker-compose, 단일 origin 게이트웨이) ───────────
+STAGING_URL = os.getenv("MEASURE_STAGING_URL", "http://localhost:8090")   # 게이트웨이 (UI/API 모드 공용)
 BACKEND_URL = os.getenv("MEASURE_BACKEND_URL", "http://localhost:8000")
 CONTRACTS_URL = os.getenv("MEASURE_CONTRACTS_URL", "http://localhost:8001")
-HEALTH_URLS = [f"{BACKEND_URL}/health", f"{CONTRACTS_URL}/health", STAGING_URL]
+SUT_DB_AGENT_URL = os.getenv("MEASURE_SUT_DB_AGENT_URL", "http://localhost:8091")  # DB cross-check
+HEALTH_URLS = [f"{BACKEND_URL}/health", f"{CONTRACTS_URL}/health",
+               f"{SUT_DB_AGENT_URL}/health", STAGING_URL]
 
 # SUT 로그인 (seed 계정 — 성인). 자격검증·약정 흐름에 사용.
 TEST_ACCOUNT = {
