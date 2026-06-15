@@ -173,11 +173,20 @@ def rescan() -> None:
 def ui(
     port: int = typer.Option(7860, help="웹 대시보드 포트"),
     host: str = typer.Option("127.0.0.1", help="바인딩 호스트"),
+    reload: bool = typer.Option(
+        False,
+        "--reload/--no-reload",
+        help="코드 변경 시 자동 재시작 (개발용). 진행 중인 run 태스크가 함께 죽으므로 기본 OFF",
+    ),
 ) -> None:
     """웹 대시보드 기동 (FastAPI)."""
     import uvicorn
     console.print(f"[bold {BRAND_PURPLE}]QApilot 로컬 대시보드를 시작합니다 (http://{host}:{port})...[/bold {BRAND_PURPLE}]")
-    uvicorn.run("qapilot.api.main:app", host=host, port=port, reload=True)
+    # reload=True 하드코딩이던 격차: py 파일이 변경될 때마다 (git commit 포함)
+    # uvicorn watcher 가 워커를 재생성 → 진행 중이던 e2e run 태스크가 소리 없이
+    # 죽고 runs row 가 'running' 고아로 남음 (run feb0dc5e 실증 — stop API 도
+    # not_running). 장시간 run 을 돌리는 본 서비스 특성상 기본 OFF 가 정답.
+    uvicorn.run("qapilot.api.main:app", host=host, port=port, reload=reload)
 
 
 # spec 서브커맨드

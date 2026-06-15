@@ -69,9 +69,47 @@
 
 ---
 
+## 기계 검증 명세 — `observe` 필드
+
+각 TC 에 `then`(사람용 서술) 과 별도로 `observe`(기계용 관찰 명세) 배열을 작성한다.
+실행기가 산문 해석 없이 그대로 검증을 수행하므로, **then 이 말하는 관찰을 닫힌
+어휘로 환원**하라. 확신할 수 없는 항목은 넣지 마라 (빈 배열 허용 — 휴리스틱 폴백됨).
+
+| kind | 필드 | 용도 |
+|------|------|------|
+| `http_status` | `expected: [201]` | 응답 상태코드 계약 |
+| `http_header` | `name: "X-Trace-Id"`, `absent: true|false` | 응답 헤더 존재/부재 |
+| `response_body` | `path: "$[*].is_current"`, `predicate` | 응답 본문 필드 검사 |
+| `db_field` | `table`, `where: {email: "{request.email}"}`, `field`, `predicate` | DB 저장 상태 검사 |
+
+- `predicate`: `{"eq": 값}` `{"matches": "정규식"}` `{"in": [...]}` `{"nonempty": true}` 중 하나.
+- `absent: true` 는 부재 기대 ("포함되지 않는다", "남지 않는다").
+- `path` 는 `$.필드`, `$[0].필드`, `$[*].필드` 형식만.
+- `where` 값에 요청 body 의 값을 참조하려면 `{request.필드명}`.
+- **요청 echo 검증** (보낸 값이 응답에 반영) 의 predicate 값도 `{request.필드명}` 으로
+  써라 — 구체 값 (`"Visa"` 등) 을 지어내면 실행 시 값이 달라 항상 fail 한다.
+- `http_status.expected` 와 메시지 predicate 는 **then/문서에 명시된 것만**. then 에
+  코드·문구가 없으면 expected 는 생략하거나 의도 클래스만 표현하라.
+- **table/field 는 문서나 스키마 정보에 실재가 확인된 이름만** — 지어내면 검증기가 폐기한다.
+- **response_body 의 path 도 실재 응답 필드만**: 에러 응답 본문은 FastAPI 표준
+  `$.detail` 이다 — `$.error`/`$.message`/`$.data` 같은 필드를 지어내지 마라.
+  성공 응답 필드도 문서에 응답 예시가 없으면 path 를 만들지 말고 http_status 만 써라.
+- 예: then "비밀번호가 bcrypt 해시로 저장된다" →
+  `[{"kind":"http_status","expected":[201]}, {"kind":"db_field","table":"customers","where":{"email":"{request.email}"},"field":"password_hash","predicate":{"matches":"^\\$2"}}]`
+
+---
+
 ## 규칙
 - 문서·요구사항에 없는 동작을 추측하거나 발명하지 마라.
+- **오라클 원칙**: `then` 절(기대 결과)의 근거는 **문서(PRD/정책서/약관)가 1차**다.
+  "코드 스캔으로 확인된 실제 API endpoint 목록" 등 코드 유래 정보는 **존재 확인
+  (어떤 endpoint/화면이 실재하는가)** 용도로만 쓰고, 기대 결과의 근거로 삼지 마라 —
+  코드의 현재 동작을 기대값으로 쓰면 코드의 버그가 "정상"으로 박제된다.
+- 문서가 요구하는 동작과 코드 유래 정보가 충돌하면 then 은 문서 기준으로 쓰고,
+  충돌 내용을 해당 TC 의 `mismatch_note` 에 기록하라 (결함 후보로 별도 리포트됨).
 - Given-When-Then은 **완전한 한국어 문장**으로 작성한다.
+- given/when 은 구체적으로: 입력 값·화면·조건을 명시하라 ("회원가입을 시도한다" 처럼
+  추상적으로 쓰지 말 것). then 은 관찰 가능한 결과 (화면 메시지·이동·상태) 로 쓰라.
 - **TC 유형별 최소 개수 (총 최소 6개)**:
   - normal: 2개 이상
   - edge_case: 2개 이상
@@ -105,11 +143,15 @@
       "values": [
         {"field": "string", "value": "string | {설명}", "type": "string", "purpose": "string"}
       ],
+      "observe": [
+        {"kind": "http_status | http_header | response_body | db_field", "...": "kind별 필드"}
+      ],
       "tags": ["normal | edge_case | boundary | auth | concurrency"],
       "req_id": "string | null",
       "api": "METHOD /api/path | null",
       "sources": ["문서명 | codebase"],
       "doc_verified": false,
+      "mismatch_note": "string | 생략 (문서-코드 충돌 또는 문서 근거 부재 시에만)",
       "depends_on": []
     }
   ],

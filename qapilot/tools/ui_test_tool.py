@@ -22,6 +22,7 @@ Created: 2026-05-15
 
 from __future__ import annotations
 
+import asyncio
 import difflib
 import re
 import time
@@ -76,8 +77,18 @@ _GET_BY_METHODS = {  # noqa: F841 — spec §4.5.3 매핑표 참조용 (의미 �
 #   후 다음 step skip → ui_result.json 저장 → 다음 TC 진행 보장. ActionMapper 환각으로
 #   selector chain 이 모두 fail 하는 케이스도 trace abort 안 됨.
 # - LLM 추론 selector 가 대부분 1~2 attempt 안에 적중하므로 5s 1차도 충분 (e2e 통계).
-_CHAIN_PRIMARY_TIMEOUT_MS = 5_000
-_CHAIN_FALLBACK_TIMEOUT_MS = 3_000
+#
+# 2026-06-12 v3 (run 1ead19b7 병목 분석): 1 × 3.5s + N × 1.5s = 8s (4 attempt).
+# navigate 가 별도로 load state 를 기다린 뒤라, SPA 렌더 완료 후 3.5s 안에 안
+# 나타나는 요소는 사실상 부재 (fail 운명) — 절감은 부재 케이스에서만 발생해
+# verdict 불변. ui_fallback_chain_retry 303건 × 구간 단축 = run 수 분 절약.
+_CHAIN_PRIMARY_TIMEOUT_MS = 3_500
+_CHAIN_FALLBACK_TIMEOUT_MS = 1_500
+
+# 스텝당 wall-clock 상한(초). 미존재 요소의 fallback chain 이 BaseTool 60s 타임아웃
+# 까지 누적되어 TC 하나가 60s 씩 잡아먹던 문제(run 27d3eed4 의 TS-005) 방어.
+# navigate(networkidle 10s + 로그인 복구 ~8s) 가 들어가도록 여유. 초과 시 해당 step fail.
+_STEP_WALL_CAP_S = 25
 
 # 이슈 #121 (옵션 C): auto-navigate 의 api_endpoint 파싱 패턴.
 # 형식 예: "POST /login" / "GET /plans/{id}" / "/signup".
@@ -125,6 +136,10 @@ class UITestTool(BaseTool):
         # 이슈 #174 (격차 12 D 영역): TC 시작 시 인증 fail-safe 용 test_account.
         # pipeline 의 _test_execution 이 cfg.project.test_account 를 dict 로 넘김.
         test_account: dict[str, Any] | None = params.get("test_account")
+        # navigate step 의 가드 리다이렉트 복구 (_recover_login_redirect) 용 보존.
+        # per-TC 컨텍스트 격리 후 인증 필요 라우트 navigate 가 /login 으로 튕기는
+        # 케이스 (run dcf265f7: TS-004+ 전 TC 가 로그인 화면에서 멈춤).
+        self._test_account = test_account
 
         screenshot_dir: Path | None = None
         if params.get("screenshot_dir") is not None:
@@ -211,12 +226,14 @@ class UITestTool(BaseTool):
             error_msg: str | None = None
 
             try:
-                await self._run_step(page, step, target_url)
-            except PWTimeoutError as e:
+                # per-step wall cap — 미존재 요소가 60s tool 타임아웃까지 끌지 않도록.
+                await asyncio.wait_for(
+                    self._run_step(page, step, target_url), timeout=_STEP_WALL_CAP_S)
+            except (PWTimeoutError, asyncio.TimeoutError) as e:
                 status = "fail"
                 tc_status = "fail"
                 code = ErrorCode.TOOL_UI_LOCATOR_NOT_FOUND if action in _DOM_ACTIONS else ErrorCode.TOOL_UI_TIMEOUT
-                error_msg = f"{code}: {e}"
+                error_msg = f"{code}: {e or 'step wall-cap 초과'}"
             except AssertionError as e:
                 status, tc_status = "fail", "fail"
                 error_msg = f"{ErrorCode.TOOL_UI_ASSERTION_FAIL}: {e}"
@@ -236,6 +253,11 @@ class UITestTool(BaseTool):
                 "step_no": step_no,
                 "action": action,
                 "status": status,  # type: ignore[typeddict-item]
+                # selector 보존 — Layer 3 분류기가 문장형 텍스트 assert (검증 표현력
+                # 한계) 를 식별하는 입력. 누락 시 전부 PRODUCT 후보로 오염
+                # (run d20fc18f: UNVERIFIABLE 0건 / PRODUCT 11건의 원인).
+                "selector": step.get("selector"),
+                "selector_type": step.get("selector_type"),
                 "screenshot_path": screenshot_path,
                 "console_logs": list(console_logs),
                 "error": error_msg,
@@ -446,6 +468,48 @@ class UITestTool(BaseTool):
         # 로그인 성공 후 원 의도 URL 재네비 (PR #122 와 동일 + #197 보강)
         if steps and self._should_auto_navigate(steps):
             await self._try_auto_navigate(page, steps, target_url)
+
+    async def _recover_login_redirect(self, page: Page, intended_full: str) -> None:
+        """navigate 가 SUT 인증 가드에 막혀 /login 으로 리다이렉트된 경우 복구.
+
+        조건: 의도한 URL 이 로그인 페이지가 아닌데 실제 URL 이 로그인 패턴 +
+        test_account 보유. _ensure_authenticated 의 form 휴리스틱으로 로그인 후
+        의도한 URL 로 재네비게이트. 실패는 graceful (후속 step 이 fail 로 보고).
+        """
+        account = getattr(self, "_test_account", None)
+        if not account or not account.get("email") or not account.get("password"):
+            return
+        patterns = ("/login", "/signin", "/sign-in", "/auth/login")
+        if any(p in intended_full.lower() for p in patterns):
+            return  # 로그인 페이지 자체가 목적지 — 복구 대상 아님
+        try:
+            actual = (page.url or "").lower()
+        except Exception:
+            return
+        if not any(p in actual for p in patterns):
+            return  # 리다이렉트 안 됨 (공개 페이지 또는 이미 인증)
+
+        self.logger.info(
+            "ui_navigate_login_redirect_detected",
+            intended=intended_full, actual=page.url,
+        )
+        await self._ensure_authenticated(page, [], intended_full, account)
+        try:
+            still_login = any(p in (page.url or "").lower() for p in patterns)
+        except Exception:
+            return
+        if still_login:
+            return  # 로그인 실패 — graceful (후속 step 이 정직하게 fail)
+        try:
+            await page.goto(intended_full, wait_until="networkidle", timeout=10000)
+        except Exception:
+            try:
+                await page.goto(intended_full)
+            except Exception as e:
+                self.logger.warning(
+                    "ui_login_redirect_renav_failed",
+                    intended=intended_full, error=str(e)[:80],
+                )
 
     def _should_auto_navigate(self, steps: list[ActionStep]) -> bool:
         """auto-navigate 발동 조건 (PR #122 + #197 보강).
@@ -680,6 +744,11 @@ class UITestTool(BaseTool):
                 self.logger.warning("ui_navigate_networkidle_timeout",
                                     target=full, error=str(e)[:80])
                 await page.goto(full)
+            # 가드 리다이렉트 복구 — 인증 필요 라우트로 navigate 했는데 SUT 라우터
+            # 가드가 /login 으로 튕긴 경우, test_account 로 로그인 후 원 URL 재시도.
+            # per-TC 컨텍스트 격리 (격차 3 fix) 후 모든 TC 가 비인증 시작이므로
+            # 이 복구가 인증 선행조건 (fixture/beforeEach 패턴) 의 실행 layer 다.
+            await self._recover_login_redirect(page, full)
             # #248 진단 로그: navigate 후 actual page.url + SPA mount 상태 노출
             try:
                 actual_url = page.url
@@ -734,6 +803,18 @@ class UITestTool(BaseTool):
                 raise ToolExecutionError(
                     ErrorCode.TOOL_UI_ASSERTION_FAIL, "assert_url 에는 expected 필요"
                 )
+            # Playwright to_have_url 은 glob 미지원 — 문자열은 base_url join 후
+            # exact 비교라 "**/dashboard" 가 영원히 불일치 (run eb5145b7:
+            # 로그인 200 + 대시보드 도달인데 assert_url fail). glob 문자가 있으면
+            # wait_for_url (glob 지원, redirect 폴링 포함) 로 검증.
+            if isinstance(expected, str) and any(ch in expected for ch in "*?"):
+                try:
+                    await page.wait_for_url(expected, timeout=10_000)
+                except PWTimeoutError as e:
+                    raise AssertionError(
+                        f"assert_url: URL 이 {expected!r} 와 불일치 (현재: {page.url})"
+                    ) from e
+                return
             await expect(page).to_have_url(expected)
             return
 
@@ -889,7 +970,10 @@ class UITestTool(BaseTool):
                         if r > best_ratio:
                             best_ratio = r
                             best_line = line
-                    if best_ratio >= 0.6:
+                    # 임계 0.75 — 0.6 은 무관한 문장도 통과시키는 false-pass 채널
+                    # (e2e trace 40fce3fa 의 가짜 PASS 패턴). substring 매칭은 위에서
+                    # 이미 처리되므로 여기는 보수적으로.
+                    if best_ratio >= 0.75:
                         self.logger.info(
                             "ui_assert_pagewide_fuzzy_match",
                             target=target_text[:80],

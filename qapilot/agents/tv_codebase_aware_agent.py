@@ -57,6 +57,20 @@ def _format_existing_values(values: list[dict]) -> str:
     return _format_dict_compact(values, max_chars=1500)
 
 
+def _format_same_ts_values(entries: list[dict]) -> str:
+    """같은 TS 의 이전 TC 들이 사용한 (tc_id, field, value) 목록 — unique 중복 회피용."""
+    if not entries:
+        return "없음 (이 TS 의 첫 TC)"
+    lines = [
+        f"- [{e.get('tc_id', '?')}] {e.get('field', '?')} = {e.get('value', '?')}"
+        for e in entries
+    ]
+    text = "\n".join(lines)
+    if len(text) > 1500:
+        text = text[:1500] + f"\n... (truncated, {len(lines)} entries total)"
+    return text
+
+
 def _format_source_snippets(snippets: list[dict] | None) -> str:
     """load_source 결과를 LLM prompt 친화 format 으로.
 
@@ -199,6 +213,8 @@ class TVFromCodebaseAgent(BaseAgent):
         db_snapshot = context.get("db_snapshot")  # {"table": ..., "rows": [...]} 또는 None
         # 코드베이스 본문 (load_source 결과) — [{file, line_start, line_end, content}, ...]
         source_snippets: list[dict] = context.get("source_snippets") or []
+        # 같은 TS 의 이전 TC 값 (격차 2) — unique 필드 재사용 방지 컨텍스트
+        same_ts_values: list[dict] = context.get("same_ts_values") or []
 
         # ── 1. TC 기반 필터링 ──────────────────────────────────────────
         filtered = filter_metadata_for_tc(
@@ -250,6 +266,7 @@ class TVFromCodebaseAgent(BaseAgent):
                 patterns=_format_dict_compact(filtered["patterns"], max_chars=1500),
                 db_snapshot=_format_db_snapshot(sanitized_db_snapshot),
                 source_snippets=_format_source_snippets(source_snippets),
+                same_ts_values=_format_same_ts_values(same_ts_values),
                 validation_feedback=feedback,
             )
 

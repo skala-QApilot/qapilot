@@ -722,7 +722,13 @@ class GitCodebaseScannerTool(BaseTool):
 
     @staticmethod
     def _apply_router_prefixes(file_infos: list[FileInfo], prefix_map: dict[str, str]) -> None:
-        """파일 stem 기반으로 endpoint path에 라우터 prefix를 적용한다."""
+        """파일 stem 기반으로 endpoint path에 라우터 prefix를 적용한다.
+
+        격차 4: decorator path 가 이미 prefix 를 포함하는 SUT 패턴
+        (`@router.post("/api/auth/signup")` + `include_router(prefix="/api/auth")`)
+        에서 무조건 결합하면 "/api/auth/api/auth/signup" 이중 prefix 가 생긴다.
+        sub path 가 prefix 로 시작하면 결합하지 않는다.
+        """
         for fi in file_infos:
             stem = PurePosixPath(fi["path"]).stem
             prefix = prefix_map.get(stem, "")
@@ -730,7 +736,12 @@ class GitCodebaseScannerTool(BaseTool):
                 continue
             for ep in fi["endpoints"]:
                 sub_path = ep["path"]
-                ep["path"] = prefix + sub_path if sub_path else prefix
+                if not sub_path:
+                    ep["path"] = prefix
+                    continue
+                if sub_path == prefix or sub_path.startswith(prefix.rstrip("/") + "/"):
+                    continue
+                ep["path"] = prefix + sub_path
 
     # ── 스킵 체크 ─────────────────────────────────────────────────────────────
 

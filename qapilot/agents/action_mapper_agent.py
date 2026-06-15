@@ -38,8 +38,10 @@ _FUZZY_MATCH_SHARED_SUBSTRING_BONUS = 0.15
 _FRONTEND_CANDIDATE_FILE_LIMIT = 4
 _FRONTEND_CANDIDATE_ELEMENT_LIMIT = 40
 _SEMANTIC_ALIASES: dict[str, tuple[str, ...]] = {
-    "회원가입": ("signup", "가입", "create account"),
-    "가입": ("signup", "회원가입"),
+    # "가입" 단독 → signup 매핑 금지 — "요금제 가입"/"가족 가입"/"멤버십 가입" 등
+    # 도메인 가입 시나리오가 전부 회원가입 페이지로 오염된다 (run 3b50a65b:
+    # TS-006 신규 요금제 가입이 /signup + signup-submit 으로 매핑). 회원가입만 인정.
+    "회원가입": ("signup", "create account"),
     "로그인": ("login", "signin"),
     "이메일": ("email", "mail"),
     "비밀번호": ("password", "pwd", "pass"),
@@ -64,6 +66,19 @@ _ASSERT_ACTIONS = {
     "assert", "assert_visible", "assert_hidden", "assert_text",
     "assert_value", "assert_enabled", "assert_disabled", "assert_count",
 }
+
+# 격차 1: then 절의 outcome (positive/negative) 분류 키워드.
+# negative = 실패/거부/에러를 기대하는 TC — assert 대상은 error 류 selector 여야 한다.
+_NEGATIVE_OUTCOME_HINTS = (
+    "오류", "실패", "잘못", "거부", "반려", "거절", "이미 존재", "이미 가입", "중복",
+    "유효하지 않", "불가", "에러", "경고", "남아 있", "유지",
+    "error", "fail", "invalid", "missing", "duplicate", "already", "denied",
+    "reject", "conflict", "bad request", "unauthorized", "forbidden",
+    "400", "401", "403", "404", "409", "422",
+)
+# selector(testid/text) 의 방향성 토큰 — outcome 과 일치해야 가점, 불일치 시 감점.
+_POSITIVE_SELECTOR_TOKENS = ("success", "complete", "toast", "confirm", "welcome", "done")
+_NEGATIVE_SELECTOR_TOKENS = ("error", "fail", "invalid", "warning", "alert", "danger")
 
 _SELECTOR_REQUIRED_ACTIONS = {
     "fill", "clear", "click", "dblclick", "hover", "select", "check", "uncheck",
@@ -462,6 +477,19 @@ class ActionMapperAgent(BaseAgent):
         if not frontend_dom:
             return []
 
+        # TC.api 기반 가점용. batch 는 TS slice (test_cases 안에 TC) — per-TC 분할
+        # (#129) 후 test_cases 는 1개. TS dict 에서 api 를 읽으면 항상 None 이라
+        # api 보너스가 죽는다 (v3 재생성에서 TS-006 이 여전히 signup 으로 간 원인).
+        self._current_tc_api = next(
+            (
+                str(tc.get("api") or "")
+                for item in batch
+                for tc in (item.get("test_cases") or [item] if isinstance(item, dict) else [])
+                if isinstance(tc, dict) and tc.get("api")
+            ),
+            "",
+        )
+
         scenario_text = self._scenario_text_for_candidates(batch)
         if not scenario_text.strip():
             return frontend_dom[:_FRONTEND_CANDIDATE_ELEMENT_LIMIT]
@@ -534,9 +562,18 @@ class ActionMapperAgent(BaseAgent):
                 if any(alias in control_type for alias in aliases):
                     score += 0.3
 
-        if any(term in scenario_text for term in ("회원가입", "가입")):
+        # "가입" 단독 매칭 금지 (TS-006 오염) — 회원가입 명시 시에만 signup 가점.
+        if "회원가입" in scenario_text:
             if "signup" in file_path or route == "/signup" or page == "signup":
                 score += 2.0
+        # TC.api 기반 가점 — api path segment 가 element 의 route/file/page 와
+        # 일치하면 그 화면이 본 TC 의 무대일 가능성이 높다 (도메인 무관 신호).
+        api_path = str(getattr(self, "_current_tc_api", "") or "")
+        for seg in api_path.lower().split("/"):
+            if seg and seg not in ("api",) and not seg.startswith("{") and len(seg) > 2:
+                if seg in file_path or seg in route or seg in page:
+                    score += 1.5
+                    break
         if any(term in scenario_text for term in ("로그인",)):
             if "login" in file_path or route == "/login" or page == "login":
                 score += 2.0
@@ -699,7 +736,10 @@ class ActionMapperAgent(BaseAgent):
         """LLM 이 만든 step intent 를 frontend index 원소로만 resolve 한다."""
         mapping = dict(action_mapping)
         scenario_text = " ".join(str(tc.get(key) or "") for key in ("name", "given", "when", "then"))
-        route_hint = self._route_hint_from_elements(frontend_dom) or self._route_hint_from_tc(tc)
+        # TC 신호 (api segment ↔ 실존 route, 명시 keyword) 를 후보 다수결보다 우선.
+        # 후보 풀이 오염된 경우 (가입→signup 류) 다수결이 오염을 라우트로 승격시킨다
+        # (v3 재생성에서 TS-006 잔존 원인 #2).
+        route_hint = self._route_hint_from_tc(tc) or self._route_hint_from_elements(frontend_dom)
         steps: list[ActionStep] = []
 
         for raw_step in mapping.get("steps") or []:
@@ -731,7 +771,21 @@ class ActionMapperAgent(BaseAgent):
             if intent.get("target_kind"):
                 step["target_kind"] = intent["target_kind"]
             if action in {"assert", "assert_visible"}:
-                step["expected"] = None
+                if resolved is not None:
+                    step["expected"] = None
+                else:
+                    then_text = str(tc.get("then") or "").strip()
+                    if intent.get("expects_absence") and then_text:
+                        # absence 의도 (포함되지 않는다 류): LLM 이 expected 에
+                        # grounding 의 화면 문구 (empty-state) 를 써둔 경우 then 으로
+                        # 강제 — 그래야 codegen 의 absence 가드가 작동한다
+                        # (run d20fc18f: TS-004-TC-02 가 'getByText(없습니다)' 로
+                        # 강등되어 데이터 존재 시 영구 fail 하던 잔여 구멍).
+                        step["expected"] = then_text
+                    elif not step.get("expected"):
+                        # selector 미해결 assert — then 절 텍스트를 expected 로 보존해
+                        # UITestTool 의 page-wide fuzzy fallback 이 의미 검증을 수행하게 한다.
+                        step["expected"] = then_text or None
             steps.append(step)
 
         steps = self._ensure_navigate_step(steps, route_hint)
@@ -777,11 +831,26 @@ class ActionMapperAgent(BaseAgent):
         explicit_target_kind = str(step.get("target_kind") or "").strip()
 
         if explicit_target_name or explicit_target_kind:
-            return {
+            intent: dict[str, str | None] = {
                 "target_name": explicit_target_name or None,
                 "target_kind": explicit_target_kind or None,
                 "target_text": expected or selector or None,
             }
+            # 격차 1 보강: LLM 이 target_kind 를 명시한 assert step 도 outcome 분류.
+            # 이 조기 return 이 outcome 을 건너뛰면 레거시 스코어링이 작동해
+            # negative TC 가 다시 success 류 selector 로 일괄 매핑된다
+            # (trace 77bf4ec8: TS-001 전 TC signup-success-toast 재발 원인).
+            if action in _ASSERT_ACTIONS:
+                then_text = str(tc.get("then") or "")
+                outcome_basis = " ".join(p for p in (expected, then_text) if p).lower()
+                intent["outcome"] = (
+                    "negative"
+                    if any(h in outcome_basis for h in _NEGATIVE_OUTCOME_HINTS)
+                    else "positive"
+                )
+                if any(t in outcome_basis for t in ("않는다", "않습니다", "지 않", "없어야")):
+                    intent["expects_absence"] = "true"
+            return intent
 
         if action in {"fill", "clear", "select", "press", "upload"}:
             return {
@@ -796,7 +865,8 @@ class ActionMapperAgent(BaseAgent):
 
         if action in {"click", "dblclick", "hover", "check", "uncheck"}:
             target_text = selector if self._is_meaningful_selector_hint(selector, value) else scenario_text
-            target_kind = "submit" if any(tok in scenario_text.lower() for tok in ("회원가입", "signup", "가입")) else "actionable"
+            # "가입" 단독은 도메인 가입 (요금제/가족/멤버십) 과 구분 불가 — 회원가입만.
+            target_kind = "submit" if any(tok in scenario_text.lower() for tok in ("회원가입", "signup")) else "actionable"
             return {
                 "target_name": self._field_from_hint(selector),
                 "target_kind": target_kind,
@@ -804,10 +874,22 @@ class ActionMapperAgent(BaseAgent):
             }
 
         if action in _ASSERT_ACTIONS:
+            # 격차 1: then 절 + expected 로 TC outcome (positive/negative) 분류.
+            # negative TC 의 assert 가 success 류 selector 에 매칭되는 격차의 본질 차단.
+            then_text = str(tc.get("then") or "")
+            outcome_basis = " ".join(part for part in (expected, then_text) if part).lower()
+            is_negative = any(h in outcome_basis for h in _NEGATIVE_OUTCOME_HINTS)
             return {
                 "target_name": None,
                 "target_kind": "assertion",
-                "target_text": expected or selector or str(tc.get("then") or "") or None,
+                "target_text": expected or selector or then_text or None,
+                "outcome": "negative" if is_negative else "positive",
+                # 부재 기대 ("포함되지 않는다" 류) — 존재-검증 selector 로 표현 불가
+                "expects_absence": (
+                    "true"
+                    if any(t in outcome_basis for t in ("않는다", "않습니다", "지 않", "없어야"))
+                    else None
+                ),
             }
 
         return {"target_name": None, "target_kind": None, "target_text": selector or None}
@@ -820,6 +902,11 @@ class ActionMapperAgent(BaseAgent):
         route_hint: str | None,
         scenario_text: str,
     ) -> dict[str, str] | None:
+        # 부재 기대 assert 는 존재-검증 (visible) 으로 표현 불가 — 미해결로 두면
+        # then 절이 expected 로 보존되고 codegen 이 MANUAL_REVIEW (정직한 미검증)
+        # 처리한다. fuzzy 가 empty-state 문구를 골라 잡담 fail 내던 격차 차단.
+        if action in _ASSERT_ACTIONS and intent.get("expects_absence"):
+            return None
         candidates = self._frontend_candidates_for_action(action, frontend_dom, route_hint)
         if not candidates:
             return None
@@ -852,9 +939,27 @@ class ActionMapperAgent(BaseAgent):
     def _frontend_candidates_for_action(
         self, action: str, frontend_dom: list[dict], route_hint: str | None
     ) -> list[dict]:
+        result = self._collect_candidates(action, frontend_dom, route_hint)
+        if not result and route_hint:
+            # route 필터로 전멸 — 무필터 재시도 (skip 35건 분해: login-submit 등
+            # 실존 요소가 route 불일치만으로 MANUAL_REVIEW 로 빠지던 격차).
+            # 방향성 실격·threshold 가 오매칭을 계속 방어한다.
+            result = self._collect_candidates(action, frontend_dom, None)
+        return result
+
+    def _collect_candidates(
+        self, action: str, frontend_dom: list[dict], route_hint: str | None
+    ) -> list[dict]:
         result: list[dict] = []
         for el in frontend_dom:
-            if route_hint and str(el.get("route") or "").strip() not in {"", route_hint}:
+            el_route = str(el.get("route") or "").strip()
+            # "/_components/*" 는 공유 컴포넌트 (sidebar/navbar) — 모든 화면에
+            # 존재하므로 route 필터 면제 (nav-* 셀렉터가 영원히 미해결되던 원인).
+            if (
+                route_hint
+                and el_route not in {"", route_hint}
+                and not el_route.startswith("/_components")
+            ):
                 continue
             actionable = bool(el.get("actionable"))
             control_type = str(el.get("control_type") or "").lower()
@@ -919,22 +1024,61 @@ class ActionMapperAgent(BaseAgent):
         ):
             score += 0.5
         if action in _ASSERT_ACTIONS:
+            outcome = str(intent.get("outcome") or "").strip().lower()
+            testid_l = str(element.get("testid") or "").lower()
+            text_l = str(element.get("text") or "").lower()
+            # empty-state 류 조건부 문구 ("...없습니다") 는 then 이 부재/없음을
+            # 명시할 때만 후보 — "포함되지 않는다" ↔ "요금제가 없습니다" 가
+            # fuzzy 토큰 (요금제+없) 으로 오결합되던 격차 (run feb0dc5e 축 ②,
+            # 스크린샷 실증: 카탈로그 정상 표시 중인데 대시보드 empty-state 를 찾음).
+            target_text_l = str(intent.get("target_text") or "").lower()
+            el_is_empty_state = any(
+                tok in text_l for tok in ("없습니다", "없어요", "비어 있", "비었")
+            )
+            intent_expects_absence = any(
+                tok in target_text_l for tok in ("없", "비어", "않는다", "않습니다", "지 않")
+            )
+            if el_is_empty_state and not intent_expects_absence:
+                return 0.0
             if not bool(element.get("actionable")):
                 score += 0.2
             if control_type.startswith("feedback"):
                 score += 1.2
-            if target_kind == "assertion" and any(token in str(element.get("testid") or "").lower() for token in ("success", "error", "toast", "message", "status")):
+            if target_kind == "assertion" and any(token in testid_l for token in ("success", "error", "toast", "message", "status")):
                 score += 0.7
-            if target_kind == "assertion" and any(token in str(element.get("text") or "").lower() for token in ("완료", "성공", "이동")):
-                score += 0.5
+            # 격차 1: outcome 방향성 분기 — negative TC 의 assert 가 success 류
+            # selector 에 매칭 (또는 그 반대) 되는 것은 감점이 아니라 실격 (0점).
+            # 의미 보너스 (_semantic_bonus) 가 커서 단순 감점으로는 threshold 를
+            # 넘는 경계 케이스가 남는다. 방향이 맞으면 가점.
+            if outcome == "negative":
+                if any(t in testid_l for t in _POSITIVE_SELECTOR_TOKENS):
+                    return 0.0
+                if any(t in testid_l for t in _NEGATIVE_SELECTOR_TOKENS) or any(
+                    t in text_l for t in ("오류", "실패", "에러", "잘못", "유효하지 않")
+                ):
+                    score += 1.0
+            elif outcome == "positive":
+                if any(t in testid_l for t in _NEGATIVE_SELECTOR_TOKENS):
+                    return 0.0
+                if target_kind == "assertion" and any(token in text_l for token in ("완료", "성공", "이동")):
+                    score += 0.5
+                if any(t in testid_l for t in _POSITIVE_SELECTOR_TOKENS):
+                    score += 0.5
+            else:
+                if target_kind == "assertion" and any(token in text_l for token in ("완료", "성공", "이동")):
+                    score += 0.5
 
         if target_kind == "submit":
+            # element 텍스트의 "가입" 은 유지 — 시나리오 쪽 "가입" 오염은 L832
+            # (target_kind 부여) 와 후보 선택에서 이미 차단된다. 여기서 좁히면
+            # 정당한 회원가입 submit ("가입하기" 버튼) 매칭이 깨진다.
             if any(token in str(element.get("text") or "").lower() for token in ("가입", "signup")):
                 score += 0.7
             if any(token in str(element.get("testid") or "").lower() for token in ("signup", "submit")):
                 score += 0.7
 
-        if any(term in scenario_text.lower() for term in ("회원가입", "가입", "signup")) and "signup" in str(element.get("page") or "").lower():
+        # "가입" 단독 → signup 페이지 가점 금지 (TS-006 오염) — 회원가입 명시 시에만.
+        if any(term in scenario_text.lower() for term in ("회원가입", "signup")) and "signup" in str(element.get("page") or "").lower():
             score += 0.4
         return score
 
@@ -1004,14 +1148,38 @@ class ActionMapperAgent(BaseAgent):
         return False
 
     def _route_hint_from_elements(self, elements: list[dict]) -> str | None:
-        routes = [str(el.get("route") or "").strip() for el in elements if str(el.get("route") or "").strip()]
+        routes = [
+            r for el in elements
+            if (r := str(el.get("route") or "").strip())
+            and not r.startswith("/_components")  # 공유 컴포넌트는 다수결 제외
+        ]
         if not routes:
             return None
         return max(set(routes), key=routes.count)
 
     def _route_hint_from_tc(self, tc: dict[str, Any]) -> str | None:
+        # 1차: TC.api 의 path segment 가 DOM 인덱스에 실존하는 route 와 일치하면
+        # 그 화면이 무대 (도메인 무관 신호 — keyword 보다 우선).
+        api = str(tc.get("api") or "")
+        dom_index = getattr(self, "_frontend_dom_index", None) or []
+        if api and dom_index:
+            known_routes = {
+                str(el.get("route") or "").strip()
+                for el in dom_index if str(el.get("route") or "").strip()
+            }
+            segs = [
+                s for s in api.lower().split(" ")[-1].split("/")
+                if s and s != "api" and not s.startswith("{")
+            ]
+            if segs:
+                for cand in (f"/{segs[0]}", f"/{segs[0]}s"):
+                    if cand in known_routes:
+                        return cand
+
+        # 2차: keyword — "가입" 단독은 요금제/가족/멤버십 가입과 구분 불가 (TS-006
+        # 가 /signup 으로 오염됐던 원인) — 회원가입 명시 시에만 /signup.
         text = " ".join(str(tc.get(key) or "") for key in ("name", "given", "when", "then")).lower()
-        if any(term in text for term in ("회원가입", "가입", "signup")):
+        if any(term in text for term in ("회원가입", "signup")):
             return "/signup"
         if "로그인" in text or "login" in text:
             return "/login"

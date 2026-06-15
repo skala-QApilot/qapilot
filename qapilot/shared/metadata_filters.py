@@ -392,6 +392,13 @@ def pick_table_for_tc(
     if not schemas:
         return None
     db_models = schemas.get("db_models") or {}
+    # declarative base 가 db_model 로 잘못 인덱싱된 기존 metadata-index 방어 —
+    # column 0개 + 이름 base 류는 실제 테이블이 아니다 (스냅샷 404 의 원인).
+    db_models = {
+        name: model for name, model in db_models.items()
+        if (model.get("table_name") or "").lower() not in ("", "base", "declarativebase")
+        or (model.get("columns") or [])
+    }
     if not db_models:
         return None
 
@@ -412,7 +419,10 @@ def pick_table_for_tc(
 
     # 3. filter_schemas_by_api 로 좁힌 db_models 의 첫 번째 (가장 관련 깊다고 가정)
     filtered = filter_schemas_by_api(schemas, api)
-    filtered_models = filtered.get("db_models") or {}
+    filtered_models = {
+        name: model for name, model in (filtered.get("db_models") or {}).items()
+        if name in db_models
+    }
     if filtered_models:
         first = next(iter(filtered_models.values()))
         return first.get("table_name")

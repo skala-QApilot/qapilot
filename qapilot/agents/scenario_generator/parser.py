@@ -146,20 +146,23 @@ def parse_response(
                 if preserve_tc_ids and raw_tc_id
                 else f"{ts_id}-TC-{j + 1:02d}"
             )
-            unique_tcs.append(
-                {
-                    "tc_id": assigned_tc_id,
-                    "name": tc.get("name", ""),
-                    "given": tc.get("given", ""),
-                    "when": tc.get("when", ""),
-                    "then": tc.get("then", ""),
-                    "values": values,
-                    "tags": tc.get("tags", []),
-                    "req_id": tc.get("req_id"),
-                    "api": tc.get("api"),
-                    "depends_on": _resolve_tc_depends_on(tc.get("depends_on", []), ts_id),
-                }
-            )
+            parsed_tc: TestCase = {
+                "tc_id": assigned_tc_id,
+                "name": tc.get("name", ""),
+                "given": tc.get("given", ""),
+                "when": tc.get("when", ""),
+                "then": tc.get("then", ""),
+                "values": values,
+                "tags": tc.get("tags", []),
+                "req_id": tc.get("req_id"),
+                "api": tc.get("api"),
+                "depends_on": _resolve_tc_depends_on(tc.get("depends_on", []), ts_id),
+            }
+            # 오라클 원칙 (문서 1차): 문서-코드 충돌 / 문서 근거 부재를 LLM 이
+            # TC 단위로 보고 — 결함 후보·잠정(provisional) TC 식별 신호로 보존.
+            if tc.get("mismatch_note"):
+                parsed_tc["mismatch_note"] = str(tc["mismatch_note"])  # type: ignore[typeddict-unknown-key]
+            unique_tcs.append(parsed_tc)
 
         if not unique_tcs:
             continue

@@ -126,7 +126,9 @@ class LLMClient:
         json_mode: bool = False,
     ) -> LLMResponse:
         """재시도 로직 (3회, 1s/2s/4s backoff)."""
-        kwargs: dict = {"model": model, "temperature": temperature}
+        # seed 고정 — temperature 0.0 만으로는 결정성 미보장 (OpenAI best-effort
+        # determinism 은 seed 필요). 같은 입력 → 같은 시나리오/코드 재현성.
+        kwargs: dict = {"model": model, "temperature": temperature, "seed": 42}
         if json_mode:
             kwargs["model_kwargs"] = {"response_format": {"type": "json_object"}}
         llm = ChatOpenAI(**kwargs)

@@ -36,6 +36,10 @@
 
 {{source_snippets}}
 
+## 같은 시나리오(TS)의 이전 TC 들이 이미 사용한 값
+
+{{same_ts_values}}
+
 ## 이전 검증 실패 피드백 (있는 경우)
 
 {{validation_feedback}}
@@ -50,6 +54,7 @@
 4. `tags=[edge_case]` + `then` 절이 "400 Bad Request" 등 validation fail 이면 의도적으로 schema 위반.
 5. **sensitive 필드 (password / token / secret / api_key 등) 는 values 에 포함하지 마라** — 시스템이 별도 처리.
 6. **위 "코드베이스 본문" 의 실 구현 로직을 보고** 검증 규칙 (예: `existing = db.scalar(...)` → 중복 체크 / `raise HTTPException(409, ...)` → 409 에러 메시지) 을 정확히 반영하라. 문서에 없어도 코드에 있으면 우선.
-7. 추론 불가능한 값이면 `purpose` 에 "스키마 정보 부족" 명시.
+7. **unique 제약 필드 (email / username / phone 등) 는 위 "같은 시나리오(TS)의 이전 TC 들이 이미 사용한 값" 과 절대 중복되지 않게 하라.** 단, `then` 절이 "이미 존재 / 409 / 중복" 류의 의도적 중복 케이스면 예외 — 그때는 DB 데이터 또는 이전 TC 값을 그대로 재사용해야 한다.
+8. 추론 불가능한 값이면 `purpose` 에 "스키마 정보 부족" 명시.
 
 JSON 만 출력하라. 마크다운 코드블록 X.

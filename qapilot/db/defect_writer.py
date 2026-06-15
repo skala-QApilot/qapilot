@@ -16,6 +16,15 @@ from qapilot.shared.logger import get_logger
 
 _logger = get_logger("db.defect_writer")
 
+# defects.category CHECK 제약과 동기 (qapilot-server V15 migration).
+# 신규 4종은 Layer 3 결정 분류 (_classify_failure) — V15 미적용 DB 에서는
+# CHECK 위반으로 batch 전체가 유실되므로, 허용 집합 밖이면 legacy 추론으로
+# 강등해서라도 기록한다 (전량 유실 < 분류 정밀도 손실).
+_ALLOWED_CATEGORIES = {
+    "UI_ERROR", "API_ERROR", "DATA_MISMATCH", "INFRA", "DOMAIN_RULE",
+    "TEST_DEFECT_MAPPING", "TEST_DEFECT_UNVERIFIABLE", "ENV_TIMEOUT", "ENV_UNVERIFIED", "PRODUCT_DEFECT_CANDIDATE",
+}
+
 # cross_check error_code 의 prefix → defects.category 매핑.
 _CATEGORY_PREFIX = {
     "UI": "UI_ERROR",
@@ -69,7 +78,11 @@ def insert_defects(
         top = candidates[0]
 
         cc = cc_by_tc.get(tc_id) or {}
-        category = _infer_category(cc.get("error_code"))
+        # 결정적 1차 분류 (pipeline._classify_failure) 가 있으면 그것이 진실 —
+        # TEST_DEFECT/ENV 계열을 SUT defect (UI_ERROR) 로 오기록하던 격차 해소.
+        category = rc.get("category") or _infer_category(cc.get("error_code"))
+        if category not in _ALLOWED_CATEGORIES:
+            category = _infer_category(cc.get("error_code"))
 
         fr = fix_by_tc.get(tc_id) or {}
         suggestions = fr.get("suggestions") or []
@@ -100,26 +113,37 @@ def insert_defects(
     if not rows:
         return 0
 
+    _INSERT_SQL = """
+        INSERT INTO defects (
+            id, service_id, run_id, ts_id, tc_id, category,
+            root_cause_top1, root_cause_confidence,
+            solution_guide, assignee, file_location
+        )
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+    """
+
     try:
         with pool.connection() as conn, conn.cursor() as cur:
-            cur.executemany(
-                """
-                INSERT INTO defects (
-                    id, service_id, run_id, ts_id, tc_id, category,
-                    root_cause_top1, root_cause_confidence,
-                    solution_guide, assignee, file_location
-                )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                """,
-                rows,
-            )
+            cur.executemany(_INSERT_SQL, rows)
         _logger.info("defects_persisted", service_id=service_id, run_id=run_id, count=len(rows))
         return len(rows)
     except Exception as e:
+        # batch 실패 시 row 단위 재시도 — 한 row 의 제약 위반 (run 544ab04d:
+        # defects_category_check) 이 전체 run 의 defect 기록을 유실시키면 안 된다.
         _logger.warning(
-            "defects_persist_failed",
-            service_id=service_id,
-            run_id=run_id,
-            error=str(e),
+            "defects_persist_batch_failed_retrying_rows",
+            service_id=service_id, run_id=run_id, error=str(e),
         )
-        return 0
+        inserted = 0
+        for row in rows:
+            try:
+                with pool.connection() as conn, conn.cursor() as cur:
+                    cur.execute(_INSERT_SQL, row)
+                inserted += 1
+            except Exception as row_e:
+                _logger.warning(
+                    "defect_row_persist_failed",
+                    tc_id=row[4], category=row[5], error=str(row_e)[:120],
+                )
+        _logger.info("defects_persisted", service_id=service_id, run_id=run_id, count=inserted)
+        return inserted

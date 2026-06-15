@@ -21,6 +21,7 @@ from fastapi import FastAPI, Request
 
 from qapilot.api.agent_router import router as agent_router
 from qapilot.api.response import fail
+from qapilot.api.stream_router import router as stream_router
 from qapilot.modules.trace_module import TraceModule
 from qapilot.shared.errors import AuthError, QApilotError
 from qapilot.shared.logger import get_logger, setup_logger
@@ -100,6 +101,10 @@ def create_app() -> FastAPI:
 
     # 최종 FastAPI는 AI 실행 서버로 축소한다.
     app.include_router(agent_router)
+    # CDP Screencast 실시간 스트리밍 WebSocket — agent_router 와 같은 /api/agent
+    # prefix 하위(/api/agent/ws/stream/{trace_id}). 인증 미들웨어가 WebSocket scope
+    # 에 적용되지 않으므로 trace_id 가 암묵적 접근 제어 역할을 한다.
+    app.include_router(stream_router, prefix="/api/agent")
 
     return app
 

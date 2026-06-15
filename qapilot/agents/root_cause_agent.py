@@ -132,8 +132,12 @@ class RootCauseAgent(BaseAgent):
         mismatches: list = params.get("mismatches") or context.get("mismatches") or []
         has_mismatch: bool = params.get("has_mismatch", context.get("has_mismatch", False))
 
-        # runtime_context: tc_id 기반 더미 파일 (파이프라인 완성 전까지)
-        runtime_context_raw = self._load_dummy_context(tc_id, "runtime_context") if tc_id else ""
+        # runtime_context: 파이프라인이 실측 실행 컨텍스트 (ui fail step/error)
+        # 를 context 로 제공 — 더미 파일은 그 부재 시 폴백 (run 04d5f79e 감사:
+        # 전 TC context_not_found 68건 = 실행 증거 없이 코드만 보고 추론하던 격차).
+        runtime_context_raw = (context or {}).get("runtime_context") or (
+            self._load_dummy_context(tc_id, "runtime_context") if tc_id else ""
+        )
 
         runtime_str = self._stringify(runtime_context_raw)
 

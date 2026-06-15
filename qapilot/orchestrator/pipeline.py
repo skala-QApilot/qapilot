@@ -2210,6 +2210,20 @@ async def _code_generate(state: PipelineState) -> dict:
     action_mappings = state.get("action_mappings") or []
     agent_logs = state.get("agent_logs", [])
 
+    # SUT 의 기존 테스트 패턴 (sut_tests-patterns metadata-index) — 이 앱에서
+    # 통하는 셀렉터/인증 셋업/대기 패턴의 few-shot 근거. 코드 생성이 테스트 작성
+    # 노하우 0 으로 추측하던 격차의 보강 (옵션 2 소비처 확장).
+    sut_test_patterns = None
+    try:
+        trace_meta = load_trace(state.get("trace_id") or "") or {}
+        cg_service_id = trace_meta.get("service_id")
+        if cg_service_id:
+            from qapilot.shared.scan_storage import load_metadata_index
+            sut_test_patterns = load_metadata_index(cg_service_id, "sut_tests", "patterns")
+    except Exception as e:
+        logger.warning("code_generate_patterns_load_failed",
+                       trace_id=state.get("trace_id"), error=str(e))
+
     try:
         agent = CodeGeneratorAgent(trace_id=state.get("trace_id"))
         result = await agent.run(
@@ -2220,6 +2234,7 @@ async def _code_generate(state: PipelineState) -> dict:
                     "scenarios": state.get("scenarios", []),
                     "frontend_dom": state.get("frontend_dom") or [],
                     "qapilot_dir": state.get("qapilot_dir"),
+                    "sut_test_patterns": sut_test_patterns,
                 },
                 params={},
             )
@@ -2564,8 +2579,47 @@ async def _test_execution(state: PipelineState) -> dict:
                 "password": test_account_cfg.password,
                 "login_path": getattr(test_account_cfg, "login_path", None),
             }
+    if test_account_dict is None:
+        # env fallback — SaaS 흐름에서 Spring 이 test_account 를 안 보내고
+        # cfg.project 도 빈 경우 (run dcf265f7: 인증 필요 TS 전부 /login 에 멈춤).
+        # 인증 선행조건 (가드 리다이렉트 복구) 이 작동하려면 계정이 필수.
+        env_email = os.environ.get("QAPILOT_TEST_EMAIL")
+        env_pw = os.environ.get("QAPILOT_TEST_PASSWORD") or os.environ.get("TEST_PASSWORD")
+        if env_email and env_pw:
+            test_account_dict = {"email": env_email, "password": env_pw, "login_path": None}
+            logger.info(
+                "test_account_env_fallback",
+                trace_id=trace_id, email_masked=env_email[:3] + "***",
+            )
 
     results_root = _qapilot_path(state, "results", trace_id)
+
+    # 데이터 사전조건 fixture (Arrange via API) — 선택 TC 들이 참조하는 리소스
+    # (path param 보유 api) 가 SUT 에 0건이면 깊은 흐름 TC 가 전부 '대상 없음'
+    # 으로 퇴화 (run 544ab04d: orders 0건 → 요금제 변경 TS 전멸). 실패는 graceful.
+    if target_url and test_account_dict:
+        try:
+            from qapilot.shared.precondition_fixture import ensure_resource_preconditions
+            tc_apis = [
+                str(tc.get("api"))
+                for sc in scenarios
+                for tc in (sc.get("test_cases") or [])
+                if tc.get("api")
+            ]
+            if tc_apis:
+                fixture_results = await ensure_resource_preconditions(
+                    target_url, test_account_dict, tc_apis, trace_id=trace_id,
+                )
+                if fixture_results:
+                    logger.info(
+                        "precondition_fixture_summary",
+                        trace_id=trace_id, results=fixture_results,
+                    )
+        except Exception as e:
+            logger.warning(
+                "precondition_fixture_error",
+                trace_id=trace_id, error=f"{type(e).__name__}: {e}",
+            )
 
     ui_results: list[dict] = []
     api_results: list[dict] = []
@@ -2573,16 +2627,280 @@ async def _test_execution(state: PipelineState) -> dict:
 
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(headless=headless)
-        context = await browser.new_context(
-            extra_http_headers={"X-Trace-Id": trace_id}
-        )
-        page = await context.new_page()
 
         try:
             execution_items = generated_codes or action_mappings
             action_mapping_by_tc = {
                 str(am.get("tc_id")): am for am in action_mappings if am.get("tc_id")
             }
+            # tc_id → then 절 (email 유니크화의 negative-의도 제외 판단용)
+            tc_then_by_id: dict[str, str] = {
+                str(tc.get("tc_id")): str(tc.get("then") or "")
+                for sc in scenarios
+                for tc in (sc.get("test_cases") or [])
+                if tc.get("tc_id")
+            }
+            # tc_id → tags (auth-negative 판정용 — run feb0dc5e 축 ①)
+            tc_tags_by_id: dict[str, list] = {
+                str(tc.get("tc_id")): list(tc.get("tags") or [])
+                for sc in scenarios
+                for tc in (sc.get("test_cases") or [])
+                if tc.get("tc_id")
+            }
+            # tc_id → 원본 TC (api-mode 실행이 values/api 필요)
+            tc_by_id: dict[str, dict] = {
+                str(tc.get("tc_id")): tc
+                for sc in scenarios
+                for tc in (sc.get("test_cases") or [])
+                if tc.get("tc_id")
+            }
+
+            # ── P1.5 DB 관찰 축: DB-계약형 then 의 api-mode 가 Act 직후 신선
+            # 스냅샷을 보도록 캐시 우회 fetcher + 테이블 선택용 schemas 준비.
+            # 어느 쪽이든 실패는 graceful — db_table=None 이면 status 폴백.
+            exec_schemas = None
+            try:
+                _svc = (load_trace(trace_id) or {}).get("service_id")
+                if _svc:
+                    from qapilot.shared.scan_storage import load_metadata_index
+                    exec_schemas = load_metadata_index(str(_svc), "backend", "schemas")
+            except Exception as e:
+                logger.info("api_mode_db_schemas_unavailable",
+                            trace_id=trace_id, error=f"{type(e).__name__}: {e}")
+
+            # ── api-mode 참고 화면 캡처 — 검증 증거가 아니라 보고/확인용 부가물
+            # (검증은 API 응답이 수행). 공유 컨텍스트 1개 재사용: 첫 캡처에서
+            # 로그인 화면이면 1회 로그인해 세션 유지. 실패는 전부 무시.
+            # 파일명 step_1.png → 기존 mirror 가 S3+tc_artifacts 로 업로드.
+            _cap_state: dict = {"page": None, "logged_in": False}
+
+            async def _cap_login_if_needed(page_c) -> None:
+                # auth-negative(비인증 접근 거부 검증) TC 는 자동 로그인 금지 —
+                # 로그인된 화면을 찍으면 '인증 통과처럼' 오해 (검증 전제 = 비인증).
+                if _cap_state.get("auth_negative"):
+                    return
+                if _cap_state["logged_in"] or not test_account_dict:
+                    return
+                if "/login" not in page_c.url:
+                    return
+                try:
+                    await page_c.fill("input[type=email]",
+                                      test_account_dict["email"], timeout=1500)
+                    await page_c.fill("input[type=password]",
+                                      test_account_dict["password"], timeout=1500)
+                    await page_c.click("button[type=submit]", timeout=1500)
+                    await page_c.wait_for_load_state("networkidle", timeout=4000)
+                    _cap_state["logged_in"] = True
+                except Exception:
+                    pass
+
+            def _is_auth_route(route: str) -> bool:
+                """로그인/회원가입 화면 — 비인증으로 보여줘야 하는 라우트."""
+                p = (route or "").split("?")[0].rstrip("/")
+                return p in ("/login", "/signup")
+
+            async def _cap_logout(page_c) -> None:
+                """공유 캡처 컨텍스트 로그아웃 — auth 페이지를 비인증으로 캡처하기 위해
+                쿠키 + localStorage/sessionStorage(JWT 보관처) 클리어. best-effort.
+                (이미 로그인된 세션이면 /login → /dashboard 리다이렉트로 로그인 폼이
+                안 떴음 — run 5498271b 진단)."""
+                try:
+                    await page_c.context.clear_cookies()
+                except Exception:
+                    pass
+                try:
+                    await page_c.evaluate(
+                        "() => { try { localStorage.clear(); sessionStorage.clear(); } catch (e) {} }")
+                except Exception:
+                    pass
+                _cap_state["logged_in"] = False
+
+            async def _ref_fill_field(page_c, step: dict, value: str) -> None:
+                """참고 화면용 fill — 실제 UI 경로(ui_test_tool)와 동일한 selector_type
+                매핑. 입력 타이핑은 mutation 이 아니므로 부작용 없음. best-effort."""
+                sel_type = str(step.get("selector_type") or "").lower()
+                sel = str(step.get("selector") or "")
+                if not sel:
+                    return
+                if sel_type in {"testid", "test_id", "data-testid", "data-test-id"}:
+                    await page_c.get_by_test_id(sel).fill(value, timeout=2000)
+                elif sel_type == "label":
+                    await page_c.get_by_label(sel).fill(value, timeout=2000)
+                elif sel_type == "placeholder":
+                    await page_c.get_by_placeholder(sel).fill(value, timeout=2000)
+                else:
+                    loc = sel if sel.startswith(("#", ".", "[")) else (
+                        f"[data-testid='{sel}'], #{sel}, [name='{sel}']")
+                    await page_c.locator(loc).first.fill(value, timeout=2000)
+
+            async def _ref_click_safe(page_c, step: dict) -> None:
+                """비-mutating click 만 실제 수행 (탭 전환·내비 등). api_endpoint 를
+                가진 터미널 submit 은 호출부에서 미수행 처리됨. best-effort."""
+                sel_type = str(step.get("selector_type") or "").lower()
+                sel = str(step.get("selector") or "")
+                if not sel:
+                    return
+                if sel_type in {"testid", "test_id", "data-testid", "data-test-id"}:
+                    await page_c.get_by_test_id(sel).click(timeout=2000)
+                else:
+                    loc = sel if sel.startswith(("#", ".", "[")) else (
+                        f"[data-testid='{sel}'], #{sel}, [name='{sel}']")
+                    await page_c.locator(loc).first.click(timeout=2000)
+
+            async def _capture_reference(
+                tc_api: str | None, shots_dir: Path,
+                mapping_steps: list | None = None,
+                request_body: dict | None = None,
+                response_body: dict | None = None,
+                on_shot=None,
+                intent_negative: bool = False,
+                auth_negative: bool = False,
+            ) -> None:
+                """스텝별 참고 화면 — 부작용 없는 범위에서 브라우저를 실제 구동해
+                스텝별로 '다른' 화면을 촬영 (빈폼 → 입력 → 제출직전 → 결과).
+
+                안전성 모델 (방안 A):
+                - navigate / fill: 실제 수행. 입력 타이핑은 mutation 아님 → 안전.
+                  값은 매핑이 아니라 api_payload 의 실제 request_body 로 채워 '제출된
+                  실제 값' 을 보여준다 (process.env.* 마스킹 회피).
+                - 터미널 mutating click (api_endpoint 보유): 미수행 — API 가 이미
+                  동일 부작용을 수행했으므로 중복 실행 차단. '입력 완료된 폼' 화면을
+                  그 스텝으로 촬영한다.
+                - 비-mutating click (api_endpoint 없음): 실제 수행 (안전한 내비/토글).
+                - assert: API 응답이 만든 결과 라우트로 navigate 시도 → 성공 화면.
+                  실패 시 직전(채워진 폼) 화면 유지.
+                전 과정 best-effort — 실패는 무시 (검증 verdict 와 완전 분리).
+                step_{n}.png 로 저장 → mirror 가 S3+tc_artifacts 업로드."""
+                if not (target_url and tc_api):
+                    return
+                _cap_state["auth_negative"] = auth_negative
+                try:
+                    if _cap_state["page"] is None:
+                        _cap_ctx = await browser.new_context()
+                        _cap_state["page"] = await _cap_ctx.new_page()
+                        # 실시간 송출 — 캡처 컨텍스트에도 CDP screencast 시작.
+                        # api-mode TC(로그인 등)는 per-TC ui 컨텍스트가 없어 라이브
+                        # 스트림이 없었음 → 캡처 페이지에 screencast 를 켜 동일
+                        # broadcast_frame 경로로 프론트 WS 에 송출.
+                        if trace_id:
+                            try:
+                                from qapilot.shared.stream_store import broadcast_frame as _cap_bf
+                                _cap_cdp = await _cap_ctx.new_cdp_session(_cap_state["page"])
+                                _cap_tid = trace_id
+
+                                async def _on_cap_frame(event: dict) -> None:
+                                    try:
+                                        _cap_bf(_cap_tid, event["data"])
+                                        await _cap_cdp.send(
+                                            "Page.screencastFrameAck",
+                                            {"sessionId": event["sessionId"]})
+                                    except Exception:
+                                        pass
+
+                                _cap_cdp.on("Page.screencastFrame", _on_cap_frame)
+                                await _cap_cdp.send(
+                                    "Page.startScreencast",
+                                    {"format": "jpeg", "quality": 60,
+                                     "maxWidth": 1280, "maxHeight": 800})
+                                _cap_state["cdp"] = _cap_cdp
+                                logger.info("capture_screencast_started", trace_id=trace_id)
+                            except Exception as _cap_sc_err:
+                                logger.warning("capture_screencast_failed",
+                                               trace_id=trace_id, error=str(_cap_sc_err)[:120])
+                    page_c = _cap_state["page"]
+                    shots_dir.mkdir(parents=True, exist_ok=True)
+                    base = target_url.rstrip("/")
+                    rb = request_body if isinstance(request_body, dict) else {}
+
+                    steps = [s for s in (mapping_steps or []) if isinstance(s, dict)]
+                    if steps:
+                        for s in steps:
+                            step_no = s.get("step_no") or (steps.index(s) + 1)
+                            plan = _ref_step_plan(s, rb, intent_negative)
+                            try:
+                                if plan["op"] == "navigate":
+                                    # 로그인/회원가입 화면은 비인증으로 — goto 전에
+                                    # 로그아웃(쿠키+localStorage). 그 외 가드 라우트는
+                                    # 로그인 유지 + 필요 시 자동 로그인.
+                                    _auth_page = _is_auth_route(plan["route"])
+                                    if _auth_page:
+                                        await _cap_logout(page_c)
+                                    await page_c.goto(base + plan["route"], timeout=5000,
+                                                      wait_until="domcontentloaded")
+                                    if not _auth_page:
+                                        await _cap_login_if_needed(page_c)
+                                elif plan["op"] == "fill":
+                                    await _ref_fill_field(page_c, s, str(plan["value"]))
+                                elif plan["op"] == "click":
+                                    # 비-mutating click 만 (mutating submit 은 plan=noop)
+                                    await _ref_click_safe(page_c, s)
+                                elif plan["op"] == "result":
+                                    # 성공 결과 화면 — 응답 redirect 있으면 그 프론트
+                                    # 라우트, 없으면 SUT 루트 '/'(앱 랜딩: /plans·
+                                    # /dashboard 로 redirect). 폼에 머물지 않고 '액션
+                                    # 후 앱' 화면을 보여줘 step_6(제출 직전 폼) 과 구분.
+                                    # API 세그먼트(/auth)로는 안 감 → 흰 화면 방지.
+                                    seg = _result_route_from(response_body) or "/"
+                                    await page_c.goto(base + seg, timeout=5000,
+                                                      wait_until="domcontentloaded")
+                                    await _cap_login_if_needed(page_c)
+                                # noop (mutating submit / wait / 미지원) → 현재 화면 촬영
+                            except Exception:
+                                pass
+                            shot_path = shots_dir / f"step_{step_no}.png"
+                            try:
+                                await page_c.screenshot(path=str(shot_path))
+                            except Exception:
+                                pass
+                            # 증분 라이브 — 이 스텝을 즉시 S3/DB 로 올려 '최신' 으로
+                            # 만들고 짧게 머무름 (실행 중 프리뷰가 스텝별로 넘어감).
+                            if on_shot is not None:
+                                await on_shot(step_no, shot_path)
+                        return
+
+                    # 매핑 없음 — 응답 redirect 있으면 그 프론트 라우트, 없으면 SUT
+                    # 루트 '/'(실존: /plans·/dashboard 로 redirect). /auth 류 API
+                    # 세그먼트로 가지 않는다 (흰 화면 방지).
+                    seg = _result_route_from(response_body) or "/"
+                    await page_c.goto(base + seg, timeout=5000,
+                                      wait_until="domcontentloaded")
+                    await _cap_login_if_needed(page_c)
+                    shot_path = shots_dir / "step_1.png"
+                    await page_c.screenshot(path=str(shot_path))
+                    if on_shot is not None:
+                        await on_shot(1, shot_path)
+                except Exception:
+                    pass
+
+            async def _fresh_snapshot(table: str) -> dict | None:
+                try:
+                    return await DBTestTool(trace_id=trace_id)._get_snapshot(table)  # noqa: SLF001
+                except Exception as e:
+                    logger.warning("api_mode_db_snapshot_failed",
+                                   trace_id=trace_id, table=table,
+                                   error=f"{type(e).__name__}: {e}"[:160])
+                    return None
+
+            # ── 실시간 스트리밍 뷰어 연결 대기 ───────────────────────────────
+            # 뷰어(WebSocket)가 붙기 전에 테스트가 시작되면 초반 화면(폼 입력 등)이
+            # 스트림에 누락돼 "현재 테스트와 다른 화면"으로 보인다. 구독자가 생길
+            # 때까지 최대 _STREAM_CONNECT_WAIT_SEC 대기한 뒤 테스트를 시작한다.
+            # 뷰어가 없는 실행(CLI/API 트리거 등)은 타임아웃 후 그대로 진행한다.
+            if trace_id:
+                import asyncio as _asyncio
+                from qapilot.shared.stream_store import has_subscribers as _has_subs
+
+                _STREAM_CONNECT_WAIT_SEC = 10.0
+                _stream_waited = 0.0
+                while not _has_subs(trace_id) and _stream_waited < _STREAM_CONNECT_WAIT_SEC:
+                    await _asyncio.sleep(0.2)
+                    _stream_waited += 0.2
+                logger.info(
+                    "stream_viewer_wait_done",
+                    trace_id=trace_id,
+                    connected=_has_subs(trace_id),
+                    waited_sec=round(_stream_waited, 1),
+                )
 
             for item in execution_items:
                 tc_id = item.get("tc_id") or "unknown"
@@ -2591,75 +2909,438 @@ async def _test_execution(state: PipelineState) -> dict:
                 screenshots_dir = tc_dir / "screenshots"
                 tc_dir.mkdir(parents=True, exist_ok=True)
 
-                # item may be either a GeneratedCode dict or an ActionMapping dict.
-                # Only call the parser when this item looks like generated code (has "code").
-                if generated_codes and isinstance(item, dict) and item.get("code") is not None:
-                    exec_mapping = _action_mapping_from_generated_code(item)
-                    # api_endpoint 힌트는 기존 ActionMapping 의 값을 최대한 유지.
-                    original = action_mapping_by_tc.get(str(tc_id)) or {}
-                    original_steps = list(original.get("steps") or [])
-                    for idx, step in enumerate(exec_mapping.get("steps") or []):
-                        if idx < len(original_steps):
-                            step["api_endpoint"] = original_steps[idx].get("api_endpoint")
-                            # #256 본질 fix — generated_code 가 password 등을 process.env.*
-                            # 로 마스킹. _resolve_js_value 가 환경변수 미설정 시 "" 반환 →
-                            # fill('') → form 빈 채 → POST 0건. e2e trace `87041b5e` 진단
-                            # (ui_fill_cached password value_len=0). 본인 누적 10 PR (D 영역
-                            # race fix) 모두 본질 아니었음 — 진짜 본질은 generated_code 변환.
-                            # ActionMapping 원본 value 가 있고 generated_code 의 value 가
-                            # 빈 채면 원본으로 fallback (password masking 회피).
-                            orig_value = original_steps[idx].get("value")
-                            if orig_value and not step.get("value"):
-                                step["value"] = orig_value
-                else:
-                    exec_mapping = item
-
-                ui_res = await _run_ui_with_trace(
-                    page=page,
-                    tc_id=tc_id,
-                    action_mapping=exec_mapping,
-                    target_url=target_url,
-                    screenshots_dir=screenshots_dir,
-                    trace_id=trace_id,
-                    UITestTool=UITestTool,
-                    APITraceTool=APITraceTool,
-                    ToolInput=ToolInput,
-                    test_account=test_account_dict,
+                # ── P1 검증 모드 이원화: API-계약형 / UI 무대 부재 TC 는 API 직접 검증 ──
+                _tc_meta = tc_by_id.get(str(tc_id)) or {}
+                verify_mode = _decide_verify_mode(
+                    tc_then_by_id.get(str(tc_id), ""),
+                    tc_tags_by_id.get(str(tc_id), []),
+                    _tc_meta.get("api"),
+                    action_mapping_by_tc.get(str(tc_id)),
+                    item.get("code") if isinstance(item, dict) else None,
+                    tc_observe=_tc_meta.get("observe"),
                 )
-                ui_results.append(ui_res["ui_result"])
-                api_results.append(ui_res["api_result"])
+                if verify_mode == "api":
+                    intent_neg = _is_negative_intent_then(tc_then_by_id.get(str(tc_id), ""))
+                    auth_neg = _is_auth_negative_tc(
+                        tc_then_by_id.get(str(tc_id), ""),
+                        tc_tags_by_id.get(str(tc_id), []),
+                    )
+                    from qapilot.tools.api_exec_tool import (
+                        _db_contract,
+                        execute_api_verification,
+                    )
+                    db_table = None
+                    _needs_db = _db_contract(tc_then_by_id.get(str(tc_id), "")) or any(
+                        isinstance(o, dict) and o.get("kind") == "db_field"
+                        for o in (_tc_meta.get("observe") or [])
+                    )
+                    if _needs_db and exec_schemas:
+                        try:
+                            from qapilot.shared.metadata_filters import pick_table_for_tc
+                            db_table = pick_table_for_tc(_tc_meta, exec_schemas)
+                        except Exception:
+                            db_table = None
+                    try:
+                        exec_out = await execute_api_verification(
+                            tc=_tc_meta if _tc_meta else {"tc_id": tc_id},
+                            base_url=target_url,
+                            test_account=test_account_dict,
+                            intent_negative=intent_neg,
+                            auth_negative=auth_neg,
+                            trace_id=trace_id,
+                            db_table=db_table,
+                            snapshot_fetch=_fresh_snapshot,
+                        )
+                    except Exception as e:
+                        exec_out = {
+                            "tc_id": tc_id, "verify_mode": "api", "calls": [],
+                            "total_calls": 0, "error_calls": 0,
+                            "verdict": "fail", "reason": f"{type(e).__name__}: {e}",
+                        }
+                    logger.info(
+                        "api_mode_verified",
+                        trace_id=trace_id, tc_id=tc_id,
+                        verdict=exec_out.get("verdict"), reason=exec_out.get("reason"),
+                        db_observation=exec_out.get("db_observation"),
+                    )
+                    # ui kind 는 status 없음 (UI 미수행 — skip 과 구분: S 카운트
+                    # 오염 금지, RunReader 의 skip 보호와도 무관). verdict 는
+                    # api kind (의도-인지 라벨링) + cross_check 가 만든다.
+                    _ref_steps = _api_mode_ref_steps(
+                        (action_mapping_by_tc.get(str(tc_id)) or {}).get("steps"))
+                    ui_payload = {
+                        "tc_id": tc_id, "verify_mode": "api", "status": None,
+                        "steps": _ref_steps, "total_duration_ms": 0,
+                        "summary": f"API-mode 검증: {exec_out.get('reason', '')}",
+                    }
+                    api_payload = {
+                        "tc_id": tc_id, "verify_mode": "api",
+                        "calls": exec_out.get("calls") or [],
+                        "total_calls": exec_out.get("total_calls", 0),
+                        "error_calls": exec_out.get("error_calls", 0),
+                        "verdict": exec_out.get("verdict"),
+                    }
+                    if exec_out.get("db_observation"):
+                        api_payload["db_observation"] = exec_out["db_observation"]
+                    if exec_out.get("observe_results"):
+                        # UI 상세 패널이 observe 사유를 표시 (api-mode 스크린샷 대체)
+                        api_payload["observe_results"] = exec_out["observe_results"]
+                    db_res = await _run_db_test_safe(
+                        tc_id=tc_id, trace_id=trace_id,
+                        DBTestTool=DBTestTool, ToolInput=ToolInput,
+                    )
+                    # 스텝별 참고 화면 캡처 — 실제 제출값(request_body) 으로 폼을
+                    # 채워 스텝별 화면을 만든다. 라이브 프리뷰가 스텝마다 넘어가도록
+                    # ui row 를 먼저 만들어(id 확보) 캡처가 스텝마다 증분 업로드.
+                    _first_call = (api_payload.get("calls") or [{}])[0]
+                    _live_ui_id = upsert_tc_result(
+                        run_id=trace_id, ts_id=ts_id, tc_id=tc_id, kind="ui",
+                        payload=ui_payload)
+                    await _capture_reference(
+                        _tc_meta.get("api"), screenshots_dir,
+                        mapping_steps=(action_mapping_by_tc.get(str(tc_id)) or {}).get("steps"),
+                        request_body=_first_call.get("request_body")
+                        if isinstance(_first_call, dict) else None,
+                        response_body=_first_call.get("response_body")
+                        if isinstance(_first_call, dict) else None,
+                        on_shot=_make_live_shot(
+                            trace_id=trace_id, ts_id=ts_id, tc_id=tc_id,
+                            ui_result_id=_live_ui_id),
+                        intent_negative=intent_neg,
+                        auth_negative=auth_neg,
+                    )
+                    ui_results.append(ui_payload)
+                    api_results.append(api_payload)
+                    db_results.append(db_res)
+                    (tc_dir / "ui_result.json").write_text(
+                        json.dumps(ui_payload, ensure_ascii=False, indent=2), "utf-8")
+                    (tc_dir / "api_result.json").write_text(
+                        json.dumps(api_payload, ensure_ascii=False, indent=2), "utf-8")
+                    (tc_dir / "db_result.json").write_text(
+                        json.dumps(db_res, ensure_ascii=False, indent=2), "utf-8")
+                    try:
+                        # 캡처가 증분 업로드했으면(_live_ui_id) mirror 는 screenshots skip
+                        # — 재삽입 시 artifact_count 중복 + created_at 순서 깨짐.
+                        _mirror_tc_results_and_artifacts(
+                            trace_id=trace_id, ts_id=ts_id, tc_id=tc_id,
+                            ui_result=ui_payload, api_result=api_payload,
+                            db_result=db_res, screenshots_dir=screenshots_dir,
+                            intent_negative=intent_neg,
+                            skip_screenshots=bool(_live_ui_id),
+                        )
+                    except Exception as e:
+                        logger.warning("tc_mirror_failed", trace_id=trace_id, tc_id=tc_id, error=str(e))
+                    continue
 
-                db_res = await _run_db_test_safe(
-                    tc_id=tc_id,
-                    trace_id=trace_id,
-                    DBTestTool=DBTestTool,
-                    ToolInput=ToolInput,
+                # TC 간 cookie/session/localStorage 격리 — 컨텍스트를 TC 마다 새로 만든다.
+                # 단일 컨텍스트 공유 시 첫 로그인 성공 TC 이후 auth token 이 남아
+                # SUT 라우터 가드가 /login·/signup → /dashboard 리다이렉트,
+                # 이후 모든 TC 가 locator not found 로 연쇄 fail (run f142978d: 9/11).
+                context = await browser.new_context(
+                    extra_http_headers={"X-Trace-Id": trace_id}
                 )
-                db_results.append(db_res)
+                page = await context.new_page()
 
-                # L2 디스크 저장 (spec §6.1)
+                # ── 실시간 스트리밍: CDP Screencast 시작 ──────────────────────
+                # 스텝별 스크린샷(disk/S3 업로드)은 그대로 두고, 실행 중 라이브
+                # 화면을 WebSocket 으로 브로드캐스트한다. headless 환경에서도 동작.
+                # 프레임은 stream_store 의 trace_id 구독자 큐로 흘러가고, 구독자가
+                # 없으면 broadcast_frame 이 no-op 이라 비용이 거의 없다.
+                _cdp_session = None
+                if trace_id:
+                    from qapilot.shared.stream_store import broadcast_frame as _broadcast_frame
+
+                    _tid = trace_id  # 클로저 캡처용
+
+                    try:
+                        _cdp_session = await context.new_cdp_session(page)
+
+                        async def _on_screencast_frame(event: dict) -> None:
+                            # event["data"] 는 이미 base64 JPEG 문자열.
+                            try:
+                                _broadcast_frame(_tid, event["data"])
+                                await _cdp_session.send(
+                                    "Page.screencastFrameAck",
+                                    {"sessionId": event["sessionId"]},
+                                )
+                            except Exception:
+                                pass
+
+                        _cdp_session.on("Page.screencastFrame", _on_screencast_frame)
+                        await _cdp_session.send(
+                            "Page.startScreencast",
+                            {"format": "jpeg", "quality": 60, "maxWidth": 1280, "maxHeight": 800},
+                        )
+                        logger.info("screencast_started", trace_id=trace_id, tc_id=tc_id)
+                    except Exception as _sc_err:
+                        _cdp_session = None
+                        logger.warning("screencast_start_failed", trace_id=trace_id, error=str(_sc_err))
+
+                # per-TC 실패 흡수 준비 — TC 1개의 Tool 타임아웃/예외가 run 전체를
+                # abort 시키면 안 된다 (run eb5145b7: TS-004 의 60s Tool 타임아웃이
+                # pipeline_failed → 나머지 TC 전부 미실행). 예외 시 리스트를 이
+                # 시점으로 되돌리고 failed 결과를 기록 후 다음 TC 로 계속.
+                _ui_len, _api_len, _db_len = len(ui_results), len(api_results), len(db_results)
+                # api-mode 폴백이 스텝별 증분 캡처를 했으면 True → 아래 공용 mirror 가
+                # screenshots 재삽입을 건너뜀 (ui-mode 경로는 False 유지 → 정상 업로드).
+                _live_skip_shots = False
+
+                try:
+                    # item may be either a GeneratedCode dict or an ActionMapping dict.
+                    # Only call the parser when this item looks like generated code (has "code").
+                    if generated_codes and isinstance(item, dict) and item.get("code") is not None:
+                        exec_mapping = _action_mapping_from_generated_code(item)
+                        # api_endpoint 힌트는 기존 ActionMapping 의 값을 최대한 유지.
+                        original = action_mapping_by_tc.get(str(tc_id)) or {}
+                        original_steps = list(original.get("steps") or [])
+                        for idx, step in enumerate(exec_mapping.get("steps") or []):
+                            if idx < len(original_steps):
+                                step["api_endpoint"] = original_steps[idx].get("api_endpoint")
+                                # #256 본질 fix — generated_code 가 password 등을 process.env.*
+                                # 로 마스킹. _resolve_js_value 가 환경변수 미설정 시 "" 반환 →
+                                # fill('') → form 빈 채 → POST 0건. e2e trace `87041b5e` 진단
+                                # (ui_fill_cached password value_len=0). 본인 누적 10 PR (D 영역
+                                # race fix) 모두 본질 아니었음 — 진짜 본질은 generated_code 변환.
+                                # ActionMapping 원본 value 가 있고 generated_code 의 value 가
+                                # 빈 채면 원본으로 fallback (password masking 회피).
+                                orig_value = original_steps[idx].get("value")
+                                if orig_value and not step.get("value"):
+                                    step["value"] = orig_value
+                    else:
+                        exec_mapping = item
+
+                    # run 간 데이터 격리 — TV 의 정적 email 값은 첫 run 이 SUT 에
+                    # 가입시키는 순간 소진되어 다음 run 부터 409 (run dcf265f7:
+                    # TS-001-TC-04 가 이전 run 의 가입 데이터로 fail). positive 의도
+                    # signup TC 의 email 에 run suffix 를 붙여 매 run 신규 보장.
+                    _uniquify_signup_email_for_run(
+                        exec_mapping, tc_then_by_id.get(str(tc_id), ""), trace_id,
+                    )
+
+                    # auth-negative TC (비인증 → 차단 검증) 는 인증 fail-safe 비활성
+                    # — test_account 미전달로 자동 로그인/리다이렉트 복구 둘 다 차단.
+                    # (run feb0dc5e 축 ①: 자동 로그인이 검증 전제를 파괴해 auth TC
+                    # 전멸하던 부작용)
+                    tc_test_account = test_account_dict
+                    if _is_auth_negative_tc(
+                        tc_then_by_id.get(str(tc_id), ""),
+                        tc_tags_by_id.get(str(tc_id), []),
+                    ):
+                        tc_test_account = None
+                        logger.info(
+                            "auth_failsafe_disabled_for_negative_tc",
+                            trace_id=trace_id, tc_id=tc_id,
+                        )
+
+                    ui_res = await _run_ui_with_trace(
+                        page=page,
+                        tc_id=tc_id,
+                        action_mapping=exec_mapping,
+                        target_url=target_url,
+                        screenshots_dir=screenshots_dir,
+                        trace_id=trace_id,
+                        UITestTool=UITestTool,
+                        APITraceTool=APITraceTool,
+                        ToolInput=ToolInput,
+                        test_account=tc_test_account,
+                    )
+                    # 공허한 pass 차단 — 생성 코드의 MANUAL_REVIEW(자동화 불가) step
+                    # 은 매핑 변환 시 증발한다. 남은 step (navigate/wait 뿐일 수 있음)
+                    # 만 통과하고 pass 로 보고하면 검증 없는 가짜 pass (run dcf265f7:
+                    # TS-003-TC-02 가 wait 1 step 만으로 pass). skip 으로 강등.
+                    if isinstance(item, dict) and item.get("code"):
+                        dropped = (
+                            str(item["code"]).count("QAPILOT_MANUAL_REVIEW")
+                            + str(item["code"]).count("test.skip(")
+                        )
+                        if dropped and ui_res["ui_result"].get("status") == "pass":
+                            ui_res["ui_result"]["status"] = "skip"
+                            ui_res["ui_result"]["manual_review_steps"] = dropped
+                            ui_res["ui_result"]["error"] = (
+                                f"MANUAL_REVIEW: 자동화 불가 step {dropped}건 증발 — "
+                                "실행된 step 만으로는 검증 미완 (pass 아님)"
+                            )
+                            logger.warning(
+                                "tc_vacuous_pass_downgraded",
+                                trace_id=trace_id, tc_id=tc_id, dropped_steps=dropped,
+                            )
+
+                    ui_results.append(ui_res["ui_result"])
+                    api_results.append(ui_res["api_result"])
+
+                    db_res = await _run_db_test_safe(
+                        tc_id=tc_id,
+                        trace_id=trace_id,
+                        DBTestTool=DBTestTool,
+                        ToolInput=ToolInput,
+                    )
+                    db_results.append(db_res)
+
+                    ui_payload = ui_res["ui_result"]
+                    api_payload = ui_res["api_result"]
+                except Exception as e:
+                    # TC 단위 흡수 — Tool 타임아웃(60s)·예상 밖 예외가 run 전체를
+                    # abort 시키던 격차 (run eb5145b7). failed 로 기록하고 다음 TC 계속.
+                    logger.error(
+                        "tc_execution_failed",
+                        trace_id=trace_id, tc_id=tc_id,
+                        error=f"{type(e).__name__}: {e}",
+                    )
+                    del ui_results[_ui_len:]
+                    del api_results[_api_len:]
+                    del db_results[_db_len:]
+                    ui_payload = {
+                        "tc_id": tc_id, "status": "fail", "steps": [],
+                        "total_duration_ms": 0,
+                        "error": f"{type(e).__name__}: {e}",
+                    }
+                    api_payload = {
+                        "tc_id": tc_id, "calls": [], "total_calls": 0, "error_calls": 0,
+                    }
+                    db_res = {
+                        "tc_id": tc_id, "snapshots": [], "skipped": True,
+                        "summary": f"TC 실행 예외로 미수행: {type(e).__name__}",
+                    }
+                    ui_results.append(ui_payload)
+                    api_results.append(api_payload)
+                    db_results.append(db_res)
+
+                # ── api-mode 폴백 (run 04d5f79e U 해부): UI 가 검증을 못 끝낸 TC
+                # (MANUAL_REVIEW skip 강등 / step 0 빈 매핑 / 타임아웃 예외 흡수) 는
+                # tc.api 가 있으면 API 직접 검증으로 측정 가능화 — U 6건 중 4건
+                # (TS-011-TC-05, TS-014-TC-01/02, TS-015-TC-04) + TS-006 steps=0
+                # 군집이 대상. 실제 호출이 성사된 경우에만 채택 (정직성 게이트).
+                _ui_unmeasured = (
+                    ui_payload.get("status") == "skip"
+                    or (ui_payload.get("status") == "fail"
+                        and not (ui_payload.get("steps") or []))
+                )
+                if (
+                    _ui_unmeasured
+                    and ui_payload.get("verify_mode") != "api"
+                    and (tc_by_id.get(str(tc_id)) or {}).get("api")
+                ):
+                    from qapilot.tools.api_exec_tool import (
+                        _db_contract as _db_contract_fb,
+                        execute_api_verification as _exec_api_fb,
+                    )
+                    _fb_meta = tc_by_id.get(str(tc_id)) or {}
+                    _fb_then = tc_then_by_id.get(str(tc_id), "")
+                    _fb_intent_neg = _is_negative_intent_then(_fb_then)
+                    _fb_auth_neg = _is_auth_negative_tc(
+                        _fb_then, tc_tags_by_id.get(str(tc_id), []))
+                    _fb_table = None
+                    if _db_contract_fb(_fb_then) and exec_schemas:
+                        try:
+                            from qapilot.shared.metadata_filters import pick_table_for_tc
+                            _fb_table = pick_table_for_tc(_fb_meta, exec_schemas)
+                        except Exception:
+                            _fb_table = None
+                    try:
+                        _fb_out = await _exec_api_fb(
+                            tc=_fb_meta, base_url=target_url,
+                            test_account=test_account_dict,
+                            intent_negative=_fb_intent_neg,
+                            auth_negative=_fb_auth_neg, trace_id=trace_id,
+                            db_table=_fb_table, snapshot_fetch=_fresh_snapshot,
+                        )
+                    except Exception as e:
+                        _fb_out = {"calls": [], "reason": f"{type(e).__name__}: {e}"}
+                    if _fb_out.get("calls"):
+                        _orig = str(ui_payload.get("error") or "UI step 0")[:60]
+                        logger.info(
+                            "api_mode_fallback",
+                            trace_id=trace_id, tc_id=tc_id,
+                            verdict=_fb_out.get("verdict"),
+                            reason=_fb_out.get("reason"), ui_reason=_orig,
+                            db_observation=_fb_out.get("db_observation"),
+                        )
+                        ui_payload = {
+                            "tc_id": tc_id, "verify_mode": "api", "status": None,
+                            "steps": _api_mode_ref_steps(
+                                (action_mapping_by_tc.get(str(tc_id)) or {}).get("steps")),
+                            "total_duration_ms": 0,
+                            "summary": (
+                                f"UI 미측정({_orig}) → API-mode 폴백: "
+                                f"{_fb_out.get('reason', '')}"
+                            ),
+                        }
+                        api_payload = {
+                            "tc_id": tc_id, "verify_mode": "api",
+                            "calls": _fb_out.get("calls") or [],
+                            "total_calls": _fb_out.get("total_calls", 0),
+                            "error_calls": _fb_out.get("error_calls", 0),
+                            "verdict": _fb_out.get("verdict"),
+                        }
+                        if _fb_out.get("db_observation"):
+                            api_payload["db_observation"] = _fb_out["db_observation"]
+                        if _fb_out.get("observe_results"):
+                            api_payload["observe_results"] = _fb_out["observe_results"]
+                        _fb_first_call = (api_payload.get("calls") or [{}])[0]
+                        _fb_live_ui_id = upsert_tc_result(
+                            run_id=trace_id, ts_id=ts_id, tc_id=tc_id, kind="ui",
+                            payload=ui_payload)
+                        await _capture_reference(
+                            _fb_meta.get("api"), screenshots_dir,
+                            mapping_steps=(action_mapping_by_tc.get(str(tc_id)) or {}).get("steps"),
+                            request_body=_fb_first_call.get("request_body")
+                            if isinstance(_fb_first_call, dict) else None,
+                            response_body=_fb_first_call.get("response_body")
+                            if isinstance(_fb_first_call, dict) else None,
+                            on_shot=_make_live_shot(
+                                trace_id=trace_id, ts_id=ts_id, tc_id=tc_id,
+                                ui_result_id=_fb_live_ui_id),
+                            intent_negative=_fb_intent_neg,
+                            auth_negative=_fb_auth_neg,
+                        )
+                        _live_skip_shots = bool(_fb_live_ui_id)
+                        ui_results[-1] = ui_payload
+                        api_results[-1] = api_payload
+
+                # L2 디스크 저장 (spec §6.1) — 예외 흡수 TC 도 failed 로 기록
                 (tc_dir / "ui_result.json").write_text(
-                    json.dumps(ui_res["ui_result"], ensure_ascii=False, indent=2), "utf-8"
+                    json.dumps(ui_payload, ensure_ascii=False, indent=2), "utf-8"
                 )
                 (tc_dir / "api_result.json").write_text(
-                    json.dumps(ui_res["api_result"], ensure_ascii=False, indent=2), "utf-8"
+                    json.dumps(api_payload, ensure_ascii=False, indent=2), "utf-8"
                 )
                 (tc_dir / "db_result.json").write_text(
                     json.dumps(db_res, ensure_ascii=False, indent=2), "utf-8"
                 )
 
                 # L3 DB / S3 mirror — 실패해도 디스크 진실은 보존됨
-                _mirror_tc_results_and_artifacts(
-                    trace_id=trace_id,
-                    ts_id=ts_id,
-                    tc_id=tc_id,
-                    ui_result=ui_res["ui_result"],
-                    api_result=ui_res["api_result"],
-                    db_result=db_res,
-                    screenshots_dir=screenshots_dir,
-                )
+                try:
+                    _mirror_tc_results_and_artifacts(
+                        trace_id=trace_id,
+                        ts_id=ts_id,
+                        tc_id=tc_id,
+                        ui_result=ui_payload,
+                        api_result=api_payload,
+                        db_result=db_res,
+                        screenshots_dir=screenshots_dir,
+                        intent_negative=_is_negative_intent_then(
+                            tc_then_by_id.get(str(tc_id), "")
+                        ),
+                        skip_screenshots=_live_skip_shots,
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "tc_mirror_failed", trace_id=trace_id, tc_id=tc_id, error=str(e),
+                    )
+
+                # CDP Screencast 정리 — context.close() 전에 명시적으로 중단.
+                if _cdp_session is not None:
+                    try:
+                        await _cdp_session.send("Page.stopScreencast")
+                        await _cdp_session.detach()
+                    except Exception:
+                        pass
+                # per-TC 컨텍스트 정리 — 예외 시에도 닫는다 (잔여는 browser.close() 가 정리).
+                try:
+                    await context.close()
+                except Exception:
+                    pass
         finally:
-            await context.close()
             await browser.close()
 
     # tc_results / scenario_results 집계는 디스크 기반 — 같은 trace_id 로 resume 한 경우
@@ -2677,17 +3358,33 @@ async def _test_execution(state: PipelineState) -> dict:
     }
 
 
-def _derive_api_status(payload: dict | None) -> str | None:
-    """api kind 의 tc_results.status 도출 (#227).
+def _derive_api_status(payload: dict | None, intent_negative: bool = False) -> str | None:
+    """api kind 의 tc_results.status 도출 (#227 + 의도 인지 라벨링).
 
-    APITraceResult schema 에 status 키가 없어 자동 추출 None — error_calls 기반 명시 분류.
+    APITraceResult schema 에 status 키가 없어 자동 추출 None — error_calls 기반 분류.
+    negative 의도 TC 의 4xx 는 '의도된 거부' 라 fail 오라벨이었다 (run 9590382a:
+    TS-001-TC-05 의 의도된 409 가 api fail 로 표시). 의도 인지:
+    - negative + 4xx 만 존재 (5xx 없음) → pass (의도 도달)
+    - 5xx 는 의도와 무관한 서버 오류 — 항상 fail
     """
     if not isinstance(payload, dict):
         return None
+    # api-mode (P1): 실행기 verdict 가 정밀 판정 (헤더 계약/명시 코드 포함)
+    if payload.get("verify_mode") == "api" and payload.get("verdict") in ("pass", "fail"):
+        return str(payload["verdict"])
     try:
-        return "pass" if int(payload.get("error_calls", 0)) == 0 else "fail"
+        error_calls = int(payload.get("error_calls", 0))
     except (TypeError, ValueError):
         return None
+    if error_calls == 0:
+        return "pass"
+    if intent_negative:
+        has_5xx = any(
+            (c.get("status_code") or 0) >= 500
+            for c in (payload.get("calls") or [])
+        )
+        return "fail" if has_5xx else "pass"
+    return "fail"
 
 
 def _derive_db_status(payload: dict | None) -> str | None:
@@ -2704,6 +3401,230 @@ def _derive_db_status(payload: dict | None) -> str | None:
     return "pass"
 
 
+# API-계약형 then — UI 가 아니라 API 응답이 검증 대상인 표현들 (P1 모드 이원화)
+_API_CONTRACT_HINTS = (
+    "헤더", "header", "x-trace", "상태코드", "상태 코드", "status code",
+    "응답 코드", "응답코드", "bcrypt", "해시", "로그에", "메모리에",
+    "직렬화", "json 응답", "응답 본문",
+)
+
+
+def _build_runtime_context(ui_result: dict | None) -> str:
+    """RootCause 용 실측 실행 컨텍스트 — ui fail step + error 요약.
+
+    run 04d5f79e 감사: RootCauseAgent 가 더미 파일 (_load_dummy_context) 만
+    찾다 전 TC context_not_found (68건) — 실행 증거 없이 코드만 보고 추론.
+    """
+    if not isinstance(ui_result, dict):
+        return ""
+    parts: list[str] = []
+    if ui_result.get("verify_mode") == "api":
+        parts.append(f"검증 수단: API 직접 호출. {ui_result.get('summary') or ''}")
+    err = ui_result.get("error")
+    if err:
+        parts.append(f"TC 에러: {str(err)[:300]}")
+    for s in ui_result.get("steps") or []:
+        if s.get("status") != "fail":
+            continue
+        parts.append(
+            f"실패 step {s.get('step_no')}: action={s.get('action')} "
+            f"selector={str(s.get('selector'))[:80]} "
+            f"({s.get('selector_type')}) error={str(s.get('error'))[:200]}"
+        )
+    return "\n".join(parts)
+
+
+def _derive_cc_status(cc: dict) -> str:
+    """cross_check kind 의 status 도출 — has_mismatch → fail, 검증 부재 → unverified.
+
+    "unverified" 분리는 e2e false PASS 차단의 본질 fix — DB env 부재 또는 API trace
+    capture 실패 시 묵시 PASS 처리 차단. 사용자가 리포트에서 명시 인식 → 환경 fix.
+    """
+    # api-mode: exec 판정이 최종 — 게이트류 (inputs/skip/unverified) 는
+    # UI 실행 전제의 플래그라 api-mode 에 부적용 (run 04d5f79e: 부재-긍정
+    # then 오분류 구제 5건 차단).
+    if cc.get("api_exec_verdict") in ("pass", "fail"):
+        return str(cc["api_exec_verdict"])
+    if cc.get("inputs_incomplete"):
+        return "unverified"  # 입력 결손 실행 — 판정 자체가 무의미
+    if str(cc.get("error_code") or "") == "CC_PARSE_FAIL":
+        return "unverified"  # 정합성 분석 미수행 — 조용한 pass 금지
+    if cc.get("has_mismatch"):
+        return "fail"
+    if cc.get("ui_skipped"):
+        return "unverified"  # UI 검증 미완 — pass 둔갑 차단
+    if cc.get("db_unverified") or cc.get("api_unverified"):
+        return "unverified"
+    return "pass"
+
+
+def _result_route_from(response_body: dict | None) -> str | None:
+    """api-mode 의 assert/결과 화면용 '프론트엔드' 라우트 — 응답이 redirect 류
+    path(반드시 '/' 로 시작하는 프론트 경로)를 줄 때만 사용.
+
+    ⚠️ API 경로 세그먼트(예: POST /api/auth/signup → /auth)를 프론트 라우트로
+    오추출하면 SPA 가 매칭 실패 → 흰 화면이 된다. SUT 프론트 라우트는 /signup·
+    /login·/dashboard 류지 /auth 가 아니다 (run 92269223 의 step_7 흰 화면 +
+    06-02 회귀 _infer_target_route /auth 오추출 의 근본 원인). API 세그먼트
+    휴리스틱은 제거 — redirect 없으면 None → 호출부가 네비를 건너뛴다."""
+    if isinstance(response_body, dict):
+        for k in ("redirect", "redirect_url", "url", "location", "next"):
+            v = response_body.get(k)
+            if isinstance(v, str) and v.startswith("/"):
+                return v
+    return None
+
+
+# 라이브 프리뷰 — 캡처 스텝마다 프레임이 '최신' 으로 잡히도록 머무는 시간(초).
+# 실행 중 프리뷰 폴링(1s)이 각 스텝을 놓치지 않게. 작을수록 빠르게 넘어감.
+_LIVE_SHOT_PACE_S = 0.8
+
+
+def _make_live_shot(*, trace_id: str, ts_id: str, tc_id: str,
+                    ui_result_id: str | None):
+    """캡처 스텝마다 즉시 S3 업로드 + tc_artifact 삽입 → 라이브 프리뷰가 스텝별로
+    전진(빈폼→입력→…→결과). 배치 mirror 와 달리 created_at 이 스텝마다 올라가
+    `load_latest_screenshot_s3_key`(created_at DESC) 가 각 스텝을 차례로 반환.
+
+    ui_result_id 없으면(DB 비활성) None → 캡처는 디스크에만 쓰고 mirror 경로로.
+    """
+    if not ui_result_id:
+        return None
+
+    async def _on_shot(step_no: int, png_path) -> None:
+        try:
+            import asyncio as _asyncio
+            s3_key = (f"runs/{trace_id}/tc/{ts_id}/{tc_id}"
+                      f"/screenshots/{png_path.name}")
+            meta = s3_client.put_file(s3_key, str(png_path), content_type="image/png")
+            if meta:
+                insert_tc_artifact(
+                    tc_result_id=ui_result_id, step_index=step_no, kind="png",
+                    s3_key=s3_key, sha256=meta.get("sha256"),
+                    size_bytes=meta.get("bytes"),
+                )
+            # 이 프레임이 '최신' 으로 잠깐 머물러 프리뷰 폴링이 잡도록.
+            await _asyncio.sleep(_LIVE_SHOT_PACE_S)
+        except Exception:
+            pass
+
+    return _on_shot
+
+
+def _ref_step_plan(step: dict, request_body: dict | None,
+                   intent_negative: bool = False) -> dict:
+    """참고 화면 1 스텝의 수행 계획 — 부작용 안전 모델(방안 A)의 단일 진실.
+
+    순수 함수(브라우저 비의존)라 안전 불변식을 결정적으로 테스트할 수 있다:
+    - navigate/fill 만 실제 동작 (입력 타이핑은 mutation 아님).
+    - 터미널 mutating click (api_endpoint 보유) 은 미수행("noop") — API 가 이미
+      동일 부작용을 수행했으므로 중복 실행 차단.
+    - fill 값은 매핑이 아니라 실제 제출값(request_body) 우선. process.env.* 마스킹은
+      빈 문자열로 대체.
+    - assert(결과) 는 intent 인지: positive 는 결과 앱 화면("result"=/plans 류),
+      negative(거부 기대) 는 "noop" — 폼에 머문다. negative 인데 /plans(성공 앱)로
+      가면 '가입 성공처럼' 오해됨. 폼은 거부 맥락(보호자 동의 필드/잘못된 입력)을
+      그대로 보여주므로 진실에 부합.
+    반환: {"op": "navigate"|"fill"|"click"|"result"|"noop", ...}
+    """
+    action = str(step.get("action") or "").lower()
+    rb = request_body if isinstance(request_body, dict) else {}
+    if action == "navigate":
+        route = str(step.get("value") or step.get("selector") or "")
+        return {"op": "navigate", "route": route} if route.startswith("/") else {"op": "noop"}
+    if action == "fill":
+        key = step.get("target_name") or step.get("selector")
+        if key in rb:
+            val = rb[key]
+        else:
+            raw = step.get("value")
+            val = "" if (isinstance(raw, str) and raw.startswith("process.env.")) else raw
+        return {"op": "fill", "value": val} if val is not None else {"op": "noop"}
+    if action == "click":
+        # 터미널 mutating submit (api_endpoint) 은 미수행 — 부작용 중복 차단.
+        return {"op": "noop"} if step.get("api_endpoint") else {"op": "click"}
+    if action.startswith("assert"):
+        # negative 는 결과 앱 화면 금지 → 폼(거부 맥락) 유지.
+        return {"op": "noop"} if intent_negative else {"op": "result"}
+    return {"op": "noop"}
+
+
+def _api_mode_ref_steps(mapping_steps: list | None) -> list[dict]:
+    """api-mode 의 ui payload steps[] — 매핑 스텝을 참고 화면 레코드로 변환.
+
+    status 는 None: per-step 검증이 아니라 참고 화면이므로 (verdict 의 단일 진실은
+    api/cross_check kind 가 소유). 프론트가 스텝 스트립·캡처 버튼·썸네일을 렌더하는
+    데 필요한 최소 필드 (step_no/action/screenshot_path) 만 채운다."""
+    out: list[dict] = []
+    for s in mapping_steps or []:
+        if not isinstance(s, dict):
+            continue
+        n = s.get("step_no") or (len(out) + 1)
+        out.append({
+            "step_no": n,
+            "action": s.get("action"),
+            "status": None,
+            "screenshot_path": f"step_{n}.png",
+            "target_name": s.get("target_name") or s.get("selector"),
+            "value": s.get("value"),
+        })
+    return out
+
+
+def _decide_verify_mode(
+    tc_then: str, tc_tags: list, tc_api: str | None,
+    original_mapping: dict | None, generated_code: str | None,
+    tc_observe: list | None = None,
+) -> str:
+    """TC 의 검증 수단 결정 — "ui" | "api" (P1, run 254ca267 해부 기반).
+
+    api 조건 (보수적 — UI 무대가 실재하면 UI 유지):
+    ① then 이 API-계약형 (헤더/상태코드/해시 류) — UI assert 가 수단 오류
+    ② 매핑에 해결된 (selector 보유) assert 가 0 + 코드에 MANUAL_REVIEW 존재
+       — UI 무대 자체가 없어 실행해도 검증 불가 (S 로 빠지던 군집)
+    어느 쪽이든 tc.api 가 있어야 api-mode 가능.
+    """
+    if not tc_api:
+        return "ui"
+    # P3: 구조화 observe 가 API-검증형 kind 를 보유하면 api-mode (휴리스틱 불요)
+    from qapilot.tools.api_exec_tool import _API_OBSERVE_KINDS, _db_contract
+    if any(
+        isinstance(o, dict) and o.get("kind") in _API_OBSERVE_KINDS
+        for o in (tc_observe or [])
+    ):
+        return "api"
+    then_l = (tc_then or "").lower()
+    if any(k in then_l for k in _API_CONTRACT_HINTS):
+        return "api"
+    # P1.5 DB-계약형 (db에/테이블에 저장 류) — 판정 기준은 api_exec_tool 의
+    # _db_contract 단일 소스 (쓰기 동사 동반 요구로 HTML table 표현과 구분).
+    if _db_contract(tc_then):
+        return "api"
+    steps = (original_mapping or {}).get("steps") or []
+    if original_mapping is not None and not steps:
+        # 빈 매핑 — UI 로 검증할 것이 없다. 기존엔 UI 시도 → 60s 타임아웃 →
+        # api 폴백이었음 (run 1ead19b7: UITestTool 438s 의 다수). 선제 라우팅
+        # 은 같은 verdict 를 타임아웃 없이 만든다.
+        # 단 mapping=None (아티팩트 미로드) 은 제외 — generated_code 의 step
+        # 으로 UI 실행이 가능할 수 있는 경로라 기존 판단 로직에 맡긴다.
+        return "api"
+    resolved_asserts = sum(
+        1 for s in steps
+        if str(s.get("action") or "").startswith("assert") and s.get("selector")
+    )
+    if resolved_asserts == 0 and "QAPILOT_MANUAL_REVIEW" in str(generated_code or ""):
+        return "api"
+    return "ui"
+
+
+def _is_negative_intent_then(then: str) -> bool:
+    """then 절이 거부/오류를 기대하는지 — api kind 의 의도 인지 라벨링용."""
+    from qapilot.agents.action_mapper_agent import _NEGATIVE_OUTCOME_HINTS
+
+    t = (then or "").lower()
+    return any(h in t for h in _NEGATIVE_OUTCOME_HINTS)
+
+
 def _mirror_tc_results_and_artifacts(
     *,
     trace_id: str,
@@ -2713,10 +3634,14 @@ def _mirror_tc_results_and_artifacts(
     api_result: dict,
     db_result: dict,
     screenshots_dir: Path,
+    intent_negative: bool = False,
+    skip_screenshots: bool = False,
 ) -> None:
     """ui/api/db 결과 → tc_results UPSERT, 스크린샷 PNG → S3 + tc_artifacts.
 
     DB / S3 미설정/실패 시 모두 graceful — file 기록이 source of truth.
+    skip_screenshots: api-mode 가 캡처 루프에서 스텝마다 증분 업로드/삽입을 이미
+    마친 경우 True — 여기서 재삽입하면 artifact_count 중복 + 라이브 순서 깨짐.
     """
     ui_result_id = upsert_tc_result(
         run_id=trace_id, ts_id=ts_id, tc_id=tc_id, kind="ui", payload=ui_result,
@@ -2725,7 +3650,7 @@ def _mirror_tc_results_and_artifacts(
     # upsert_tc_result 의 자동 추출이 None → DB status 컬럼 null 저장됨. 명시적 도출 (#227).
     upsert_tc_result(
         run_id=trace_id, ts_id=ts_id, tc_id=tc_id, kind="api", payload=api_result,
-        status=_derive_api_status(api_result),
+        status=_derive_api_status(api_result, intent_negative=intent_negative),
     )
     upsert_tc_result(
         run_id=trace_id, ts_id=ts_id, tc_id=tc_id, kind="db", payload=db_result,
@@ -2733,7 +3658,8 @@ def _mirror_tc_results_and_artifacts(
     )
 
     # 스크린샷은 UI result 에 묶음. tc_result_id 없으면 (DB 비활성) S3 도 skip.
-    if not ui_result_id or not screenshots_dir.exists():
+    # skip_screenshots — 캡처가 증분으로 이미 올림 (api-mode 라이브 프리뷰).
+    if skip_screenshots or not ui_result_id or not screenshots_dir.exists():
         return
 
     for png in sorted(screenshots_dir.glob("step_*.png")):
@@ -2791,10 +3717,12 @@ def _load_all_tc_results_from_disk(
 def _aggregate_tc_results(
     ui_results: list[dict], api_results: list[dict], db_results: list[dict]
 ) -> dict[str, str]:
-    """TC 별 종합 status 도출 — `passed` / `failed`.
+    """TC 별 종합 status 도출 — `passed` / `failed` / `skipped`.
 
-    판정 기준: UI 가 pass/skip/fallback_used 이고, API error_calls 0, DB error 없음 → passed.
-    하나라도 위반 → failed. spec §6 의 results/{trace}/{ts}/{tc}/*.json 과 정합.
+    판정 기준: UI 가 pass/fallback_used 이고, API error_calls 0, DB error 없음 → passed.
+    UI fail 또는 API/DB error → failed. UI skip 은 **검증 안 됨** — passed 로 세면
+    false-positive 라 `skipped` 로 분리 (Spring ScenarioStatusAggregator 도 pass/fail
+    외 상태는 미측정 처리). spec §6 의 results/{trace}/{ts}/{tc}/*.json 과 정합.
     """
     ui_map: dict[str, Any] = {str(r["tc_id"]): r for r in ui_results if r.get("tc_id") is not None}
     api_map: dict[str, Any] = {str(r["tc_id"]): r for r in api_results if r.get("tc_id") is not None}
@@ -2807,11 +3735,22 @@ def _aggregate_tc_results(
         db = db_map.get(tc_id) or {}
 
         ui_status = ui.get("status", "")
-        ui_ok = ui_status in ("pass", "skip", "fallback_used")
         api_ok = int(api.get("error_calls") or 0) == 0
         db_ok = not db.get("error")
 
-        tc_results[tc_id] = "passed" if (ui_ok and api_ok and db_ok) else "failed"
+        # api-mode (P1): UI 미수행 — api 실행 verdict 가 축 (의도-인지)
+        if ui.get("verify_mode") == "api":
+            tc_results[tc_id] = (
+                "passed" if api.get("verdict") == "pass" and db_ok else "failed"
+            )
+            continue
+
+        if ui_status == "skip":
+            tc_results[tc_id] = "skipped"
+        elif ui_status in ("pass", "fallback_used") and api_ok and db_ok:
+            tc_results[tc_id] = "passed"
+        else:
+            tc_results[tc_id] = "failed"
     return tc_results
 
 
@@ -2821,7 +3760,8 @@ def _aggregate_scenario_results(
     """TS 별 status 도출 — 모든 TC passed → passed, 하나라도 failed → failed, TC 없으면 미수록.
 
     Scenario 에 속한 TC 중 실행된 것만 봄. 실행 안 된 TC 는 무시
-    (selective 실행 시나리오 보존).
+    (selective 실행 시나리오 보존). skipped TC 는 측정에서 제외 —
+    전부 skipped 인 TS 는 미수록 (passed 로 잡으면 false-positive).
     """
     scenario_results: dict[str, str] = {}
     for ts in scenarios or []:
@@ -2829,11 +3769,14 @@ def _aggregate_scenario_results(
         if not ts_id:
             continue
         ts_tc_ids = [tc.get("tc_id") for tc in (ts.get("test_cases") or []) if tc.get("tc_id")]
-        ran = [tc_id for tc_id in ts_tc_ids if tc_id in tc_results]
-        if not ran:
+        measured = [
+            tc_id for tc_id in ts_tc_ids
+            if tc_results.get(tc_id) in ("passed", "failed")
+        ]
+        if not measured:
             continue
         scenario_results[ts_id] = (
-            "failed" if any(tc_results[tc_id] == "failed" for tc_id in ran) else "passed"
+            "failed" if any(tc_results[tc_id] == "failed" for tc_id in measured) else "passed"
         )
     return scenario_results
 
@@ -3089,6 +4032,7 @@ async def _run_db_test_safe(*, tc_id: str, trace_id: str, DBTestTool, ToolInput)
         return {
             "tc_id": tc_id,
             "snapshots": [],
+            "skipped": True,
             "summary": "DBTest skip: QAPILOT_SUT_DB_URL 미설정 (env 사전 점검)",
         }
 
@@ -3102,6 +4046,7 @@ async def _run_db_test_safe(*, tc_id: str, trace_id: str, DBTestTool, ToolInput)
         return {
             "tc_id": tc_id,
             "snapshots": [],
+            "skipped": True,
             "summary": f"DBTest skip: {type(e).__name__}: {e}",
         }
 
@@ -3163,18 +4108,42 @@ async def _cross_check(state: PipelineState) -> dict:
     # = pass 가 정답인데 has_mismatch=True 로 잘못 fail. cross_check 가 본문 안
     # 받음. 본 fix 로 scenarios state 에서 추출 + tc_intent 로 context 주입.
     scenarios = state.get("scenarios") or []
+    am_by_tc = {
+        str(am.get("tc_id")): am
+        for am in (state.get("action_mappings") or [])
+        if am.get("tc_id")
+    }
     tc_intent_map: dict[str, dict] = {}
     for sc in scenarios:
         for tc in (sc.get("test_cases") or []):
             tid = tc.get("tc_id")
             if not tid:
                 continue
+            # 입력 완전성 — 같은 TS 의 형제 TC 대비 fill 결손 (상대 비교).
+            # 절대 기준 (values 수) 은 조회형 TC (fill 0 정상, values 는 조회
+            # 파라미터) 를 오판해 27/32 과잉 unverified (run d054cbe6).
+            # 같은 TS 의 max fill 이 2+ 인데 본 TC 가 그 절반 미만이면 결손.
+            am_steps = (am_by_tc.get(str(tid)) or {}).get("steps") or []
+            fill_n = sum(1 for s in am_steps if str(s.get("action") or "") == "fill")
+            ts_prefix = str(tid).split("-TC-")[0]
+            sibling_fills = [
+                sum(1 for s in (am_by_tc.get(k) or {}).get("steps") or []
+                    if str(s.get("action") or "") == "fill")
+                for k in am_by_tc if k.startswith(ts_prefix + "-TC-")
+            ]
+            ts_max_fill = max(sibling_fills) if sibling_fills else 0
+            inputs_complete = (
+                None if ts_max_fill < 2
+                else (fill_n * 2 >= ts_max_fill)
+            )
             tc_intent_map[str(tid)] = {
                 "name": tc.get("name") or "",
                 "tags": tc.get("tags") or [],
                 "given": tc.get("given") or "",
                 "when": tc.get("when") or "",
                 "then": tc.get("then") or "",
+                "api": tc.get("api"),
+                "inputs_complete": inputs_complete,
             }
 
     for tc_id in ui_map.keys():
@@ -3182,6 +4151,30 @@ async def _cross_check(state: PipelineState) -> dict:
         api_trace = api_map.get(tc_id, {})
         db_result = db_map.get(tc_id, {})
         scenario_intent = tc_intent_map.get(str(tc_id)) or {}
+
+        # api-mode: exec 판정이 최종이라 cc LLM (summary 생성) 의 부가가치가
+        # 없다 — agent 호출 생략 (run 1ead19b7: cc 335s 중 api-mode 105 TC
+        # ≈ 300s 가 summary 용 LLM). verdict 경로는 기존과 동일
+        # (api_exec_verdict → _derive_cc_status / has_mismatch → Layer 3).
+        if (ui_result or {}).get("verify_mode") == "api" and (
+            (api_trace or {}).get("verdict") in ("pass", "fail")
+        ):
+            _v = api_trace["verdict"]
+            cross_check_results.append({
+                "tc_id": tc_id,
+                "match_score": 1.0 if _v == "pass" else 0.0,
+                "matched_fields": 1 if _v == "pass" else 0,
+                "mismatched_fields": 0 if _v == "pass" else 1,
+                "mismatches": [],
+                "has_mismatch": _v == "fail",
+                "api_exec_verdict": _v,
+                "intent_satisfied": _v == "pass",
+                "error_code": "",
+                "summary": str((ui_result or {}).get("summary") or ""),
+            })
+            if _v == "fail":
+                any_mismatch = True
+            continue
 
         agent = CrossCheckAgent(trace_id=trace_id)
         try:
@@ -3206,6 +4199,18 @@ async def _cross_check(state: PipelineState) -> dict:
                     "tc_id": tc_id, "match_score": 0.0, "matched_fields": 0,
                     "mismatched_fields": 0, "mismatches": [], "has_mismatch": False,
                 }
+            # api-mode TC 의 verdict 단일 진실 = exec 판정 (run 04d5f79e 감사).
+            # cc 의 의도 재추론이 부재-긍정 then ("위약금이 부과되지 않는다",
+            # "로그에 기록되지 않는다") 을 negative 로 오분류해 404/409 를
+            # '기대된 거부' 로 구제 — family 라우터 미배선 (진짜 결함) 검출
+            # 5건을 pass 로 둔갑시켰다. exec 는 이미 의도-인지 판정이므로
+            # cc 재추론은 정보 손실만 낳는다.
+            if (ui_result or {}).get("verify_mode") == "api":
+                exec_verdict = (api_trace or {}).get("verdict")
+                if exec_verdict in ("pass", "fail"):
+                    cc["api_exec_verdict"] = exec_verdict
+                    cc["has_mismatch"] = exec_verdict == "fail"
+                    cc["intent_satisfied"] = exec_verdict == "pass"
             # UI 단계 fail 인 TC 는 Layer 3 진입 위해 has_mismatch 강제 True.
             # #259 본질 보강: 시나리오 의도 negative + outcome 도달 시 ui_failed 라도
             # 강제 fail 처리하지 않음 (cross_check agent 의 판정 우선). 단순 ui_failed
@@ -3221,6 +4226,20 @@ async def _cross_check(state: PipelineState) -> dict:
                 # 의도 도달 — ui_failed 기록만 유지하고 has_mismatch 는 agent 판정 따름
                 cc.setdefault("ui_failed", True)
                 cc.setdefault("intent_satisfied", True)
+            # ui skip (검증 미완 — MANUAL_REVIEW 강등 등) 은 cross_check 가 pass 로
+            # 둔갑시키면 안 된다 — UI 가 검증을 안 했으므로 정합성 판정의 전제 부재.
+            # unverified 로 분리 (verdict 차원에서 S/U 로 표시).
+            if (ui_result or {}).get("status") == "skip":
+                cc["ui_skipped"] = True
+            # 입력 결손 실행 — 의도한 입력을 만들지 못했으므로 pass/fail 양쪽 모두
+            # 무의미 (TS-001-TC-03: fill 1/4 로 email-required 에 막힌 것을
+            # '비밀번호 규칙 검증 통과' 로 구제하던 격차). unverified 처리.
+            # api-mode 는 fill 무관 (P1) — 게이트 제외.
+            if (
+                scenario_intent.get("inputs_complete") is False
+                and (ui_result or {}).get("verify_mode") != "api"
+            ):
+                cc["inputs_incomplete"] = True
             # DB / API 검증 부재 표시 — has_mismatch 변경 X (root_cause 호출 안 함)
             if tc_id in db_unverified_tc_ids:
                 cc["db_unverified"] = True
@@ -3234,7 +4253,7 @@ async def _cross_check(state: PipelineState) -> dict:
                 any_mismatch = True
         except Exception as e:
             # CrossCheck 실패 — UI fail TC 는 mismatch 신호 보존, 그 외는 False
-            cross_check_results.append({
+            _cc_fallback = {
                 "tc_id": tc_id, "match_score": 0.0, "matched_fields": 0,
                 "mismatched_fields": 0, "mismatches": [],
                 "has_mismatch": tc_id in ui_failed_tc_ids,
@@ -3244,17 +4263,14 @@ async def _cross_check(state: PipelineState) -> dict:
                 "error_code": "",
                 "summary": "",
                 "error": f"CrossCheck skip: {type(e).__name__}: {e}",
-            })
-
-    # status 도출: has_mismatch → "fail", 검증 부재 → "unverified", 정상 → "pass".
-    # "unverified" 분리는 e2e false PASS 차단의 본질 fix — DB env 부재 또는 API trace
-    # capture 실패 시 묵시 PASS 처리 차단. 사용자가 리포트에서 명시 인식 → 환경 fix.
-    def _derive_cc_status(cc: dict) -> str:
-        if cc.get("has_mismatch"):
-            return "fail"
-        if cc.get("db_unverified") or cc.get("api_unverified"):
-            return "unverified"
-        return "pass"
+            }
+            # api-mode 는 cc 실패와 무관하게 exec 판정이 진실
+            if (ui_result or {}).get("verify_mode") == "api" and (
+                (api_trace or {}).get("verdict") in ("pass", "fail")
+            ):
+                _cc_fallback["api_exec_verdict"] = api_trace["verdict"]
+                _cc_fallback["has_mismatch"] = api_trace["verdict"] == "fail"
+            cross_check_results.append(_cc_fallback)
 
     # tc_id ("TS-001-TC-05") → ts_id ("TS-001") 도출. upsert_tc_result 는
     # ts_id 빈 값 시 skip — 격차: cross_check kind tc_results 가 DB 에 0건 저장됐던 원인.
@@ -3283,27 +4299,95 @@ async def _cross_check(state: PipelineState) -> dict:
     }
 
 
-async def _root_cause(state: PipelineState) -> dict:
-    """Layer 3 두 번째 노드 — RootCauseAgent 호출 (FR-010).
+_INTERACTION_ACTIONS = {
+    "navigate", "fill", "clear", "click", "dblclick", "hover", "select",
+    "check", "uncheck", "press", "upload", "wait", "wait_for_url",
+    "wait_for_load_state", "wait_for_response", "reload", "go_back", "go_forward",
+}
 
-    cross_check_results 의 mismatch TC 별로 원인 후보 Top-N 추론.
-    Cross-check 결과의 error_code / summary / mismatches 를 params 로 전달.
+
+def _classify_failure(cc: dict, ui_result: dict | None) -> tuple[str, str]:
+    """실패의 결정적 1차 분류 — (category, reason).
+
+    run 45522e5d 진단: 코드 컨텍스트 0 인 상태에서 모든 실패를 LLM root cause 에
+    넣으면 환각 진단 (무관 파일을 confidence 0.90 으로 지목) + 테스트 측 결함이
+    전부 SUT defect 로 기록 (false defect ~96%). 분류는 error code/step 구조로
+    결정적으로 가능 — PRODUCT_DEFECT_CANDIDATE 만 LLM 추론 대상.
+
+    분류:
+    - ENV_TIMEOUT: TC 실행 타임아웃/예외 — 사전조건(데이터 상태)·인프라 문제
+    - ENV_UNVERIFIED: API/DB 검증 자체가 미수행 — 환경 설정 문제
+    - TEST_DEFECT_MAPPING: 상호작용 step (fill/click/navigate …) 실패 —
+      셀렉터/매핑/화면 전제의 테스트 측 결함 (SUT 결함 아님)
+    - PRODUCT_DEFECT_CANDIDATE: 상호작용 전부 통과 후 assert 만 실패 —
+      앱이 의도와 다르게 동작했을 후보 (LLM 정밀 분석 대상)
+    """
+    ui = ui_result or {}
+    err = str(ui.get("error") or "")
+    if "타임아웃" in err or "TC 실행 예외" in err or "TOOL_001" in err:
+        return "ENV_TIMEOUT", (
+            f"TC 실행 타임아웃/예외 — 사전조건 데이터 상태 또는 인프라 점검 필요: {err[:120]}"
+        )
+
+    steps = ui.get("steps") or []
+    failed = next((s for s in steps if s.get("status") == "fail"), None)
+    if failed is None:
+        if cc.get("api_unverified") or cc.get("db_unverified"):
+            return "ENV_UNVERIFIED", "API/DB 검증 미수행 — trace capture / DB 접속 환경 점검 필요"
+        return "PRODUCT_DEFECT_CANDIDATE", "UI 통과 + 정합성 mismatch — 제품 결함 후보"
+
+    action = str(failed.get("action") or "")
+    ferr = str(failed.get("error") or "")
+    if action in _INTERACTION_ACTIONS:
+        return "TEST_DEFECT_MAPPING", (
+            f"상호작용 step 실패 (action={action}) — 셀렉터/매핑/화면 전제의 "
+            f"테스트 측 결함 우선 의심: {ferr[:120]}"
+        )
+    # 문장형 텍스트 assert (then 절 서술문을 getByText 로 강등한 케이스) 의 실패는
+    # "화면에 그 문장이 없다" 는 검증 표현력 한계 — 제품 결함 신호가 아니다
+    # (run feb0dc5e 축 ③: '자동 로그아웃된다' 류 서술문 fail 이 PRODUCT 로 오염).
+    sel = str(failed.get("selector") or "")
+    sel_type = str(failed.get("selector_type") or "")
+    # text-type assert 실패 = then 절 텍스트 매칭 시도가 화면 문구와 불일치 —
+    # 짧은 서술문 ("인증 오류가 발생한다.", 공백 2개) 이 공백 임계를 피해
+    # PRODUCT 로 새던 잔여 (run 254ca267: PRODUCT 71 중 text-fail 19건).
+    if sel_type == "text" or (sel.count(" ") >= 3 and len(sel) > 15):
+        return "TEST_DEFECT_UNVERIFIABLE", (
+            f"then 텍스트 매칭 assert 실패 — 화면 실제 문구와 불일치 (표현력 한계). "
+            f"then 을 testid/URL 기반 관찰로 구체화 필요: {sel[:80]!r}"
+        )
+    return "PRODUCT_DEFECT_CANDIDATE", (
+        f"상호작용 전부 통과 후 assert 실패 (action={action}) — "
+        "앱 동작이 시나리오 의도와 다름 (제품 결함 후보)"
+    )
+
+
+async def _root_cause(state: PipelineState) -> dict:
+    """Layer 3 두 번째 노드 — 결정적 분류 → 제품 결함 후보만 RootCauseAgent (FR-010).
+
+    cross_check_results 의 mismatch TC 를 _classify_failure 로 1차 분류.
+    TEST/ENV 계열은 결정적 원인으로 즉시 기록 (LLM 호출 0 — 환각·비용 차단),
+    PRODUCT_DEFECT_CANDIDATE 만 LLM Top-N 추론.
     """
     from qapilot.agents.root_cause_agent import RootCauseAgent
     from qapilot.shared.schemas import AgentInput
 
     trace_id = state["trace_id"]
     cross_check_results = state.get("cross_check_results") or []
+    ui_by_tc = {
+        str(r.get("tc_id")): r for r in (state.get("ui_results") or [])
+        if r.get("tc_id")
+    }
 
     root_cause_results: list[dict] = []
     # agent_logs 누적 append — Layer 3 cost 집계 (#232).
     agent_logs = state.get("agent_logs", [])
 
-    for cc in cross_check_results:
-        if not cc.get("has_mismatch"):
-            continue
-        tc_id = cc.get("tc_id", "unknown")
+    # service_id 1회 해석 (병렬 task 들이 공유)
+    _svc_id = state.get("service_id") or (load_trace(state["trace_id"]) or {}).get("service_id")
 
+    async def _run_rc_llm(cc: dict, tc_id: str) -> tuple[dict, dict | None]:
+        """PRODUCT 후보 1건의 LLM 추론 — (rc_item, agent_log)."""
         try:
             agent = RootCauseAgent(trace_id=trace_id)
             output = await agent.run(
@@ -3311,15 +4395,14 @@ async def _root_cause(state: PipelineState) -> dict:
                     trace_id=trace_id,
                     context={
                         # SaaS 흐름에서 RootCauseAgent 가 codebase-index 로드하려면
-                        # state.qapilot_dir 가 필요. cfg.project.repo_path 는 None →
-                        # fallback Path(".") = qapilot 디렉토리에서 .qapilot/codebase-index
-                        # 찾기 실패 → `codebase_index_empty` warning. 본 fix.
-                        # service_id (#245, #248): state.service_id 가 LangGraph state
-                        # propagation 에서 누락되는 격차 (PipelineState schema 추가 +
-                        # load_trace fallback). 다른 노드 (line 1254/1548) 와 동일 패턴.
+                        # state.qapilot_dir 가 필요 (#245, #248 — service_id 동형).
                         "qapilot_dir": state.get("qapilot_dir"),
-                        "service_id": state.get("service_id")
-                            or (load_trace(state["trace_id"]) or {}).get("service_id"),
+                        "service_id": _svc_id,
+                        # 실측 실행 컨텍스트 — fail step/error (run 04d5f79e:
+                        # context_not_found 68건 = 더미 파일만 찾던 격차)
+                        "runtime_context": _build_runtime_context(
+                            ui_by_tc.get(str(tc_id))
+                        ),
                     },
                     params={
                         "tc_id": tc_id,
@@ -3330,23 +4413,63 @@ async def _root_cause(state: PipelineState) -> dict:
                     },
                 )
             )
-            agent_logs = agent_logs + [output.metadata.model_dump()]
             root_causes = output.result.get("root_causes") or []
-            # 단일 또는 list — list 첫 번째를 결과로
+            # 단일 또는 list — list 첫 번째를 결과로. 분류 category 보존.
             if isinstance(root_causes, list) and root_causes:
-                root_cause_results.append(dict(root_causes[0]))
+                rc_item = dict(root_causes[0])
             elif isinstance(root_causes, dict):
-                root_cause_results.append(dict(root_causes))
+                rc_item = dict(root_causes)
             else:
-                root_cause_results.append({
-                    "tc_id": tc_id, "candidates": [],
-                })
+                rc_item = {"tc_id": tc_id, "candidates": []}
+            rc_item.setdefault("category", "PRODUCT_DEFECT_CANDIDATE")
+            return rc_item, output.metadata.model_dump()
         except Exception as e:
-            root_cause_results.append({
+            return {
                 "tc_id": tc_id,
                 "candidates": [],
                 "error": f"RootCause skip: {type(e).__name__}: {e}",
+            }, None
+
+    # 1차: 결정적 분류 — PRODUCT 후보는 placeholder 로 자리 확보 후
+    # 병렬 LLM (run 1ead19b7: 순차 85호출 1048s = run 의 42% — TC 간 독립이라
+    # 병렬화는 verdict 에 영향 없음. 세마포어 6 으로 rate limit 보호).
+    llm_jobs: list[tuple[int, dict, str]] = []
+    for cc in cross_check_results:
+        if not cc.get("has_mismatch"):
+            continue
+        tc_id = cc.get("tc_id", "unknown")
+
+        category, reason = _classify_failure(cc, ui_by_tc.get(str(tc_id)))
+        if category != "PRODUCT_DEFECT_CANDIDATE":
+            logger.info(
+                "failure_classified_deterministic",
+                trace_id=trace_id, tc_id=tc_id, category=category,
+            )
+            root_cause_results.append({
+                "tc_id": tc_id,
+                "category": category,
+                "classified_deterministic": True,
+                "candidates": [{"cause": reason, "confidence": 1.0, "category": category}],
             })
+            continue
+        root_cause_results.append({})  # placeholder — 순서 보존
+        llm_jobs.append((len(root_cause_results) - 1, cc, tc_id))
+
+    if llm_jobs:
+        import asyncio as _asyncio
+        sem = _asyncio.Semaphore(6)
+
+        async def _bounded(cc: dict, tc_id: str):
+            async with sem:
+                return await _run_rc_llm(cc, tc_id)
+
+        gathered = await _asyncio.gather(
+            *[_bounded(cc, tc_id) for _, cc, tc_id in llm_jobs]
+        )
+        for (idx, _, _), (rc_item, log) in zip(llm_jobs, gathered):
+            root_cause_results[idx] = rc_item
+            if log:
+                agent_logs = agent_logs + [log]
 
     return {"root_cause_results": root_cause_results, "agent_logs": agent_logs}
 
@@ -3366,41 +4489,92 @@ async def _fix_recommend(state: PipelineState) -> dict:
     # agent_logs 누적 append — Layer 3 cost 집계 (#232).
     agent_logs = state.get("agent_logs", [])
 
+    # 결정 분류 카테고리별 가이드 — LLM 호출 없이 즉시 권고 (테스트/환경 결함은
+    # SUT 수정 권고가 아니라 테스트 자산/환경 수정 권고가 정답).
+    _DETERMINISTIC_GUIDES = {
+        "TEST_DEFECT_MAPPING": (
+            "테스트 측 결함 — SUT 수정 대상 아님. ActionMapper 매핑/DOM 인덱스/화면 "
+            "전제(라우트·인증·데이터 상태)를 점검하고 코드 생성을 재실행하라."
+        ),
+        "ENV_TIMEOUT": (
+            "환경/사전조건 결함 — SUT 수정 대상 아님. TC 가 요구하는 사전 상태 "
+            "(예: 활성 주문 보유 계정) 를 API fixture 또는 시드로 구성하거나, "
+            "per-step 타임아웃 예산을 점검하라."
+        ),
+        "ENV_UNVERIFIED": (
+            "검증 환경 부재 — API trace capture / QAPILOT_SUT_DB_URL 설정을 점검하라. "
+            "이 TC 의 결과는 미검증 상태이며 pass/fail 판정에 사용하면 안 된다."
+        ),
+        "TEST_DEFECT_UNVERIFIABLE": (
+            "검증 표현력 한계 — then 절이 화면 문구가 아닌 자연어 서술이라 텍스트 "
+            "매칭으로 검증 불가. TC 의 then 을 관찰 가능한 결과 (실제 화면 메시지/"
+            "이동 URL/요소) 로 구체화하거나 수동 검토 대상으로 분류하라."
+        ),
+    }
+
+    _fix_llm_jobs: list[tuple[int, str, list]] = []
     for rc in root_cause_results:
         tc_id = rc.get("tc_id", "unknown")
         candidates = rc.get("candidates") or []
 
-        try:
-            agent = FixRecommenderAgent(trace_id=trace_id)
-            output = await agent.run(
-                AgentInput(
-                    trace_id=trace_id,
-                    context={
-                        # FixRecommender 가 codebase-index fallback 사용 시 필요 (#244, #248)
-                        "qapilot_dir": state.get("qapilot_dir"),
-                        "service_id": state.get("service_id")
-                            or (load_trace(state["trace_id"]) or {}).get("service_id"),
-                    },
-                    params={
-                        "tc_id": tc_id,
-                        "candidates": candidates,
-                    },
-                )
-            )
-            agent_logs = agent_logs + [output.metadata.model_dump()]
-            fr_list = output.result.get("fix_results") or []
-            if isinstance(fr_list, list) and fr_list:
-                fix_results.append(dict(fr_list[0]))
-            elif isinstance(fr_list, dict):
-                fix_results.append(dict(fr_list))
-            else:
-                fix_results.append({"tc_id": tc_id, "suggestions": []})
-        except Exception as e:
+        if rc.get("classified_deterministic"):
+            guide = _DETERMINISTIC_GUIDES.get(rc.get("category") or "", "")
             fix_results.append({
                 "tc_id": tc_id,
-                "suggestions": [],
-                "error": f"FixRecommender skip: {type(e).__name__}: {e}",
+                "category": rc.get("category"),
+                "suggestions": [{"description": guide}] if guide else [],
             })
+            continue
+
+        fix_results.append({})  # placeholder — 순서 보존, 병렬 후 채움
+        _fix_llm_jobs.append((len(fix_results) - 1, tc_id, candidates))
+
+    # PRODUCT 후보 병렬 LLM (root_cause 와 동형 — TC 간 독립, 세마포어 6)
+    if _fix_llm_jobs:
+        import asyncio as _asyncio
+        _svc_id = state.get("service_id") or (load_trace(state["trace_id"]) or {}).get("service_id")
+        sem = _asyncio.Semaphore(6)
+
+        async def _run_fix(tc_id: str, candidates: list) -> tuple[dict, dict | None]:
+            try:
+                agent = FixRecommenderAgent(trace_id=trace_id)
+                output = await agent.run(
+                    AgentInput(
+                        trace_id=trace_id,
+                        context={
+                            # codebase-index fallback 사용 시 필요 (#244, #248)
+                            "qapilot_dir": state.get("qapilot_dir"),
+                            "service_id": _svc_id,
+                        },
+                        params={"tc_id": tc_id, "candidates": candidates},
+                    )
+                )
+                fr_list = output.result.get("fix_results") or []
+                if isinstance(fr_list, list) and fr_list:
+                    item = dict(fr_list[0])
+                elif isinstance(fr_list, dict):
+                    item = dict(fr_list)
+                else:
+                    item = {"tc_id": tc_id, "suggestions": []}
+                return item, output.metadata.model_dump()
+            except Exception as e:
+                return {
+                    "tc_id": tc_id,
+                    "suggestions": [],
+                    "error": f"FixRecommender skip: {type(e).__name__}: {e}",
+                }, None
+
+        async def _bounded_fix(tc_id: str, candidates: list):
+            async with sem:
+                return await _run_fix(tc_id, candidates)
+
+        gathered = await _asyncio.gather(
+            *[_bounded_fix(t, c) for _, t, c in _fix_llm_jobs]
+        )
+        for (idx, _, _), (item, log) in zip(_fix_llm_jobs, gathered):
+            fix_results[idx] = item
+            if log:
+                agent_logs = agent_logs + [log]
 
     return {"fix_results": fix_results, "agent_logs": agent_logs}
 
@@ -3584,6 +4758,204 @@ async def _ts_generate_prd_only(state: PipelineState) -> dict:
     return {"ts_list": ts_list, "agent_logs": agent_logs}
 
 
+def _is_auth_negative_tc(then: str, tags: list) -> bool:
+    """'비인증 접근 → 차단/오류' 를 검증하는 TC 인지 판정 (run feb0dc5e 축 ①).
+
+    이런 TC 에 인증 fail-safe (자동 로그인/리다이렉트 복구) 가 발동하면
+    검증 전제 (비인증 상태) 자체가 파괴된다 — "인증 오류가 발생한다" 가
+    영원히 검증 불가. auth 문맥 + negative/요구 의도 둘 다 충족 시 True.
+    """
+    from qapilot.agents.action_mapper_agent import _NEGATIVE_OUTCOME_HINTS
+
+    t = (then or "").lower()
+    auth_context = (
+        "auth" in (tags or [])
+        or any(k in t for k in ("인증", "로그인", "unauthorized", "401", "토큰"))
+    )
+    if not auth_context:
+        return False
+    auth_texted = any(k in t for k in ("인증", "로그인", "unauthorized", "401", "토큰"))
+    negative = (
+        any(h in t for h in _NEGATIVE_OUTCOME_HINTS)
+        or any(k in t for k in ("요구", "필요", "차단", "로그아웃"))
+    )
+    return auth_texted and negative
+
+
+def _uniquify_signup_email_for_run(
+    exec_mapping: dict, tc_then: str, trace_id: str
+) -> None:
+    """positive 의도 signup TC 의 email 값에 run suffix 부여 — run 간 데이터 격리.
+
+    TV 가 시나리오 생성 시점에 만든 정적 email 은 첫 run 에서 SUT 에 가입되는
+    순간 소진 → 이후 run 은 전부 409. negative(중복/오류 의도) TC 는 제외
+    (의도적 기존 값 재사용 보존). email+suffix@domain 은 RFC 유효 주소.
+    """
+    from qapilot.agents.action_mapper_agent import _NEGATIVE_OUTCOME_HINTS
+
+    then_l = (tc_then or "").lower()
+    if any(h in then_l for h in _NEGATIVE_OUTCOME_HINTS):
+        return
+    steps = exec_mapping.get("steps") or []
+    if not any("signup" in str(s.get("api_endpoint") or "").lower() for s in steps):
+        return
+    suffix = (trace_id or "").replace("-", "")[:8]
+    if not suffix:
+        return
+    for s in steps:
+        if str(s.get("action") or "") != "fill":
+            continue
+        ident = f"{s.get('target_name') or ''} {s.get('selector') or ''}".lower()
+        val = str(s.get("value") or "")
+        if "email" in ident and "@" in val and f"+{suffix}@" not in val:
+            local, _, domain = val.partition("@")
+            s["value"] = f"{local}+{suffix}@{domain}"
+            logger.info(
+                "signup_email_uniquified",
+                trace_id=trace_id,
+                tc_id=exec_mapping.get("tc_id"),
+                value=s["value"],
+            )
+
+
+def _build_frontend_grounding(routes_idx: Any, selectors_idx: Any) -> str:
+    """frontend 메타데이터 → TC 생성용 화면 grounding 요약 (오라클 아님 — 실재 확인용).
+
+    - 라우트 목록 + 인증 가드/리다이렉트 (given 절의 전제 조건 grounding)
+    - 라우트별 피드백 요소 (error/success/toast 류 testid) — then 절을
+      "관찰 가능한 결과" 로 구체화할 근거.
+    """
+    lines: list[str] = []
+    route_items = (routes_idx or {}).get("routes") or []
+    if route_items:
+        lines.append("[실재하는 화면 라우트]")
+        for r in route_items:
+            path = r.get("path") or ""
+            if not path:
+                continue
+            notes: list[str] = []
+            if r.get("guards"):
+                notes.append("인증 필요")
+            if r.get("redirects_when_authed"):
+                notes.append(f"로그인 상태면 {r['redirects_when_authed']} 로 리다이렉트")
+            suffix = f" ({', '.join(notes)})" if notes else ""
+            lines.append(f"- {path}{suffix}")
+
+    by_route = (selectors_idx or {}).get("by_route") or {}
+    feedback_tokens = ("error", "success", "toast", "message", "status", "alert")
+    fb_lines: list[str] = []
+    for route, groups in by_route.items():
+        testids = [
+            el.get("testid") for el in (groups.get("outputs") or [])
+            if el.get("testid") and any(t in el["testid"].lower() for t in feedback_tokens)
+        ]
+        if testids:
+            fb_lines.append(f"- {route}: {', '.join(sorted(set(testids)))}")
+    if fb_lines:
+        lines.append("")
+        lines.append("[라우트별 관찰 가능한 피드백 요소 (data-testid)]")
+        lines.extend(sorted(fb_lines))
+
+    return "\n".join(lines)
+
+
+def _validate_tc_apis_against_scan(
+    test_cases: list[dict], endpoint_specs: list[str], trace_id: str
+) -> None:
+    """TC.api 를 코드 스캔 endpoint 카탈로그와 대조 — 환각 endpoint 차단 (격차 4).
+
+    path 파라미터 이름 차이 ({id} vs {order_id}) 는 정규화 후 유일 매칭 시 교정,
+    카탈로그에 없는 api 는 null (없는 endpoint 로 검증하는 것보다 정직).
+    """
+    if not endpoint_specs or not test_cases:
+        return
+
+    valid = set(endpoint_specs)
+
+    def _norm(api: str) -> str:
+        return re.sub(r"\{[^}]*\}", "{}", api.strip())
+
+    norm_map: dict[str, list[str]] = {}
+    for spec in endpoint_specs:
+        norm_map.setdefault(_norm(spec), []).append(spec)
+
+    for tc in test_cases:
+        api = tc.get("api")
+        if not api or str(api).strip().lower() == "null":
+            tc["api"] = None
+            continue
+        api = str(api).strip()
+        if api in valid:
+            tc["api"] = api
+            continue
+        candidates = norm_map.get(_norm(api)) or []
+        if len(candidates) == 1:
+            tc["api"] = candidates[0]
+            continue
+        logger.warning(
+            "tc_api_not_in_codebase",
+            trace_id=trace_id, tc_name=tc.get("name"), api=api,
+        )
+        tc["api"] = None
+
+
+def _validate_tc_observe_against_scan(
+    test_cases: list[dict], schemas: dict | None, trace_id: str
+) -> None:
+    """TC.observe 의 db_field 를 스키마 인덱스와 대조 — 환각 테이블/컬럼 폐기 (P3).
+
+    실재하지 않는 테이블·컬럼 관찰은 영원히 fail 하는 가짜 계약이 된다.
+    db_field 외 kind (http_*/response_body) 는 실행 시점 검증이라 통과.
+    스키마 인덱스 부재 시 보수적으로 db_field 전부 유지 (드롭이 더 위험).
+    """
+    db_models = (schemas or {}).get("db_models") or {}
+    if not db_models or not test_cases:
+        return
+    tables: dict[str, set[str]] = {}
+    for model in db_models.values():
+        tname = str(model.get("table_name") or "").lower()
+        if not tname or tname in ("base", "declarativebase"):
+            continue
+        cols = {str(c.get("name") or c).lower() for c in (model.get("columns") or [])}
+        tables[tname] = cols
+
+    for tc in test_cases:
+        observes = tc.get("observe") or []
+        if not observes:
+            continue
+        kept: list[dict] = []
+        for o in observes:
+            if not isinstance(o, dict):
+                continue
+            # 항진 predicate (어떤 값이든 통과) — 무검증 observe 폐기
+            from qapilot.tools.api_exec_tool import _is_tautological_predicate
+            if _is_tautological_predicate(o.get("predicate")):
+                logger.warning("tc_observe_tautological_predicate",
+                               trace_id=trace_id, tc_name=tc.get("name"),
+                               kind=o.get("kind"))
+                continue
+            if o.get("kind") != "db_field":
+                kept.append(o)
+                continue
+            table = str(o.get("table") or "").lower()
+            cols = tables.get(table)
+            if cols is None:
+                logger.warning("tc_observe_table_not_in_schema",
+                               trace_id=trace_id, tc_name=tc.get("name"), table=table)
+                continue
+            field = str(o.get("field") or "").lower()
+            where_keys = [str(k).lower() for k in (o.get("where") or {})]
+            unknown = [c for c in ([field] if field else []) + where_keys
+                       if cols and c not in cols]
+            if unknown:
+                logger.warning("tc_observe_column_not_in_schema",
+                               trace_id=trace_id, tc_name=tc.get("name"),
+                               table=table, columns=unknown)
+                continue
+            kept.append(o)
+        tc["observe"] = kept
+
+
 async def _tc_generate_doc_search(state: PipelineState) -> dict:
     """ts_list 중 대상 TS만 문서 검색 → TC 생성 + S3 저장."""
     import time
@@ -3624,10 +4996,47 @@ async def _tc_generate_doc_search(state: PipelineState) -> dict:
         if isinstance(r, dict):
             req_content_map[r.get("req_id", "")] = r.get("content", "")
 
+    # 격차 4: codebase_scan_exp 결과에서 실제 endpoint 카탈로그 구성.
+    # PRD 기반 TC 생성 시 LLM 이 SUT 에 없는 endpoint (예: PUT /profile,
+    # PATCH /api/contracts/...) 를 창작하는 환각의 본질 차단 — prompt 제약 + 사후 검증.
+    scan = state.get("scan_result") or {}
+    endpoint_specs: list[str] = sorted({
+        f"{(ep.get('method') or '').upper()} {ep.get('path')}"
+        for f in (scan.get("files") or [])
+        for ep in (f.get("endpoints") or [])
+        if ep.get("method") and ep.get("path")
+    })
+
+    # 화면 grounding (라우트 + 피드백 요소) — then 절을 관찰 가능한 결과로
+    # 구체화할 근거. 기대값 오라클이 아니라 실재 확인용 (prompt 에 원칙 명시).
+    frontend_grounding = ""
+    if service_id:
+        try:
+            from qapilot.shared.scan_storage import load_metadata_index
+            routes_idx = load_metadata_index(service_id, "frontend", "routes")
+            selectors_idx = load_metadata_index(service_id, "frontend", "selectors")
+            frontend_grounding = _build_frontend_grounding(routes_idx, selectors_idx)
+        except Exception as e:
+            logger.warning("tc_frontend_grounding_load_failed", trace_id=trace_id, error=str(e))
+
     agent_logs = list(state.get("agent_logs") or [])
     result_test_cases: dict[int, list] = {}
 
-    for idx in target_indices:
+    # P3 접지용 스키마 인덱스 — 병렬 task 공유 (1회 로드)
+    _schemas_idx = None
+    if service_id:
+        try:
+            from qapilot.shared.scan_storage import load_metadata_index
+            _schemas_idx = load_metadata_index(service_id, "backend", "schemas")
+        except Exception as e:
+            logger.info("tc_observe_validation_skipped",
+                        trace_id=trace_id, error=f"{type(e).__name__}: {e}")
+
+    async def _gen_one_ts(idx: int) -> None:
+        """TS 1개의 문서검색→TC생성→검증→S3 — TS 간 완전 독립이라 병렬 안전.
+
+        run 84c0e1eb 병목: 25 TS 순차 330s. seed 고정이라 병렬화해도
+        TS별 출력은 동일 (결정성 유지). 세마포어 5 로 rate limit 보호."""
         ts_item = ts_list[idx]
         ts_name = ts_item.get("name", "")
         domain_area = ts_item.get("domain_area", "")
@@ -3664,12 +5073,21 @@ async def _tc_generate_doc_search(state: PipelineState) -> dict:
         agent = TCFromDocsAgent(trace_id=trace_id)
         output = await agent.run(AgentInput(
             trace_id=trace_id,
-            context={"ts_item": ts_item, "retrieved_docs": retrieved_docs},
+            context={
+                "ts_item": ts_item,
+                "retrieved_docs": retrieved_docs,
+                "endpoints": endpoint_specs,
+                "frontend_grounding": frontend_grounding,
+            },
             params={},
         ))
         duration = round(time.monotonic() - start, 2)
         test_cases = output.result.get("test_cases") or []
         analysis = output.result.get("analysis") or []
+        _validate_tc_apis_against_scan(test_cases, endpoint_specs, trace_id)
+        # P3: observe 의 db_field 접지 검증 — 환각 테이블/컬럼 폐기
+        if _schemas_idx is not None:
+            _validate_tc_observe_against_scan(test_cases, _schemas_idx, trace_id)
         result_test_cases[idx] = test_cases
 
         if service_id:
@@ -3700,6 +5118,15 @@ async def _tc_generate_doc_search(state: PipelineState) -> dict:
             )
 
         agent_logs.append(output.metadata.model_dump())
+
+    import asyncio as _asyncio
+    _sem = _asyncio.Semaphore(5)
+
+    async def _bounded_gen(idx: int) -> None:
+        async with _sem:
+            await _gen_one_ts(idx)
+
+    await _asyncio.gather(*[_bounded_gen(i) for i in target_indices])
 
     return {"tc_by_ts_index": result_test_cases, "agent_logs": agent_logs}
 
@@ -3767,7 +5194,9 @@ async def _tv_generate_codebase_aware(state: PipelineState) -> dict:
         logger.info("tv_no_commit_sha", trace_id=trace_id,
                     reason="codebase_scan 결과에 git_diff.commit_hash 없음")
 
-    for idx, tcs in tc_by_index.items():
+    async def _tv_one_group(idx, tcs) -> None:
+        # TS 그룹 1개의 TV 채움 — 그룹 간 독립이라 병렬 안전 (run 84c0e1eb
+        # 병목: 120 TC 순차 279s). seed 고정으로 TC별 출력 결정성 유지.
         updated_tcs: list[dict] = []
         for tc in tcs:
             # schemas.db_models 기반으로 TC 와 가장 관련 깊은 테이블 1개 선택 + DB snapshot 조회
@@ -3849,6 +5278,16 @@ async def _tv_generate_codebase_aware(state: PipelineState) -> dict:
                         files=[s["file"] for s in source_snippets],
                     )
 
+            # 같은 TS 의 이전 TC 들이 이미 사용한 값 — unique 필드 (email 등) 재사용 방지.
+            # 격차 2: TV agent 가 TC 단위 호출이라 sibling 값을 못 봐 test@test.com 등이
+            # TS 안에서 중복 생성 → SUT unique constraint 위반 → positive TC api fail.
+            same_ts_values: list[dict] = [
+                {"tc_id": prev.get("tc_id"), "field": v.get("field"), "value": v.get("value")}
+                for prev in updated_tcs
+                for v in (prev.get("values") or [])
+                if v.get("field") and v.get("value")
+            ]
+
             start = time.monotonic()
             try:
                 agent = TVFromCodebaseAgent(trace_id=trace_id)
@@ -3862,6 +5301,7 @@ async def _tv_generate_codebase_aware(state: PipelineState) -> dict:
                         "patterns": patterns,
                         "db_snapshot": db_snapshot,
                         "source_snippets": source_snippets,
+                        "same_ts_values": same_ts_values,
                     },
                     params={},
                 ))
@@ -3899,6 +5339,15 @@ async def _tv_generate_codebase_aware(state: PipelineState) -> dict:
                 updated_tcs.append(tc)  # graceful — 원본 보존
 
         updated_tc_by_index[idx] = updated_tcs
+
+    import asyncio as _asyncio
+    _tv_sem = _asyncio.Semaphore(5)
+
+    async def _bounded_tv(idx, tcs) -> None:
+        async with _tv_sem:
+            await _tv_one_group(idx, tcs)
+
+    await _asyncio.gather(*[_bounded_tv(i, t) for i, t in tc_by_index.items()])
 
     return {"tc_by_ts_index": updated_tc_by_index, "agent_logs": agent_logs}
 
@@ -3940,6 +5389,17 @@ async def _save_experiment_scenarios(state: PipelineState) -> dict:
         merged_scenarios.append(ts)
         if service_id:
             upsert_scenario_version(service_id, ts_id, ts)
+
+    # RTM 버전 생성 — 구 경로 (_save_scenarios) 에만 wire 되어 있어 prd_only
+    # 경로는 RTM 0건 → 대시보드 RTM 0% (TC 의 req_id 는 존재하는데 링크
+    # 미생성). 동일 graceful 패턴으로 연결.
+    try:
+        _write_initial_rtm_version(state, scenarios=merged_scenarios)
+    except Exception as e:
+        logger.warning(
+            "rtm_version_write_failed",
+            trace_id=state.get("trace_id"), error=str(e),
+        )
 
     return {
         "scenarios": merged_scenarios,

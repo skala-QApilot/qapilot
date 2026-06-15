@@ -1,0 +1,269 @@
+<mxfile host="app.diagrams.net" modified="2026-06-09T08:00:00.000Z" agent="Mozilla/5.0" version="24.0.0" type="device">
+  <diagram name="Scan Enhancement Architecture" id="scan-enhancement-arch">
+    <mxGraphModel dx="1800" dy="1100" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="2200" pageHeight="1400" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+        <!-- ============================== TITLE ============================== -->
+        <mxCell id="title" value="QApilot 코드 스캔 고도화 — 데이터 layer 아키텍처 (PoC 1~10)" style="text;html=1;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;whiteSpace=wrap;rounded=0;fontSize=20;fontStyle=1" vertex="1" parent="1">
+          <mxGeometry x="40" y="20" width="2100" height="40" as="geometry" />
+        </mxCell>
+
+        <!-- ============================== LEGEND ============================== -->
+        <mxCell id="legend-box" value="범례" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666;fontSize=12;fontStyle=1;verticalAlign=top;" vertex="1" parent="1">
+          <mxGeometry x="40" y="80" width="280" height="180" as="geometry" />
+        </mxCell>
+        <mxCell id="legend-new" value="신규 (PoC 1~10)" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=11" vertex="1" parent="1">
+          <mxGeometry x="60" y="110" width="120" height="30" as="geometry" />
+        </mxCell>
+        <mxCell id="legend-existing" value="기존 유지 (영향 0)" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=11" vertex="1" parent="1">
+          <mxGeometry x="60" y="150" width="120" height="30" as="geometry" />
+        </mxCell>
+        <mxCell id="legend-external" value="외부 (유빈/E 영역)" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=11" vertex="1" parent="1">
+          <mxGeometry x="60" y="190" width="120" height="30" as="geometry" />
+        </mxCell>
+        <mxCell id="legend-cache" value="cache layer ⚡" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontSize=11" vertex="1" parent="1">
+          <mxGeometry x="200" y="110" width="100" height="30" as="geometry" />
+        </mxCell>
+
+        <!-- ============================== CALLERS (TOP) ============================== -->
+        <mxCell id="caller-box" value="Callers (호출자)" style="swimlane;fontSize=14;fillColor=#fff2cc;strokeColor=#d6b656;startSize=30;swimlaneFillColor=#fff9e6;fontStyle=1" vertex="1" parent="1">
+          <mxGeometry x="380" y="80" width="1760" height="120" as="geometry" />
+        </mxCell>
+        <mxCell id="caller-yubin" value="유빈 TC/TV Generator agent&#10;(PRD → TS → TC → TV)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=12;align=center" vertex="1" parent="caller-box">
+          <mxGeometry x="40" y="40" width="280" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="caller-cli" value="CLI&#10;qapilot scan &lt;service&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=12;align=center" vertex="1" parent="caller-box">
+          <mxGeometry x="360" y="40" width="220" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="caller-register" value="Service Register Flow&#10;(POST /services + webhook)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=12;align=center" vertex="1" parent="caller-box">
+          <mxGeometry x="620" y="40" width="240" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="caller-cross" value="Cross-check Agent&#10;(검증 흐름 — 본인 #259)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=12;align=center" vertex="1" parent="caller-box">
+          <mxGeometry x="900" y="40" width="240" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="caller-actionmap" value="ActionMapper Agent&#10;(LLM context 주입)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=12;align=center" vertex="1" parent="caller-box">
+          <mxGeometry x="1180" y="40" width="240" height="60" as="geometry" />
+        </mxCell>
+
+        <!-- ============================== PUBLIC API LAYER ============================== -->
+        <mxCell id="api-box" value="Public API (5개) — 호출자가 사용할 entry point" style="swimlane;fontSize=14;fillColor=#d5e8d4;strokeColor=#82b366;startSize=30;swimlaneFillColor=#e8f5e8;fontStyle=1" vertex="1" parent="1">
+          <mxGeometry x="380" y="240" width="1760" height="130" as="geometry" />
+        </mxCell>
+        <mxCell id="api-scan-all" value="scan_all_metadata()&#10;PoC 10" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=11;align=center;fontStyle=1" vertex="1" parent="api-box">
+          <mxGeometry x="40" y="50" width="200" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="api-load-meta" value="load_metadata_index()&#10;PoC 4 + LRU ⚡" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=11;align=center;fontStyle=1" vertex="1" parent="api-box">
+          <mxGeometry x="260" y="50" width="220" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="api-load-source" value="load_source(... line_range)&#10;PoC 4 + LRU ⚡" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=11;align=center;fontStyle=1" vertex="1" parent="api-box">
+          <mxGeometry x="500" y="50" width="240" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="api-db-snap" value="get_db_snapshot_cached()&#10;PoC 8 + TTL ⚡" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=11;align=center;fontStyle=1" vertex="1" parent="api-box">
+          <mxGeometry x="760" y="50" width="240" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="api-tv-validate" value="TVValidator.validate()&#10;PoC 7" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=11;align=center;fontStyle=1" vertex="1" parent="api-box">
+          <mxGeometry x="1020" y="50" width="220" height="60" as="geometry" />
+        </mxCell>
+
+        <!-- ============================== ORCHESTRATION (scan_all_metadata) ============================== -->
+        <mxCell id="orch-box" value="Orchestration (PoC 10)" style="swimlane;fontSize=14;fillColor=#d5e8d4;strokeColor=#82b366;startSize=30;swimlaneFillColor=#e8f5e8;fontStyle=1" vertex="1" parent="1">
+          <mxGeometry x="40" y="410" width="700" height="380" as="geometry" />
+        </mxCell>
+        <mxCell id="orch-clone" value="clone_repo_shallow()&#10;(git clone --depth 1)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=11;align=center" vertex="1" parent="orch-box">
+          <mxGeometry x="30" y="50" width="180" height="55" as="geometry" />
+        </mxCell>
+        <mxCell id="orch-dump" value="dump_source_to_s3()&#10;walk + S3 PUT (whitelist)&#10;PoC 9" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=11;align=center" vertex="1" parent="orch-box">
+          <mxGeometry x="240" y="50" width="200" height="55" as="geometry" />
+        </mxCell>
+        <mxCell id="orch-extract" value="_build_*() 함수 4개&#10;(영역별 extractor 호출 + Pydantic 조립)" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=11;align=center;fontStyle=2" vertex="1" parent="orch-box">
+          <mxGeometry x="30" y="135" width="410" height="50" as="geometry" />
+        </mxCell>
+        <mxCell id="orch-upsert" value="upsert_metadata_index() × 4&#10;(영역별 DB+S3 mirror)&#10;PoC 3 + head_object cache ⚡" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=11;align=center" vertex="1" parent="orch-box">
+          <mxGeometry x="30" y="215" width="410" height="65" as="geometry" />
+        </mxCell>
+        <mxCell id="orch-result" value="ScanAllResult&#10;{selectors_count, routes_count, schemas_*, patterns_count, errors[]}" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=11;align=center;fontStyle=2" vertex="1" parent="orch-box">
+          <mxGeometry x="30" y="305" width="410" height="50" as="geometry" />
+        </mxCell>
+
+        <!-- Extractors swimlane (오른쪽 — orch 안) -->
+        <mxCell id="extractors-box" value="Extractors (PoC 2 / 5 / 5.1 / 6.A / 6.B)" style="swimlane;fontSize=13;fillColor=#d5e8d4;strokeColor=#82b366;startSize=25;swimlaneFillColor=#f0fff0;fontStyle=1" vertex="1" parent="orch-box">
+          <mxGeometry x="460" y="50" width="220" height="305" as="geometry" />
+        </mxCell>
+        <mxCell id="ext-vue-sfc" value="vue_sfc_parser&#10;→ frontend.selectors&#10;(@vue/compiler-sfc subprocess)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=10;align=center" vertex="1" parent="extractors-box">
+          <mxGeometry x="15" y="35" width="190" height="50" as="geometry" />
+        </mxCell>
+        <mxCell id="ext-vue-router" value="vue_router_parser&#10;→ frontend.routes&#10;(tree-sitter-js/ts)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=10;align=center" vertex="1" parent="extractors-box">
+          <mxGeometry x="15" y="95" width="190" height="50" as="geometry" />
+        </mxCell>
+        <mxCell id="ext-backend" value="backend_schema_parser&#10;→ backend.schemas&#10;(Pydantic + SQLAlchemy)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=10;align=center" vertex="1" parent="extractors-box">
+          <mxGeometry x="15" y="155" width="190" height="50" as="geometry" />
+        </mxCell>
+        <mxCell id="ext-pytest" value="pytest_ast_parser&#10;+ llm_pattern_classifier&#10;→ sut_tests.patterns" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=10;align=center" vertex="1" parent="extractors-box">
+          <mxGeometry x="15" y="215" width="190" height="50" as="geometry" />
+        </mxCell>
+
+        <!-- ============================== STORAGE LAYER ============================== -->
+        <mxCell id="storage-box" value="Storage Layer (DB + S3 mirror)" style="swimlane;fontSize=14;fillColor=#d5e8d4;strokeColor=#82b366;startSize=30;swimlaneFillColor=#e8f5e8;fontStyle=1" vertex="1" parent="1">
+          <mxGeometry x="780" y="410" width="700" height="380" as="geometry" />
+        </mxCell>
+
+        <!-- PostgreSQL -->
+        <mxCell id="db-pg" value="PostgreSQL" style="swimlane;fontSize=13;fillColor=#dae8fc;strokeColor=#6c8ebf;startSize=25;swimlaneFillColor=#eef5ff;fontStyle=1" vertex="1" parent="storage-box">
+          <mxGeometry x="20" y="50" width="320" height="305" as="geometry" />
+        </mxCell>
+        <mxCell id="db-services" value="services&#10;(기존)" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=11;align=center;fontStyle=1" vertex="1" parent="db-pg">
+          <mxGeometry x="20" y="40" width="120" height="50" as="geometry" />
+        </mxCell>
+        <mxCell id="db-codebase" value="codebase_indices&#10;(기존, 변경 0)&#10;C 영역" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=11;align=center" vertex="1" parent="db-pg">
+          <mxGeometry x="170" y="40" width="130" height="65" as="geometry" />
+        </mxCell>
+        <mxCell id="db-metadata" value="metadata_indices ★ 신규 ★&#10;PK: id&#10;FK: service_id → services&#10;UNIQUE: (service_id, commit_hash, kind, sub_kind)&#10;CHECK: kind/sub_kind/extraction_method&#10;----&#10;s3_key / bytes / sha256 / file_count&#10;confidence / extraction_method&#10;scanned_at" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=10;align=left;verticalAlign=top;spacingTop=4;spacingLeft=8;fontStyle=1" vertex="1" parent="db-pg">
+          <mxGeometry x="20" y="125" width="280" height="160" as="geometry" />
+        </mxCell>
+
+        <!-- S3 / MinIO -->
+        <mxCell id="db-s3" value="S3 / MinIO" style="swimlane;fontSize=13;fillColor=#dae8fc;strokeColor=#6c8ebf;startSize=25;swimlaneFillColor=#eef5ff;fontStyle=1" vertex="1" parent="storage-box">
+          <mxGeometry x="360" y="50" width="320" height="305" as="geometry" />
+        </mxCell>
+        <mxCell id="s3-old" value="기존 (변경 0)&#10;codebase-index/ generated-code/ domain/ results/" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=10;align=left;verticalAlign=top;spacingTop=4;spacingLeft=8" vertex="1" parent="db-s3">
+          <mxGeometry x="20" y="40" width="280" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="s3-meta" value="신규 metadata-index/&#10;services/{sid}/metadata-index/{sha}/&#10;  ├── frontend-selectors.json&#10;  ├── frontend-routes.json&#10;  ├── backend-schemas.json&#10;  └── sut_tests-patterns.json" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=10;align=left;verticalAlign=top;spacingTop=4;spacingLeft=8;fontStyle=1" vertex="1" parent="db-s3">
+          <mxGeometry x="20" y="115" width="280" height="100" as="geometry" />
+        </mxCell>
+        <mxCell id="s3-source" value="신규 source/ (코드베이스 원본)&#10;services/{sid}/source/{sha}/{path}&#10;TTL 30일 (lifecycle policy — 운영 시점)" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=10;align=left;verticalAlign=top;spacingTop=4;spacingLeft=8;fontStyle=1" vertex="1" parent="db-s3">
+          <mxGeometry x="20" y="230" width="280" height="55" as="geometry" />
+        </mxCell>
+
+        <!-- ============================== VALIDATION LAYER ============================== -->
+        <mxCell id="valid-box" value="Validation + DB cache" style="swimlane;fontSize=14;fillColor=#d5e8d4;strokeColor=#82b366;startSize=30;swimlaneFillColor=#e8f5e8;fontStyle=1" vertex="1" parent="1">
+          <mxGeometry x="1520" y="410" width="620" height="380" as="geometry" />
+        </mxCell>
+        <mxCell id="valid-tv" value="TVValidator (PoC 7)&#10;----&#10;1. schema 일치 + type 매칭&#10;2. format (email / iso_date / regex / min_length / ...)&#10;3. DB 존재성 (expects_existing_in_db)&#10;4. DB 부재성 (expects_absent_in_db)&#10;&#10;→ ValidationResult(valid, checks[], reasons[])" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=11;align=left;verticalAlign=top;spacingTop=8;spacingLeft=12" vertex="1" parent="valid-box">
+          <mxGeometry x="20" y="50" width="280" height="170" as="geometry" />
+        </mxCell>
+        <mxCell id="valid-db" value="db_state (PoC 8)&#10;----&#10;_TTLCache (thread-safe)&#10;list_db_tables_cached() — TTL 300s&#10;get_db_snapshot_cached() — TTL 60s&#10;&#10;cache key: (service_id, table)&#10;→ DBTestTool wrap" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontSize=11;align=left;verticalAlign=top;spacingTop=8;spacingLeft=12;fontStyle=1" vertex="1" parent="valid-box">
+          <mxGeometry x="320" y="50" width="280" height="170" as="geometry" />
+        </mxCell>
+        <mxCell id="valid-dbtool" value="DBTestTool (기존, E 영역)&#10;HTTP /db/snapshot, /db/tables&#10;QAPILOT_SUT_DB_URL" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=11;align=center" vertex="1" parent="valid-box">
+          <mxGeometry x="320" y="240" width="280" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="valid-sut-db" value="SUT DB&#10;(mini-bss-lite PostgreSQL)" style="ellipse;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=11;align=center" vertex="1" parent="valid-box">
+          <mxGeometry x="370" y="320" width="180" height="40" as="geometry" />
+        </mxCell>
+
+        <!-- ============================== CACHE LAYER (BOTTOM) ============================== -->
+        <mxCell id="cache-layer" value="⚡ Cache Layer (성능)" style="swimlane;fontSize=14;fillColor=#f8cecc;strokeColor=#b85450;startSize=30;swimlaneFillColor=#ffeae6;fontStyle=1" vertex="1" parent="1">
+          <mxGeometry x="40" y="820" width="2100" height="180" as="geometry" />
+        </mxCell>
+        <mxCell id="cache-1" value="① S3 head_object cache&#10;(PoC 3, 저장 측)&#10;----&#10;재스캔 시 PUT 회피&#10;같은 SHA → bytes 일치 시&#10;PUT skip + DB UPDATE 만" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontSize=11;align=left;verticalAlign=top;spacingTop=8;spacingLeft=10" vertex="1" parent="cache-layer">
+          <mxGeometry x="30" y="50" width="380" height="120" as="geometry" />
+        </mxCell>
+        <mxCell id="cache-2" value="② Metadata LRU cache&#10;(PoC 4, 조회 측)&#10;----&#10;process-local LRU (maxsize 64)&#10;키: (sid, kind, sub_kind, sha)&#10;반복 호출 → DB/S3 0회" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontSize=11;align=left;verticalAlign=top;spacingTop=8;spacingLeft=10" vertex="1" parent="cache-layer">
+          <mxGeometry x="440" y="50" width="380" height="120" as="geometry" />
+        </mxCell>
+        <mxCell id="cache-3" value="③ Source LRU cache&#10;(PoC 4, 조회 측)&#10;----&#10;LRU (maxsize 128)&#10;키: (sid, sha, path)&#10;line range 슬라이싱은 cache 후&#10;→ 다른 range = S3 GET 1회" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontSize=11;align=left;verticalAlign=top;spacingTop=8;spacingLeft=10" vertex="1" parent="cache-layer">
+          <mxGeometry x="850" y="50" width="380" height="120" as="geometry" />
+        </mxCell>
+        <mxCell id="cache-4" value="④ DB snapshot TTL cache&#10;(PoC 8)&#10;----&#10;_TTLCache (thread-safe dict)&#10;키: (sid, table)&#10;TTL tables 300s, snapshot 60s&#10;DB 실패는 cache 안 함" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontSize=11;align=left;verticalAlign=top;spacingTop=8;spacingLeft=10" vertex="1" parent="cache-layer">
+          <mxGeometry x="1260" y="50" width="380" height="120" as="geometry" />
+        </mxCell>
+        <mxCell id="cache-note" value="⚠️ LLM 응답 자체는 cache 안 함&#10;LLM 호출 결과를 metadata_indices 에 저장&#10;→ 같은 commit_sha 재스캔 시 head_object skip&#10;→ LLM 호출 사실상 1회/SHA" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=11;align=left;verticalAlign=top;spacingTop=8;spacingLeft=10" vertex="1" parent="cache-layer">
+          <mxGeometry x="1670" y="50" width="400" height="120" as="geometry" />
+        </mxCell>
+
+        <!-- ============================== EXTERNAL (BOTTOM) ============================== -->
+        <mxCell id="external-box" value="External Source (caller 시점 입력)" style="swimlane;fontSize=14;fillColor=#fff2cc;strokeColor=#d6b656;startSize=30;swimlaneFillColor=#fffce6;fontStyle=1" vertex="1" parent="1">
+          <mxGeometry x="40" y="1030" width="2100" height="120" as="geometry" />
+        </mxCell>
+        <mxCell id="ext-github" value="GitHub Repo&#10;(SUT — mini-bss-lite / Spring service 등)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=12;align=center" vertex="1" parent="external-box">
+          <mxGeometry x="40" y="40" width="300" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="ext-docs" value="PRD / 정책서 / 약관 / API 문서&#10;(기존 domain_documents — C 영역)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=12;align=center" vertex="1" parent="external-box">
+          <mxGeometry x="380" y="40" width="320" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="ext-llm" value="LLM (OpenAI ChatGPT)&#10;LLMClient + temperature=0.0&#10;(PoC 5.1 의미 분류)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=12;align=center" vertex="1" parent="external-box">
+          <mxGeometry x="740" y="40" width="300" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="ext-sutdb" value="SUT 의 DB&#10;(mini-bss-lite PostgreSQL via DBTestTool)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=12;align=center" vertex="1" parent="external-box">
+          <mxGeometry x="1080" y="40" width="320" height="60" as="geometry" />
+        </mxCell>
+
+        <!-- ============================== ARROWS ============================== -->
+        <!-- callers → public api -->
+        <mxCell id="arrow-caller-api" style="endArrow=classic;html=1;rounded=0;strokeColor=#666;strokeWidth=2" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="1260" y="200" as="sourcePoint" />
+            <mxPoint x="1260" y="240" as="targetPoint" />
+          </mxGeometry>
+        </mxCell>
+
+        <!-- scan_all_metadata → orchestration -->
+        <mxCell id="arrow-api-orch" style="endArrow=classic;html=1;rounded=0;strokeColor=#82b366;strokeWidth=2" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="480" y="370" as="sourcePoint" />
+            <mxPoint x="380" y="410" as="targetPoint" />
+          </mxGeometry>
+        </mxCell>
+
+        <!-- load_metadata/load_source → storage -->
+        <mxCell id="arrow-api-storage" style="endArrow=classic;html=1;rounded=0;strokeColor=#82b366;strokeWidth=2" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="900" y="370" as="sourcePoint" />
+            <mxPoint x="1080" y="410" as="targetPoint" />
+          </mxGeometry>
+        </mxCell>
+
+        <!-- TV/get_db → validation -->
+        <mxCell id="arrow-api-valid" style="endArrow=classic;html=1;rounded=0;strokeColor=#82b366;strokeWidth=2" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="1500" y="370" as="sourcePoint" />
+            <mxPoint x="1830" y="410" as="targetPoint" />
+          </mxGeometry>
+        </mxCell>
+
+        <!-- orch → storage (upsert) -->
+        <mxCell id="arrow-orch-storage" value="upsert" style="endArrow=classic;html=1;rounded=0;strokeColor=#82b366;strokeWidth=2;startArrow=none;curved=1;labelBackgroundColor=#ffffff" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="740" y="600" as="sourcePoint" />
+            <mxPoint x="780" y="600" as="targetPoint" />
+          </mxGeometry>
+        </mxCell>
+
+        <!-- storage → external SUT DB (via DBTool) -->
+        <mxCell id="arrow-valid-sutdb" value="HTTP /db/snapshot" style="endArrow=classic;html=1;rounded=0;strokeColor=#d6b656;strokeWidth=2;labelBackgroundColor=#ffffff" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="1830" y="790" as="sourcePoint" />
+            <mxPoint x="1240" y="1030" as="targetPoint" />
+          </mxGeometry>
+        </mxCell>
+
+        <!-- orch → external GitHub (git clone) -->
+        <mxCell id="arrow-orch-github" value="git clone --depth 1" style="endArrow=classic;html=1;rounded=0;strokeColor=#82b366;strokeWidth=2;labelBackgroundColor=#ffffff" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="200" y="790" as="sourcePoint" />
+            <mxPoint x="200" y="1030" as="targetPoint" />
+          </mxGeometry>
+        </mxCell>
+
+        <!-- extractors → LLM (PoC 5.1) -->
+        <mxCell id="arrow-ext-llm" value="LLM 의미 분류 (PoC 5.1)" style="endArrow=classic;html=1;rounded=0;strokeColor=#82b366;strokeWidth=2;dashed=1;labelBackgroundColor=#ffffff" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="660" y="790" as="sourcePoint" />
+            <mxPoint x="890" y="1030" as="targetPoint" />
+          </mxGeometry>
+        </mxCell>
+
+        <!-- ============================== KEY METRICS BOX ============================== -->
+        <mxCell id="metrics-box" value="📊 핵심 지표 (mini-bss-lite, commit 3fc4330)" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666;fontSize=12;fontStyle=1;verticalAlign=top;spacingTop=8;spacingLeft=12;align=left" vertex="1" parent="1">
+          <mxGeometry x="40" y="1180" width="2100" height="190" as="geometry" />
+        </mxCell>
+        <mxCell id="metrics-content" value="• 정확도: Vue selectors 78% → 100% (regex → AST), 큰 .vue 파일 8건 누락 → 0건 (stdout flush callback)&#10;• 한 호출 결과: source 157/157 PUT, selectors 125 elements (9 routes), routes 16, schemas 51 (req 12 + resp 24 + db_models 15), patterns 129, errors 0&#10;• 재스캔 시 비용: PUT 161회 → head_object 161회 (~1/10), DB upsert 만&#10;• 한 trace 반복 호출 절감: load_metadata 5회 → DB/S3 1회, load_source 3 range → S3 GET 1회, db_snapshot 5회 → DBTool 1회&#10;• 결정성 보장: AST + sort_keys=True + LRU + LLM temperature=0.0 + TTL 명시 (5중)&#10;• 단위 테스트: 231/231 PASS, 외부 의존성 추가 0 (npm @vue/compiler-sfc 1개만 — node-bridge 격리)&#10;• 기존 영향: codebase_indices / code_writer / DBTestTool / s3_client 모두 그대로 (병존)" style="text;html=1;strokeColor=none;fillColor=none;align=left;verticalAlign=top;whiteSpace=wrap;rounded=0;fontSize=11;spacingTop=4;spacingLeft=12" vertex="1" parent="1">
+          <mxGeometry x="50" y="1210" width="2080" height="160" as="geometry" />
+        </mxCell>
+
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

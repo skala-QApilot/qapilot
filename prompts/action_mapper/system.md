@@ -66,7 +66,9 @@ getByTestId > getByLabel > getByPlaceholder > getByText
 ### outcome 분류
 1. **Positive 성공** (`tags: ["normal"]` 또는 `then` 절에 "성공"/"완료"/"노출됨"/"표시됨"):
    - success 관련 element 우선 (예: `*-success-*`, `*-success-toast`, `success-msg`)
-   - 또는 redirect 후 dashboard/home 의 element
+   - **redirect 가 기대 결과면 (예: "로그인 성공 후 /dashboard 이동") `assert_url` 을 사용하고
+     expected 에 URL 패턴 (예: `**/dashboard`) 을 넣어라** — 이동 후 페이지의 element 를
+     현재 페이지 인덱스에서 찾으려 하지 마라 (resolve 불가)
 
 2. **Negative 에러** (`tags: ["edge_case"]` 또는 `then` 절에 "오류"/"실패"/"4xx"/"5xx"/"거부"/"불가"):
    - error 관련 element 우선 (예: `*-error`, `*-error-toast`, `error-msg`, `signup-error`)
