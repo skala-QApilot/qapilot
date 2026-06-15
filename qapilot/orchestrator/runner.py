@@ -103,12 +103,17 @@ async def run_pipeline(
         logger.error("pipeline_failed", error=f"{type(e).__name__}: {e}")
         raise
 
-    result["total_cost"] = round(
-        sum(log.get("cost_usd", 0.0) for log in result.get("agent_logs", [])), 6
-    )
+    _logs = result.get("agent_logs", [])
+    result["total_cost"] = round(sum(log.get("cost_usd", 0.0) for log in _logs), 6)
+    result["total_input_tokens"] = sum(log.get("input_tokens", 0) for log in _logs)
+    result["total_output_tokens"] = sum(log.get("output_tokens", 0) for log in _logs)
+    result["total_tokens"] = sum(log.get("tokens_used", 0) for log in _logs)
     logger.info(
         "pipeline_complete",
         status=result.get("status"),
         total_cost_usd=result["total_cost"],
+        total_input_tokens=result["total_input_tokens"],
+        total_output_tokens=result["total_output_tokens"],
+        total_tokens=result["total_tokens"],
     )
     return result
