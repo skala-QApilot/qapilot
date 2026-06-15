@@ -44,6 +44,26 @@ def _infer_category(error_code: str | None) -> str:
     return _CATEGORY_PREFIX.get(head, "UI_ERROR")
 
 
+# ②결정분류 중 '제품 결함'을 가리키는 값 — 이 경우에만 ①장애유형을 산출한다.
+# TEST_DEFECT_*/ENV_* 는 제품 장애가 아니므로 ①장애유형이 없다(None).
+_PRODUCT_DECISIONS = {
+    "PRODUCT_DEFECT_CANDIDATE",
+    "UI_ERROR", "API_ERROR", "DATA_MISMATCH", "INFRA", "DOMAIN_RULE",
+}
+
+
+def _infer_defect_type(error_code: str | None) -> str | None:
+    """①장애유형 — cross_check error_code prefix 로 결정적 산출.
+
+    _infer_category 와 달리 단서(error_code/매핑) 가 없으면 None 을 반환한다.
+    측정에서 ①을 임의 기본값(UI_ERROR)으로 채워 정확도를 부풀리지 않기 위함.
+    """
+    if not error_code:
+        return None
+    head = error_code.upper().split("_")[0]
+    return _CATEGORY_PREFIX.get(head)
+
+
 def _ts_from_tc(tc_id: str) -> str:
     """'TS-002-TC-05' → 'TS-002'."""
     parts = tc_id.split("-TC-")
@@ -84,6 +104,14 @@ def insert_defects(
         if category not in _ALLOWED_CATEGORIES:
             category = _infer_category(cc.get("error_code"))
 
+        # ①장애유형 — 제품 결함(②결정분류) 일 때만 error_code prefix 로 산출.
+        # category(②결정분류) 가 PRODUCT_DEFECT_CANDIDATE 여도 ①은 별도 보존되어
+        # 장애 분류 정확도 측정에서 ① ∧ ② 를 모두 대조할 수 있다.
+        defect_type = (
+            _infer_defect_type(cc.get("error_code"))
+            if category in _PRODUCT_DECISIONS else None
+        )
+
         fr = fix_by_tc.get(tc_id) or {}
         suggestions = fr.get("suggestions") or []
         top_fix = suggestions[0] if suggestions else {}
@@ -103,6 +131,7 @@ def insert_defects(
             _ts_from_tc(tc_id),
             tc_id,
             category,
+            defect_type,
             top.get("cause"),
             float(top.get("confidence") or 0.0),
             solution_guide,
@@ -115,11 +144,11 @@ def insert_defects(
 
     _INSERT_SQL = """
         INSERT INTO defects (
-            id, service_id, run_id, ts_id, tc_id, category,
+            id, service_id, run_id, ts_id, tc_id, category, defect_type,
             root_cause_top1, root_cause_confidence,
             solution_guide, assignee, file_location
         )
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
     """
 
     try:

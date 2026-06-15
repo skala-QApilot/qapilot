@@ -74,3 +74,30 @@ class TestDefectWriterCategoryPassthrough:
         cc = {"tc_id": "TC-1", "error_code": "API_TRACE_FAIL"}
         category = rc.get("category") or dw._infer_category(cc.get("error_code"))
         assert category == "API_ERROR"
+
+
+class TestDefectTypeInference:
+    """①장애유형 — ②결정분류(category) 와 독립적으로 산출되어 둘 다 측정에 쓰인다."""
+
+    def _defect_type(self, category, error_code):
+        # insert_defects 의 ①장애유형 결정부 재현 (pool 없이).
+        from qapilot.db import defect_writer as dw
+        return (
+            dw._infer_defect_type(error_code)
+            if category in dw._PRODUCT_DECISIONS else None
+        )
+
+    def test_product_candidate_keeps_defect_type_from_error_code(self):
+        # ②=PRODUCT_DEFECT_CANDIDATE 라도 ①장애유형은 error_code 로 보존된다.
+        assert self._defect_type("PRODUCT_DEFECT_CANDIDATE", "RULE_MINOR") == "DOMAIN_RULE"
+        assert self._defect_type("PRODUCT_DEFECT_CANDIDATE", "API_500") == "API_ERROR"
+        assert self._defect_type("PRODUCT_DEFECT_CANDIDATE", "DATA_MISMATCH_X") == "DATA_MISMATCH"
+
+    def test_test_and_env_decisions_have_no_defect_type(self):
+        # 테스트/환경 분류는 제품 장애가 아니므로 ①장애유형 없음(None).
+        assert self._defect_type("TEST_DEFECT_MAPPING", "UI_X") is None
+        assert self._defect_type("ENV_TIMEOUT", "INFRA_X") is None
+
+    def test_missing_error_code_yields_none_not_default(self):
+        # 단서 없으면 임의 기본값(UI_ERROR) 으로 ① 채우지 않는다 — 측정 정확도 보호.
+        assert self._defect_type("PRODUCT_DEFECT_CANDIDATE", None) is None
