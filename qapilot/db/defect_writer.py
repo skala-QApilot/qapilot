@@ -50,12 +50,45 @@ def _ts_from_tc(tc_id: str) -> str:
     return parts[0] if len(parts) >= 2 else tc_id
 
 
+def _build_blame_map(blame: list[dict]) -> dict[str, str]:
+    """GitDiff.blame → {file: 추천 담당자(author_email 우선, 없으면 author 이름)}."""
+    mapping: dict[str, str] = {}
+    for entry in blame:
+        file = entry.get("file")
+        who = entry.get("author_email") or entry.get("author")
+        if file and who:
+            mapping[file] = who
+    return mapping
+
+
+def _resolve_assignee(
+    blame_map: dict[str, str], file_path: str | None, blame_author: str | None
+) -> str | None:
+    """fix suggestion 의 blame_author 우선, 없으면 file_path 로 blame_map 조회.
+
+    blame_map 은 정확한 경로로 먼저 조회하고, 매칭이 없으면 basename 으로 재시도한다
+    (LLM 이 생성한 file_path 와 git_diff.changed_files 경로의 prefix 가 다를 수 있음).
+    """
+    if blame_author:
+        return blame_author
+    if not file_path:
+        return None
+    if file_path in blame_map:
+        return blame_map[file_path]
+    base = file_path.rsplit("/", 1)[-1]
+    for f, who in blame_map.items():
+        if f.rsplit("/", 1)[-1] == base:
+            return who
+    return None
+
+
 def insert_defects(
     service_id: str,
     run_id: str,
     cross_check_results: list[dict],
     root_cause_results: list[dict],
     fix_results: list[dict],
+    blame: list[dict] | None = None,
 ) -> int:
     """mismatch 가 있는 각 TC 마다 defect row INSERT. 반환: 박힌 row 수."""
     pool = get_pool()
@@ -66,6 +99,8 @@ def insert_defects(
     cc_by_tc = {cc.get("tc_id"): cc for cc in cross_check_results if cc.get("tc_id")}
     # tc_id → fix_result (suggestion 추출용)
     fix_by_tc = {fr.get("tc_id"): fr for fr in fix_results if fr.get("tc_id")}
+    # file → 추천 담당자 (git 이력 기준)
+    blame_map = _build_blame_map(blame or [])
 
     rows: list[tuple] = []
     for rc in root_cause_results:
@@ -88,8 +123,8 @@ def insert_defects(
         suggestions = fr.get("suggestions") or []
         top_fix = suggestions[0] if suggestions else {}
         solution_guide = top_fix.get("description")
-        assignee = top_fix.get("blame_author")
         file_path = top_fix.get("file_path")
+        assignee = _resolve_assignee(blame_map, file_path, top_fix.get("blame_author"))
         line_no = top_fix.get("line_number")
         file_location = (
             f"{file_path}:{line_no}" if file_path and line_no is not None
