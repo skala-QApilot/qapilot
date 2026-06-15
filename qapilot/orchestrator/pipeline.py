@@ -4686,12 +4686,38 @@ async def _report(state: PipelineState) -> dict:
             fr_plain: list[dict] = []
             for fr in (fix_results or []):
                 fr_plain.append(_ensure_payload_dict(fr))
+            scan = state.get("scan_result") or {}
+            blame = list((scan.get("git_diff") or {}).get("blame") or [])
+
+            # git_diff.blame 은 최신 commit 의 changed_files 로만 한정 — defect 가
+            # 가리키는 파일이 그보다 전에 마지막으로 바뀐 것이면 추천 담당자가 항상
+            # 비게 된다. fix 제안의 top file_path 들에 대해 직접 git blame 을 추가
+            # 조회해 보강한다 (LLM 미사용, 결정적 git 연산).
+            fix_file_paths = {
+                fp
+                for fr in fr_plain
+                for s in (fr.get("suggestions") or [])[:1]
+                if (fp := s.get("file_path"))
+            }
+            if fix_file_paths:
+                try:
+                    from qapilot.tools.codebase_scanner_tool import blame_for_files
+
+                    repo_path = _resolve_project_root(state)
+                    if repo_path is not None:
+                        blame.extend(blame_for_files(repo_path, fix_file_paths))
+                except Exception as e:
+                    get_logger(source="orchestrator", trace_id=trace_id).warning(
+                        "fix_file_blame_failed", error=str(e)
+                    )
+
             inserted = insert_defects(
                 service_id=service_id,
                 run_id=trace_id,
                 cross_check_results=cc_plain,
                 root_cause_results=rc_plain,
                 fix_results=fr_plain,
+                blame=blame,
             )
             get_logger(source="orchestrator", trace_id=trace_id).info(
                 "defects_persisted", count=inserted
