@@ -4051,6 +4051,23 @@ async def _run_db_test_safe(*, tc_id: str, trace_id: str, DBTestTool, ToolInput)
         }
 
 
+def _api_error_code(api_trace: dict) -> str:
+    """api-mode 실패 TC 의 error_code 를 관측 status 로 산출 (측정용 ①장애유형 신호).
+
+    api-mode 빠른 경로는 cross-check LLM 을 생략하며 error_code 를 비웠다 → ①장애유형
+    (_infer_defect_type) 입력이 사라졌다. 응답 status 로 최소 신호를 복원한다:
+      5xx → INFRA_<code> (INFRA), 4xx → API_<code> (API_ERROR).
+    verdict/has_mismatch 판정은 api_exec_verdict 로 별도 결정되므로 거동 영향 없음(정보 필드).
+    """
+    for c in (api_trace or {}).get("calls") or []:
+        sc = c.get("status_code") or 0
+        if sc >= 500:
+            return f"INFRA_{sc}"
+        if sc >= 400:
+            return f"API_{sc}"
+    return ""
+
+
 async def _cross_check(state: PipelineState) -> dict:
     """Layer 2 정합성 검증 노드 — TC 별 CrossCheckAgent 호출.
 
@@ -4169,7 +4186,7 @@ async def _cross_check(state: PipelineState) -> dict:
                 "has_mismatch": _v == "fail",
                 "api_exec_verdict": _v,
                 "intent_satisfied": _v == "pass",
-                "error_code": "",
+                "error_code": _api_error_code(api_trace) if _v == "fail" else "",
                 "summary": str((ui_result or {}).get("summary") or ""),
             })
             if _v == "fail":
@@ -4260,7 +4277,7 @@ async def _cross_check(state: PipelineState) -> dict:
                 "ui_failed": tc_id in ui_failed_tc_ids,
                 "db_unverified": tc_id in db_unverified_tc_ids,
                 "api_unverified": tc_id in api_unverified_tc_ids,
-                "error_code": "",
+                "error_code": _api_error_code(api_trace),
                 "summary": "",
                 "error": f"CrossCheck skip: {type(e).__name__}: {e}",
             }

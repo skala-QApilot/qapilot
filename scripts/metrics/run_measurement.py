@@ -59,14 +59,54 @@ def invoke_qapilot_live(config_name: str, run_idx: int) -> dict:
         print(f"[qapilot] 실행 실패 ({config_name} run{run_idx}): {type(e).__name__}: {e}")
         traceback.print_exc()
         return {"cross_check_results": [], "root_cause_results": [], "status": "error"}
+    # api_results: TC별 관측 HTTP status/endpoint — golden 오라클 대조 + ①장애유형 + 검출 endpoint.
+    # 부피 줄이려 calls 의 method/url/status_code 만 슬림 저장.
+    api_slim = []
+    for ar in (state.get("api_results") or []):
+        calls = [{"method": c.get("method"), "url": c.get("url"),
+                  "status_code": c.get("status_code")}
+                 for c in (ar.get("calls") or []) if isinstance(c, dict)]
+        api_slim.append({"tc_id": ar.get("tc_id"), "verdict": ar.get("verdict"),
+                         "verify_mode": ar.get("verify_mode"), "calls": calls})
     return {
         "cross_check_results": state.get("cross_check_results") or [],
         "root_cause_results": state.get("root_cause_results") or [],
         # fix_results 에 원인 위치(file_path)가 담긴다 — 원인 추론 Top-N 측정에 필요.
         # (root_cause 후보의 file_path 는 None 인 경우가 많아 fix_results 로 보완)
         "fix_results": state.get("fix_results") or [],
+        "api_results": api_slim,
         "status": state.get("status"),
     }
+
+
+def _build_llm_judge():
+    """원인 의미 일치 LLM-judge — (candidate_cause, gt_root_cause) -> bool.
+
+    qapilot LLMClient(seed=42, temp=0) 로 0/1 판정. 실패 시 False.
+    """
+    try:
+        from qapilot.shared.llm_client import LLMClient
+        client = LLMClient()
+    except Exception as e:  # noqa: BLE001
+        print(f"[judge] LLMClient 사용 불가 → 의미 채점 생략: {e}")
+        return None
+
+    def judge(cand: str, gt: str) -> bool:
+        prompt = (
+            "두 텍스트가 같은 결함 원인을 가리키는지 판정하라.\n"
+            f"[정답 원인]\n{gt}\n\n[시스템 추론]\n{cand}\n\n"
+            "시스템 추론이 정답 원인의 핵심(어느 함수/규칙/조건이 왜 잘못됐는지)과 "
+            "의미상 일치하면 YES, 아니면 NO. 한 단어로만 답하라: YES 또는 NO."
+        )
+        try:
+            resp = client.complete(prompt) if hasattr(client, "complete") else None
+            if resp is None:
+                # 메서드명 호환 fallback
+                resp = client.chat(prompt) if hasattr(client, "chat") else ""
+            return "YES" in str(resp).upper()
+        except Exception:  # noqa: BLE001
+            return False
+    return judge
 
 
 def _artifact_path(out_dir: Path, config_name: str, run_idx: int) -> Path:
@@ -88,25 +128,32 @@ def save_artifact(out_dir: Path, config_name: str, run_idx: int, raw: dict) -> N
 
 # ── 구성별 채점 ─────────────────────────────────────────────────────
 def score_config(config_name: str, runs: list[list[scoring.TCOutcome]],
-                 faults, clean_runs: list[list[scoring.TCOutcome]] | None) -> dict:
+                 faults, clean_runs: list[list[scoring.TCOutcome]] | None,
+                 golden=None, llm_judge=None) -> dict:
     """한 구성의 N회 결과를 채점."""
     if config_name == config.CLEAN:
-        accs = [scoring.test_code_accuracy_clean(r)["accuracy"] for r in runs]
+        tca = [scoring.test_code_accuracy_clean(r) for r in runs]
         vvr = [scoring.valid_verdict_rate(r)["rate"] for r in runs]
         fp = [scoring.precision_from_clean(r)["false_positives"] for r in runs]
         return {
             "config": config_name, "kind": "clean",
-            "test_code_accuracy": scoring.mean_std(accs),
+            "test_code_accuracy": scoring.mean_std([t["accuracy"] for t in tca]),
+            "test_code_accuracy_explicit": scoring.mean_std(
+                [t["accuracy_explicit"] for t in tca if t["accuracy_explicit"] is not None]),
+            "n_estimated_fail": scoring.mean_std([float(t["n_estimated_fail"]) for t in tca]),
             "valid_verdict_rate": scoring.mean_std(vvr),
             "false_positives_mean": scoring.mean_std([float(x) for x in fp]),
-            "per_run": [scoring.test_code_accuracy_clean(r) for r in runs],
+            "golden_oracle": scoring.golden_oracle_accuracy(runs[0], golden) if golden else None,
+            "per_run": tca,
         }
 
     fault = faults[config_name]
-    clean_rep = (clean_runs or [[]])[0] if clean_runs else []
-    det = [scoring.detection(r, fault, clean_rep) for r in runs]
+    # 검출 기준선 = clean 전 런 합집합(노이즈 제거). 단일 런이 아니라 모든 clean 런.
+    clean_all = [o for run in (clean_runs or []) for o in run]
+    det = [scoring.detection(r, fault, clean_all) for r in runs]
     cls = [scoring.classification(r, fault) for r in runs]
     rc = [scoring.root_cause_topn(r, fault) for r in runs]
+    sem = [scoring.root_cause_semantic(r, fault, llm_judge) for r in runs]
     return {
         "config": config_name, "kind": "fault",
         "fault": {"category": fault.category, "defect_type": fault.defect_type,
@@ -126,7 +173,9 @@ def score_config(config_name: str, runs: list[list[scoring.TCOutcome]],
             "top3": scoring.consistency([r["top3"] for r in rc]),
             "top5": scoring.consistency([r["top5"] for r in rc]),
             "mrr": scoring.mean_std([r["mrr"] for r in rc]),
-            "per_run": rc,
+            "semantic_match": scoring.mean_std(
+                [s["match_rate"] for s in sem if s["match_rate"] is not None]),
+            "per_run": rc, "semantic_per_run": sem,
         },
     }
 
@@ -137,6 +186,8 @@ def main() -> int:
                     help="저장된 run 아티팩트만으로 채점 (SUT/QApilot 미실행)")
     ap.add_argument("--no-fresh-volume", action="store_true",
                     help="구성 전환 시 down -v 생략 (디버그용 — seed/state 오염 주의)")
+    ap.add_argument("--judge", action="store_true",
+                    help="원인 의미(LLM-judge) 채점 활성화 (qapilot LLMClient, seed 고정)")
     ap.add_argument("--configs", nargs="*", default=config.CONFIGS,
                     help=f"측정할 구성 (기본: {config.CONFIGS})")
     ap.add_argument("--n", type=int, default=config.N_RUNS)
@@ -175,17 +226,21 @@ def main() -> int:
                 raw.get("root_cause_results", []),
                 endpoint_by_tc=raw.get("endpoint_by_tc"),
                 req_by_tc=raw.get("req_by_tc"),
+                fix_results=raw.get("fix_results"),
+                api_results=raw.get("api_results"),
             ))
         collected[cfg] = runs
 
     # 2) 채점
     clean_runs = collected.get(config.CLEAN)
+    llm_judge = _build_llm_judge() if args.judge else None
     report = {"generated_at": datetime.now().isoformat(timespec="seconds"),
               "n_runs": args.n, "configs": {}}
     for cfg, runs in collected.items():
         if not runs:
             continue
-        report["configs"][cfg] = score_config(cfg, runs, faults, clean_runs)
+        report["configs"][cfg] = score_config(
+            cfg, runs, faults, clean_runs, golden=golden, llm_judge=llm_judge)
 
     out_file = out_dir / "metrics_report.json"
     out_file.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")

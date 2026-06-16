@@ -13,12 +13,12 @@ from ground_truth import FaultGT  # noqa: E402
 
 
 def tc(tc_id, verdict="pass", has_mismatch=False, error_code="", decision=None,
-       candidates=None, endpoint=None):
+       candidates=None, endpoint=None, fix_files=None):
     return scoring.TCOutcome(
         tc_id=tc_id, verdict=verdict, has_mismatch=has_mismatch, error_code=error_code,
         decision=decision,
         defect_type=(scoring._infer_defect_type(error_code) if decision == scoring._PRODUCT else None),
-        candidates=candidates or [], endpoint=endpoint)
+        candidates=candidates or [], endpoint=endpoint, fix_files=fix_files or [])
 
 
 RULE004 = FaultGT(
@@ -58,7 +58,7 @@ def test_detection_by_endpoint():
         tc("o2", "pass", endpoint="GET /api/plans"),
     ]
     r = scoring.detection(fault_run, RULE004)
-    assert r["detected"] is True and r["basis"] == "endpoint" and r["hit_tc_ids"] == ["o1"]
+    assert r["detected"] is True and r["basis"] == "endpoint+delta" and r["hit_tc_ids"] == ["o1"]
 
 
 def test_detection_fallback_delta_vs_clean():
@@ -93,10 +93,11 @@ def test_classification_wrong_type():
 
 # ── §3.5 원인 추론 Top-N / MRR ──────────────────────────────────────
 def test_root_cause_topn_and_mrr():
-    cands = [{"file_path": "backend/app/routers/auth.py"},          # 오답 rank1
-             {"file_path": "backend/app/routers/orders.py"}]        # 정답 rank2
+    # 위치는 fix_recommender 의 file_path(rank 순)로 채점
+    fix = ["backend/app/routers/auth.py",            # 오답 rank1
+           "backend/app/routers/orders.py"]          # 정답 rank2
     run = [tc("o1", "fail", has_mismatch=True, error_code="RULE_X",
-              decision=scoring._PRODUCT, candidates=cands, endpoint="POST /api/orders")]
+              decision=scoring._PRODUCT, fix_files=fix, endpoint="POST /api/orders")]
     r = scoring.root_cause_topn(run, RULE004)
     assert r["best_rank"] == 2
     assert r["top1"] is False and r["top3"] is True and r["top5"] is True
@@ -104,9 +105,9 @@ def test_root_cause_topn_and_mrr():
 
 
 def test_root_cause_basename_match():
-    cands = [{"file_path": "/abs/whatever/orders.py"}]
     run = [tc("o1", "fail", has_mismatch=True, error_code="RULE_X",
-              decision=scoring._PRODUCT, candidates=cands, endpoint="POST /api/orders")]
+              decision=scoring._PRODUCT, fix_files=["/abs/whatever/orders.py"],
+              endpoint="POST /api/orders")]
     assert scoring.root_cause_topn(run, RULE004)["top1"] is True
 
 
