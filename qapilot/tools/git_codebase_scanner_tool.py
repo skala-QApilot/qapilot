@@ -241,6 +241,28 @@ class GitHubAdapter(GitPlatformAdapter):
         # GitHub REST API는 blame 미지원
         return []
 
+    async def create_issue(
+        self, title: str, body: str, labels: list[str] | None = None
+    ) -> dict:
+        """GitHub Issue를 생성한다.
+
+        Returns:
+            {"number": int, "html_url": str, "title": str}
+        """
+        url = self._url("/issues")
+        payload: dict[str, Any] = {"title": title, "body": body}
+        if labels:
+            payload["labels"] = labels
+        async with httpx.AsyncClient(headers=self._headers, timeout=30.0) as client:
+            resp = await client.post(url, json=payload)
+            _raise_for_api_error(resp)
+            data = resp.json()
+            return {
+                "number": data["number"],
+                "html_url": data["html_url"],
+                "title": data["title"],
+            }
+
 
 class GitLabAdapter(GitPlatformAdapter):
     """GitLab REST API 어댑터. 사내 GitLab 포함."""
