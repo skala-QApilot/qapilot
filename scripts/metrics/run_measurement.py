@@ -86,8 +86,10 @@ def _build_llm_judge():
     """
     import asyncio
     try:
+        from qapilot.shared.config import load_config
         from qapilot.shared.llm_client import LLMClient
-        client = LLMClient()
+        # LLMClient(config.llm) — base_agent/code_generator 와 동일 생성 규약.
+        client = LLMClient(load_config().llm)
     except Exception as e:  # noqa: BLE001
         print(f"[judge] LLMClient 사용 불가 → 의미 채점 생략: {e}")
         return None
