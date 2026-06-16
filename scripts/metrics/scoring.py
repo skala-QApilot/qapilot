@@ -207,6 +207,26 @@ def _exercises_fault(o: TCOutcome, fault: FaultGT) -> bool:
     return bool(fault_path_regex(fault).search(path))
 
 
+# ── 검출된 결함 = 측정 단위 ─────────────────────────────────────────
+def detected_hits(fault_outcomes: list[TCOutcome], fault: FaultGT,
+                  clean_outcomes: list[TCOutcome] | None = None) -> list[TCOutcome]:
+    """결함 ON 에서 '진짜 검출된' product-fail = clean 에 없던 + (있으면)해당 endpoint.
+
+    분류·원인 정확도는 이 '검출된 결함'에만 적용한다(clean 오탐 제외). 정답지(faults)와
+    대조 가능한 단위가 곧 검출된 결함이기 때문.
+    """
+    clean_pf = {o.tc_id for o in (clean_outcomes or []) if o.is_product_fail}
+    have_ep = any(o.endpoint for o in fault_outcomes)
+    out = []
+    for o in fault_outcomes:
+        if not o.is_product_fail or o.tc_id in clean_pf:
+            continue
+        if have_ep and o.endpoint and not _exercises_fault(o, fault):
+            continue
+        out.append(o)
+    return out
+
+
 # ── §3.3 결함 검출 ──────────────────────────────────────────────────
 def detection(
     fault_outcomes: list[TCOutcome],
@@ -248,11 +268,10 @@ def precision_from_clean(clean_outcomes: list[TCOutcome]) -> dict:
 
 
 # ── §3.4 장애 분류 ①∧② ─────────────────────────────────────────────
-def classification(fault_outcomes: list[TCOutcome], fault: FaultGT) -> dict:
-    """검출된 product-fail 에 대해 ①장애유형·②결정분류 정확도."""
-    hits = [o for o in fault_outcomes
-            if o.verdict == "fail" and o.has_mismatch and (
-                not o.endpoint or _exercises_fault(o, fault))]
+def classification(fault_outcomes: list[TCOutcome], fault: FaultGT,
+                   clean_outcomes: list[TCOutcome] | None = None) -> dict:
+    """**검출된 결함**에 대해 ①장애유형·②결정분류 정확도 (clean 오탐 제외)."""
+    hits = detected_hits(fault_outcomes, fault, clean_outcomes)
     if not hits:
         return {"n": 0, "decision_acc": None, "type_acc": None, "both_acc": None, "detail": []}
     detail, d_ok, t_ok, b_ok = [], 0, 0, 0
@@ -284,13 +303,13 @@ def _file_matches(candidate_path: str | None, fix_file: str) -> bool:
 
 
 def root_cause_topn(fault_outcomes: list[TCOutcome], fault: FaultGT,
-                    ns: tuple[int, ...] = (1, 3, 5)) -> dict:
-    """검출 product-fail 후보 중 정답 fix_file 이 Top-N 안에 드나 + MRR.
+                    ns: tuple[int, ...] = (1, 3, 5),
+                    clean_outcomes: list[TCOutcome] | None = None) -> dict:
+    """**검출된 결함**의 원인 후보 중 정답 fix_file 이 Top-N 안에 드나 + MRR (clean 오탐 제외).
 
     여러 검출 TC 가 있으면 각 TC 별 최선 rank 중 가장 좋은 것을 결함 단위 대표로.
     """
-    hits = [o for o in fault_outcomes
-            if o.is_product_fail and (not o.endpoint or _exercises_fault(o, fault))]
+    hits = detected_hits(fault_outcomes, fault, clean_outcomes)
     best_rank: int | None = None
     per_tc = []
     for o in hits:
@@ -316,14 +335,13 @@ def root_cause_topn(fault_outcomes: list[TCOutcome], fault: FaultGT,
 
 # ── §3.5(b) 원인 의미 일치 — LLM-judge ──────────────────────────────
 def root_cause_semantic(fault_outcomes: list[TCOutcome], fault,
-                        llm_judge) -> dict:
-    """검출 product-fail 의 root_cause cause 텍스트가 정답 root_cause 와 의미 일치하나.
+                        llm_judge, clean_outcomes: list[TCOutcome] | None = None) -> dict:
+    """**검출된 결함**의 root_cause cause 텍스트가 정답 root_cause 와 의미 일치하나.
 
     llm_judge(candidate_cause: str, gt_root_cause: str) -> bool 를 주입. None 이면 미실행.
     검출된 TC 중 후보 하나라도 의미 일치하면 그 TC 는 hit.
     """
-    hits = [o for o in fault_outcomes
-            if o.is_product_fail and (not o.endpoint or _exercises_fault(o, fault))]
+    hits = detected_hits(fault_outcomes, fault, clean_outcomes)
     if not hits or llm_judge is None:
         return {"n": len(hits), "match_rate": None, "per_tc": []}
     per_tc, matched = [], 0

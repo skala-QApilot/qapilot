@@ -149,9 +149,9 @@ def score_config(config_name: str, runs: list[list[scoring.TCOutcome]],
     # 검출 기준선 = clean 전 런 합집합(노이즈 제거). 단일 런이 아니라 모든 clean 런.
     clean_all = [o for run in (clean_runs or []) for o in run]
     det = [scoring.detection(r, fault, clean_all) for r in runs]
-    cls = [scoring.classification(r, fault) for r in runs]
-    rc = [scoring.root_cause_topn(r, fault) for r in runs]
-    sem = [scoring.root_cause_semantic(r, fault, llm_judge) for r in runs]
+    cls = [scoring.classification(r, fault, clean_all) for r in runs]
+    rc = [scoring.root_cause_topn(r, fault, clean_outcomes=clean_all) for r in runs]
+    sem = [scoring.root_cause_semantic(r, fault, llm_judge, clean_all) for r in runs]
     return {
         "config": config_name, "kind": "fault",
         "fault": {"category": fault.category, "defect_type": fault.defect_type,
