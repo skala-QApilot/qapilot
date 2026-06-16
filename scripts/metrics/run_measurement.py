@@ -84,6 +84,7 @@ def _build_llm_judge():
 
     qapilot LLMClient(seed=42, temp=0) 로 0/1 판정. 실패 시 False.
     """
+    import asyncio
     try:
         from qapilot.shared.llm_client import LLMClient
         client = LLMClient()
@@ -91,19 +92,16 @@ def _build_llm_judge():
         print(f"[judge] LLMClient 사용 불가 → 의미 채점 생략: {e}")
         return None
 
+    SYS = ("너는 결함 원인 판정관이다. 시스템 추론이 정답 원인의 핵심"
+           "(어느 함수/규칙/조건이 왜 잘못됐는지)과 의미상 일치하면 YES, 아니면 NO. "
+           "한 단어로만 답하라: YES 또는 NO.")
+
     def judge(cand: str, gt: str) -> bool:
-        prompt = (
-            "두 텍스트가 같은 결함 원인을 가리키는지 판정하라.\n"
-            f"[정답 원인]\n{gt}\n\n[시스템 추론]\n{cand}\n\n"
-            "시스템 추론이 정답 원인의 핵심(어느 함수/규칙/조건이 왜 잘못됐는지)과 "
-            "의미상 일치하면 YES, 아니면 NO. 한 단어로만 답하라: YES 또는 NO."
-        )
+        user = f"[정답 원인]\n{gt}\n\n[시스템 추론]\n{cand}"
         try:
-            resp = client.complete(prompt) if hasattr(client, "complete") else None
-            if resp is None:
-                # 메서드명 호환 fallback
-                resp = client.chat(prompt) if hasattr(client, "chat") else ""
-            return "YES" in str(resp).upper()
+            resp = asyncio.run(client.chat(SYS, user, temperature=0.0))
+            text = getattr(resp, "content", None) or getattr(resp, "text", None) or str(resp)
+            return "YES" in str(text).upper()
         except Exception:  # noqa: BLE001
             return False
     return judge
