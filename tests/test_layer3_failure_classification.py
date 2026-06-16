@@ -101,3 +101,45 @@ class TestDefectTypeInference:
     def test_missing_error_code_yields_none_not_default(self):
         # 단서 없으면 임의 기본값(UI_ERROR) 으로 ① 채우지 않는다 — 측정 정확도 보호.
         assert self._defect_type("PRODUCT_DEFECT_CANDIDATE", None) is None
+
+
+class TestDefectWriterAssigneeFromBlame:
+    """defects.assignee — git_diff.blame 기반 담당자 추천 (pool 없이 순수 로직만 검증)."""
+
+    def test_exact_file_match_uses_author_email(self):
+        from qapilot.db import defect_writer as dw
+        blame = [{"file": "app/services/payment_service.py", "author": "Alice",
+                   "author_email": "alice@example.com"}]
+        blame_map = dw._build_blame_map(blame)
+        assignee = dw._resolve_assignee(blame_map, "app/services/payment_service.py", None)
+        assert assignee == "alice@example.com"
+
+    def test_falls_back_to_author_name_when_email_empty(self):
+        from qapilot.db import defect_writer as dw
+        blame = [{"file": "app/services/payment_service.py", "author": "Alice", "author_email": ""}]
+        blame_map = dw._build_blame_map(blame)
+        assignee = dw._resolve_assignee(blame_map, "app/services/payment_service.py", None)
+        assert assignee == "Alice"
+
+    def test_basename_match_when_path_prefix_differs(self):
+        from qapilot.db import defect_writer as dw
+        blame = [{"file": "src/app/services/payment_service.py", "author": "Alice",
+                   "author_email": "alice@example.com"}]
+        blame_map = dw._build_blame_map(blame)
+        assignee = dw._resolve_assignee(blame_map, "app/services/payment_service.py", None)
+        assert assignee == "alice@example.com"
+
+    def test_no_match_returns_none(self):
+        from qapilot.db import defect_writer as dw
+        blame = [{"file": "app/services/payment_service.py", "author": "Alice",
+                   "author_email": "alice@example.com"}]
+        blame_map = dw._build_blame_map(blame)
+        assert dw._resolve_assignee(blame_map, "app/other/unrelated.py", None) is None
+
+    def test_blame_author_takes_precedence_over_blame_map(self):
+        from qapilot.db import defect_writer as dw
+        blame = [{"file": "app/services/payment_service.py", "author": "Alice",
+                   "author_email": "alice@example.com"}]
+        blame_map = dw._build_blame_map(blame)
+        assignee = dw._resolve_assignee(blame_map, "app/services/payment_service.py", "bob@example.com")
+        assert assignee == "bob@example.com"

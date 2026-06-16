@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
 _KST = ZoneInfo("Asia/Seoul")
+from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
@@ -26,8 +27,11 @@ import tree_sitter_yaml as tsyaml
 from tree_sitter import Language, Node, Parser
 
 from qapilot.shared.errors import ErrorCode, ToolExecutionError
+from qapilot.shared.logger import get_logger
 from qapilot.shared.schemas import FileInfo, GitDiff, ScanResult
 from qapilot.tools.base_tool import BaseTool
+
+_logger = get_logger("tools.codebase_scanner")
 
 # ── 상수 ──────────────────────────────────────────────────────────────────────
 
@@ -1092,3 +1096,44 @@ class CodebaseScannerTool(BaseTool):
             json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8"
         )
         self.logger.info("manifest_saved", files=len(scanned_files), commit=commit_hash)
+
+
+# ── 결함 담당자 추천용 blame ──────────────────────────────────────────────────
+
+def blame_for_files(repo_path: Path, file_paths: Iterable[str]) -> list[dict]:
+    """defect.file_location 에 등장하는 파일들에 대해 git blame 을 직접 조회한다.
+
+    `_extract_git_diff`의 blame 은 최신 commit 의 changed_files 로만 한정되어,
+    그보다 전에 마지막으로 바뀐 파일을 가리키는 defect 는 추천 담당자가 항상
+    비게 된다. file_path 는 repo_path 의 부모 기준 경로(예: "system-under-test/
+    backend/...")로 올 수 있어, repo_path.name/ prefix 를 보정해 blame 한다.
+    반환되는 "file" 키는 보정 전 원본 file_path 그대로 — defect_writer 의
+    _resolve_assignee 가 file_path 로 정확히 매칭할 수 있게 한다.
+    """
+    try:
+        repo = git.Repo(repo_path)
+    except Exception as e:
+        _logger.warning("blame_for_files_repo_unavailable", path=str(repo_path), error=str(e))
+        return []
+
+    prefix = f"{repo_path.name}/"
+    blame_summary: list[dict] = []
+    for file_path in file_paths:
+        rel = file_path[len(prefix):] if file_path.startswith(prefix) else file_path
+        try:
+            blame_entries = repo.blame("HEAD", rel)
+        except Exception as e:
+            _logger.warning("blame_failed", file=file_path, error=str(e))
+            continue
+        if not blame_entries:
+            continue
+        latest_commit = blame_entries[-1][0]
+        blame_summary.append({
+            "file": file_path,
+            "author": latest_commit.author.name or "",
+            "author_email": latest_commit.author.email or "",
+            "timestamp": datetime.fromtimestamp(
+                latest_commit.authored_date, tz=timezone.utc
+            ).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        })
+    return blame_summary
