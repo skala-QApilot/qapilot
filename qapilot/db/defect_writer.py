@@ -139,11 +139,10 @@ def insert_defects(
         if category not in _ALLOWED_CATEGORIES:
             category = _infer_category(cc.get("error_code"))
 
-        # ①장애유형 — 제품 결함(②결정분류) 일 때만 error_code prefix 로 산출.
-        # category(②결정분류) 가 PRODUCT_DEFECT_CANDIDATE 여도 ①은 별도 보존되어
-        # 장애 분류 정확도 측정에서 ① ∧ ② 를 모두 대조할 수 있다.
+        # ①장애유형 — 파이프라인 root_cause 가 채운 defect_type(상태코드+도메인규칙 신호)
+        # 우선, 없으면 error_code prefix 폴백. 제품 결함(②결정분류)일 때만.
         defect_type = (
-            _infer_defect_type(cc.get("error_code"))
+            (rc.get("defect_type") or _infer_defect_type(cc.get("error_code")))
             if category in _PRODUCT_DECISIONS else None
         )
 

@@ -88,8 +88,15 @@
 - `where` 값에 요청 body 의 값을 참조하려면 `{request.필드명}`.
 - **요청 echo 검증** (보낸 값이 응답에 반영) 의 predicate 값도 `{request.필드명}` 으로
   써라 — 구체 값 (`"Visa"` 등) 을 지어내면 실행 시 값이 달라 항상 fail 한다.
-- `http_status.expected` 와 메시지 predicate 는 **then/문서에 명시된 것만**. then 에
-  코드·문구가 없으면 expected 는 생략하거나 의도 클래스만 표현하라.
+- **★ `http_status` observe 는 모든 TC 에 필수이며 `expected` 는 단일 명시 코드여야 한다**
+  (예: `expected: [400]`). 클래스 범위(`[400..499]`)·생략 금지 — 생략하면 검증기가 런타임에
+  클래스를 추정해 오탐을 낸다. then 에 코드가 명시돼 있으니 그 코드를 그대로 사용하고, 없으면
+  의도에 맞는 단일 코드(생성 201, 조회/수정 200, 검증오류 400/422, 인증 401, 권한 403,
+  미존재 404, 충돌 409)를 명시하라.
+- **★ response_body predicate 는 보수적으로 — 과구체화·환각 금지**: 정확한 메시지 문자열
+  `{"eq": "…"}` 는 **문서/코드에 그 문구가 명문화돼 있을 때만**. 불확실하면 `{"nonempty": true}`
+  로 "존재"만 검사하라. 정상 응답은 http_status 만으로 충분하면 response_body 를 만들지 마라.
+  (검증 verdict 는 observe 들의 AND 라, 지어낸 body 조건 1개가 정상 응답을 통째로 fail 시킨다.)
 - **table/field 는 문서나 스키마 정보에 실재가 확인된 이름만** — 지어내면 검증기가 폐기한다.
 - **response_body 의 path 도 실재 응답 필드만**: 에러 응답 본문은 FastAPI 표준
   `$.detail` 이다 — `$.error`/`$.message`/`$.data` 같은 필드를 지어내지 마라.

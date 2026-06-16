@@ -4068,6 +4068,36 @@ def _api_error_code(api_trace: dict) -> str:
     return ""
 
 
+# ①장애유형: 제품 결함의 도메인 규칙 위반 신호 (root_cause cause / then 텍스트).
+# 비즈니스 규칙(약관·자격·요금제·약정 등) 위반이면 DOMAIN_RULE. status 만으로는
+# 4xx 가 도메인규칙인지 일반 API 오류인지 구분 못 하므로, 원인 텍스트로 보강한다.
+# 일반 도메인 명사(약정·요금제 등)는 API 오류 맥락(중복약정 등)에도 등장하므로 제외하고,
+# 명확한 '규칙 위반' 용어만 둔다(over-claim 방지).
+_DOMAIN_RULE_RE = re.compile(
+    r"동의|보호자|미성년|청소년|자격|연령|위약금|면제|"
+    r"가입.{0,4}(제한|금지|강제)|(전용|청소년).{0,6}요금제|요금제.{0,6}(전용|강제|제한)")
+
+
+def _infer_defect_type(error_code: str, cause_text: str) -> str | None:
+    """①장애유형 — 상태코드(API/INFRA) + 원인 텍스트(DOMAIN_RULE). 단서 없으면 None.
+
+    우선순위: INFRA(5xx) > DOMAIN_RULE(규칙 위반 텍스트) > API_ERROR(4xx) > None.
+    임의 기본값을 채우지 않아 측정 정확도를 부풀리지 않는다.
+    """
+    ec = (error_code or "").upper()
+    if ec.startswith("INFRA"):
+        return "INFRA"
+    if cause_text and _DOMAIN_RULE_RE.search(cause_text):
+        return "DOMAIN_RULE"
+    if ec.startswith("API"):
+        return "API_ERROR"
+    if ec.startswith("DATA") or ec.startswith("DB"):
+        return "DATA_MISMATCH"
+    if ec.startswith("UI") or ec.startswith("TOOL_UI"):
+        return "UI_ERROR"
+    return None
+
+
 async def _cross_check(state: PipelineState) -> dict:
     """Layer 2 정합성 검증 노드 — TC 별 CrossCheckAgent 호출.
 
@@ -4456,6 +4486,11 @@ async def _root_cause(state: PipelineState) -> dict:
             else:
                 rc_item = {"tc_id": tc_id, "candidates": []}
             rc_item.setdefault("category", "PRODUCT_DEFECT_CANDIDATE")
+            # ①장애유형 — 상태코드 + 원인 텍스트(도메인 규칙 신호)로 산출, rc_item 에 보존.
+            # 단일 출처: defect_writer·측정 스코어링 모두 이 필드를 우선 사용.
+            _cands = rc_item.get("candidates") or []
+            _cause = " ".join(str(c.get("cause") or "") for c in _cands[:3])
+            rc_item["defect_type"] = _infer_defect_type(cc.get("error_code") or "", _cause)
             return rc_item, output.metadata.model_dump()
         except Exception as e:
             return {

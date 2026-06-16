@@ -101,9 +101,12 @@ def normalize_run(
         error_code = cc.get("error_code") or ""
         rc = rc_by_tc.get(tc_id) or {}
         decision = rc.get("category")
-        defect_type = (
-            _infer_defect_type(error_code) if decision == _PRODUCT else None
-        )
+        # ①장애유형 — 파이프라인이 root_cause 에 채운 defect_type(상태코드+도메인규칙) 우선,
+        # 없으면(구버전 아티팩트) error_code prefix 로 폴백.
+        if decision == _PRODUCT:
+            defect_type = rc.get("defect_type") or _infer_defect_type(error_code)
+        else:
+            defect_type = None
         # 원인 위치: fix_recommender suggestions 의 file_path (rank 순)
         fr = fix_by_tc.get(tc_id) or {}
         fix_files = [s.get("file_path") for s in (fr.get("suggestions") or [])
