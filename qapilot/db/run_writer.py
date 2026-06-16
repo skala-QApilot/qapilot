@@ -138,6 +138,10 @@ def _build_summary(trace: dict) -> dict | None:
         summary["tc_results"] = trace["tc_results"]
     if trace.get("scenario_results"):
         summary["scenario_results"] = trace["scenario_results"]
+    # 토큰 사용량 — runs 테이블에 컬럼이 없어 summary jsonb 로 영속화 (스키마 변경 회피).
+    for k in ("total_input_tokens", "total_output_tokens", "total_tokens"):
+        if trace.get(k) is not None:
+            summary[k] = trace[k]
     return summary or None
 
 

@@ -59,6 +59,9 @@ def update_trace(trace_id: str, state: dict) -> None:
         "confidence": _average_confidence(agent_logs),
         "agent_logs": agent_logs,
         "total_cost": state.get("total_cost", 0.0),
+        "total_input_tokens": state.get("total_input_tokens"),
+        "total_output_tokens": state.get("total_output_tokens"),
+        "total_tokens": state.get("total_tokens"),
         "result_summary": _result_summary(state),
     }
     tc_results = state.get("tc_results")

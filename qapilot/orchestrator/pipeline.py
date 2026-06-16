@@ -4777,6 +4777,22 @@ async def _ts_generate_prd_only(state: PipelineState) -> dict:
     trace_id = state["trace_id"]
     requirements = state.get("requirements") or []
 
+    # 비기능 요구사항(REQ-, 성능/보안/제약 등)은 UI E2E 시나리오 대상이 아님 →
+    # functional 만 통과시켜 TS 폭증 방지 (비기능까지 1:1 TS 생성되던 격차).
+    _all_reqs = requirements
+    _functional = [
+        r for r in _all_reqs if (r.get("req_type") or "").lower() == "functional"
+    ]
+    # functional 이 하나라도 있으면 그것만, 전혀 없으면(타입 미분류 PRD) 전체 유지.
+    requirements = _functional if _functional else _all_reqs
+    if len(requirements) != len(_all_reqs):
+        get_logger("orchestrator").info(
+            "ts_filter_non_functional",
+            total=len(_all_reqs),
+            functional=len(requirements),
+            dropped=len(_all_reqs) - len(requirements),
+        )
+
     start = time.monotonic()
     agent = TSFromPRDAgent(trace_id=trace_id)
     output = await agent.run(AgentInput(
@@ -5406,12 +5422,32 @@ async def _tv_generate_codebase_aware(state: PipelineState) -> dict:
     return {"tc_by_ts_index": updated_tc_by_index, "agent_logs": agent_logs}
 
 
+def _write_tc_generation_version(service_id: str, trace_id: str, ts_id: str, ts: dict) -> None:
+    """scenario-runs/{trace}/tc_generation/{ts_id}/ 에 버전 파일(vN.json) 기록 + latest.json 갱신.
+
+    upsert_scenario_version (DB scenarios 테이블, MAX(version_number)+1) 과 같은 버전 의미를
+    S3 에도 미러. S3 비활성/실패 시 put_bytes/list_objects 모두 graceful no-op.
+    """
+    prefix = f"services/{service_id}/scenario-runs/{trace_id}/tc_generation/{ts_id}/"
+    existing = s3_client.list_objects(prefix)
+    versions = [
+        int(m.group(1))
+        for key in existing
+        if (m := re.match(r"v(\d+)\.json$", key[len(prefix):]))
+    ]
+    next_version = max(versions, default=0) + 1
+    body = json.dumps(ts, ensure_ascii=False, indent=2).encode()
+    s3_client.put_bytes(f"{prefix}v{next_version}.json", body, "application/json")
+    s3_client.put_bytes(f"{prefix}latest.json", body, "application/json")
+
+
 async def _save_experiment_scenarios(state: PipelineState) -> dict:
-    """ts_list + tc_by_ts_index를 병합해 최종 시나리오 파일로 디스크·DB 저장."""
+    """ts_list + tc_by_ts_index를 병합해 최종 시나리오 파일로 디스크·DB·S3 저장."""
     ts_list = state.get("ts_list") or []
     tc_by_index: dict = state.get("tc_by_ts_index") or {}
     trace = load_trace(state["trace_id"]) or {}
     service_id = trace.get("service_id")
+    trace_id = state["trace_id"]
     trigger = state["run_options"].get("trigger") or "init"
 
     scenarios_dir = _qapilot_path(state, "scenarios")
@@ -5443,6 +5479,10 @@ async def _save_experiment_scenarios(state: PipelineState) -> dict:
         merged_scenarios.append(ts)
         if service_id:
             upsert_scenario_version(service_id, ts_id, ts)
+            # 최종 병합 시나리오(given/when/then/value 포함)를 S3 에도 버전드 저장
+            # (scenario-runs/{trace}/tc_generation/{ts}/v{N}.json + latest.json) — 검색 문서/
+            # 코드 열람·아카이브용. DB(upsert_scenario_version) 와 동일 버전 의미로 미러.
+            _write_tc_generation_version(service_id, trace_id, ts_id, ts)
 
     # RTM 버전 생성 — 구 경로 (_save_scenarios) 에만 wire 되어 있어 prd_only
     # 경로는 RTM 0건 → 대시보드 RTM 0% (TC 의 req_id 는 존재하는데 링크
