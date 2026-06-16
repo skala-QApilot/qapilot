@@ -4068,36 +4068,6 @@ def _api_error_code(api_trace: dict) -> str:
     return ""
 
 
-# ①장애유형: 제품 결함의 도메인 규칙 위반 신호 (root_cause cause / then 텍스트).
-# 비즈니스 규칙(약관·자격·요금제·약정 등) 위반이면 DOMAIN_RULE. status 만으로는
-# 4xx 가 도메인규칙인지 일반 API 오류인지 구분 못 하므로, 원인 텍스트로 보강한다.
-# 일반 도메인 명사(약정·요금제 등)는 API 오류 맥락(중복약정 등)에도 등장하므로 제외하고,
-# 명확한 '규칙 위반' 용어만 둔다(over-claim 방지).
-_DOMAIN_RULE_RE = re.compile(
-    r"동의|보호자|미성년|청소년|자격|연령|위약금|면제|"
-    r"가입.{0,4}(제한|금지|강제)|(전용|청소년).{0,6}요금제|요금제.{0,6}(전용|강제|제한)")
-
-
-def _infer_defect_type(error_code: str, cause_text: str) -> str | None:
-    """①장애유형 — 상태코드(API/INFRA) + 원인 텍스트(DOMAIN_RULE). 단서 없으면 None.
-
-    우선순위: INFRA(5xx) > DOMAIN_RULE(규칙 위반 텍스트) > API_ERROR(4xx) > None.
-    임의 기본값을 채우지 않아 측정 정확도를 부풀리지 않는다.
-    """
-    ec = (error_code or "").upper()
-    if ec.startswith("INFRA"):
-        return "INFRA"
-    if cause_text and _DOMAIN_RULE_RE.search(cause_text):
-        return "DOMAIN_RULE"
-    if ec.startswith("API"):
-        return "API_ERROR"
-    if ec.startswith("DATA") or ec.startswith("DB"):
-        return "DATA_MISMATCH"
-    if ec.startswith("UI") or ec.startswith("TOOL_UI"):
-        return "UI_ERROR"
-    return None
-
-
 async def _cross_check(state: PipelineState) -> dict:
     """Layer 2 정합성 검증 노드 — TC 별 CrossCheckAgent 호출.
 
@@ -4386,17 +4356,19 @@ def _classify_failure(cc: dict, ui_result: dict | None) -> tuple[str, str]:
         if cc.get("api_unverified") or cc.get("db_unverified"):
             return "ENV_UNVERIFIED", "API/DB 검증 미수행 — trace capture / DB 접속 환경 점검 필요"
         # api-mode 는 per-step status 가 없어 무조건 여기로 온다. 검증부(api_exec)가
-        # 남긴 summary 신호로 '테스트 측 결함(오라클 추정/관찰 과구체)'을 PRODUCT 와
-        # 구분한다 — 제품 결함으로 단정할 수 없는 fail 을 오탐으로 흘리지 않기 위함.
+        # 남긴 summary 신호 중 **명백히 테스트 측 결함**인 것만 PRODUCT 에서 분리한다.
+        # (보수적: 모호한 신호는 PRODUCT 로 둬 진짜 결함을 가리지 않는다.)
         summary = str(cc.get("summary") or "")
+        # ① then 에 명시 status 가 없어 LLM 이 클래스 추정한 오라클 → 추정 한계, 제품 단정 불가
         if "미명시" in summary or "LLM 추정" in summary or _RANGE_EXPECT_RE.search(summary):
             return "TEST_DEFECT_UNVERIFIABLE", (
                 "api-mode 기대 status 미명시 → LLM 추정 오라클 기반 mismatch — "
                 "제품 결함 단정 불가. then 에 명시 status 필요")
-        if ("관찰 명세 결함" in summary or "unresolved" in summary
-                or "predicate=미충족" in summary):
+        # ② 관찰 jsonpath 가 응답에 부재(환각 경로) → 테스트 명세 결함. 단 'predicate 값
+        #   불일치'(status 는 맞고 body 값만 다름) 는 진짜 제품 결함일 수 있어 제외(PRODUCT 유지).
+        if "관찰 명세 결함" in summary or "unresolved" in summary:
             return "TEST_DEFECT_MAPPING", (
-                "api-mode 관찰(observe) 조건 미충족 — 응답에 없는 필드/과구체 단언 등 "
+                "api-mode 관찰(observe) 경로가 응답에 부재 — 환각 jsonpath 등 "
                 "테스트 명세 측 결함 우선 의심")
         return "PRODUCT_DEFECT_CANDIDATE", "UI 통과 + 정합성 mismatch — 제품 결함 후보"
 
@@ -4486,11 +4458,6 @@ async def _root_cause(state: PipelineState) -> dict:
             else:
                 rc_item = {"tc_id": tc_id, "candidates": []}
             rc_item.setdefault("category", "PRODUCT_DEFECT_CANDIDATE")
-            # ①장애유형 — 상태코드 + 원인 텍스트(도메인 규칙 신호)로 산출, rc_item 에 보존.
-            # 단일 출처: defect_writer·측정 스코어링 모두 이 필드를 우선 사용.
-            _cands = rc_item.get("candidates") or []
-            _cause = " ".join(str(c.get("cause") or "") for c in _cands[:3])
-            rc_item["defect_type"] = _infer_defect_type(cc.get("error_code") or "", _cause)
             return rc_item, output.metadata.model_dump()
         except Exception as e:
             return {

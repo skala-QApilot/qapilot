@@ -69,8 +69,12 @@ class TestClassifyFailure:
     def test_api_llm_estimated_oracle_is_test_defect(self):
         assert self._api("status 422 (then 코드 미명시, LLM 추정 [400])") == "TEST_DEFECT_UNVERIFIABLE"
 
-    def test_api_body_predicate_unmet_is_test_defect(self):
-        assert self._api("observe: body $.detail predicate=미충족") == "TEST_DEFECT_MAPPING"
+    def test_api_unresolved_jsonpath_is_test_defect(self):
+        assert self._api("observe: body $.foo unresolved 응답에 부재") == "TEST_DEFECT_MAPPING"
+
+    def test_api_body_predicate_unmet_stays_product(self):
+        # body 값 불일치(status 는 맞음)는 진짜 제품 결함일 수 있어 PRODUCT 유지 (보수적)
+        assert self._api("observe: body $.detail predicate=미충족") == "PRODUCT_DEFECT_CANDIDATE"
 
     def test_api_explicit_code_mismatch_stays_product(self):
         # then 에 명시 코드(기대 [401]) + 추정/관찰 신호 없음 → 제품 결함 후보 유지
