@@ -17,7 +17,7 @@ spec:
         - name: harbor-cred
       containers:
         - name: sut-db-agent
-          image: amdp-registry.skala-ai.com/skala26a-ai1/team3-sut-db-agent:v1
+          image: amdp-registry.skala-ai.com/skala26a-ai1/team3-sut-db-agent:v3
           ports:
             - containerPort: 8000
           envFrom:

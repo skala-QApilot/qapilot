@@ -1686,6 +1686,13 @@ async def _save_scenarios(state: PipelineState) -> dict:
     requirements = state.get("requirements") or []
     logger = get_logger(source="orchestrator", trace_id=state.get("trace_id"))
 
+    # 독립 실행용 DB precondition 후처리 — given 절 기준 db_check_sql/db_seed_sql 채움
+    # (규칙 기반·결정적). 디스크/DB 저장 전에 적용해 재생성 시에도 포함되게 한다.
+    from qapilot.shared.scenario_preconditions import apply_preconditions
+    _pc_n = apply_preconditions(scenarios)
+    if _pc_n:
+        logger.info("scenario_preconditions_applied", count=_pc_n)
+
     # natural_lang에서 insufficient/rejected 반환 시 시나리오 저장 없이 통과 (이슈 #182)
     query_status = state.get("query_status")
     if query_status and query_status != "sufficient":
@@ -2317,6 +2324,16 @@ async def _save_codes(state: PipelineState) -> dict:
         if service_id:
             upsert_generated_code(service_id, tc_id, code_text)
 
+    # 시나리오의 DB precondition 을 tc_id 로 인덱싱 — action mapping 에 실어 실행 전(preview)
+    # 에도 "준비" step 이 보이게 한다 (UI 는 action mapping 을 preview 데이터원으로 사용).
+    _pc_by_tc: dict[str, tuple] = {}
+    for sc in state.get("scenarios") or []:
+        if not isinstance(sc, dict):
+            continue
+        for tc in sc.get("test_cases") or []:
+            if isinstance(tc, dict) and (tc.get("db_check_sql") or tc.get("db_seed_sql")):
+                _pc_by_tc[str(tc.get("tc_id"))] = (tc.get("db_check_sql"), tc.get("db_seed_sql"))
+
     # ActionMapping 디스크 영속화 (Layer 2 의 _load_scenarios_for_test 가 읽음)
     for am in action_mappings:
         tc_id = am.get("tc_id")
@@ -2325,6 +2342,10 @@ async def _save_codes(state: PipelineState) -> dict:
         path = am_dir / f"{tc_id}.json"
         # normalize to plain dict (supports dict-like or pydantic/model objects)
         payload = _ensure_payload_dict(am)
+        _pc = _pc_by_tc.get(str(tc_id))
+        if _pc:
+            payload.setdefault("db_check_sql", _pc[0])
+            payload.setdefault("db_seed_sql", _pc[1])
         path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         if service_id:
             upsert_action_mapping(service_id, tc_id, payload)
@@ -2909,8 +2930,19 @@ async def _test_execution(state: PipelineState) -> dict:
                 screenshots_dir = tc_dir / "screenshots"
                 tc_dir.mkdir(parents=True, exist_ok=True)
 
-                # ── P1 검증 모드 이원화: API-계약형 / UI 무대 부재 TC 는 API 직접 검증 ──
                 _tc_meta = tc_by_id.get(str(tc_id)) or {}
+
+                # DB precondition: TC 액션 실행 전에 원하는 DB 상태를 확인하고, 아니면 시드한다.
+                # (독립 실행 — TC 가 필요한 데이터를 스스로 보장.) db_check_sql/db_seed_sql 정의가
+                # 없으면 None.
+                db_precondition = await _apply_db_precondition(trace_id, _tc_meta)
+
+                # 실제 DB 변경 diff 의 기준점 — TC 액션 실행 *전*(단, precondition 시드 *후*)
+                # 상태를 캡처한다. 이렇게 하면 롤백 시 precondition 은 유지되고 TC 자체 변경만
+                # 되돌려지며, diff 도 TC 변경만 보인다. env 미설정/실패 시 None.
+                db_before = await _capture_db_before(trace_id)
+
+                # ── P1 검증 모드 이원화: API-계약형 / UI 무대 부재 TC 는 API 직접 검증 ──
                 verify_mode = _decide_verify_mode(
                     tc_then_by_id.get(str(tc_id), ""),
                     tc_tags_by_id.get(str(tc_id), []),
@@ -2988,7 +3020,10 @@ async def _test_execution(state: PipelineState) -> dict:
                     db_res = await _run_db_test_safe(
                         tc_id=tc_id, trace_id=trace_id,
                         DBTestTool=DBTestTool, ToolInput=ToolInput,
+                        before=db_before,
                     )
+                    if db_precondition:
+                        db_res["precondition"] = db_precondition
                     # 스텝별 참고 화면 캡처 — 실제 제출값(request_body) 으로 폼을
                     # 채워 스텝별 화면을 만든다. 라이브 프리뷰가 스텝마다 넘어가도록
                     # ui row 를 먼저 만들어(id 확보) 캡처가 스텝마다 증분 업로드.
@@ -3173,7 +3208,10 @@ async def _test_execution(state: PipelineState) -> dict:
                         trace_id=trace_id,
                         DBTestTool=DBTestTool,
                         ToolInput=ToolInput,
+                        before=db_before,
                     )
+                    if db_precondition:
+                        db_res["precondition"] = db_precondition
                     db_results.append(db_res)
 
                     ui_payload = ui_res["ui_result"]
@@ -3201,6 +3239,8 @@ async def _test_execution(state: PipelineState) -> dict:
                         "tc_id": tc_id, "snapshots": [], "skipped": True,
                         "summary": f"TC 실행 예외로 미수행: {type(e).__name__}",
                     }
+                    if db_precondition:
+                        db_res["precondition"] = db_precondition
                     ui_results.append(ui_payload)
                     api_results.append(api_payload)
                     db_results.append(db_res)
@@ -4017,7 +4057,63 @@ async def _run_ui_with_trace(
     }
 
 
-async def _run_db_test_safe(*, tc_id: str, trace_id: str, DBTestTool, ToolInput) -> dict:
+async def _apply_db_precondition(trace_id: str, tc: dict) -> dict | None:
+    """TC 실행 전 DB precondition 확인 + 미충족 시 시드 — step 표시용 결과 반환.
+
+    TC 의 db_check_sql / db_seed_sql 사용. 둘 다 없으면 None (precondition 단계 없음).
+    db_check_sql 이 1행 이상 반환하면(matched) 시드 생략, 아니면 db_seed_sql 주입.
+    실패는 graceful — error 를 담아 반환(파이프라인 흐름은 계속).
+    """
+    from qapilot.tools.db_test_tool import DBTestTool, _module_url
+
+    check_sql = str(tc.get("db_check_sql") or "").strip()
+    seed_sql = str(tc.get("db_seed_sql") or "").strip()
+    if not (check_sql or seed_sql) or not _module_url():
+        return None
+
+    tool = DBTestTool(trace_id=trace_id)
+    try:
+        matched = await tool._check_db(check_sql) if check_sql else False  # noqa: SLF001
+        seeded = False
+        if not matched and seed_sql:
+            await tool._inject_seed(seed_sql)  # noqa: SLF001
+            seeded = True
+        return {"applied": True, "matched": matched, "seeded": seeded, "error": None}
+    except Exception as e:
+        logger.warning("db_precondition_failed", trace_id=trace_id,
+                       error=f"{type(e).__name__}: {e}"[:160])
+        return {"applied": True, "matched": False, "seeded": False,
+                "error": f"{type(e).__name__}: {e}"[:160]}
+
+
+async def _capture_db_before(trace_id: str) -> dict | None:
+    """TC 액션 실행 *전* DB 상태 캡처 — 실제 변경 diff 의 기준점.
+
+    db_test 는 액션 종료 후 호출되므로 그 안의 before/after 는 동일(변경 0). 의미 있는
+    diff 를 위해 액션 전에 여기서 떠 두고 _run_db_test_safe(before=...) 로 넘긴다.
+    env 미설정/연결 실패 시 None (graceful) — db_test 는 before 없이 진행(변경 미표시).
+    """
+    from qapilot.tools.db_test_tool import DBTestTool, _module_url
+
+    if not _module_url():
+        return None
+    try:
+        tool = DBTestTool(trace_id=trace_id)
+        # 서버에 복원점 설정(rollback 시 이 상태로 복원) + diff 용 before snapshots 수신.
+        # DB 읽기 1회로 복원·diff 둘 다 충족.
+        snapshots = await tool._create_restore_point()  # noqa: SLF001
+        if not snapshots:
+            return None
+        return {"tables": list(snapshots.keys()), "snapshots": snapshots}
+    except Exception as e:
+        logger.warning("db_before_capture_failed", trace_id=trace_id,
+                       error=f"{type(e).__name__}: {e}"[:160])
+        return None
+
+
+async def _run_db_test_safe(
+    *, tc_id: str, trace_id: str, DBTestTool, ToolInput, before: dict | None = None
+) -> dict:
     """DBTestTool graceful — env 부재 시 Tool 호출 자체 차단 (로그 노이즈 0).
 
     DBTestTool 본체가 `QAPILOT_SUT_DB_URL` 미설정 시 ValueError raise + BaseTool 가
@@ -4038,7 +4134,10 @@ async def _run_db_test_safe(*, tc_id: str, trace_id: str, DBTestTool, ToolInput)
 
     try:
         tool = DBTestTool(trace_id=trace_id)
-        out = await tool.run(ToolInput(trace_id=trace_id, params={"tc_id": tc_id}))
+        params = {"tc_id": tc_id}
+        if before:
+            params["before_snapshot"] = before
+        out = await tool.run(ToolInput(trace_id=trace_id, params=params))
         return dict(out.result.get("db_test") or {
             "tc_id": tc_id, "snapshots": [], "summary": "DB test 결과 비어있음",
         })

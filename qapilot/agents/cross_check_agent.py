@@ -432,6 +432,10 @@ class CrossCheckAgent(BaseAgent):
             if not isinstance(snap, dict):
                 continue
             s = dict(snap)
+            # UI 전용 변경 행 상세 — LLM 페이로드에서 제외 (정합성 분석엔 요약 카운트만 사용,
+            # DB 원본 행 값 LLM 미전송 원칙 유지). db_test_tool 이 채우는 신규 필드.
+            s.pop("rows_added", None)
+            s.pop("rows_removed", None)
             rows = s.get("rows") or s.get("data") or []
             if isinstance(rows, list) and len(rows) > _MAX_DB_ROWS_PER_SNAPSHOT:
                 s["rows"] = rows[:_MAX_DB_ROWS_PER_SNAPSHOT]

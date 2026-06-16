@@ -231,6 +231,24 @@ def test_compact_db_handles_empty(mock_llm_client):
     assert agent._compact_db_result(None) == {}  # type: ignore[arg-type]
 
 
+def test_compact_db_strips_ui_only_changed_rows(mock_llm_client):
+    """UI 전용 변경 행(rows_added/rows_removed)은 LLM 페이로드에서 제외 (요약만 유지)."""
+    agent = _make_agent(mock_llm_client)
+    db = {"snapshots": [{
+        "table": "users",
+        "row_count_before": 1, "row_count_after": 2,
+        "added": 1, "deleted": 0, "modified": 0,
+        "rows_added": [{"id": 2, "name": "bob"}],
+        "rows_removed": [{"id": 1, "name": "alice"}],
+    }]}
+    out = agent._compact_db_result(db)
+    snap = out["snapshots"][0]
+    assert "rows_added" not in snap
+    assert "rows_removed" not in snap
+    # 요약 카운트는 유지
+    assert snap["added"] == 1 and snap["row_count_after"] == 2
+
+
 # ── _compact_for_llm 통합 ─────────────────────────────────────────────────
 
 

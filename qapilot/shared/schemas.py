@@ -209,6 +209,10 @@ class TestCase(TypedDict):
     req_id: str | None
     api: str | None  # 검증 대상 API (예: "POST /api/orders")
     depends_on: list[str]  # 선행 TC ID 목록 (예: ["TS-034-TC-01"])
+    # DB precondition (독립 실행용) — 실행 전 db_check_sql 로 상태 확인, 행이 없으면
+    # db_seed_sql 주입. precondition 은 롤백에서 유지(시드 후 restore-point 캡처).
+    db_check_sql: NotRequired[str]  # 충족 시 ≥1행 반환하는 SELECT (예: "SELECT 1 FROM users WHERE email='t@x.com'")
+    db_seed_sql: NotRequired[str]   # 미충족 시 주입할 INSERT
 
 
 class TestScenario(TypedDict):
@@ -320,6 +324,11 @@ class DBSnapshot(TypedDict):
     added: int
     deleted: int
     modified: int
+    # UI 상세 표시용 — 실제 변경된 행 값 (cap 적용). LLM 페이로드에서는 제외된다
+    # (cross_check_agent._compact_db_result 가 strip). before 에만 있던 행(삭제/수정 전) /
+    # after 에만 있던 행(추가/수정 후) 으로, 수정된 행은 양쪽에 나타난다.
+    rows_removed: NotRequired[list[dict]]
+    rows_added: NotRequired[list[dict]]
 
 
 class DBTestResult(TypedDict):

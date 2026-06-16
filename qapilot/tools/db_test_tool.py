@@ -25,6 +25,9 @@ from qapilot.tools.base_tool import BaseTool
 # (override 적용/revert) 와 완전히 무관.
 _DOTENV_LOADED = False
 
+# UI 상세 표시용 변경 행 보존 상한 (테이블당). diff 결과는 보통 작지만 안전장치.
+_MAX_DIFF_ROWS = 50
+
 
 def _ensure_dotenv() -> None:
     """`.env` 의 값을 강제 로드 (override=True) + 1회 캐시.
@@ -109,6 +112,38 @@ class DBTestTool(BaseTool):
         except httpx.HTTPStatusError as e:
             raise ToolExecutionError(ErrorCode.TOOL_003, f"스냅샷 조회 실패: {e.response.status_code}")
 
+    async def _create_restore_point(self) -> dict | None:
+        """rollback 복원 기준점 캡처 — 서버가 복원용 native 상태를 보관한다.
+
+        이 호출 이후의 변경(시드/테스트 액션)은 _rollback() 의 스냅샷 복원으로 되돌려진다.
+        반환: diff 용 {table: {table, row_count, rows}} (서버 응답) 또는 None.
+        """
+        try:
+            async with httpx.AsyncClient() as client:
+                response = await client.post(
+                    f"{_module_url()}/db/restore-point", headers=_auth_headers()
+                )
+                response.raise_for_status()
+                return response.json().get("data", {}).get("snapshots")
+        except httpx.ConnectError as e:
+            raise ToolExecutionError(ErrorCode.TOOL_004, f"DB 스캔 모듈 연결 실패: {e}")
+        except httpx.HTTPStatusError as e:
+            raise ToolExecutionError(ErrorCode.TOOL_003, f"restore-point 생성 실패: {e.response.status_code}")
+
+    async def _check_db(self, check_sql: str) -> bool:
+        """precondition 충족 여부 — check_sql(SELECT) 이 1행 이상 반환하면 True."""
+        try:
+            async with httpx.AsyncClient() as client:
+                response = await client.post(
+                    f"{_module_url()}/db/check", json={"sql": check_sql}, headers=_auth_headers()
+                )
+                response.raise_for_status()
+                return bool(response.json()["data"]["matched"])
+        except httpx.ConnectError as e:
+            raise ToolExecutionError(ErrorCode.TOOL_004, f"DB 스캔 모듈 연결 실패: {e}")
+        except httpx.HTTPStatusError as e:
+            raise ToolExecutionError(ErrorCode.TOOL_003, f"DB 상태 확인 실패: {e.response.status_code}")
+
     async def _inject_seed(self, seed_sql: str) -> None:
         """시드 데이터 주입."""
         try:
@@ -146,22 +181,34 @@ class DBTestTool(BaseTool):
             raise ToolExecutionError(ErrorCode.TOOL_003, f"롤백 실패: {e.response.status_code}")
 
     async def _execute(self, params: dict[str, Any]) -> dict[str, Any]:
-        """테스트 전후 DB 스냅샷 비교."""
+        """테스트 전후 DB 스냅샷 비교.
+
+        before_snapshot 가 주어지면(파이프라인이 TC 액션 *전* 캡처한 기준점) 이를 before 로
+        사용해 실제 변경을 diff 한다. 없으면 호출 시점에 before 를 캡처한다(단위 테스트 등).
+        """
         tc_id = params.get("tc_id", "unknown")
         seed_sql = params.get("seed_sql")
+        pre = params.get("before_snapshot")
 
         if not _module_url():
             raise ValueError("QAPILOT_SUT_DB_URL 환경변수가 설정되지 않았습니다.")
 
-        tables = await self._get_tables()
+        if pre and pre.get("snapshots"):
+            # 액션 전 상태가 주어짐 → before 재캡처 없이 사용 (seed 는 이 경로에서 미사용).
+            tables = pre.get("tables") or list(pre["snapshots"].keys())
+            before = pre["snapshots"]
+        else:
+            tables = await self._get_tables()
 
-        # seed 주입을 before 스냅샷 이전에 수행 → 시드 SQL이 테스트 SQL 로그에 섞이지 않도록
-        if seed_sql:
-            await self._inject_seed(seed_sql)
+            # seed 주입을 before 스냅샷 이전에 수행 → 시드 SQL이 테스트 SQL 로그에 섞이지 않도록.
+            # 시드 주입 직전에 복원 기준점을 캡처해 _rollback() 이 시드를 확실히 되돌리게 한다.
+            if seed_sql:
+                await self._create_restore_point()
+                await self._inject_seed(seed_sql)
 
-        before = {}
-        for table in tables:
-            before[table] = await self._get_snapshot(table)
+            before = {}
+            for table in tables:
+                before[table] = await self._get_snapshot(table)
 
         sql_logs = []
         try:
@@ -183,26 +230,44 @@ class DBTestTool(BaseTool):
 
             # before/after rows 데이터가 있으면 실제 행 변경 감지
             modified = 0
+            rows_added: list[dict] = []
+            rows_removed: list[dict] = []
             before_rows = before_data.get("rows")
             after_rows = after_data.get("rows")
             if before_rows is not None and after_rows is not None:
-                # primary key 기준으로 동일한 행 수 내 데이터 변경 감지
-                before_set = {json.dumps(row, sort_keys=True) for row in before_rows}
-                after_set = {json.dumps(row, sort_keys=True) for row in after_rows}
+                # 행 전체를 canonical JSON 으로 직렬화해 집합 diff. before 에만 있던 행 /
+                # after 에만 있던 행을 실제 값과 함께 보존 (UI 상세 표시용).
+                before_map = {json.dumps(row, sort_keys=True, default=str): row for row in before_rows}
+                after_map = {json.dumps(row, sort_keys=True, default=str): row for row in after_rows}
+                before_keys = set(before_map)
+                after_keys = set(after_map)
+                rows_removed = [before_map[k] for k in before_keys - after_keys]
+                rows_added = [after_map[k] for k in after_keys - before_keys]
                 # 행 수는 같지만 내용이 다른 경우 modified 계산
                 if before_count == after_count:
-                    modified = len(before_set - after_set)
+                    modified = len(before_keys - after_keys)
 
-            snapshots.append(DBSnapshot(
+            snap = DBSnapshot(
                 table=table,
                 row_count_before=before_count,
                 row_count_after=after_count,
                 added=max(diff, 0),
                 deleted=max(-diff, 0),
                 modified=modified,
-            ))
+            )
+            # 변경 행만 보존 (cap) — 미변경 테이블은 필드 자체를 생략해 payload 비대화 방지.
+            if rows_added:
+                snap["rows_added"] = rows_added[:_MAX_DIFF_ROWS]
+            if rows_removed:
+                snap["rows_removed"] = rows_removed[:_MAX_DIFF_ROWS]
+            snapshots.append(snap)
 
-        await self._rollback()
+        # 복원은 diff 산출 이후. 권한/FK 등으로 복원이 실패해도 변경 diff 결과는 보존한다
+        # (복원 실패 시 변경이 DB 에 잔존 — 경고만 남기고 다음 TC 가 새 복원점을 잡는다).
+        try:
+            await self._rollback()
+        except Exception as e:
+            self.logger.warning(f"DB 롤백(복원) 실패 — 변경 잔존: {e}")
 
         result = DBTestResult(
             tc_id=tc_id,

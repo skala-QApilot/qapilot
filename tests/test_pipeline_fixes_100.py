@@ -190,3 +190,51 @@ async def test_cross_check_exception_preserves_ui_fail_signal():
     assert by_id["TC-1"]["has_mismatch"] is True  # UI fail → 강제 True
     assert by_id["TC-2"]["has_mismatch"] is False  # UI pass → False
     assert result["has_mismatch"] is True  # 어느 하나라도 True
+
+
+# ── DB precondition (독립 실행 — 실행 전 상태 확인 + 미충족 시 시드) ──────────
+
+
+@pytest.mark.asyncio
+async def test_precondition_none_when_no_fields():
+    """db_check_sql/db_seed_sql 둘 다 없으면 precondition 단계 없음(None)."""
+    result = await P._apply_db_precondition("trace-1", {"tc_id": "TC-1"})
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_precondition_seeds_when_not_matched():
+    """상태 미충족(check False) → 시드 주입, seeded=True."""
+    from qapilot.tools.db_test_tool import DBTestTool
+
+    seed = AsyncMock()
+    with patch("qapilot.tools.db_test_tool._module_url", return_value="http://x"), \
+         patch.object(DBTestTool, "_check_db", new=AsyncMock(return_value=False)), \
+         patch.object(DBTestTool, "_inject_seed", new=seed):
+        result = await P._apply_db_precondition("trace-1", {
+            "tc_id": "TC-1",
+            "db_check_sql": "SELECT 1 FROM users WHERE email='t@x.com'",
+            "db_seed_sql": "INSERT INTO users(email) VALUES('t@x.com')",
+        })
+
+    seed.assert_awaited_once()
+    assert result == {"applied": True, "matched": False, "seeded": True, "error": None}
+
+
+@pytest.mark.asyncio
+async def test_precondition_skips_seed_when_matched():
+    """상태 충족(check True) → 시드 생략, matched=True/seeded=False."""
+    from qapilot.tools.db_test_tool import DBTestTool
+
+    seed = AsyncMock()
+    with patch("qapilot.tools.db_test_tool._module_url", return_value="http://x"), \
+         patch.object(DBTestTool, "_check_db", new=AsyncMock(return_value=True)), \
+         patch.object(DBTestTool, "_inject_seed", new=seed):
+        result = await P._apply_db_precondition("trace-1", {
+            "tc_id": "TC-1",
+            "db_check_sql": "SELECT 1 FROM users WHERE email='t@x.com'",
+            "db_seed_sql": "INSERT INTO users(email) VALUES('t@x.com')",
+        })
+
+    seed.assert_not_awaited()
+    assert result == {"applied": True, "matched": True, "seeded": False, "error": None}

@@ -4,11 +4,13 @@ QApilot이 대상 시스템(minibss) PostgreSQL에 접근하기 위한 FastAPI �
 클러스터 안에서 실행되어 ClusterIP 서비스로 minibss-postgres에 접근.
 
 엔드포인트:
-    GET  /db/tables      - 테이블 목록 조회
-    GET  /db/snapshot    - 테이블 스냅샷 조회
-    POST /db/seed        - 시드 데이터 주입
-    GET  /db/sql-logs    - SQL 쿼리 로그 조회
-    POST /db/rollback    - cleanup SQL 기반 롤백
+    GET  /db/tables        - 테이블 목록 조회
+    GET  /db/snapshot      - 테이블 스냅샷 조회
+    POST /db/check         - precondition 상태 확인 (SELECT 매칭 행 수)
+    POST /db/seed          - 시드 데이터 주입
+    GET  /db/sql-logs      - SQL 쿼리 로그 조회
+    POST /db/restore-point - 복원 기준점 캡처 (rollback 시 복원)
+    POST /db/rollback      - 스냅샷 기반 롤백 (restore-point 로 복원)
 
 인증: Authorization 헤더 토큰 검증
 """
@@ -40,6 +42,11 @@ pool: asyncpg.Pool | None = None
 
 # SQL 로그 버퍼 (인메모리)
 sql_log_buffer: list[dict] = []
+
+# 스냅샷 기반 롤백 기준점 (인메모리). restore-point 캡처 시 전체 public 테이블의
+# 행 데이터를 보관, rollback 시 이 상태로 복원한다. 단일 SUT · TC 순차 실행 가정
+# (db_test_tool 의 _module_url 단일 URL 전제와 정합).
+restore_snapshot: dict[str, list[dict]] | None = None
 
 
 @asynccontextmanager
@@ -144,6 +151,21 @@ async def get_snapshot(table: str):
         raise err(f"스냅샷 조회 실패: {e}")
 
 
+class CheckRequest(BaseModel):
+    sql: str
+
+
+@app.post("/db/check", dependencies=[Depends(verify_token)])
+async def check_state(body: CheckRequest):
+    """precondition 상태 확인 — SELECT 실행 후 매칭 행 수 반환. count>=1 이면 충족."""
+    try:
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(body.sql)
+        return ok({"count": len(rows), "matched": len(rows) > 0})
+    except Exception as e:
+        raise err(f"상태 확인 실패: {e}")
+
+
 class SeedRequest(BaseModel):
     sql: str
 
@@ -172,19 +194,113 @@ async def get_sql_logs():
     return ok({"logs": logs})
 
 
+async def _list_public_tables(conn) -> list[str]:
+    """public 스키마의 BASE TABLE 목록."""
+    rows = await conn.fetch(
+        """
+        SELECT table_name
+        FROM information_schema.tables
+        WHERE table_schema = 'public' AND table_type = 'BASE TABLE'
+        ORDER BY table_name
+        """
+    )
+    return [row["table_name"] for row in rows]
+
+
+@app.post("/db/restore-point", dependencies=[Depends(verify_token)])
+async def create_restore_point():
+    """현재 전체 public 테이블 상태를 메모리에 캡처 — rollback 복원 기준점.
+
+    시드 주입 직전에 호출하면 시드(및 이후 변경)를 rollback 으로 되돌릴 수 있다.
+    """
+    global restore_snapshot
+    try:
+        snapshot: dict[str, list[dict]] = {}
+        async with pool.acquire() as conn:
+            for table in await _list_public_tables(conn):
+                rows = await conn.fetch(f'SELECT * FROM "{table}"')
+                snapshot[table] = [dict(row) for row in rows]
+        restore_snapshot = snapshot
+        total_rows = sum(len(v) for v in snapshot.values())
+        logger.info(f"restore-point 캡처: {len(snapshot)}개 테이블, {total_rows}행")
+        # diff 용 snapshots 동봉 — 클라이언트가 before 로 사용. 서버는 native 객체를
+        # restore_snapshot 에 그대로 보관(복원 시 타입 손실 없음), 응답만 JSON 직렬화된다.
+        snapshots = {
+            t: {"table": t, "row_count": len(rows), "rows": rows}
+            for t, rows in snapshot.items()
+        }
+        return ok({"tables": len(snapshot), "rows": total_rows, "snapshots": snapshots})
+    except Exception as e:
+        raise err(f"restore-point 생성 실패: {e}")
+
+
+async def _restore_from_snapshot(snapshot: dict[str, list[dict]]) -> None:
+    """캡처된 스냅샷으로 전체 복원.
+
+    FK 순서 의존을 피하려 session_replication_role=replica 로 트리거(FK 포함) 를
+    우회한다. 권한 부족 시 TRUNCATE … CASCADE 로 fallback (이 경우 FK 순서로 인해
+    재삽입이 일부 실패할 수 있어 경고 로그만 남기고 진행).
+    """
+    tables = list(snapshot.keys())
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            replica_ok = True
+            try:
+                await conn.execute("SET session_replication_role = replica")
+            except Exception as e:
+                replica_ok = False
+                logger.warning(f"session_replication_role 설정 실패(권한?) — FK 순서 의존 잔존: {e}")
+
+            if tables:
+                quoted = ", ".join(f'"{t}"' for t in tables)
+                await conn.execute(f"TRUNCATE TABLE {quoted} RESTART IDENTITY CASCADE")
+
+            for table, rows in snapshot.items():
+                if not rows:
+                    continue
+                cols = list(rows[0].keys())
+                await conn.copy_records_to_table(
+                    table,
+                    records=[tuple(row[c] for c in cols) for row in rows],
+                    columns=cols,
+                )
+
+            # TRUNCATE RESTART IDENTITY 로 1 로 리셋된 시퀀스를 재삽입 최대값 기준 보정
+            # — 다음 app insert 의 PK 충돌 방지.
+            for table, rows in snapshot.items():
+                if not rows:
+                    continue
+                for col in rows[0].keys():
+                    seq = await conn.fetchval("SELECT pg_get_serial_sequence($1, $2)", table, col)
+                    if not seq:
+                        continue
+                    maxv = await conn.fetchval(f'SELECT MAX("{col}") FROM "{table}"')
+                    if maxv is not None:
+                        await conn.execute("SELECT setval($1, $2, true)", seq, int(maxv))
+
+            if replica_ok:
+                await conn.execute("SET session_replication_role = DEFAULT")
+
+
 class RollbackRequest(BaseModel):
     cleanup_sql: str | None = None
 
 
 @app.post("/db/rollback", dependencies=[Depends(verify_token)])
 async def rollback(body: RollbackRequest = RollbackRequest()):
-    """cleanup SQL 기반 롤백.
+    """스냅샷 기반 롤백.
 
-    트랜잭션 롤백 불가(별도 커넥션) → cleanup SQL로 데이터 정리.
-    cleanup_sql 없으면 로그 버퍼만 초기화.
+    우선순위:
+      1) restore-point 존재 → 전체 TRUNCATE + 재삽입으로 그 상태 복원 (시드 포함 되돌림)
+      2) cleanup_sql 명시 → 해당 SQL 실행 (하위 호환)
+      3) 둘 다 없으면 로그 버퍼만 초기화
     """
+    global restore_snapshot
     try:
-        if body.cleanup_sql:
+        if restore_snapshot is not None:
+            await _restore_from_snapshot(restore_snapshot)
+            restore_snapshot = None
+        elif body.cleanup_sql:
             async with pool.acquire() as conn:
                 await conn.execute(body.cleanup_sql)
         sql_log_buffer.clear()

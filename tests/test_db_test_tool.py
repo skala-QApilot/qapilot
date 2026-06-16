@@ -51,6 +51,7 @@ async def test_seed_injected_before_snapshot(tool):
     with patch("qapilot.tools.db_test_tool.MODULE_URL", "http://localhost:8001"), \
          patch.object(tool, "_get_tables", new=AsyncMock(return_value=["users"])), \
          patch.object(tool, "_get_snapshot", new=mock_get_snapshot), \
+         patch.object(tool, "_create_restore_point", new=AsyncMock()), \
          patch.object(tool, "_inject_seed", new=mock_inject_seed), \
          patch.object(tool, "_get_sql_logs", new=AsyncMock(return_value=[])), \
          patch.object(tool, "_rollback", new=AsyncMock()):
@@ -64,6 +65,48 @@ async def test_seed_injected_before_snapshot(tool):
     # seed가 첫 번째 snapshot 이전에 실행되어야 함
     assert call_order[0] == "seed", f"seed가 먼저 실행되어야 함. 실제 순서: {call_order}"
     assert call_order[1] == "snapshot", f"snapshot이 seed 이후에 실행되어야 함. 실제 순서: {call_order}"
+
+
+@pytest.mark.asyncio
+async def test_restore_point_before_seed(tool):
+    """seed 가 있으면 복원 기준점이 seed 주입 이전에 캡처되어야 함 (스냅샷 기반 롤백)."""
+    call_order = []
+
+    async def mock_restore_point():
+        call_order.append("restore_point")
+
+    async def mock_inject_seed(sql):
+        call_order.append("seed")
+
+    with patch("qapilot.tools.db_test_tool.MODULE_URL", "http://localhost:8001"), \
+         patch.object(tool, "_get_tables", new=AsyncMock(return_value=["users"])), \
+         patch.object(tool, "_get_snapshot", new=AsyncMock(return_value={"row_count": 1})), \
+         patch.object(tool, "_create_restore_point", new=mock_restore_point), \
+         patch.object(tool, "_inject_seed", new=mock_inject_seed), \
+         patch.object(tool, "_get_sql_logs", new=AsyncMock(return_value=[])), \
+         patch.object(tool, "_rollback", new=AsyncMock()):
+
+        await tool.run(ToolInput(
+            trace_id="t", params={"tc_id": "TC-001", "seed_sql": "INSERT INTO users VALUES (1)"}))
+
+    assert call_order == ["restore_point", "seed"], f"실제 순서: {call_order}"
+
+
+@pytest.mark.asyncio
+async def test_restore_point_skipped_without_seed(tool):
+    """seed 가 없으면 복원 기준점을 캡처하지 않아야 함 (불필요한 전체 스냅샷 방지)."""
+    mock_restore_point = AsyncMock()
+
+    with patch("qapilot.tools.db_test_tool.MODULE_URL", "http://localhost:8001"), \
+         patch.object(tool, "_get_tables", new=AsyncMock(return_value=["users"])), \
+         patch.object(tool, "_get_snapshot", new=AsyncMock(return_value={"row_count": 1})), \
+         patch.object(tool, "_create_restore_point", new=mock_restore_point), \
+         patch.object(tool, "_get_sql_logs", new=AsyncMock(return_value=[])), \
+         patch.object(tool, "_rollback", new=AsyncMock()):
+
+        await tool.run(ToolInput(trace_id="t", params={"tc_id": "TC-001"}))
+
+    mock_restore_point.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -135,3 +178,86 @@ async def test_modified_zero_when_no_rows_data(tool):
 
     snapshot = output.result["db_test"]["snapshots"][0]
     assert snapshot["modified"] == 0
+
+
+@pytest.mark.asyncio
+async def test_changed_rows_captured(tool):
+    """before/after diff 로 실제 변경 행(rows_added/rows_removed)이 보존되는지 확인."""
+    call_count = 0
+
+    async def mock_get_snapshot(table):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:  # before
+            return {"row_count": 2, "rows": [
+                {"id": 1, "name": "alice"},
+                {"id": 2, "name": "bob"},
+            ]}
+        return {"row_count": 3, "rows": [  # after — bob 수정 + carol 추가
+            {"id": 1, "name": "alice"},
+            {"id": 2, "name": "bob_updated"},
+            {"id": 3, "name": "carol"},
+        ]}
+
+    with patch("qapilot.tools.db_test_tool.MODULE_URL", "http://localhost:8001"), \
+         patch.object(tool, "_get_tables", new=AsyncMock(return_value=["users"])), \
+         patch.object(tool, "_get_snapshot", new=mock_get_snapshot), \
+         patch.object(tool, "_get_sql_logs", new=AsyncMock(return_value=[])), \
+         patch.object(tool, "_rollback", new=AsyncMock()):
+
+        output = await tool.run(ToolInput(trace_id="t", params={"tc_id": "TC-001"}))
+
+    snapshot = output.result["db_test"]["snapshots"][0]
+    # after 에만 있던 행: bob_updated, carol
+    assert {"id": 2, "name": "bob_updated"} in snapshot["rows_added"]
+    assert {"id": 3, "name": "carol"} in snapshot["rows_added"]
+    # before 에만 있던 행: 수정 전 bob
+    assert snapshot["rows_removed"] == [{"id": 2, "name": "bob"}]
+
+
+@pytest.mark.asyncio
+async def test_before_snapshot_param_used_for_diff(tool):
+    """before_snapshot 가 주어지면 그것을 before 로 쓰고, 액션 후 after 와 실제 diff 한다."""
+    pre = {
+        "tables": ["users"],
+        "snapshots": {"users": {"row_count": 1, "rows": [{"id": 1, "name": "alice"}]}},
+    }
+
+    async def mock_after_snapshot(table):  # 액션 후 — bob 추가됨
+        return {"row_count": 2, "rows": [{"id": 1, "name": "alice"}, {"id": 2, "name": "bob"}]}
+
+    get_tables = AsyncMock(return_value=["users"])
+    with patch("qapilot.tools.db_test_tool.MODULE_URL", "http://localhost:8001"), \
+         patch.object(tool, "_get_tables", new=get_tables), \
+         patch.object(tool, "_get_snapshot", new=mock_after_snapshot), \
+         patch.object(tool, "_get_sql_logs", new=AsyncMock(return_value=[])), \
+         patch.object(tool, "_rollback", new=AsyncMock()):
+
+        output = await tool.run(ToolInput(
+            trace_id="t", params={"tc_id": "TC-1", "before_snapshot": pre}))
+
+    # pre.tables 사용 → _get_tables 미호출
+    get_tables.assert_not_called()
+    snap = output.result["db_test"]["snapshots"][0]
+    assert snap["added"] == 1
+    assert snap["rows_added"] == [{"id": 2, "name": "bob"}]
+    assert "rows_removed" not in snap
+
+
+@pytest.mark.asyncio
+async def test_changed_rows_absent_when_no_change(tool):
+    """변경이 없으면 rows_added/rows_removed 필드 자체가 없어야 함 (payload 비대화 방지)."""
+    async def mock_get_snapshot(table):
+        return {"row_count": 1, "rows": [{"id": 1, "name": "alice"}]}
+
+    with patch("qapilot.tools.db_test_tool.MODULE_URL", "http://localhost:8001"), \
+         patch.object(tool, "_get_tables", new=AsyncMock(return_value=["users"])), \
+         patch.object(tool, "_get_snapshot", new=mock_get_snapshot), \
+         patch.object(tool, "_get_sql_logs", new=AsyncMock(return_value=[])), \
+         patch.object(tool, "_rollback", new=AsyncMock()):
+
+        output = await tool.run(ToolInput(trace_id="t", params={"tc_id": "TC-001"}))
+
+    snapshot = output.result["db_test"]["snapshots"][0]
+    assert "rows_added" not in snapshot
+    assert "rows_removed" not in snapshot
