@@ -102,6 +102,8 @@ class BaseAgent(ABC):
                 metadata = BaseMetadata(
                     model=self._resolved.model,
                     tokens_used=self.llm.total_tokens,
+                    input_tokens=self.llm.total_input_tokens,
+                    output_tokens=self.llm.total_output_tokens,
                     cost_usd=self.llm.total_cost_usd,
                     duration_sec=duration,
                     retry_count=retry_count,

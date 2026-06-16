@@ -35,6 +35,8 @@ class BaseMetadata(BaseModel):
 
     model: str
     tokens_used: int
+    input_tokens: int = 0
+    output_tokens: int = 0
     cost_usd: float = 0.0
     duration_sec: float
     retry_count: int = 0
