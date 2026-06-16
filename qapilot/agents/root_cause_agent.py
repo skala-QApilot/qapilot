@@ -66,6 +66,9 @@ _JUDGE_PROMPT_FALLBACK = """\
 }}"""
 
 _VALID_EVIDENCE_TYPES = frozenset({"code_location", "runtime_data"})
+# ①장애유형 — LLM 이 코드 분석 결과로 분류(키워드/상태코드 추론 아님). 일반적·SUT 무관.
+_VALID_DEFECT_TYPES = frozenset(
+    {"UI_ERROR", "API_ERROR", "DATA_MISMATCH", "INFRA", "DOMAIN_RULE"})
 
 
 def _load_codebase_index_from_db_mirror(service_id: str) -> dict[str, Any]:
@@ -199,6 +202,8 @@ class RootCauseAgent(BaseAgent):
         except AgentExecutionError as e:
             self.logger.warning("parse_failed_using_fallback", tc_id=tc_id, error=str(e))
             candidates = self._build_fallback_candidates(error_code, summary, mismatches)
+        # ①장애유형 — LLM 의 구조화 분류 (실패 시 None).
+        defect_type = self._parse_defect_type(response.content)
 
         candidates = candidates[:3]
 
@@ -220,7 +225,8 @@ class RootCauseAgent(BaseAgent):
 
         self.logger.info("root_cause_analyzed", tc_id=tc_id, candidate_count=len(candidates))
 
-        root_cause_result: RootCauseResult = {"tc_id": tc_id, "candidates": candidates}
+        root_cause_result: RootCauseResult = {
+            "tc_id": tc_id, "candidates": candidates, "defect_type": defect_type}
         return ExecuteResult(
             result={"root_causes": [root_cause_result]},
             confidence=agent_confidence,
@@ -336,6 +342,15 @@ class RootCauseAgent(BaseAgent):
         return min(1.0, max(0.0, (avg - 1) / 4))
 
     # ── 파싱 ───────────────────────────────────────────────────────────────────
+
+    def _parse_defect_type(self, content: str) -> str | None:
+        """LLM 출력에서 ①장애유형(defect_type)을 추출·검증. 누락/오타면 None."""
+        try:
+            cleaned = re.sub(r"```(?:json)?\s*|\s*```", "", content).strip()
+            dt = (json.loads(cleaned) or {}).get("defect_type")
+        except (json.JSONDecodeError, AttributeError):
+            return None
+        return dt if dt in _VALID_DEFECT_TYPES else None
 
     def _parse_response(self, content: str) -> list[RootCauseCandidate]:
         """LLM 응답 JSON을 파싱하고 RootCauseCandidate 목록을 반환한다.

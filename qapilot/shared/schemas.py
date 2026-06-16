@@ -376,6 +376,7 @@ class RootCauseResult(TypedDict):
 
     tc_id: str
     candidates: list[RootCauseCandidate]
+    defect_type: NotRequired[str | None]  # ①장애유형 (LLM 구조화 분류, 없으면 None)
 
 
 class FixSuggestion(TypedDict):

@@ -139,10 +139,10 @@ def insert_defects(
         if category not in _ALLOWED_CATEGORIES:
             category = _infer_category(cc.get("error_code"))
 
-        # ①장애유형 — cross_check error_code prefix(상태코드 유래 API/INFRA 등)로 산출.
-        # 제품 결함(②결정분류)일 때만. 단서 없으면 None(임의 기본값으로 부풀리지 않음).
+        # ①장애유형 — root_cause LLM 의 구조화 분류(defect_type) 우선(일반적·정확),
+        # 없으면 error_code prefix 폴백. 제품 결함(②결정분류)일 때만. 단서 없으면 None.
         defect_type = (
-            _infer_defect_type(cc.get("error_code"))
+            (rc.get("defect_type") or _infer_defect_type(cc.get("error_code")))
             if category in _PRODUCT_DECISIONS else None
         )
 
