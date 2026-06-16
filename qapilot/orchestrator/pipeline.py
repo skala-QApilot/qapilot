@@ -4394,6 +4394,17 @@ async def _root_cause(state: PipelineState) -> dict:
         str(r.get("tc_id")): r for r in (state.get("ui_results") or [])
         if r.get("tc_id")
     }
+    # tc_id → 기대 동작(then = 명세된 규칙). ①장애유형 분류 시 LLM 이 증상(상태코드)이
+    # 아니라 '어긴 규칙'으로 판단하도록 주입 — 기대가 '조건부 거부/허용/제한'인데 SUT 가
+    # 이를 어기면 DOMAIN_RULE 로 인식 가능 (증상만 보면 API_ERROR 로 오분류하던 격차).
+    tc_expected_by_id: dict[str, str] = {
+        str(tc.get("tc_id")): " / ".join(
+            p for p in (str(tc.get("name") or ""), str(tc.get("then") or "")) if p
+        )
+        for sc in (state.get("scenarios") or [])
+        for tc in (sc.get("test_cases") or [])
+        if tc.get("tc_id")
+    }
 
     root_cause_results: list[dict] = []
     # agent_logs 누적 append — Layer 3 cost 집계 (#232).
@@ -4425,6 +4436,7 @@ async def _root_cause(state: PipelineState) -> dict:
                         "error_code": cc.get("error_code") or "",
                         "summary": cc.get("summary") or "",
                         "mismatches": cc.get("mismatches") or [],
+                        "expected_behavior": tc_expected_by_id.get(str(tc_id), ""),
                         "has_mismatch": True,
                     },
                 )

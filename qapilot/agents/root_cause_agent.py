@@ -134,6 +134,11 @@ class RootCauseAgent(BaseAgent):
         summary: str = params.get("summary") or context.get("summary") or ""
         mismatches: list = params.get("mismatches") or context.get("mismatches") or []
         has_mismatch: bool = params.get("has_mismatch", context.get("has_mismatch", False))
+        # 기대 동작(then = 명세된 규칙) — ①장애유형 분류 시 증상이 아니라 '어긴 규칙'으로
+        # 판단하도록 LLM 에 제공. 없으면 빈 문자열(기존 동작 보존).
+        expected_behavior: str = (
+            params.get("expected_behavior") or context.get("expected_behavior") or ""
+        )
 
         # runtime_context: 파이프라인이 실측 실행 컨텍스트 (ui fail step/error)
         # 를 context 로 제공 — 더미 파일은 그 부재 시 폴백 (run 04d5f79e 감사:
@@ -180,6 +185,7 @@ class RootCauseAgent(BaseAgent):
             "error_code": error_code,
             "summary": summary,
             "mismatches": mismatches,
+            "expected_behavior": expected_behavior,
             "has_mismatch": has_mismatch,
         }
 
