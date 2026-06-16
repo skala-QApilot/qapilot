@@ -57,6 +57,25 @@ class TestClassifyFailure:
         cat, _ = _classify_failure({"has_mismatch": True}, {"tc_id": "x", "status": "pass", "steps": []})
         assert cat == "PRODUCT_DEFECT_CANDIDATE"
 
+    # api-mode: per-step status 없음 → summary 신호로 테스트측 결함 구분
+    def _api(self, summary):
+        return _classify_failure(
+            {"has_mismatch": True, "summary": summary},
+            {"tc_id": "x", "status": "fail", "steps": [], "error": ""})[0]
+
+    def test_api_estimated_range_oracle_is_test_defect(self):
+        assert self._api("기대 status 400~499 — 실제 201") == "TEST_DEFECT_UNVERIFIABLE"
+
+    def test_api_llm_estimated_oracle_is_test_defect(self):
+        assert self._api("status 422 (then 코드 미명시, LLM 추정 [400])") == "TEST_DEFECT_UNVERIFIABLE"
+
+    def test_api_body_predicate_unmet_is_test_defect(self):
+        assert self._api("observe: body $.detail predicate=미충족") == "TEST_DEFECT_MAPPING"
+
+    def test_api_explicit_code_mismatch_stays_product(self):
+        # then 에 명시 코드(기대 [401]) + 추정/관찰 신호 없음 → 제품 결함 후보 유지
+        assert self._api("observe: status 500 (기대 [401])") == "PRODUCT_DEFECT_CANDIDATE"
+
 
 class TestDefectWriterCategoryPassthrough:
     def test_rc_category_wins_over_error_code_inference(self):

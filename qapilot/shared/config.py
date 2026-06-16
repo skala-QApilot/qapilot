@@ -15,8 +15,8 @@ from pydantic import BaseModel, Field
 
 
 class LLMConfig(BaseModel):
-    default_model: str = "gpt-4o-mini"
-    deep_model: str = "gpt-4o"
+    default_model: str = "gpt-5.4-mini-2026-03-17"
+    deep_model: str = "gpt-5.4-mini-2026-03-17"
     monthly_budget_usd: float = 500
     max_tokens_per_task: int = 300000
 

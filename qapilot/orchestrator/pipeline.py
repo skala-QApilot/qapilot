@@ -4322,6 +4322,10 @@ _INTERACTION_ACTIONS = {
     "wait_for_load_state", "wait_for_response", "reload", "go_back", "go_forward",
 }
 
+# api-mode summary 의 '기대 status NNN~NNN' (범위) = then 명시코드 없이 클래스 추정한
+# 오라클. 이 경우 mismatch 는 제품 결함이 아니라 추정 오라클 한계로 본다.
+_RANGE_EXPECT_RE = re.compile(r"기대 status \d{3}~\d{3}")
+
 
 def _classify_failure(cc: dict, ui_result: dict | None) -> tuple[str, str]:
     """실패의 결정적 1차 분류 — (category, reason).
@@ -4351,6 +4355,19 @@ def _classify_failure(cc: dict, ui_result: dict | None) -> tuple[str, str]:
     if failed is None:
         if cc.get("api_unverified") or cc.get("db_unverified"):
             return "ENV_UNVERIFIED", "API/DB 검증 미수행 — trace capture / DB 접속 환경 점검 필요"
+        # api-mode 는 per-step status 가 없어 무조건 여기로 온다. 검증부(api_exec)가
+        # 남긴 summary 신호로 '테스트 측 결함(오라클 추정/관찰 과구체)'을 PRODUCT 와
+        # 구분한다 — 제품 결함으로 단정할 수 없는 fail 을 오탐으로 흘리지 않기 위함.
+        summary = str(cc.get("summary") or "")
+        if "미명시" in summary or "LLM 추정" in summary or _RANGE_EXPECT_RE.search(summary):
+            return "TEST_DEFECT_UNVERIFIABLE", (
+                "api-mode 기대 status 미명시 → LLM 추정 오라클 기반 mismatch — "
+                "제품 결함 단정 불가. then 에 명시 status 필요")
+        if ("관찰 명세 결함" in summary or "unresolved" in summary
+                or "predicate=미충족" in summary):
+            return "TEST_DEFECT_MAPPING", (
+                "api-mode 관찰(observe) 조건 미충족 — 응답에 없는 필드/과구체 단언 등 "
+                "테스트 명세 측 결함 우선 의심")
         return "PRODUCT_DEFECT_CANDIDATE", "UI 통과 + 정합성 mismatch — 제품 결함 후보"
 
     action = str(failed.get("action") or "")
