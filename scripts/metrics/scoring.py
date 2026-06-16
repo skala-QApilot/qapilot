@@ -270,6 +270,42 @@ def precision_from_clean(clean_outcomes: list[TCOutcome]) -> dict:
     }
 
 
+def detection_aggregate(fault_detections: dict[str, list[dict]],
+                        clean_false_positives: float) -> dict:
+    """전체 결함 검출 Recall/Precision (설계서 §3.3).
+
+    fault_detections: {fault_id: [detection() 반환 dict, ...N회]}.
+    clean_false_positives: clean 구성의 평균 오탐 TC 수.
+
+    - **Recall (결함 단위)** = ≥1회 검출된 결함 / 주입 결함 전체.
+      "주입한 결함을 잡았나"는 결함 단위 질문이므로 결함 수로 센다.
+    - **Precision (TC 단위)** = 진짜 검출 hit TC / (진짜 검출 hit TC + clean 오탐 TC).
+      검출 신호(PRODUCT-FAIL) 중 정답 비율. clean 오탐이 분모에 들어가 정밀도를 깎는다.
+      (hit TC 는 detected_hits 로 이미 clean 오탐을 뺀 '진짜 신규' 만 → 분자=TP.)
+    """
+    n_faults = len(fault_detections)
+    detected = 0
+    tp = 0
+    per_fault: dict[str, dict] = {}
+    for fid, runs in fault_detections.items():
+        hit = any(d.get("detected") for d in runs)
+        n_hits = max((d.get("n_hits", 0) for d in runs), default=0)
+        detected += 1 if hit else 0
+        tp += n_hits
+        per_fault[fid] = {"detected": hit, "n_hits": n_hits}
+    fp = float(clean_false_positives or 0.0)
+    denom = tp + fp
+    return {
+        "recall": round(detected / n_faults, 4) if n_faults else None,
+        "n_faults": n_faults,
+        "n_detected": detected,
+        "precision": round(tp / denom, 4) if denom > 0 else None,
+        "true_positives": tp,
+        "false_positives": round(fp, 2),
+        "per_fault": per_fault,
+    }
+
+
 # ── §3.4 장애 분류 ①∧② ─────────────────────────────────────────────
 def classification(fault_outcomes: list[TCOutcome], fault: FaultGT,
                    clean_outcomes: list[TCOutcome] | None = None) -> dict:

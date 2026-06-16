@@ -123,3 +123,26 @@ def test_infer_defect_type_none_without_clue():
     assert scoring._infer_defect_type("") is None
     assert scoring._infer_defect_type("RULE_MINOR") == "DOMAIN_RULE"
     assert scoring._infer_defect_type("API_500") == "API_ERROR"
+
+
+def test_detection_aggregate_recall_precision():
+    # 5결함 중 1개만 검출(hit 1건), clean 오탐 49건 → 1차 수치 재현(Recall 0.2, Prec≈0.02).
+    fault_dets = {
+        "BUG-RULE-001": [{"detected": True, "n_hits": 1}],
+        "BUG-RULE-002": [{"detected": False, "n_hits": 0}],
+        "BUG-RULE-003": [{"detected": False, "n_hits": 0}],
+        "BUG-RULE-004": [{"detected": False, "n_hits": 0}],
+        "BUG-API-001": [{"detected": False, "n_hits": 0}],
+    }
+    agg = scoring.detection_aggregate(fault_dets, clean_false_positives=49)
+    assert agg["recall"] == 0.2 and agg["n_detected"] == 1 and agg["n_faults"] == 5
+    assert agg["true_positives"] == 1 and agg["false_positives"] == 49
+    assert agg["precision"] == round(1 / 50, 4)  # ≈ 0.02
+
+
+def test_detection_aggregate_any_run_counts_as_detected():
+    # N회 중 한 번이라도 검출되면 그 결함은 검출(결함 단위 Recall).
+    fault_dets = {"f1": [{"detected": False, "n_hits": 0}, {"detected": True, "n_hits": 2}]}
+    agg = scoring.detection_aggregate(fault_dets, clean_false_positives=0)
+    assert agg["n_detected"] == 1 and agg["true_positives"] == 2
+    assert agg["precision"] == 1.0  # FP=0 → 모든 검출이 진짜

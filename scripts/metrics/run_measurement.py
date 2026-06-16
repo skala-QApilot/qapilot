@@ -240,6 +240,14 @@ def main() -> int:
         report["configs"][cfg] = score_config(
             cfg, runs, faults, clean_runs, golden=golden, llm_judge=llm_judge)
 
+    # 전체 결함 검출 Recall/Precision 집계 (구성별 신호 → 단일 헤드라인 수치)
+    fault_dets = {cfg: r["detection"]["per_run"]
+                  for cfg, r in report["configs"].items() if r.get("kind") == "fault"}
+    clean_r = report["configs"].get(config.CLEAN)
+    clean_fp = (clean_r or {}).get("false_positives_mean", {}).get("mean", 0.0)
+    if fault_dets:
+        report["detection_summary"] = scoring.detection_aggregate(fault_dets, clean_fp)
+
     out_file = out_dir / "metrics_report.json"
     out_file.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"\n[report] {out_file}")
@@ -249,6 +257,10 @@ def main() -> int:
 
 def _print_summary(report: dict) -> None:
     print("\n=== 측정 요약 ===")
+    ds = report.get("detection_summary")
+    if ds:
+        print(f"[검출 전체] Recall={ds['recall']} ({ds['n_detected']}/{ds['n_faults']}) "
+              f"Precision={ds['precision']} (TP={ds['true_positives']}, FP={ds['false_positives']})")
     for cfg, r in report["configs"].items():
         if r["kind"] == "clean":
             print(f"[clean] 테스트코드정확도={r['test_code_accuracy']['mean']} "
