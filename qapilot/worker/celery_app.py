@@ -24,7 +24,7 @@ celery_app = Celery(
     "qapilot",
     broker=_BROKER_URL,
     backend=_BROKER_URL,
-    include=["qapilot.worker.tasks"],
+    include=["qapilot.worker.tasks", "qapilot.rl.tasks"],
 )
 
 celery_app.conf.update(
